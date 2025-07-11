@@ -1,0 +1,185 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..b863e95a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Script to reproduce the issue with binary method strings in Python 3.
++"""
++
++import sys
++import requests
++
++def print_separator():
++    print("\n" + "=" * 50 + "\n")
++
++def test_method(session, method, expected_endpoint=None):
++    """Test a specific HTTP method."""
++    print(f"Method: {method!r}")
++    
++    # If no endpoint is specified, derive it from the method
++    if expected_endpoint is None:
++        if isinstance(method, bytes):
++            expected_endpoint = method.decode('utf-8').lower()
++        else:
++            expected_endpoint = method.lower()
++    
++    url = f"http://httpbin.org/{expected_endpoint}"
++    print(f"Making request to {url}")
++    
++    try:
++        response = session.request(method, url)
++        print(f"Response status: {response.status_code}")
++        print(f"Response URL: {response.url}")
++        print(f"Success: {response.status_code == 200}")
++        return response.status_code == 200
++    except Exception as e:
++        print(f"Exception: {e}")
++        return False
++
++def main():
++    print("Python version:", sys.version)
++    
++    # Create a session
++    s = requests.Session()
++    
++    # Show how binary methods are converted (for demonstration)
++    from requests.compat import builtin_str
++    binary_method = b'GET'
++    converted = builtin_str(binary_method)
++    print(f"Binary method {binary_method!r} after builtin_str(): {converted!r}")
++    print_separator()
++    
++    # Test various methods in both binary and string forms
++    methods = [
++        # Standard methods
++        (b'GET', 'get'),
++        ('GET', 'get'),
++        (b'POST', 'post'),
++        ('POST', 'post'),
++        (b'PUT', 'put'),
++        ('PUT', 'put'),
++        (b'DELETE', 'delete'),
++        ('DELETE', 'delete'),
++        
++        # Test case sensitivity
++        (b'get', 'get'),
++        ('get', 'get'),
++        
++        # Test non-ASCII characters (should be rare but let's test anyway)
++        (b'GET\xe2\x80\x99', 'get', 'get'),  # Unicode apostrophe in UTF-8
++        ('GET\u2019', 'get', 'get')  # Unicode apostrophe
++    ]
++    
++    successes = 0
++    total_tests = len(methods)
++    
++    for i, method_data in enumerate(methods):
++        if len(method_data) == 2:
++            method, endpoint = method_data
++            alternate_endpoint = None
++        else:
++            method, endpoint, alternate_endpoint = method_data
++            
++        print(f"\nTest {i+1}/{total_tests}:")
++        success = test_method(s, method, expected_endpoint=endpoint)
++        
++        # If the first attempt failed and we have an alternate endpoint, try with that
++        if not success and alternate_endpoint:
++            print("Trying with alternate endpoint...")
++            success = test_method(s, method, expected_endpoint=alternate_endpoint)
++            
++        if success:
++            successes += 1
++        
++        print_separator()
++    
++    print(f"Results: {successes}/{total_tests} tests passed")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/requests/sessions.py b/requests/sessions.py
+index d701ff2e..86858e75 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -425,7 +425,11 @@ class Session(SessionRedirectMixin):
+             If Tuple, ('cert', 'key') pair.
+         """
+ 
+-        method = builtin_str(method)
++        # Handle binary strings in Python 3
++        if isinstance(method, bytes):
++            method = method.decode('utf-8')
++        else:
++            method = builtin_str(method)
+ 
+         # Create the Request.
+         req = Request(
+diff --git a/test_method_handling.py b/test_method_handling.py
+new file mode 100644
+index 00000000..b1f684ef
+--- /dev/null
++++ b/test_method_handling.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++import unittest
++import requests
++from requests.compat import is_py2, is_py3
++
++class MethodHandlingTest(unittest.TestCase):
++    """Test class for verifying correct handling of HTTP methods in different formats."""
++    
++    def _test_session_request_with_method(self, method, expected_success=True):
++        s = requests.Session()
++        try:
++            # Convert method to string to get the appropriate endpoint
++            if isinstance(method, bytes):
++                method_str = method.decode('utf-8').lower()
++            else:
++                method_str = method.lower()
++                
++            # Special case for OPTIONS and HEAD
++            if method_str == 'options':
++                # For OPTIONS we'll just use any URL
++                url = "http://httpbin.org"
++            elif method_str == 'head':
++                url = "http://httpbin.org/get"
++            else:
++                # Use the method name as the endpoint
++                url = f"http://httpbin.org/{method_str}"
++                
++            response = s.request(method, url)
++            
++            # Verify the response is successful
++            self.assertEqual(response.status_code, 200)
++            return True
++        except Exception as e:
++            if not expected_success:
++                # If we expected failure and got one, that's a success
++                return True
++            self.fail(f"Failed with method {method!r}: {e}")
++            return False
++    
++    def test_string_methods(self):
++        """Test that string methods work correctly."""
++        methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']
++        for method in methods:
++            self._test_session_request_with_method(method)
++    
++    def test_binary_methods(self):
++        """Test that binary string methods work correctly."""
++        if is_py3:  # Only relevant in Python 3
++            methods = [b'GET', b'POST', b'PUT', b'DELETE', b'PATCH', b'OPTIONS', b'HEAD']
++            for method in methods:
++                self._test_session_request_with_method(method)
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file

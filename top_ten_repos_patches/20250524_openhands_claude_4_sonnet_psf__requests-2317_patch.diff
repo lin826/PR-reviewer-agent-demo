@@ -1,0 +1,547 @@
+diff --git a/requests/sessions.py b/requests/sessions.py
+index d701ff2e..adcfbac7 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -425,7 +425,7 @@ class Session(SessionRedirectMixin):
+             If Tuple, ('cert', 'key') pair.
+         """
+ 
+-        method = builtin_str(method)
++        method = to_native_string(method)
+ 
+         # Create the Request.
+         req = Request(
+diff --git a/test_binary_method.py b/test_binary_method.py
+new file mode 100644
+index 00000000..921952d0
+--- /dev/null
++++ b/test_binary_method.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the binary method issue.
++"""
++
++import requests
++from requests.compat import builtin_str
++
++def test_binary_method_issue():
++    """Test that demonstrates the issue with binary string methods."""
++    
++    # Simulate what happens when neutronclient passes a binary method
++    binary_method = b'GET'
++    
++    print("Testing binary method handling...")
++    print(f"Original binary method: {binary_method!r}")
++    
++    # Show what builtin_str does to binary strings
++    converted_method = builtin_str(binary_method)
++    print(f"builtin_str(binary_method): {converted_method!r}")
++    print(f"Type: {type(converted_method)}")
++    
++    # This is what we get - the literal string representation
++    assert converted_method == "b'GET'"
++    print("✓ Confirmed: builtin_str converts b'GET' to \"b'GET'\"")
++    
++    # Now test what to_native_string does
++    from requests.utils import to_native_string
++    proper_method = to_native_string(binary_method)
++    print(f"to_native_string(binary_method): {proper_method!r}")
++    print(f"Type: {type(proper_method)}")
++    
++    # This is what we want - the decoded string
++    assert proper_method == "GET"
++    print("✓ Confirmed: to_native_string converts b'GET' to 'GET'")
++    
++    print("\nTesting with actual requests...")
++    
++    # Test that the current implementation fails
++    try:
++        # Create a session and manually set a binary method to test the issue
++        session = requests.Session()
++        
++        # We can't easily test this with a real HTTP request since we'd need a server
++        # But we can test the method conversion logic
++        
++        # Test the current problematic behavior
++        method = b'GET'
++        converted = builtin_str(method)
++        print(f"Current behavior: {method!r} -> {converted!r}")
++        
++        # Test the fixed behavior
++        fixed = to_native_string(method)
++        print(f"Fixed behavior: {method!r} -> {fixed!r}")
++        
++        print("✓ Test completed successfully")
++        
++    except Exception as e:
++        print(f"Error during test: {e}")
++        raise
++
++def test_various_method_types():
++    """Test various types of method inputs."""
++    from requests.utils import to_native_string
++    
++    test_cases = [
++        ('GET', 'GET'),  # regular string
++        (b'POST', 'POST'),  # binary string
++        (b'PUT', 'PUT'),  # another binary string
++        ('DELETE', 'DELETE'),  # regular string
++    ]
++    
++    print("\nTesting various method types...")
++    
++    for input_method, expected in test_cases:
++        result = to_native_string(input_method)
++        print(f"to_native_string({input_method!r}) = {result!r}")
++        assert result == expected, f"Expected {expected!r}, got {result!r}"
++    
++    print("✓ All method type tests passed")
++
++if __name__ == '__main__':
++    test_binary_method_issue()
++    test_various_method_types()
++    print("\n🎉 All tests passed!")
+\ No newline at end of file
+diff --git a/test_binary_method_regression.py b/test_binary_method_regression.py
+new file mode 100644
+index 00000000..d6eb7d27
+--- /dev/null
++++ b/test_binary_method_regression.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++"""
++Regression test for binary method handling.
++This test should be added to the main test suite.
++"""
++
++import unittest
++import requests
++from requests.sessions import Session
++from requests.models import Response
++
++class BinaryMethodTestCase(unittest.TestCase):
++    """Test case for binary method handling regression."""
++    
++    def setUp(self):
++        """Set up mock for HTTP requests."""
++        self.original_send = Session.send
++        self.captured_method = None
++        
++        def mock_send(session_self, request, **kwargs):
++            self.captured_method = request.method
++            response = Response()
++            response.status_code = 200
++            response._content = b'{"test": "success"}'
++            response.headers['Content-Type'] = 'application/json'
++            return response
++        
++        Session.send = mock_send
++    
++    def tearDown(self):
++        """Restore original send method."""
++        Session.send = self.original_send
++    
++    def test_binary_method_name(self):
++        """Test that binary method names are properly decoded."""
++        # Test the specific issue reported: b'GET' should become 'GET', not "b'GET'"
++        session = Session()
++        response = session.request(b'GET', 'http://example.com')
++        
++        self.assertEqual(self.captured_method, 'GET')
++        self.assertEqual(response.status_code, 200)
++    
++    def test_binary_method_various_types(self):
++        """Test various binary method types."""
++        session = Session()
++        
++        test_cases = [
++            (b'GET', 'GET'),
++            (b'POST', 'POST'),
++            (b'put', 'PUT'),  # should be uppercased
++            (b'delete', 'DELETE'),
++            (b'HEAD', 'HEAD'),
++            (b'OPTIONS', 'OPTIONS'),
++        ]
++        
++        for binary_method, expected in test_cases:
++            with self.subTest(method=binary_method):
++                response = session.request(binary_method, 'http://example.com')
++                self.assertEqual(self.captured_method, expected)
++                self.assertEqual(response.status_code, 200)
++    
++    def test_string_method_backward_compatibility(self):
++        """Test that regular string methods still work (backward compatibility)."""
++        session = Session()
++        
++        test_cases = ['GET', 'POST', 'put', 'DELETE', 'head']
++        expected_cases = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD']
++        
++        for method, expected in zip(test_cases, expected_cases):
++            with self.subTest(method=method):
++                response = session.request(method, 'http://example.com')
++                self.assertEqual(self.captured_method, expected)
++                self.assertEqual(response.status_code, 200)
++    
++    def test_unicode_method_backward_compatibility(self):
++        """Test that unicode methods still work (regression test)."""
++        session = Session()
++        
++        # In Python 3, u'POST' is just 'POST', but this ensures compatibility
++        unicode_method = u'POST'
++        response = session.request(unicode_method, 'http://example.com')
++        
++        self.assertEqual(self.captured_method, 'POST')
++        self.assertEqual(response.status_code, 200)
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_binary_method_request.py b/test_binary_method_request.py
+new file mode 100644
+index 00000000..f615e328
+--- /dev/null
++++ b/test_binary_method_request.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the binary method issue with actual HTTP requests.
++"""
++
++import requests
++from requests.sessions import Session
++from requests.models import Request
++
++def test_binary_method_with_mock():
++    """Test binary method handling with a mock-like approach."""
++    
++    print("Testing binary method with Request creation...")
++    
++    # Test creating a Request with binary method
++    binary_method = b'GET'
++    
++    # Create a Request object with binary method
++    req = Request(method=binary_method, url='http://httpbin.org/get')
++    print(f"Request.method: {req.method!r} (type: {type(req.method)})")
++    
++    # Create a session and prepare the request
++    session = Session()
++    
++    # This is where the issue occurs - in session.request() method
++    # Let's manually test the problematic line
++    from requests.compat import builtin_str
++    from requests.utils import to_native_string
++    
++    # Current problematic behavior
++    current_result = builtin_str(binary_method)
++    print(f"Current (problematic): builtin_str({binary_method!r}) = {current_result!r}")
++    
++    # Fixed behavior
++    fixed_result = to_native_string(binary_method)
++    print(f"Fixed: to_native_string({binary_method!r}) = {fixed_result!r}")
++    
++    # The issue: current_result would be "b'GET'" which is not a valid HTTP method
++    assert current_result == "b'GET'"
++    assert fixed_result == "GET"
++    
++    print("✓ Confirmed the issue and the fix")
++
++def test_session_request_method_conversion():
++    """Test the actual method conversion in Session.request()"""
++    
++    print("\nTesting Session.request() method conversion...")
++    
++    # We'll monkey-patch the session to test without making actual HTTP requests
++    original_send = Session.send
++    
++    captured_method = None
++    
++    def mock_send(self, request, **kwargs):
++        nonlocal captured_method
++        captured_method = request.method
++        # Return a mock response instead of making real request
++        from requests.models import Response
++        response = Response()
++        response.status_code = 200
++        response._content = b'{"test": "success"}'
++        response.headers['Content-Type'] = 'application/json'
++        return response
++    
++    # Monkey patch
++    Session.send = mock_send
++    
++    try:
++        session = Session()
++        
++        # Test with binary method - this should fail with current implementation
++        binary_method = b'GET'
++        
++        # This will call session.request() which has the problematic line
++        response = session.request(binary_method, 'http://httpbin.org/get')
++        
++        print(f"Captured method from request: {captured_method!r}")
++        print(f"Response status: {response.status_code}")
++        
++        # With the current bug, captured_method would be "b'GET'"
++        # After our fix, it should be "GET"
++        
++    finally:
++        # Restore original method
++        Session.send = original_send
++    
++    return captured_method
++
++if __name__ == '__main__':
++    test_binary_method_with_mock()
++    captured = test_session_request_method_conversion()
++    
++    print(f"\nFinal captured method: {captured!r}")
++    
++    # This will show the current buggy behavior
++    if captured == "b'GET'":
++        print("❌ Bug confirmed: method is converted to literal string representation")
++    elif captured == "GET":
++        print("✅ Bug fixed: method is properly decoded")
++    else:
++        print(f"❓ Unexpected result: {captured}")
+\ No newline at end of file
+diff --git a/test_comprehensive_method_fix.py b/test_comprehensive_method_fix.py
+new file mode 100644
+index 00000000..b8482487
+--- /dev/null
++++ b/test_comprehensive_method_fix.py
+@@ -0,0 +1,125 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the binary method fix.
++"""
++
++import requests
++from requests.sessions import Session
++from requests.models import Response
++
++def test_all_method_types():
++    """Test various method types to ensure backward compatibility."""
++    
++    # Mock the send method to capture the actual method used
++    original_send = Session.send
++    captured_methods = []
++    
++    def mock_send(self, request, **kwargs):
++        captured_methods.append(request.method)
++        response = Response()
++        response.status_code = 200
++        response._content = b'{"test": "success"}'
++        response.headers['Content-Type'] = 'application/json'
++        return response
++    
++    Session.send = mock_send
++    
++    try:
++        session = Session()
++        
++        test_cases = [
++            # (input_method, expected_output)
++            ('GET', 'GET'),
++            (b'POST', 'POST'),
++            ('put', 'PUT'),  # should be uppercased
++            (b'delete', 'DELETE'),  # binary + lowercase
++            ('HEAD', 'HEAD'),
++            (b'OPTIONS', 'OPTIONS'),
++            ('PATCH', 'PATCH'),
++            (b'TRACE', 'TRACE'),
++        ]
++        
++        print("Testing various method types...")
++        
++        for input_method, expected in test_cases:
++            captured_methods.clear()
++            
++            try:
++                response = session.request(input_method, 'http://example.com')
++                actual = captured_methods[0] if captured_methods else None
++                
++                print(f"Input: {input_method!r:12} -> Output: {actual!r:8} (Expected: {expected!r})")
++                
++                assert actual == expected, f"Expected {expected!r}, got {actual!r}"
++                assert response.status_code == 200
++                
++            except Exception as e:
++                print(f"Error with method {input_method!r}: {e}")
++                raise
++        
++        print("✅ All method types work correctly!")
++        
++    finally:
++        Session.send = original_send
++
++def test_unicode_methods():
++    """Test unicode method names (regression test)."""
++    
++    original_send = Session.send
++    captured_method = None
++    
++    def mock_send(self, request, **kwargs):
++        nonlocal captured_method
++        captured_method = request.method
++        response = Response()
++        response.status_code = 200
++        response._content = b'{"test": "success"}'
++        return response
++    
++    Session.send = mock_send
++    
++    try:
++        session = Session()
++        
++        # Test unicode method (this was already working, ensure we didn't break it)
++        unicode_method = u'POST'  # This is just a regular string in Python 3
++        response = session.request(unicode_method, 'http://example.com')
++        
++        print(f"\nUnicode method test: {unicode_method!r} -> {captured_method!r}")
++        assert captured_method == 'POST'
++        print("✅ Unicode methods still work!")
++        
++    finally:
++        Session.send = original_send
++
++def test_edge_cases():
++    """Test edge cases and error conditions."""
++    
++    from requests.utils import to_native_string
++    
++    print("\nTesting edge cases...")
++    
++    # Test empty method
++    try:
++        result = to_native_string(b'')
++        print(f"Empty binary string: {b''!r} -> {result!r}")
++        assert result == ''
++    except Exception as e:
++        print(f"Error with empty binary string: {e}")
++    
++    # Test non-ASCII method (should work with proper encoding)
++    try:
++        # This would be unusual but should not crash
++        result = to_native_string('GET')
++        print(f"Regular string: {'GET'!r} -> {result!r}")
++        assert result == 'GET'
++    except Exception as e:
++        print(f"Error with regular string: {e}")
++    
++    print("✅ Edge cases handled correctly!")
++
++if __name__ == '__main__':
++    test_all_method_types()
++    test_unicode_methods()
++    test_edge_cases()
++    print("\n🎉 All comprehensive tests passed!")
+\ No newline at end of file
+diff --git a/test_neutronclient_scenario.py b/test_neutronclient_scenario.py
+new file mode 100644
+index 00000000..1032e791
+--- /dev/null
++++ b/test_neutronclient_scenario.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python
++"""
++Test that simulates the exact scenario described in the issue.
++This mimics what python-neutronclient does with utils.safe_encode_list(args).
++"""
++
++import requests
++from requests.sessions import Session
++from requests.models import Response
++
++def simulate_safe_encode_list(args):
++    """Simulate what neutronclient's utils.safe_encode_list does."""
++    # This function converts all values to binary strings
++    encoded_args = []
++    for arg in args:
++        if isinstance(arg, str):
++            encoded_args.append(arg.encode('utf-8'))
++        else:
++            encoded_args.append(arg)
++    return encoded_args
++
++def test_neutronclient_scenario():
++    """Test the exact scenario described in the issue."""
++    
++    print("Simulating python-neutronclient scenario...")
++    
++    # Mock the send method to capture what actually gets sent
++    original_send = Session.send
++    captured_method = None
++    
++    def mock_send(self, request, **kwargs):
++        nonlocal captured_method
++        captured_method = request.method
++        response = Response()
++        response.status_code = 200  # Success instead of 404
++        response._content = b'{"success": true}'
++        response.headers['Content-Type'] = 'application/json'
++        return response
++    
++    Session.send = mock_send
++    
++    try:
++        # Simulate what neutronclient does
++        args = ['GET', 'http://example.com/api']
++        encoded_args = simulate_safe_encode_list(args)
++        
++        print(f"Original args: {args}")
++        print(f"After safe_encode_list: {encoded_args}")
++        
++        # The method is now binary
++        binary_method = encoded_args[0]
++        url = encoded_args[1].decode('utf-8')  # URL gets decoded elsewhere
++        
++        print(f"Binary method: {binary_method!r}")
++        print(f"URL: {url!r}")
++        
++        # This is where the bug would occur - passing binary method to requests
++        session = Session()
++        response = session.request(binary_method, url)
++        
++        print(f"Method sent to server: {captured_method!r}")
++        print(f"Response status: {response.status_code}")
++        
++        # Before the fix: captured_method would be "B'GET'" and status would be 404
++        # After the fix: captured_method should be "GET" and status should be 200
++        
++        assert captured_method == 'GET', f"Expected 'GET', got {captured_method!r}"
++        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
++        
++        print("✅ Neutronclient scenario works correctly!")
++        print("✅ Binary method b'GET' was properly converted to 'GET'")
++        print("✅ No more 404 errors due to malformed method names!")
++        
++    finally:
++        Session.send = original_send
++
++def test_before_and_after_fix():
++    """Show the difference between before and after the fix."""
++    
++    from requests.compat import builtin_str
++    from requests.utils import to_native_string
++    
++    binary_method = b'GET'
++    
++    print("\nBefore and after comparison:")
++    print(f"Input: {binary_method!r}")
++    
++    # Before fix (problematic)
++    before = builtin_str(binary_method).upper()
++    print(f"Before fix (builtin_str): {before!r}")
++    
++    # After fix (correct)
++    after = to_native_string(binary_method).upper()
++    print(f"After fix (to_native_string): {after!r}")
++    
++    print(f"✅ Fixed: {before!r} -> {after!r}")
++
++if __name__ == '__main__':
++    test_neutronclient_scenario()
++    test_before_and_after_fix()
++    print("\n🎉 Issue fully resolved!")
+\ No newline at end of file

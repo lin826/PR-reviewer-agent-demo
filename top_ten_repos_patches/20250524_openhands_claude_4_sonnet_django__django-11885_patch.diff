@@ -1,0 +1,999 @@
+diff --git a/debug_edge_case.py b/debug_edge_case.py
+new file mode 100644
+index 0000000000..a5bdedfa41
+--- /dev/null
++++ b/debug_edge_case.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python
++"""
++Debug the edge case to understand what queries are being generated.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test.utils import override_settings
++from django.db import connection
++
++
++# Test models
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Entry(models.Model):
++    title = models.CharField(max_length=100)
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_entries')
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='updated_entries')
++    reviewed_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reviewed_entries', null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def setup_database():
++    """Create the database tables."""
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Entry)
++
++
++def debug_empty_user():
++    """Debug what happens when deleting a user with no related objects."""
++    print("=== Debug: Empty User Deletion ===")
++    
++    user_empty = User.objects.create(name="Empty User")
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        user_empty.delete()
++        
++        print(f"Total queries: {len(connection.queries)}")
++        for i, query in enumerate(connection.queries):
++            print(f"Query {i+1}: {query['sql']}")
++
++
++if __name__ == '__main__':
++    setup_database()
++    debug_empty_user()
+\ No newline at end of file
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index ae82d26340..408ee50843 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -310,9 +310,38 @@ class Collector:
+                     )
+ 
+             # fast deletes
++            # Group fast deletes by model to combine queries for the same table
++            fast_delete_groups = {}
+             for qs in self.fast_deletes:
+-                count = qs._raw_delete(using=self.using)
+-                deleted_counter[qs.model._meta.label] += count
++                model = qs.model
++                if model not in fast_delete_groups:
++                    fast_delete_groups[model] = []
++                fast_delete_groups[model].append(qs)
++            
++            # Execute combined queries for each model
++            for model, querysets in fast_delete_groups.items():
++                if len(querysets) == 1:
++                    # Single queryset, execute as before
++                    count = querysets[0]._raw_delete(using=self.using)
++                    deleted_counter[model._meta.label] += count
++                else:
++                    # Multiple querysets for same model, combine with OR
++                    from django.db.models.sql.where import WhereNode, OR
++                    
++                    # Create a combined WHERE node with OR connector
++                    combined_where = WhereNode()
++                    combined_where.connector = OR
++                    
++                    for qs in querysets:
++                        if qs.query.where:
++                            combined_where.add(qs.query.where, OR)
++                    
++                    if combined_where.children:
++                        # Create a new queryset with combined WHERE conditions
++                        combined_qs = model._default_manager.using(self.using).all()
++                        combined_qs.query.where = combined_where
++                        count = combined_qs._raw_delete(using=self.using)
++                        deleted_counter[model._meta.label] += count
+ 
+             # update fields
+             for model, instances_for_fieldvalues in self.field_updates.items():
+diff --git a/test_combine_querysets.py b/test_combine_querysets.py
+new file mode 100644
+index 0000000000..370fc4f882
+--- /dev/null
++++ b/test_combine_querysets.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python
++"""
++Test script to understand how to combine QuerySets with OR conditions.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++from django.db.models.deletion import Collector
++
++
++# Test models
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Entry(models.Model):
++    title = models.CharField(max_length=100)
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_entries')
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='updated_entries')
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def setup_database():
++    """Create the database tables."""
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Entry)
++
++
++def test_queryset_combination():
++    """Test how to combine QuerySets with OR conditions."""
++    print("=== Testing QuerySet Combination ===")
++    
++    # Create test data
++    user = User.objects.create(name="Test User")
++    entry1 = Entry.objects.create(title="Entry 1", created_by=user, updated_by=user)
++    entry2 = Entry.objects.create(title="Entry 2", created_by=user, updated_by=user)
++    
++    # Get the individual QuerySets that would be in fast_deletes
++    qs1 = Entry.objects.filter(created_by=user)
++    qs2 = Entry.objects.filter(updated_by=user)
++    
++    print(f"QS1 SQL: {qs1.query.get_compiler('default').as_sql()}")
++    print(f"QS2 SQL: {qs2.query.get_compiler('default').as_sql()}")
++    
++    # Try to combine them with OR
++    combined_qs = Entry.objects.filter(Q(created_by=user) | Q(updated_by=user))
++    print(f"Combined SQL: {combined_qs.query.get_compiler('default').as_sql()}")
++    
++    # Test the actual deletion
++    print(f"QS1 count: {qs1.count()}")
++    print(f"QS2 count: {qs2.count()}")
++    print(f"Combined count: {combined_qs.count()}")
++    
++    # Test _raw_delete
++    from django.test.utils import override_settings
++    from django.db import connection
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        # Test individual deletes
++        print("\n--- Individual Deletes ---")
++        count1 = qs1._raw_delete(using='default')
++        print(f"QS1 deleted: {count1}")
++        print(f"Query: {connection.queries[-1]['sql']}")
++        
++        # Recreate data for second test
++        entry3 = Entry.objects.create(title="Entry 3", created_by=user, updated_by=user)
++        qs2_new = Entry.objects.filter(updated_by=user)
++        count2 = qs2_new._raw_delete(using='default')
++        print(f"QS2 deleted: {count2}")
++        print(f"Query: {connection.queries[-1]['sql']}")
++        
++        # Test combined delete
++        print("\n--- Combined Delete ---")
++        entry4 = Entry.objects.create(title="Entry 4", created_by=user, updated_by=user)
++        entry5 = Entry.objects.create(title="Entry 5", created_by=user, updated_by=user)
++        
++        combined_qs_new = Entry.objects.filter(Q(created_by=user) | Q(updated_by=user))
++        count_combined = combined_qs_new._raw_delete(using='default')
++        print(f"Combined deleted: {count_combined}")
++        print(f"Query: {connection.queries[-1]['sql']}")
++
++
++def test_where_extraction():
++    """Test how to extract WHERE conditions from QuerySets."""
++    print("\n=== Testing WHERE Extraction ===")
++    
++    user = User.objects.create(name="Test User 2")
++    
++    qs1 = Entry.objects.filter(created_by=user)
++    qs2 = Entry.objects.filter(updated_by=user)
++    
++    print(f"QS1 WHERE: {qs1.query.where}")
++    print(f"QS2 WHERE: {qs2.query.where}")
++    
++    # Try to understand the structure
++    print(f"QS1 WHERE children: {qs1.query.where.children}")
++    print(f"QS2 WHERE children: {qs2.query.where.children}")
++
++
++if __name__ == '__main__':
++    setup_database()
++    test_queryset_combination()
++    test_where_extraction()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..ef2bd14dad
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,238 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script to verify the fast delete query combination fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test.utils import override_settings
++from django.db import connection
++
++
++# Test models
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Entry(models.Model):
++    title = models.CharField(max_length=100)
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_entries')
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='updated_entries')
++    reviewed_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reviewed_entries', null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Person(models.Model):
++    name = models.CharField(max_length=100)
++    friends = models.ManyToManyField('self', symmetrical=False)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def setup_database():
++    """Create the database tables."""
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Entry)
++        schema_editor.create_model(Person)
++        schema_editor.create_model(Category)
++        schema_editor.create_model(Article)
++
++
++def test_multiple_fk_same_table():
++    """Test multiple foreign keys pointing to the same table."""
++    print("=== Test: Multiple FK to Same Table ===")
++    
++    user = User.objects.create(name="Test User")
++    entry1 = Entry.objects.create(title="Entry 1", created_by=user, updated_by=user, reviewed_by=user)
++    entry2 = Entry.objects.create(title="Entry 2", created_by=user, updated_by=user)
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        user.delete()
++        
++        print(f"Number of queries: {len(connection.queries)}")
++        delete_queries = [q for q in connection.queries if q['sql'].startswith('DELETE')]
++        print(f"Number of DELETE queries: {len(delete_queries)}")
++        
++        for i, query in enumerate(delete_queries):
++            print(f"DELETE {i+1}: {query['sql']}")
++        
++        # Should have only 2 DELETE queries: 1 for Entry (combined), 1 for User
++        assert len(delete_queries) == 2, f"Expected 2 DELETE queries, got {len(delete_queries)}"
++        
++        # Check that Entry DELETE query uses OR
++        entry_delete = [q for q in delete_queries if 'entry' in q['sql'].lower()][0]
++        assert ' OR ' in entry_delete['sql'], "Entry DELETE should use OR condition"
++        
++        print("✓ Test passed: Multiple FK queries combined with OR")
++
++
++def test_single_fk():
++    """Test single foreign key (should not change behavior)."""
++    print("\n=== Test: Single FK (No Combination Needed) ===")
++    
++    category = Category.objects.create(name="Test Category")
++    article1 = Article.objects.create(title="Article 1", category=category)
++    article2 = Article.objects.create(title="Article 2", category=category)
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        category.delete()
++        
++        print(f"Number of queries: {len(connection.queries)}")
++        delete_queries = [q for q in connection.queries if q['sql'].startswith('DELETE')]
++        print(f"Number of DELETE queries: {len(delete_queries)}")
++        
++        for i, query in enumerate(delete_queries):
++            print(f"DELETE {i+1}: {query['sql']}")
++        
++        # Should have 2 DELETE queries: 1 for Article, 1 for Category
++        assert len(delete_queries) == 2, f"Expected 2 DELETE queries, got {len(delete_queries)}"
++        
++        # Check that Article DELETE query does NOT use OR (single condition)
++        article_delete = [q for q in delete_queries if 'article' in q['sql'].lower()][0]
++        assert ' OR ' not in article_delete['sql'], "Single FK DELETE should not use OR"
++        
++        print("✓ Test passed: Single FK behavior unchanged")
++
++
++def test_m2m_relationships():
++    """Test many-to-many relationships."""
++    print("\n=== Test: Many-to-Many Relationships ===")
++    
++    person1 = Person.objects.create(name="Person 1")
++    person2 = Person.objects.create(name="Person 2")
++    person3 = Person.objects.create(name="Person 3")
++    
++    # Create bidirectional friendships
++    person1.friends.add(person2, person3)
++    person2.friends.add(person1)
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        person1.delete()
++        
++        print(f"Number of queries: {len(connection.queries)}")
++        delete_queries = [q for q in connection.queries if q['sql'].startswith('DELETE')]
++        print(f"Number of DELETE queries: {len(delete_queries)}")
++        
++        for i, query in enumerate(delete_queries):
++            print(f"DELETE {i+1}: {query['sql']}")
++        
++        # Should have 2 DELETE queries: 1 for M2M table (combined), 1 for Person
++        assert len(delete_queries) == 2, f"Expected 2 DELETE queries, got {len(delete_queries)}"
++        
++        # Check that M2M DELETE query uses OR
++        m2m_delete = [q for q in delete_queries if 'friends' in q['sql'].lower()][0]
++        assert ' OR ' in m2m_delete['sql'], "M2M DELETE should use OR condition"
++        
++        print("✓ Test passed: M2M queries combined with OR")
++
++
++def test_edge_cases():
++    """Test edge cases."""
++    print("\n=== Test: Edge Cases ===")
++    
++    # Test with no related objects
++    user_empty = User.objects.create(name="Empty User")
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        user_empty.delete()
++        
++        print(f"Number of queries (empty): {len(connection.queries)}")
++        delete_queries = [q for q in connection.queries if q['sql'].startswith('DELETE')]
++        print(f"Number of DELETE queries (empty): {len(delete_queries)}")
++        
++        # Should have 2 DELETE queries: 1 for Entry (combined, even if empty), 1 for User
++        assert len(delete_queries) == 2, f"Expected 2 DELETE queries for empty user, got {len(delete_queries)}"
++        
++        # Check that Entry DELETE query still uses OR (even for empty result)
++        entry_delete = [q for q in delete_queries if 'entry' in q['sql'].lower()][0]
++        assert ' OR ' in entry_delete['sql'], "Entry DELETE should use OR condition even when empty"
++        
++        print("✓ Test passed: Empty relationships handled correctly")
++
++
++def test_correctness():
++    """Test that the combined queries produce correct results."""
++    print("\n=== Test: Correctness Verification ===")
++    
++    user = User.objects.create(name="Correctness User")
++    
++    # Create entries with different combinations
++    entry1 = Entry.objects.create(title="Entry 1", created_by=user, updated_by=user)  # Both FK point to user
++    entry2 = Entry.objects.create(title="Entry 2", created_by=user, updated_by=User.objects.create(name="Other"))  # Only created_by
++    entry3 = Entry.objects.create(title="Entry 3", created_by=User.objects.create(name="Another"), updated_by=user)  # Only updated_by
++    
++    print(f"Initial entries: {Entry.objects.count()}")
++    
++    user.delete()
++    
++    print(f"Remaining entries: {Entry.objects.count()}")
++    
++    # Should have deleted entry1, entry2, and entry3 (all reference the deleted user)
++    assert Entry.objects.count() == 0, f"Expected 0 entries, got {Entry.objects.count()}"
++    
++    print("✓ Test passed: Combined queries produce correct results")
++
++
++if __name__ == '__main__':
++    setup_database()
++    test_multiple_fk_same_table()
++    test_single_fk()
++    test_m2m_relationships()
++    test_edge_cases()
++    test_correctness()
++    print("\n🎉 All tests passed!")
+\ No newline at end of file
+diff --git a/test_fast_delete_issue.py b/test_fast_delete_issue.py
+new file mode 100644
+index 0000000000..9954327e84
+--- /dev/null
++++ b/test_fast_delete_issue.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the fast delete query combination issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.test.utils import override_settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.deletion import Collector
++
++
++# Test models based on the issue description
++class Person(models.Model):
++    name = models.CharField(max_length=100)
++    friends = models.ManyToManyField('self', symmetrical=False)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Entry(models.Model):
++    title = models.CharField(max_length=100)
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_entries')
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='updated_entries')
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def setup_database():
++    """Create the database tables."""
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Person)
++        schema_editor.create_model(User)
++        schema_editor.create_model(Entry)
++
++
++def test_current_behavior():
++    """Test the current behavior to see multiple DELETE queries."""
++    print("=== Testing Current Behavior ===")
++    
++    # Create test data
++    user = User.objects.create(name="Test User")
++    entry1 = Entry.objects.create(title="Entry 1", created_by=user, updated_by=user)
++    entry2 = Entry.objects.create(title="Entry 2", created_by=user, updated_by=user)
++    
++    # Create a person with friends
++    person1 = Person.objects.create(name="Person 1")
++    person2 = Person.objects.create(name="Person 2")
++    person1.friends.add(person2)
++    
++    print(f"Created user: {user.id}")
++    print(f"Created entries: {[e.id for e in Entry.objects.all()]}")
++    print(f"Created persons: {[p.id for p in Person.objects.all()]}")
++    
++    # Test User deletion (should trigger multiple DELETE queries for Entry table)
++    print("\n--- Deleting User ---")
++    
++    # Capture queries
++    from django.db import connection
++    from django.test.utils import override_settings
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        # Delete the user
++        user.delete()
++        
++        print(f"Number of queries executed: {len(connection.queries)}")
++        for i, query in enumerate(connection.queries):
++            print(f"Query {i+1}: {query['sql']}")
++    
++    print(f"Remaining entries: {Entry.objects.count()}")
++    
++    # Test Person deletion (should trigger multiple DELETE queries for M2M table)
++    print("\n--- Deleting Person ---")
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        # Delete the person
++        person1.delete()
++        
++        print(f"Number of queries executed: {len(connection.queries)}")
++        for i, query in enumerate(connection.queries):
++            print(f"Query {i+1}: {query['sql']}")
++
++
++def test_collector_fast_deletes():
++    """Test the Collector's fast_deletes to understand the structure."""
++    print("\n=== Testing Collector Fast Deletes ===")
++    
++    # Create test data
++    user = User.objects.create(name="Test User 2")
++    entry1 = Entry.objects.create(title="Entry 3", created_by=user, updated_by=user)
++    entry2 = Entry.objects.create(title="Entry 4", created_by=user, updated_by=user)
++    
++    # Create collector and collect objects for deletion
++    collector = Collector(using='default')
++    collector.collect([user])
++    
++    print(f"Number of fast_deletes: {len(collector.fast_deletes)}")
++    for i, qs in enumerate(collector.fast_deletes):
++        print(f"Fast delete {i+1}:")
++        print(f"  Model: {qs.model}")
++        print(f"  Query: {qs.query}")
++        print(f"  WHERE: {qs.query.where}")
++        print(f"  SQL: {qs.query.get_compiler('default').as_sql()}")
++
++
++if __name__ == '__main__':
++    setup_database()
++    test_current_behavior()
++    test_collector_fast_deletes()
+\ No newline at end of file
+diff --git a/test_optimization_verification.py b/test_optimization_verification.py
+new file mode 100644
+index 0000000000..0af7460281
+--- /dev/null
++++ b/test_optimization_verification.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python
++"""
++Test to verify the optimization reduces the number of database queries.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test.utils import override_settings
++from django.db import connection
++
++
++# Test models that match the issue description exactly
++class Person(models.Model):
++    name = models.CharField(max_length=100)
++    friends = models.ManyToManyField('self', symmetrical=False)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Entry(models.Model):
++    title = models.CharField(max_length=100)
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def setup_database():
++    """Create the database tables."""
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Person)
++        schema_editor.create_model(User)
++        schema_editor.create_model(Entry)
++
++
++def test_issue_example():
++    """Test the exact example from the issue description."""
++    print("=== Testing Issue Description Example ===")
++    
++    # Create test data as described in the issue
++    user = User.objects.create(name="Test User")
++    entry1 = Entry.objects.create(title="Entry 1", created_by=user, updated_by=user)
++    entry2 = Entry.objects.create(title="Entry 2", created_by=user, updated_by=user)
++    
++    person1 = Person.objects.create(name="Person 1")
++    person2 = Person.objects.create(name="Person 2")
++    person1.friends.add(person2)
++    
++    print("Testing User deletion...")
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        user.delete()
++        
++        delete_queries = [q for q in connection.queries if q['sql'].startswith('DELETE')]
++        print(f"User deletion - DELETE queries: {len(delete_queries)}")
++        for i, query in enumerate(delete_queries):
++            print(f"  {i+1}: {query['sql']}")
++        
++        # Should be 2 queries: 1 combined for Entry, 1 for User
++        # Before fix: would be 3 queries (2 separate for Entry, 1 for User)
++        assert len(delete_queries) == 2, f"Expected 2 DELETE queries, got {len(delete_queries)}"
++        
++        # Verify the Entry query uses OR
++        entry_query = [q for q in delete_queries if 'entry' in q['sql'].lower()][0]
++        assert ' OR ' in entry_query['sql'], "Entry DELETE should combine conditions with OR"
++        assert 'created_by_id' in entry_query['sql'], "Should include created_by condition"
++        assert 'updated_by_id' in entry_query['sql'], "Should include updated_by condition"
++    
++    print("Testing Person deletion...")
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        person1.delete()
++        
++        delete_queries = [q for q in connection.queries if q['sql'].startswith('DELETE')]
++        print(f"Person deletion - DELETE queries: {len(delete_queries)}")
++        for i, query in enumerate(delete_queries):
++            print(f"  {i+1}: {query['sql']}")
++        
++        # Should be 2 queries: 1 combined for M2M, 1 for Person
++        # Before fix: would be 3 queries (2 separate for M2M, 1 for Person)
++        assert len(delete_queries) == 2, f"Expected 2 DELETE queries, got {len(delete_queries)}"
++        
++        # Verify the M2M query uses OR
++        m2m_query = [q for q in delete_queries if 'friends' in q['sql'].lower()][0]
++        assert ' OR ' in m2m_query['sql'], "M2M DELETE should combine conditions with OR"
++        assert 'from_person_id' in m2m_query['sql'], "Should include from_person condition"
++        assert 'to_person_id' in m2m_query['sql'], "Should include to_person condition"
++    
++    print("✓ Issue example test passed!")
++
++
++def test_query_reduction():
++    """Test that we actually reduce the number of queries."""
++    print("\n=== Testing Query Reduction ===")
++    
++    # Create a scenario with many relationships to the same table
++    user = User.objects.create(name="Multi-relation User")
++    
++    # Create multiple entries that reference the user in different ways
++    for i in range(5):
++        Entry.objects.create(
++            title=f"Entry {i}",
++            created_by=user,
++            updated_by=user
++        )
++    
++    with override_settings(DEBUG=True):
++        connection.queries_log.clear()
++        
++        user.delete()
++        
++        delete_queries = [q for q in connection.queries if q['sql'].startswith('DELETE')]
++        print(f"Multi-relation deletion - DELETE queries: {len(delete_queries)}")
++        
++        # Should still be just 2 queries regardless of how many entries exist
++        assert len(delete_queries) == 2, f"Expected 2 DELETE queries, got {len(delete_queries)}"
++        
++        # The Entry DELETE should handle all entries in one query
++        entry_query = [q for q in delete_queries if 'entry' in q['sql'].lower()][0]
++        assert ' OR ' in entry_query['sql'], "Should use OR to combine conditions"
++    
++    print("✓ Query reduction test passed!")
++
++
++if __name__ == '__main__':
++    setup_database()
++    test_issue_example()
++    test_query_reduction()
++    print("\n🎉 All optimization tests passed!")
+\ No newline at end of file
+diff --git a/test_where_analysis.py b/test_where_analysis.py
+new file mode 100644
+index 0000000000..2eefd5e257
+--- /dev/null
++++ b/test_where_analysis.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python
++"""
++Test script to understand WHERE node structure and how to combine them.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++from django.db.models.sql.where import WhereNode, OR
++
++
++# Test models
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Entry(models.Model):
++    title = models.CharField(max_length=100)
++    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_entries')
++    updated_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='updated_entries')
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def setup_database():
++    """Create the database tables."""
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Entry)
++
++
++def test_where_combination():
++    """Test how to combine WHERE nodes."""
++    print("=== Testing WHERE Node Combination ===")
++    
++    user = User.objects.create(name="Test User")
++    
++    # Get individual QuerySets
++    qs1 = Entry.objects.filter(created_by=user)
++    qs2 = Entry.objects.filter(updated_by=user)
++    
++    print(f"QS1 WHERE: {qs1.query.where}")
++    print(f"QS2 WHERE: {qs2.query.where}")
++    print(f"QS1 WHERE type: {type(qs1.query.where)}")
++    print(f"QS1 WHERE children: {qs1.query.where.children}")
++    print(f"QS1 WHERE connector: {qs1.query.where.connector}")
++    
++    # Try to create a combined WHERE node
++    combined_where = WhereNode()
++    combined_where.connector = OR
++    combined_where.add(qs1.query.where, OR)
++    combined_where.add(qs2.query.where, OR)
++    
++    print(f"Combined WHERE: {combined_where}")
++    print(f"Combined WHERE children: {combined_where.children}")
++    
++    # Try to create a new QuerySet with the combined WHERE
++    combined_qs = Entry.objects.all()
++    combined_qs.query.where = combined_where
++    
++    print(f"Combined QS SQL: {combined_qs.query.get_compiler('default').as_sql()}")
++
++
++def test_alternative_approach():
++    """Test alternative approach using Q objects directly."""
++    print("\n=== Testing Q Object Approach ===")
++    
++    user = User.objects.create(name="Test User 2")
++    
++    # Get individual QuerySets
++    qs1 = Entry.objects.filter(created_by=user)
++    qs2 = Entry.objects.filter(updated_by=user)
++    
++    # Create Q objects from the original conditions
++    q1 = Q(created_by=user)
++    q2 = Q(updated_by=user)
++    combined_q = q1 | q2
++    
++    # Create combined QuerySet
++    combined_qs = Entry.objects.filter(combined_q)
++    
++    print(f"Q1: {q1}")
++    print(f"Q2: {q2}")
++    print(f"Combined Q: {combined_q}")
++    print(f"Combined QS SQL: {combined_qs.query.get_compiler('default').as_sql()}")
++
++
++def test_queryset_union():
++    """Test QuerySet union approach."""
++    print("\n=== Testing QuerySet Union Approach ===")
++    
++    user = User.objects.create(name="Test User 3")
++    entry1 = Entry.objects.create(title="Entry 1", created_by=user, updated_by=user)
++    
++    # Get individual QuerySets
++    qs1 = Entry.objects.filter(created_by=user)
++    qs2 = Entry.objects.filter(updated_by=user)
++    
++    # Try union
++    union_qs = qs1.union(qs2)
++    print(f"Union QS SQL: {union_qs.query.get_compiler('default').as_sql()}")
++    
++    # Test if union supports _raw_delete
++    try:
++        count = union_qs._raw_delete(using='default')
++        print(f"Union delete count: {count}")
++    except Exception as e:
++        print(f"Union delete error: {e}")
++
++
++if __name__ == '__main__':
++    setup_database()
++    test_where_combination()
++    test_alternative_approach()
++    test_queryset_union()
+\ No newline at end of file

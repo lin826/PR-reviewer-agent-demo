@@ -1,0 +1,367 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..ccaf7aa68
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with positional-only argument default values vanishing.
++"""
++
++import sys
++from sphinx.testing import restructuredtext
++from sphinx.testing.util import SphinxTestApp
++from sphinx.util.docutils import docutils_namespace
++from sphinx.domains.python import _parse_arglist
++from sphinx.util.inspect import signature_from_str
++
++def test_signature_parsing():
++    """Test signature parsing directly"""
++    print("=== Testing signature_from_str directly ===")
++    
++    # Test case from the issue
++    sig_str = "(a, b=0, /, c=1)"
++    print(f"Input signature: {sig_str}")
++    
++    try:
++        sig = signature_from_str(sig_str)
++        print("Parsed parameters:")
++        for name, param in sig.parameters.items():
++            print(f"  {name}: kind={param.kind.name}, default={param.default}")
++    except Exception as e:
++        print(f"Error parsing signature: {e}")
++    
++    print()
++
++def test_arglist_parsing():
++    """Test arglist parsing directly"""
++    print("=== Testing _parse_arglist directly ===")
++    
++    # Test case from the issue
++    arglist = "a, b=0, /, c=1"
++    print(f"Input arglist: {arglist}")
++    
++    try:
++        paramlist = _parse_arglist(arglist)
++        print(f"Parsed parameterlist: {paramlist.astext()}")
++        
++        # Print detailed structure
++        print("Parameter details:")
++        for i, child in enumerate(paramlist.children):
++            print(f"  {i}: {child.astext()} (type: {type(child).__name__})")
++            if hasattr(child, 'children'):
++                for j, subchild in enumerate(child.children):
++                    print(f"    {j}: {subchild.astext()} (type: {type(subchild).__name__})")
++    except Exception as e:
++        print(f"Error parsing arglist: {e}")
++    
++    print()
++
++def test_sphinx_directive():
++    """Test the full Sphinx directive"""
++    print("=== Testing full Sphinx py:function directive ===")
++    
++    with docutils_namespace():
++        app = SphinxTestApp('dummy')
++        app.setup_extension('sphinx.domains.python')
++        
++        # Test case from the issue
++        text = ".. py:function:: foo(a, b=0, /, c=1)"
++        print(f"Input directive: {text}")
++        
++        try:
++            doctree = restructuredtext.parse(app, text)
++            print(f"Generated doctree: {doctree.pformat()}")
++            
++            # Extract the signature text
++            if doctree and len(doctree) > 1:
++                desc_node = doctree[1]  # Skip index node
++                if hasattr(desc_node, 'children') and desc_node.children:
++                    sig_node = desc_node.children[0]  # desc_signature
++                    print(f"Signature text: {sig_node.astext()}")
++        except Exception as e:
++            print(f"Error with Sphinx directive: {e}")
++            import traceback
++            traceback.print_exc()
++        
++        app.cleanup()
++
++if __name__ == "__main__":
++    print("Python version:", sys.version)
++    print("Testing positional-only argument default values...\n")
++    
++    test_signature_parsing()
++    test_arglist_parsing() 
++    test_sphinx_directive()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 000000000..aca2db14d
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++"""
++Simple test to reproduce the positional-only argument default value issue.
++"""
++
++from sphinx.util.inspect import signature_from_str
++from sphinx.domains.python import _parse_arglist
++
++def test_issue():
++    print("=== Reproducing the issue ===")
++    
++    # Test case from the issue: foo(a, b=0, /, c=1)
++    arglist = "a, b=0, /, c=1"
++    print(f"Input: {arglist}")
++    
++    # Test signature parsing
++    sig = signature_from_str(f"({arglist})")
++    print("\nParsed signature parameters:")
++    for name, param in sig.parameters.items():
++        print(f"  {name}: kind={param.kind.name}, default={param.default}")
++    
++    # Test arglist parsing  
++    paramlist = _parse_arglist(arglist)
++    print(f"\nGenerated parameter list: {paramlist.astext()}")
++    
++    # Expected: (a, b=0, /, c=1)
++    # Actual: (a, b, /, c=1)  <- missing =0 for b
++    
++    print("\n=== Issue confirmed ===")
++    print("Expected: (a, b=0, /, c=1)")
++    print(f"Actual:   {paramlist.astext()}")
++    print("The default value '=0' for positional-only argument 'b' is missing!")
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/sphinx/util/inspect.py b/sphinx/util/inspect.py
+index 15f0d66e2..7bbeac407 100644
+--- a/sphinx/util/inspect.py
++++ b/sphinx/util/inspect.py
+@@ -521,16 +521,45 @@ def signature_from_str(signature: str) -> inspect.Signature:
+     params = []
+ 
+     if hasattr(args, "posonlyargs"):
+-        for arg in args.posonlyargs:  # type: ignore
++        # Calculate how many arguments (positional-only + regular) have defaults
++        total_args = len(args.posonlyargs) + len(args.args)  # type: ignore
++        num_defaults = len(args.defaults)
++        args_without_defaults = total_args - num_defaults
++        
++        for i, arg in enumerate(args.posonlyargs):  # type: ignore
+             annotation = ast_unparse(arg.annotation) or Parameter.empty
++            
++            # Check if this positional-only argument has a default value
++            if i >= args_without_defaults:
++                default_idx = i - args_without_defaults
++                default = ast_unparse(args.defaults[default_idx])
++            else:
++                default = Parameter.empty
++                
+             params.append(Parameter(arg.arg, Parameter.POSITIONAL_ONLY,
+-                                    annotation=annotation))
++                                    default=default, annotation=annotation))
+ 
+     for i, arg in enumerate(args.args):
+-        if len(args.args) - i <= len(args.defaults):
+-            default = ast_unparse(args.defaults[-len(args.args) + i])
++        # Calculate defaults for regular arguments, accounting for positional-only args
++        if hasattr(args, "posonlyargs"):
++            # We already calculated these values above
++            total_args = len(args.posonlyargs) + len(args.args)  # type: ignore
++            num_defaults = len(args.defaults)
++            args_without_defaults = total_args - num_defaults
++            
++            # For regular args, check if this arg has a default
++            regular_arg_index = len(args.posonlyargs) + i  # type: ignore
++            if regular_arg_index >= args_without_defaults:
++                default_idx = regular_arg_index - args_without_defaults
++                default = ast_unparse(args.defaults[default_idx])
++            else:
++                default = Parameter.empty
+         else:
+-            default = Parameter.empty
++            # Original logic for when there are no positional-only args
++            if len(args.args) - i <= len(args.defaults):
++                default = ast_unparse(args.defaults[-len(args.args) + i])
++            else:
++                default = Parameter.empty
+ 
+         annotation = ast_unparse(arg.annotation) or Parameter.empty
+         params.append(Parameter(arg.arg, Parameter.POSITIONAL_OR_KEYWORD,
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..3da22181a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the positional-only argument fix.
++"""
++
++from sphinx.util.inspect import signature_from_str
++from sphinx.domains.python import _parse_arglist
++
++def test_case(description, arglist):
++    print(f"=== {description} ===")
++    print(f"Input: {arglist}")
++    
++    try:
++        # Test signature parsing
++        sig = signature_from_str(f"({arglist})")
++        print("Parsed signature parameters:")
++        for name, param in sig.parameters.items():
++            default_str = param.default if param.default != param.empty else "no default"
++            print(f"  {name}: kind={param.kind.name}, default={default_str}")
++        
++        # Test arglist parsing  
++        paramlist = _parse_arglist(arglist)
++        print(f"Generated parameter list: {paramlist.astext()}")
++        
++    except Exception as e:
++        print(f"Error: {e}")
++        import traceback
++        traceback.print_exc()
++    
++    print()
++
++def main():
++    # Test cases
++    test_cases = [
++        ("Original issue", "a, b=0, /, c=1"),
++        ("Only positional-only with defaults", "a=1, b=2, /"),
++        ("Mixed defaults", "a, b=0, c=1, /, d=2"),
++        ("No positional-only defaults", "a, /, b=1"),
++        ("All have defaults", "a=0, /, b=1"),
++        ("No defaults at all", "a, /, b"),
++        ("Complex case", "a, b=0, /, c=1, *args, e=2, **kwargs"),
++        ("Only regular args", "a, b=1"),  # Should still work
++    ]
++    
++    for description, arglist in test_cases:
++        test_case(description, arglist)
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_positional_only_fix.py b/test_positional_only_fix.py
+new file mode 100644
+index 000000000..779cdb318
+--- /dev/null
++++ b/test_positional_only_fix.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""
++Test for the positional-only argument default value fix.
++This test verifies that the issue described in the GitHub issue is resolved.
++"""
++
++import sys
++import pytest
++from sphinx.testing import restructuredtext
++from sphinx.testing.util import SphinxTestApp
++from sphinx.util.docutils import docutils_namespace
++from sphinx.domains.python import _parse_arglist
++from sphinx.util.inspect import signature_from_str
++
++
++def test_signature_from_str_positional_only_defaults():
++    """Test that signature_from_str correctly handles positional-only argument defaults."""
++    
++    # Test case from the issue: foo(a, b=0, /, c=1)
++    sig = signature_from_str("(a, b=0, /, c=1)")
++    
++    params = list(sig.parameters.values())
++    
++    # Check parameter a (positional-only, no default)
++    assert params[0].name == "a"
++    assert params[0].kind == params[0].POSITIONAL_ONLY
++    assert params[0].default == params[0].empty
++    
++    # Check parameter b (positional-only, with default)
++    assert params[1].name == "b"
++    assert params[1].kind == params[1].POSITIONAL_ONLY
++    assert params[1].default == "0"  # This was the bug - should not be empty
++    
++    # Check parameter c (regular, with default)
++    assert params[2].name == "c"
++    assert params[2].kind == params[2].POSITIONAL_OR_KEYWORD
++    assert params[2].default == "1"
++
++
++def test_parse_arglist_positional_only_defaults():
++    """Test that _parse_arglist correctly renders positional-only argument defaults."""
++    
++    # Test case from the issue
++    paramlist = _parse_arglist("a, b=0, /, c=1")
++    result = paramlist.astext()
++    
++    # Should include the default value for b
++    assert result == "(a, b=0, /, c=1)"
++    
++    # Verify the structure contains the default value
++    assert "b=0" in result
++    assert "/" in result
++    assert "c=1" in result
++
++
++def test_various_positional_only_cases():
++    """Test various combinations of positional-only arguments with defaults."""
++    
++    test_cases = [
++        # (input, expected_output)
++        ("a=1, b=2, /", "(a=1, b=2, /)"),
++        ("a, b=0, /, c=1", "(a, b=0, /, c=1)"),
++        ("a, /, b=1", "(a, /, b=1)"),
++        ("a=0, /, b=1", "(a=0, /, b=1)"),
++        ("a, /, b", "(a, /, b)"),
++        ("a, b=0, c=1, /, d=2", "(a, b=0, c=1, /, d=2)"),
++    ]
++    
++    for input_args, expected in test_cases:
++        paramlist = _parse_arglist(input_args)
++        result = paramlist.astext()
++        assert result == expected, f"Failed for input: {input_args}"
++
++
++@pytest.mark.skipif(sys.version_info < (3, 8), reason='positional-only arguments require Python 3.8+')
++def test_sphinx_directive_positional_only():
++    """Test the full Sphinx py:function directive with positional-only arguments."""
++    
++    with docutils_namespace():
++        app = SphinxTestApp('dummy', srcdir=None)
++        app.setup_extension('sphinx.domains.python')
++        
++        # Test case from the issue
++        text = ".. py:function:: foo(a, b=0, /, c=1)"
++        
++        try:
++            doctree = restructuredtext.parse(app, text)
++            
++            # Extract the signature text from the doctree
++            # Structure: [index_node, desc_node[desc_signature_node, desc_content_node]]
++            if len(doctree) > 1:
++                desc_node = doctree[1]
++                if hasattr(desc_node, 'children') and desc_node.children:
++                    sig_node = desc_node.children[0]  # desc_signature
++                    sig_text = sig_node.astext()
++                    
++                    # Should contain the default value for b
++                    assert "foo(a, b=0, /, c=1)" in sig_text
++                    
++        finally:
++            app.cleanup()
++
++
++if __name__ == "__main__":
++    # Run the basic tests (skip the Sphinx directive test for now)
++    test_signature_from_str_positional_only_defaults()
++    test_parse_arglist_positional_only_defaults()
++    test_various_positional_only_cases()
++    
++    print("All tests passed!")
+\ No newline at end of file

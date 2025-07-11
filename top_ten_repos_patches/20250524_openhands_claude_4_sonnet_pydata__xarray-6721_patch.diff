@@ -1,0 +1,651 @@
+diff --git a/debug_test_failure.py b/debug_test_failure.py
+new file mode 100644
+index 00000000..219d20a6
+--- /dev/null
++++ b/debug_test_failure.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""
++Debug the test failure
++"""
++
++import xarray as xr
++import numpy as np
++import tempfile
++import os
++
++try:
++    import dask
++    import dask.array as da
++    
++    def debug_chunking_test():
++        """Debug the failing test"""
++        tmp_path = tempfile.mkdtemp()
++        zarr_path = os.path.join(tmp_path, "test.zarr")
++        
++        encoded_chunks = 100
++        dask_arr = da.from_array(
++            np.ones((500, 500), dtype="float64"), chunks=encoded_chunks
++        )
++        ds = xr.Dataset(
++            {
++                "test": xr.DataArray(
++                    dask_arr,
++                    dims=("x", "y"),
++                )
++            }
++        )
++        ds["test"].encoding["chunks"] = encoded_chunks
++        ds.to_zarr(zarr_path)
++        
++        print("Original dataset chunks:", ds.chunks)
++        
++        with dask.config.set({"array.chunk-size": "1MiB"}):
++            expected = ds.chunk('auto')
++            print("Expected chunks:", expected.chunks)
++            
++            with xr.open_dataset(zarr_path, engine="zarr", chunks='auto') as actual:
++                print("Actual chunks:", actual.chunks)
++                print("Expected == Actual:", expected.chunks == actual.chunks)
++                
++                # Check individual variables
++                print("Expected test chunks:", expected['test'].chunks)
++                print("Actual test chunks:", actual['test'].chunks)
++        
++        # Clean up
++        import shutil
++        shutil.rmtree(tmp_path)
++    
++    debug_chunking_test()
++    
++except ImportError:
++    print("Dask not available")
+\ No newline at end of file
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 00000000..09f9d382
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive verification of the fix
++"""
++
++import xarray as xr
++import numpy as np
++import tempfile
++import os
++import zarr
++import psutil
++
++def get_memory_usage():
++    """Get current memory usage in MB"""
++    process = psutil.Process(os.getpid())
++    return process.memory_info().rss / 1024 / 1024
++
++def test_zarr_chunks_no_loading():
++    """Test that zarr chunks don't trigger data loading"""
++    print("1. Testing zarr chunks without data loading...")
++    
++    temp_dir = tempfile.mkdtemp()
++    zarr_path = os.path.join(temp_dir, "test.zarr")
++    
++    # Create zarr dataset
++    zarr_group = zarr.open_group(zarr_path, mode='w')
++    data = np.random.random((100, 200))
++    zarr_array = zarr_group.create_dataset('temperature', data=data, chunks=(25, 50))
++    zarr_group.create_dataset('x', data=np.arange(100), chunks=(25,))
++    zarr_group.create_dataset('y', data=np.arange(200), chunks=(50,))
++    
++    zarr_array.attrs['_ARRAY_DIMENSIONS'] = ['x', 'y']
++    zarr_group['x'].attrs['_ARRAY_DIMENSIONS'] = ['x']
++    zarr_group['y'].attrs['_ARRAY_DIMENSIONS'] = ['y']
++    
++    # Open and test
++    ds = xr.open_dataset(zarr_path, engine='zarr', consolidated=False)
++    
++    start_memory = get_memory_usage()
++    chunks = ds.chunks
++    end_memory = get_memory_usage()
++    
++    memory_increase = end_memory - start_memory
++    expected_chunks = {'x': 25, 'y': 50}
++    
++    print(f"   Memory increase: {memory_increase:.2f} MB")
++    print(f"   Chunks: {chunks}")
++    print(f"   Expected: {expected_chunks}")
++    
++    assert memory_increase < 5, f"Memory increase too large: {memory_increase:.2f} MB"
++    assert dict(chunks) == expected_chunks, f"Chunks mismatch: {chunks} != {expected_chunks}"
++    print("   ✅ PASSED")
++    
++    import shutil
++    shutil.rmtree(temp_dir)
++
++def test_dask_chunks_still_work():
++    """Test that dask chunks still work correctly"""
++    print("2. Testing dask chunks still work...")
++    
++    try:
++        import dask.array as da
++        
++        # Create dask array
++        data = da.random.random((100, 200), chunks=(20, 40))
++        ds = xr.Dataset({'temperature': (['x', 'y'], data)})
++        
++        chunks = ds.chunks
++        expected_chunks = {'x': (20, 20, 20, 20, 20), 'y': (40, 40, 40, 40, 40)}
++        
++        print(f"   Chunks: {chunks}")
++        print(f"   Expected: {expected_chunks}")
++        
++        assert dict(chunks) == expected_chunks, f"Chunks mismatch: {chunks} != {expected_chunks}"
++        print("   ✅ PASSED")
++        
++    except ImportError:
++        print("   ⚠️  SKIPPED (dask not available)")
++
++def test_numpy_arrays():
++    """Test that numpy arrays return empty chunks"""
++    print("3. Testing numpy arrays...")
++    
++    data = np.random.random((50, 100))
++    ds = xr.Dataset({'temperature': (['x', 'y'], data)})
++    
++    chunks = ds.chunks
++    expected_chunks = {}
++    
++    print(f"   Chunks: {chunks}")
++    print(f"   Expected: {expected_chunks}")
++    
++    assert dict(chunks) == expected_chunks, f"Chunks mismatch: {chunks} != {expected_chunks}"
++    print("   ✅ PASSED")
++
++def test_mixed_dataset():
++    """Test dataset with mixed chunked/non-chunked variables"""
++    print("4. Testing mixed dataset...")
++    
++    try:
++        import dask.array as da
++        
++        numpy_data = np.random.random((50, 100))
++        dask_data = da.random.random((50, 100), chunks=(10, 20))
++        
++        ds = xr.Dataset({
++            'numpy_var': (['x', 'y'], numpy_data),
++            'dask_var': (['x', 'y'], dask_data)
++        })
++        
++        chunks = ds.chunks
++        expected_chunks = {'x': (10, 10, 10, 10, 10), 'y': (20, 20, 20, 20, 20)}
++        
++        print(f"   Chunks: {chunks}")
++        print(f"   Expected: {expected_chunks}")
++        
++        assert dict(chunks) == expected_chunks, f"Chunks mismatch: {chunks} != {expected_chunks}"
++        print("   ✅ PASSED")
++        
++    except ImportError:
++        print("   ⚠️  SKIPPED (dask not available)")
++
++def main():
++    """Run all verification tests"""
++    print("🔍 Final Verification of Zarr Chunks Fix")
++    print("=" * 50)
++    
++    test_zarr_chunks_no_loading()
++    test_dask_chunks_still_work()
++    test_numpy_arrays()
++    test_mixed_dataset()
++    
++    print("=" * 50)
++    print("🎉 All tests passed! The fix is working correctly.")
++    print("\nSummary:")
++    print("- ✅ Zarr chunks don't trigger data loading")
++    print("- ✅ Dask chunks still work correctly")
++    print("- ✅ Numpy arrays return empty chunks")
++    print("- ✅ Mixed datasets work correctly")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_chunks_issue.py b/test_chunks_issue.py
+new file mode 100644
+index 00000000..6e9b792b
+--- /dev/null
++++ b/test_chunks_issue.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the chunks loading issue with zarr-backed xarray datasets.
++"""
++
++import xarray as xr
++import numpy as np
++import tempfile
++import os
++import zarr
++import traceback
++import psutil
++import time
++
++def get_memory_usage():
++    """Get current memory usage in MB"""
++    process = psutil.Process(os.getpid())
++    return process.memory_info().rss / 1024 / 1024
++
++def create_test_zarr_dataset():
++    """Create a test zarr dataset for testing"""
++    # Create a temporary directory
++    temp_dir = tempfile.mkdtemp()
++    zarr_path = os.path.join(temp_dir, "test.zarr")
++    
++    # Create a large array to test memory usage
++    data = np.random.random((100, 100, 50))  # ~40MB array (smaller for testing)
++    
++    # Create zarr group and array with chunks
++    zarr_group = zarr.open_group(zarr_path, mode='w')
++    zarr_array = zarr_group.create_dataset('data', data=data, chunks=(10, 10, 5))
++    
++    # Add some coordinates
++    zarr_group.create_dataset('x', data=np.arange(100), chunks=(10,))
++    zarr_group.create_dataset('y', data=np.arange(100), chunks=(10,))
++    zarr_group.create_dataset('z', data=np.arange(50), chunks=(5,))
++    
++    # Add attributes to make it a proper xarray dataset
++    zarr_group.attrs['_ARRAY_DIMENSIONS'] = ['x', 'y', 'z']
++    zarr_array.attrs['_ARRAY_DIMENSIONS'] = ['x', 'y', 'z']
++    zarr_group['x'].attrs['_ARRAY_DIMENSIONS'] = ['x']
++    zarr_group['y'].attrs['_ARRAY_DIMENSIONS'] = ['y'] 
++    zarr_group['z'].attrs['_ARRAY_DIMENSIONS'] = ['z']
++    
++    return zarr_path
++
++def test_chunks_access():
++    """Test accessing chunks attribute and monitor memory usage"""
++    print("Creating test zarr dataset...")
++    zarr_path = create_test_zarr_dataset()
++    
++    print(f"Initial memory usage: {get_memory_usage():.2f} MB")
++    
++    print("Opening zarr dataset with xarray...")
++    ds = xr.open_dataset(zarr_path, engine='zarr')
++    print(f"Memory after opening dataset: {get_memory_usage():.2f} MB")
++    
++    print("Dataset variables:", list(ds.variables.keys()))
++    
++    # Get the main data variable (should be the first non-coordinate variable)
++    data_vars = [var for var in ds.variables.keys() if var not in ds.coords]
++    if data_vars:
++        var_name = data_vars[0]
++        print(f"Testing with variable: {var_name}")
++        
++        var = ds[var_name]
++        print(f"Variable shape: {var.shape}")
++        print(f"Variable dtype: {var.dtype}")
++        
++        # Check encoding
++        print(f"Variable encoding: {var.encoding}")
++        
++        # Check if _data has chunks attribute
++        print(f"Variable._data type: {type(var.variable._data)}")
++        print(f"Variable._data has chunks: {hasattr(var.variable._data, 'chunks')}")
++        
++        if hasattr(var.variable._data, 'chunks'):
++            print(f"Variable._data.chunks: {var.variable._data.chunks}")
++    
++    print(f"Memory before accessing chunks: {get_memory_usage():.2f} MB")
++    
++    try:
++        print("Accessing ds.chunks...")
++        chunks = ds.chunks
++        print(f"Chunks: {chunks}")
++        print(f"Memory after accessing chunks: {get_memory_usage():.2f} MB")
++    except Exception as e:
++        print(f"Error accessing chunks: {e}")
++        traceback.print_exc()
++    
++    # Clean up
++    import shutil
++    shutil.rmtree(os.path.dirname(zarr_path))
++
++if __name__ == "__main__":
++    test_chunks_access()
+\ No newline at end of file
+diff --git a/test_dask_chunks.py b/test_dask_chunks.py
+new file mode 100644
+index 00000000..daddbf0c
+--- /dev/null
++++ b/test_dask_chunks.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++"""
++Test that our fix doesn't break dask array chunks
++"""
++
++import xarray as xr
++import numpy as np
++
++def test_dask_chunks():
++    """Test that dask arrays still work correctly"""
++    try:
++        import dask.array as da
++    except ImportError:
++        print("Dask not available, skipping test")
++        return
++    
++    print("Testing dask array chunks...")
++    
++    # Create a dask array
++    data = da.random.random((100, 50), chunks=(20, 10))
++    
++    # Create xarray DataArray
++    da_xr = xr.DataArray(data, dims=['x', 'y'], coords={'x': range(100), 'y': range(50)})
++    
++    print(f"Dask array chunks: {data.chunks}")
++    print(f"DataArray.variable.chunks: {da_xr.variable.chunks}")
++    print(f"DataArray.variable.chunksizes: {da_xr.variable.chunksizes}")
++    
++    # Create dataset
++    ds = xr.Dataset({'temperature': da_xr})
++    print(f"Dataset.chunks: {ds.chunks}")
++    
++    # Verify chunks are correct
++    expected_chunks = {'x': (20, 20, 20, 20, 20), 'y': (10, 10, 10, 10, 10)}
++    actual_chunks = dict(ds.chunks)
++    
++    print(f"Expected chunks: {expected_chunks}")
++    print(f"Actual chunks: {actual_chunks}")
++    
++    # Check that chunks match
++    assert actual_chunks == expected_chunks, f"Chunks don't match: {actual_chunks} != {expected_chunks}"
++    print("✓ Dask array chunks work correctly!")
++
++if __name__ == "__main__":
++    test_dask_chunks()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..53dbf57b
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for chunks fix
++"""
++
++import xarray as xr
++import numpy as np
++
++def test_numpy_array():
++    """Test that numpy arrays (no chunks) still work"""
++    print("Testing numpy array (no chunks)...")
++    
++    data = np.random.random((10, 20))
++    da = xr.DataArray(data, dims=['x', 'y'])
++    ds = xr.Dataset({'temperature': da})
++    
++    print(f"Variable.chunks: {da.variable.chunks}")
++    print(f"Variable.chunksizes: {da.variable.chunksizes}")
++    print(f"Dataset.chunks: {ds.chunks}")
++    
++    # Should be empty/None for numpy arrays
++    assert da.variable.chunks is None
++    assert da.variable.chunksizes == {}
++    assert ds.chunks == {}
++    print("✓ Numpy arrays work correctly!")
++
++def test_mixed_variables():
++    """Test dataset with mixed chunked/non-chunked variables"""
++    print("\nTesting mixed variables...")
++    
++    try:
++        import dask.array as da
++        
++        # Create mixed dataset
++        numpy_data = np.random.random((10, 20))
++        dask_data = da.random.random((10, 20), chunks=(5, 10))
++        
++        ds = xr.Dataset({
++            'numpy_var': (['x', 'y'], numpy_data),
++            'dask_var': (['x', 'y'], dask_data)
++        })
++        
++        print(f"Dataset.chunks: {ds.chunks}")
++        
++        # Should only show chunks for dask variable
++        expected = {'x': (5, 5), 'y': (10, 10)}
++        actual = dict(ds.chunks)
++        assert actual == expected, f"Expected {expected}, got {actual}"
++        print("✓ Mixed variables work correctly!")
++        
++    except ImportError:
++        print("Dask not available, skipping mixed test")
++
++def test_empty_dataset():
++    """Test empty dataset"""
++    print("\nTesting empty dataset...")
++    
++    ds = xr.Dataset()
++    chunks = ds.chunks
++    print(f"Empty dataset chunks: {chunks}")
++    assert chunks == {}
++    print("✓ Empty dataset works correctly!")
++
++if __name__ == "__main__":
++    test_numpy_array()
++    test_mixed_variables()
++    test_empty_dataset()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 00000000..7fc97039
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Test that reproduces the original issue from the GitHub issue
++"""
++
++import xarray as xr
++import numpy as np
++import tempfile
++import os
++import zarr
++import psutil
++import time
++
++def get_memory_usage():
++    """Get current memory usage in MB"""
++    process = psutil.Process(os.getpid())
++    return process.memory_info().rss / 1024 / 1024
++
++def test_original_issue():
++    """Test the original issue scenario"""
++    print("Testing original issue scenario...")
++    
++    # Create a test zarr dataset similar to the original issue
++    temp_dir = tempfile.mkdtemp()
++    zarr_path = os.path.join(temp_dir, "test.zarr")
++    
++    # Create zarr group with a larger dataset
++    zarr_group = zarr.open_group(zarr_path, mode='w')
++    
++    # Create a dataset similar to the original issue
++    data = np.random.random((200, 300, 100))  # ~480MB array
++    zarr_array = zarr_group.create_dataset('temperature', data=data, chunks=(50, 75, 25))
++    
++    # Add coordinates
++    zarr_group.create_dataset('x', data=np.arange(200), chunks=(50,))
++    zarr_group.create_dataset('y', data=np.arange(300), chunks=(75,))
++    zarr_group.create_dataset('time', data=np.arange(100), chunks=(25,))
++    
++    # Add proper attributes
++    zarr_array.attrs['_ARRAY_DIMENSIONS'] = ['x', 'y', 'time']
++    zarr_group['x'].attrs['_ARRAY_DIMENSIONS'] = ['x']
++    zarr_group['y'].attrs['_ARRAY_DIMENSIONS'] = ['y']
++    zarr_group['time'].attrs['_ARRAY_DIMENSIONS'] = ['time']
++    
++    print(f"Initial memory usage: {get_memory_usage():.2f} MB")
++    
++    # Open the dataset (this should not load data)
++    print("Opening zarr dataset...")
++    ds = xr.open_dataset(zarr_path, engine='zarr', consolidated=False)
++    print(f"Memory after opening: {get_memory_usage():.2f} MB")
++    
++    # Access chunks (this should not load data with our fix)
++    print("Accessing ds.chunks...")
++    start_memory = get_memory_usage()
++    chunks = ds.chunks
++    end_memory = get_memory_usage()
++    
++    print(f"Memory before chunks access: {start_memory:.2f} MB")
++    print(f"Memory after chunks access: {end_memory:.2f} MB")
++    print(f"Memory increase: {end_memory - start_memory:.2f} MB")
++    print(f"Chunks: {chunks}")
++    
++    # Verify chunks are correct
++    expected_chunks = {'x': 50, 'y': 75, 'time': 25}
++    actual_chunks = dict(chunks)
++    
++    assert actual_chunks == expected_chunks, f"Expected {expected_chunks}, got {actual_chunks}"
++    
++    # Memory increase should be minimal (less than 10MB)
++    memory_increase = end_memory - start_memory
++    assert memory_increase < 10, f"Memory increase too large: {memory_increase:.2f} MB"
++    
++    print("✓ Original issue is fixed!")
++    print(f"  - Chunks are correct: {actual_chunks}")
++    print(f"  - Memory increase is minimal: {memory_increase:.2f} MB")
++    
++    # Clean up
++    import shutil
++    shutil.rmtree(temp_dir)
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file
+diff --git a/test_simple_chunks.py b/test_simple_chunks.py
+new file mode 100644
+index 00000000..99d80ed7
+--- /dev/null
++++ b/test_simple_chunks.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Simple test to understand the chunks issue
++"""
++
++import xarray as xr
++import numpy as np
++import tempfile
++import os
++import zarr
++
++def create_simple_zarr():
++    """Create a simple zarr dataset"""
++    temp_dir = tempfile.mkdtemp()
++    zarr_path = os.path.join(temp_dir, "simple.zarr")
++    
++    # Create zarr group
++    zarr_group = zarr.open_group(zarr_path, mode='w')
++    
++    # Create a simple array with chunks
++    data = np.random.random((20, 30))
++    zarr_array = zarr_group.create_dataset('temperature', data=data, chunks=(5, 10))
++    
++    # Add coordinates
++    zarr_group.create_dataset('x', data=np.arange(20), chunks=(5,))
++    zarr_group.create_dataset('y', data=np.arange(30), chunks=(10,))
++    
++    # Add proper attributes
++    zarr_array.attrs['_ARRAY_DIMENSIONS'] = ['x', 'y']
++    zarr_group['x'].attrs['_ARRAY_DIMENSIONS'] = ['x']
++    zarr_group['y'].attrs['_ARRAY_DIMENSIONS'] = ['y']
++    
++    return zarr_path
++
++def test_chunks_step_by_step():
++    """Test chunks access step by step"""
++    zarr_path = create_simple_zarr()
++    
++    print("1. Opening dataset...")
++    ds = xr.open_dataset(zarr_path, engine='zarr', consolidated=False)
++    
++    print("2. Dataset info:")
++    print(f"   Variables: {list(ds.variables.keys())}")
++    print(f"   Data vars: {list(ds.data_vars.keys())}")
++    
++    print("3. Temperature variable info:")
++    temp_var = ds['temperature']
++    print(f"   Shape: {temp_var.shape}")
++    print(f"   Encoding: {temp_var.encoding}")
++    
++    print("4. Variable._data info:")
++    print(f"   Type: {type(temp_var.variable._data)}")
++    print(f"   Has chunks: {hasattr(temp_var.variable._data, 'chunks')}")
++    
++    print("5. Testing Variable.chunks property:")
++    try:
++        var_chunks = temp_var.variable.chunks
++        print(f"   Variable.chunks: {var_chunks}")
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    print("6. Testing Variable.chunksizes property:")
++    try:
++        var_chunksizes = temp_var.variable.chunksizes
++        print(f"   Variable.chunksizes: {var_chunksizes}")
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    print("7. Testing Dataset.chunks property:")
++    try:
++        ds_chunks = ds.chunks
++        print(f"   Dataset.chunks: {ds_chunks}")
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    # Clean up
++    import shutil
++    shutil.rmtree(os.path.dirname(zarr_path))
++
++if __name__ == "__main__":
++    test_chunks_step_by_step()
+\ No newline at end of file
+diff --git a/xarray/core/common.py b/xarray/core/common.py
+index 3c328f42..810272a5 100644
+--- a/xarray/core/common.py
++++ b/xarray/core/common.py
+@@ -2023,8 +2023,10 @@ def get_chunksizes(
+ 
+     chunks: dict[Any, tuple[int, ...]] = {}
+     for v in variables:
+-        if hasattr(v.data, "chunks"):
+-            for dim, c in v.chunksizes.items():
++        # Use chunksizes property which checks encoding first to avoid loading data
++        v_chunksizes = v.chunksizes
++        if v_chunksizes:
++            for dim, c in v_chunksizes.items():
+                 if dim in chunks and c != chunks[dim]:
+                     raise ValueError(
+                         f"Object has inconsistent chunks along dimension {dim}. "
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 2d115ff0..582425cd 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1014,8 +1014,12 @@ class Variable(AbstractArray, NdimSizeLenMixin, VariableArithmetic):
+         Variable.chunks
+         xarray.unify_chunks
+         """
++        # If data has chunks (e.g., dask array), use those chunks
+         if hasattr(self._data, "chunks"):
+             return Frozen({dim: c for dim, c in zip(self.dims, self.data.chunks)})
++        # Otherwise, check encoding to avoid loading data for zarr arrays
++        elif "preferred_chunks" in self.encoding:
++            return Frozen(self.encoding["preferred_chunks"])
+         else:
+             return {}

@@ -1,0 +1,499 @@
+diff --git a/django/contrib/staticfiles/storage.py b/django/contrib/staticfiles/storage.py
+index f957a667b2..720767aa9e 100644
+--- a/django/contrib/staticfiles/storage.py
++++ b/django/contrib/staticfiles/storage.py
+@@ -261,6 +261,7 @@ class HashedFilesMixin:
+ 
+         paths = {path: paths[path] for path in adjustable_paths}
+ 
++        substitutions = False
+         for i in range(self.max_post_process_passes):
+             substitutions = False
+             for name, hashed_name, processed, subst in self._post_process(paths, adjustable_paths, hashed_files):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5b5f19334b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the ManifestStaticFilesStorage crash with max_post_process_passes = 0
++"""
++import os
++import sys
++import tempfile
++import shutil
++from pathlib import Path
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++from django.contrib.staticfiles.management.commands.collectstatic import Command as CollectstaticCommand
++from django.core.management import call_command
++from io import StringIO
++
++# Custom storage class with max_post_process_passes = 0
++class MyManifestStaticFilesStorage(ManifestStaticFilesStorage):
++    max_post_process_passes = 0
++
++def setup_django():
++    """Setup minimal Django configuration"""
++    # Create temporary directories
++    temp_dir = tempfile.mkdtemp()
++    static_root = os.path.join(temp_dir, 'static')
++    staticfiles_dir = os.path.join(temp_dir, 'staticfiles')
++    
++    os.makedirs(staticfiles_dir, exist_ok=True)
++    
++    # Create a simple CSS file to test with
++    css_content = """
++    body {
++        color: red;
++    }
++    """
++    css_file = os.path.join(staticfiles_dir, 'test.css')
++    with open(css_file, 'w') as f:
++        f.write(css_content)
++    
++    # Create a simple text file
++    txt_content = "Hello world"
++    txt_file = os.path.join(staticfiles_dir, 'test.txt')
++    with open(txt_file, 'w') as f:
++        f.write(txt_content)
++    
++    # Configure Django
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            STATIC_URL='/static/',
++            STATIC_ROOT=static_root,
++            STATICFILES_DIRS=[staticfiles_dir],
++            STATICFILES_STORAGE='reproduce_issue.MyManifestStaticFilesStorage',
++            SECRET_KEY='test-secret-key',
++            INSTALLED_APPS=[
++                'django.contrib.staticfiles',
++            ],
++        )
++    
++    django.setup()
++    return temp_dir
++
++def test_collectstatic():
++    """Test collectstatic with max_post_process_passes = 0"""
++    print("Testing collectstatic with max_post_process_passes = 0...")
++    
++    try:
++        # Capture output
++        stdout = StringIO()
++        stderr = StringIO()
++        
++        # Run collectstatic
++        call_command('collectstatic', '--noinput', stdout=stdout, stderr=stderr)
++        
++        print("SUCCESS: collectstatic completed without error")
++        print("STDOUT:", stdout.getvalue())
++        print("STDERR:", stderr.getvalue())
++        return True
++        
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def main():
++    """Main function to reproduce the issue"""
++    print("Reproducing ManifestStaticFilesStorage issue with max_post_process_passes = 0")
++    print("=" * 70)
++    
++    temp_dir = None
++    try:
++        temp_dir = setup_django()
++        success = test_collectstatic()
++        
++        if success:
++            print("\nTest PASSED - No error occurred")
++        else:
++            print("\nTest FAILED - Error reproduced")
++            
++    finally:
++        # Cleanup
++        if temp_dir and os.path.exists(temp_dir):
++            shutil.rmtree(temp_dir)
++            print(f"\nCleaned up temporary directory: {temp_dir}")
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_default.py b/test_default.py
+new file mode 100644
+index 0000000000..5a98a602c7
+--- /dev/null
++++ b/test_default.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python
++"""
++Test default max_post_process_passes = 5
++"""
++import os
++import sys
++import tempfile
++import shutil
++
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++from django.core.management import call_command
++from io import StringIO
++
++def main():
++    temp_dir = tempfile.mkdtemp()
++    static_root = os.path.join(temp_dir, 'static')
++    staticfiles_dir = os.path.join(temp_dir, 'staticfiles')
++    
++    os.makedirs(staticfiles_dir, exist_ok=True)
++    
++    # Create test files
++    css_content = "body { color: red; }"
++    with open(os.path.join(staticfiles_dir, 'test.css'), 'w') as f:
++        f.write(css_content)
++    
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=static_root,
++        STATICFILES_DIRS=[staticfiles_dir],
++        STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=['django.contrib.staticfiles'],
++    )
++    
++    django.setup()
++    
++    try:
++        stdout = StringIO()
++        call_command('collectstatic', '--noinput', stdout=stdout)
++        print("SUCCESS: default max_post_process_passes = 5 works")
++        print(f"Output: {stdout.getvalue().strip()}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++    finally:
++        shutil.rmtree(temp_dir)
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1864dc9029
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the ManifestStaticFilesStorage fix
++"""
++import os
++import sys
++import tempfile
++import shutil
++from pathlib import Path
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++from django.contrib.staticfiles.management.commands.collectstatic import Command as CollectstaticCommand
++from django.core.management import call_command
++from io import StringIO
++
++# Test different values of max_post_process_passes
++class ZeroPassesStorage(ManifestStaticFilesStorage):
++    max_post_process_passes = 0
++
++class OnePassStorage(ManifestStaticFilesStorage):
++    max_post_process_passes = 1
++
++class DefaultStorage(ManifestStaticFilesStorage):
++    pass  # Uses default max_post_process_passes = 5
++
++def setup_django(storage_class_name):
++    """Setup minimal Django configuration"""
++    # Create temporary directories
++    temp_dir = tempfile.mkdtemp()
++    static_root = os.path.join(temp_dir, 'static')
++    staticfiles_dir = os.path.join(temp_dir, 'staticfiles')
++    
++    os.makedirs(staticfiles_dir, exist_ok=True)
++    
++    # Create test files
++    css_content = """
++    body {
++        color: red;
++    }
++    """
++    css_file = os.path.join(staticfiles_dir, 'test.css')
++    with open(css_file, 'w') as f:
++        f.write(css_content)
++    
++    txt_content = "Hello world"
++    txt_file = os.path.join(staticfiles_dir, 'test.txt')
++    with open(txt_file, 'w') as f:
++        f.write(txt_content)
++    
++    # Configure Django
++    if settings.configured:
++        # Reset settings for new test
++        from django.conf import settings as django_settings
++        django_settings._wrapped = None
++        
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=static_root,
++        STATICFILES_DIRS=[staticfiles_dir],
++        STATICFILES_STORAGE=storage_class_name,
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++    )
++    
++    django.setup()
++    return temp_dir
++
++def test_storage(storage_class, storage_name):
++    """Test a specific storage class"""
++    print(f"\nTesting {storage_name}...")
++    
++    temp_dir = None
++    try:
++        temp_dir = setup_django(f'test_edge_cases.{storage_class.__name__}')
++        
++        # Capture output
++        stdout = StringIO()
++        stderr = StringIO()
++        
++        # Run collectstatic
++        call_command('collectstatic', '--noinput', stdout=stdout, stderr=stderr)
++        
++        print(f"SUCCESS: {storage_name} completed without error")
++        print(f"STDOUT: {stdout.getvalue().strip()}")
++        if stderr.getvalue().strip():
++            print(f"STDERR: {stderr.getvalue().strip()}")
++        return True
++        
++    except Exception as e:
++        print(f"ERROR in {storage_name}: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++        
++    finally:
++        # Cleanup
++        if temp_dir and os.path.exists(temp_dir):
++            shutil.rmtree(temp_dir)
++
++def main():
++    """Test multiple edge cases"""
++    print("Testing ManifestStaticFilesStorage edge cases")
++    print("=" * 50)
++    
++    test_cases = [
++        (ZeroPassesStorage, "max_post_process_passes = 0"),
++        (OnePassStorage, "max_post_process_passes = 1"),
++        (DefaultStorage, "default max_post_process_passes = 5"),
++    ]
++    
++    results = []
++    for storage_class, description in test_cases:
++        success = test_storage(storage_class, description)
++        results.append((description, success))
++    
++    print("\n" + "=" * 50)
++    print("SUMMARY:")
++    all_passed = True
++    for description, success in results:
++        status = "PASS" if success else "FAIL"
++        print(f"  {description}: {status}")
++        if not success:
++            all_passed = False
++    
++    if all_passed:
++        print("\nAll tests PASSED!")
++    else:
++        print("\nSome tests FAILED!")
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 0000000000..45e5f101f9
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python
++"""
++Test the exact scenario described in the issue
++"""
++import os
++import sys
++import tempfile
++import shutil
++
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++from django.core.management import call_command
++from io import StringIO
++
++# Exact class from the issue description
++class MyManifestStaticFilesStorage(ManifestStaticFilesStorage):
++    max_post_process_passes = 0
++
++def main():
++    """Test the exact scenario from the issue description"""
++    print("Testing exact scenario from issue description...")
++    print("Class: MyManifestStaticFilesStorage with max_post_process_passes = 0")
++    print("Command: collectstatic")
++    print("=" * 60)
++    
++    temp_dir = tempfile.mkdtemp()
++    static_root = os.path.join(temp_dir, 'static')
++    staticfiles_dir = os.path.join(temp_dir, 'staticfiles')
++    
++    os.makedirs(staticfiles_dir, exist_ok=True)
++    
++    # Create test files
++    css_content = "body { color: red; }"
++    with open(os.path.join(staticfiles_dir, 'test.css'), 'w') as f:
++        f.write(css_content)
++    
++    # Configure Django exactly as described in the issue
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=static_root,
++        STATICFILES_DIRS=[staticfiles_dir],
++        STATICFILES_STORAGE='test_exact_issue.MyManifestStaticFilesStorage',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=['django.contrib.staticfiles'],
++    )
++    
++    django.setup()
++    
++    try:
++        stdout = StringIO()
++        stderr = StringIO()
++        
++        # Run collectstatic as described in the issue
++        call_command('collectstatic', '--noinput', stdout=stdout, stderr=stderr)
++        
++        print("✓ SUCCESS: collectstatic completed without UnboundLocalError")
++        print(f"Output: {stdout.getvalue().strip()}")
++        if stderr.getvalue().strip():
++            print(f"Stderr: {stderr.getvalue().strip()}")
++        
++        print("\n✓ ISSUE RESOLVED: No more 'UnboundLocalError: local variable 'substitutions' referenced before assignment'")
++        return True
++        
++    except UnboundLocalError as e:
++        if "substitutions" in str(e):
++            print(f"✗ FAILED: Original issue still exists - {e}")
++            return False
++        else:
++            print(f"✗ FAILED: Different UnboundLocalError - {e}")
++            return False
++    except Exception as e:
++        print(f"✗ FAILED: Unexpected error - {type(e).__name__}: {e}")
++        return False
++    finally:
++        shutil.rmtree(temp_dir)
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_one_pass.py b/test_one_pass.py
+new file mode 100644
+index 0000000000..136b91f550
+--- /dev/null
++++ b/test_one_pass.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python
++"""
++Test max_post_process_passes = 1
++"""
++import os
++import sys
++import tempfile
++import shutil
++
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++from django.core.management import call_command
++from io import StringIO
++
++class OnePassStorage(ManifestStaticFilesStorage):
++    max_post_process_passes = 1
++
++def main():
++    temp_dir = tempfile.mkdtemp()
++    static_root = os.path.join(temp_dir, 'static')
++    staticfiles_dir = os.path.join(temp_dir, 'staticfiles')
++    
++    os.makedirs(staticfiles_dir, exist_ok=True)
++    
++    # Create test files
++    css_content = "body { color: red; }"
++    with open(os.path.join(staticfiles_dir, 'test.css'), 'w') as f:
++        f.write(css_content)
++    
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATIC_ROOT=static_root,
++        STATICFILES_DIRS=[staticfiles_dir],
++        STATICFILES_STORAGE='test_one_pass.OnePassStorage',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=['django.contrib.staticfiles'],
++    )
++    
++    django.setup()
++    
++    try:
++        stdout = StringIO()
++        call_command('collectstatic', '--noinput', stdout=stdout)
++        print("SUCCESS: max_post_process_passes = 1 works")
++        print(f"Output: {stdout.getvalue().strip()}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++    finally:
++        shutil.rmtree(temp_dir)
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

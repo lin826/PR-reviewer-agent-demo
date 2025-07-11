@@ -1,0 +1,90 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index a778cd413b..a8574d0fe0 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -88,6 +88,17 @@ class Aggregate(Func):
+                         "Cannot compute %s('%s'): '%s' is an aggregate"
+                         % (c.name, name, name)
+                     )
++                if expr.contains_over_clause:
++                    before_resolved = self.get_source_expressions()[index]
++                    name = (
++                        before_resolved.name
++                        if hasattr(before_resolved, "name")
++                        else repr(before_resolved)
++                    )
++                    raise FieldError(
++                        "Cannot compute %s('%s'): '%s' is a window function"
++                        % (c.name, name, name)
++                    )
+         if (default := c.default) is None:
+             return c
+         if hasattr(default, "resolve_expression"):
+diff --git a/tests/window_tests/__init__.py b/tests/window_tests/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/window_tests/test_window_aggregate.py b/tests/window_tests/test_window_aggregate.py
+new file mode 100644
+index 0000000000..e2119134ec
+--- /dev/null
++++ b/tests/window_tests/test_window_aggregate.py
+@@ -0,0 +1,58 @@
++from django.db.models import F, Sum, Window
++from django.test import TestCase, skipIfDBFeature, skipUnlessDBFeature
++from django.db.models.functions import Coalesce
++from django.core.exceptions import FieldError
++
++# Import the Employee model from expressions_window tests
++import sys
++sys.path.insert(0, '/workspace/django__django__5.0')
++from tests.expressions_window.models import Employee
++
++
++@skipUnlessDBFeature('supports_over_clause')
++class WindowAggregateTests(TestCase):
++    @classmethod
++    def setUpTestData(cls):
++        # Create some employees for testing
++        Employee.objects.create(
++            name="Employee 1",
++            salary=100,
++            department="Dept A",
++            hire_date="2022-01-01",
++        )
++        Employee.objects.create(
++            name="Employee 2",
++            salary=200,
++            department="Dept A",
++            hire_date="2022-01-02",
++        )
++        Employee.objects.create(
++            name="Employee 3",
++            salary=300,
++            department="Dept B",
++            hire_date="2022-01-03",
++        )
++    
++    def test_aggregate_over_window(self):
++        """
++        Test that an appropriate error is raised when trying to aggregate
++        over window functions. This verifies the fix for the issue where
++        aggregate function calls over window function calls would result
++        in a database-specific error.
++        """
++        # Create a queryset with a window function annotation
++        queryset = Employee.objects.annotate(
++            cumul_salary=Coalesce(Window(Sum("salary"), order_by=F("hire_date").asc()), 0.0)
++        )
++        
++        # Without the fix, this would raise psycopg2.errors.GroupingError 
++        # when executed on PostgreSQL. With the fix, it should raise a 
++        # Django FieldError instead.
++        with self.assertRaises(FieldError) as context:
++            aggregate = queryset.aggregate(
++                salary_total=Sum("salary"),
++                cumul_salary_total=Sum("cumul_salary")  # This should trigger the error
++            )
++        
++        # Check that the error message indicates we can't aggregate over window functions
++        self.assertIn("window function", str(context.exception).lower())
+\ No newline at end of file

@@ -1,0 +1,464 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index f8d848e926..f2f9797d88 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -670,7 +670,7 @@ class QuerySet:
+                 when_statements = []
+                 for obj in batch_objs:
+                     attr = getattr(obj, field.attname)
+-                    if not isinstance(attr, Expression):
++                    if not hasattr(attr, 'resolve_expression'):
+                         attr = Value(attr, output_field=field)
+                     when_statements.append(When(pk=obj.pk, then=attr))
+                 case_statement = Case(*when_statements, output_field=field)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c1f85a0dec
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,155 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the bulk_update() F expression issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This script as an app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define a test model
++class SelfRef(models.Model):
++    name = models.CharField(max_length=100)
++    c8 = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create the table
++from django.db import connection
++
++tables = connection.introspection.table_names()
++
++if 'main_selfref' not in tables:
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SelfRef)
++
++def test_plain_f_expression():
++    """Test the issue with plain F expressions in bulk_update."""
++    print("=== Testing plain F expression issue ===")
++    
++    # Create a test object
++    obj = SelfRef.objects.create(name='test_name', c8='original_value')
++    print(f"Created object: name='{obj.name}', c8='{obj.c8}'")
++    
++    # Assign plain F(...) to some model instance field
++    from django.db.models import F
++    obj.c8 = F('name')
++    print(f"Assigned F('name') to obj.c8: {obj.c8}")
++    
++    # Clear queries to track the SQL
++    connection.queries_log.clear()
++    
++    # Save with bulk_update
++    result = SelfRef.objects.bulk_update([obj], ['c8'])
++    print(f"bulk_update returned: {result}")
++    
++    # Check the generated SQL
++    if connection.queries:
++        last_query = connection.queries[-1]
++        print(f"Generated SQL: {last_query['sql']}")
++    
++    # Refresh and check the result
++    obj.refresh_from_db()
++    print(f"After refresh: name='{obj.name}', c8='{obj.c8}'")
++    
++    # Check if the issue exists
++    if obj.c8 == 'F(name)':
++        print("❌ ISSUE CONFIRMED: F expression was converted to string literal")
++        return False
++    elif obj.c8 == obj.name:
++        print("✅ WORKING: F expression was resolved correctly")
++        return True
++    else:
++        print(f"❓ UNEXPECTED: c8='{obj.c8}', expected '{obj.name}' or 'F(name)'")
++        return False
++
++def test_combined_f_expression():
++    """Test that combined F expressions work (they should already work)."""
++    print("\n=== Testing combined F expression (should work) ===")
++    
++    # Define a simple number model
++    class NumberTest(models.Model):
++        num = models.IntegerField()
++        
++        class Meta:
++            app_label = '__main__'
++    
++    # Create the table if it doesn't exist
++    tables = connection.introspection.table_names()
++    if 'main_numbertest' not in tables:
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(NumberTest)
++    
++    obj = NumberTest.objects.create(num=5)
++    print(f"Created Number object: num={obj.num}")
++    
++    # Assign F(...) + 1 to the field
++    from django.db.models import F
++    obj.num = F('num') + 1
++    print(f"Assigned F('num') + 1 to obj.num: {obj.num}")
++    
++    # Clear queries to track the SQL
++    connection.queries_log.clear()
++    
++    # Save with bulk_update
++    result = NumberTest.objects.bulk_update([obj], ['num'])
++    print(f"bulk_update returned: {result}")
++    
++    # Check the generated SQL
++    if connection.queries:
++        last_query = connection.queries[-1]
++        print(f"Generated SQL: {last_query['sql']}")
++    
++    # Refresh and check the result
++    obj.refresh_from_db()
++    print(f"After refresh: num={obj.num}")
++    
++    # Check if it worked
++    if obj.num == 6:
++        print("✅ WORKING: Combined F expression was resolved correctly")
++        return True
++    else:
++        print(f"❌ UNEXPECTED: num={obj.num}, expected 6")
++        return False
++
++if __name__ == '__main__':
++    print("Django version:", django.VERSION)
++    print("Testing bulk_update() with F expressions...\n")
++    
++    # Test the issue
++    plain_f_works = test_plain_f_expression()
++    combined_f_works = test_combined_f_expression()
++    
++    print(f"\n=== Summary ===")
++    print(f"Plain F expression works: {plain_f_works}")
++    print(f"Combined F expression works: {combined_f_works}")
++    
++    if not plain_f_works:
++        print("\n❌ The issue is confirmed. Plain F expressions don't work with bulk_update().")
++        sys.exit(1)
++    else:
++        print("\n✅ No issue found. Both types of F expressions work correctly.")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..92f8bbf60a
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,169 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the bulk_update() F expression fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This script as an app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.CharField(max_length=100)
++    number = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create the table
++from django.db import connection
++
++tables = connection.introspection.table_names()
++if 'main_testmodel' not in tables:
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++
++def test_plain_f_expression():
++    """Test plain F expressions work."""
++    print("=== Testing plain F expression ===")
++    
++    from django.db.models import F
++    
++    obj = TestModel.objects.create(name='test', value='original', number=10)
++    obj.value = F('name')
++    
++    result = TestModel.objects.bulk_update([obj], ['value'])
++    obj.refresh_from_db()
++    
++    assert obj.value == 'test', f"Expected 'test', got '{obj.value}'"
++    print("✅ Plain F expression works")
++
++def test_combined_f_expression():
++    """Test combined F expressions work."""
++    print("=== Testing combined F expression ===")
++    
++    from django.db.models import F
++    
++    obj = TestModel.objects.create(name='test2', value='original2', number=5)
++    obj.number = F('number') + 10
++    
++    result = TestModel.objects.bulk_update([obj], ['number'])
++    obj.refresh_from_db()
++    
++    assert obj.number == 15, f"Expected 15, got {obj.number}"
++    print("✅ Combined F expression works")
++
++def test_multiple_f_expressions():
++    """Test multiple F expressions in one bulk_update."""
++    print("=== Testing multiple F expressions ===")
++    
++    from django.db.models import F
++    
++    obj = TestModel.objects.create(name='source', value='original3', number=20)
++    obj.value = F('name')
++    obj.number = F('number') + 5
++    
++    result = TestModel.objects.bulk_update([obj], ['value', 'number'])
++    obj.refresh_from_db()
++    
++    assert obj.value == 'source', f"Expected 'source', got '{obj.value}'"
++    assert obj.number == 25, f"Expected 25, got {obj.number}"
++    print("✅ Multiple F expressions work")
++
++def test_mixed_expressions_and_values():
++    """Test mixing F expressions with regular values."""
++    print("=== Testing mixed expressions and values ===")
++    
++    from django.db.models import F
++    
++    obj1 = TestModel.objects.create(name='obj1', value='original4', number=30)
++    obj2 = TestModel.objects.create(name='obj2', value='original5', number=40)
++    
++    # obj1 gets F expression, obj2 gets regular value
++    obj1.value = F('name')
++    obj2.value = 'regular_value'
++    
++    result = TestModel.objects.bulk_update([obj1, obj2], ['value'])
++    obj1.refresh_from_db()
++    obj2.refresh_from_db()
++    
++    assert obj1.value == 'obj1', f"Expected 'obj1', got '{obj1.value}'"
++    assert obj2.value == 'regular_value', f"Expected 'regular_value', got '{obj2.value}'"
++    print("✅ Mixed expressions and values work")
++
++def test_f_expression_with_functions():
++    """Test F expressions with database functions."""
++    print("=== Testing F expressions with functions ===")
++    
++    from django.db.models import F
++    from django.db.models.functions import Upper
++    
++    obj = TestModel.objects.create(name='lowercase', value='original6', number=50)
++    obj.value = Upper(F('name'))
++    
++    result = TestModel.objects.bulk_update([obj], ['value'])
++    obj.refresh_from_db()
++    
++    assert obj.value == 'LOWERCASE', f"Expected 'LOWERCASE', got '{obj.value}'"
++    print("✅ F expressions with functions work")
++
++def test_edge_cases():
++    """Test edge cases."""
++    print("=== Testing edge cases ===")
++    
++    from django.db.models import F, Value
++    from django.db.models.functions import Concat
++    
++    obj = TestModel.objects.create(name='edge', value='original7', number=60)
++    
++    # Test complex expression
++    obj.value = Concat(F('name'), Value('_suffix'))
++    
++    result = TestModel.objects.bulk_update([obj], ['value'])
++    obj.refresh_from_db()
++    
++    assert obj.value == 'edge_suffix', f"Expected 'edge_suffix', got '{obj.value}'"
++    print("✅ Edge cases work")
++
++if __name__ == '__main__':
++    print("Django version:", django.VERSION)
++    print("Testing comprehensive bulk_update() with F expressions...\n")
++    
++    try:
++        test_plain_f_expression()
++        test_combined_f_expression()
++        test_multiple_f_expressions()
++        test_mixed_expressions_and_values()
++        test_f_expression_with_functions()
++        test_edge_cases()
++        
++        print(f"\n✅ All tests passed! The fix works correctly.")
++        sys.exit(0)
++    except Exception as e:
++        print(f"\n❌ Test failed: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_with_testbed.py b/test_with_testbed.py
+new file mode 100644
+index 0000000000..06febec165
+--- /dev/null
++++ b/test_with_testbed.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python
++"""
++Test the fix using the testbed Django installation.
++"""
++
++import os
++import sys
++
++# Add testbed to path
++sys.path.insert(0, '/testbed')
++
++import django
++from django.conf import settings
++from django.db import models, connection
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This script as an app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define a test model
++class SelfRef(models.Model):
++    name = models.CharField(max_length=100)
++    c8 = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create the table
++from django.db import connection
++
++tables = connection.introspection.table_names()
++
++if 'main_selfref' not in tables:
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SelfRef)
++
++def test_plain_f_expression():
++    """Test the issue with plain F expressions in bulk_update."""
++    print("=== Testing plain F expression issue ===")
++    
++    # Create a test object
++    obj = SelfRef.objects.create(name='test_name', c8='original_value')
++    print(f"Created object: name='{obj.name}', c8='{obj.c8}'")
++    
++    # Assign plain F(...) to some model instance field
++    from django.db.models import F
++    obj.c8 = F('name')
++    print(f"Assigned F('name') to obj.c8: {obj.c8}")
++    
++    # Clear queries to track the SQL
++    connection.queries_log.clear()
++    
++    # Save with bulk_update
++    result = SelfRef.objects.bulk_update([obj], ['c8'])
++    print(f"bulk_update returned: {result}")
++    
++    # Check the generated SQL
++    if connection.queries:
++        last_query = connection.queries[-1]
++        print(f"Generated SQL: {last_query['sql']}")
++    
++    # Refresh and check the result
++    obj.refresh_from_db()
++    print(f"After refresh: name='{obj.name}', c8='{obj.c8}'")
++    
++    # Check if the issue exists
++    if obj.c8 == 'F(name)':
++        print("❌ ISSUE CONFIRMED: F expression was converted to string literal")
++        return False
++    elif obj.c8 == obj.name:
++        print("✅ WORKING: F expression was resolved correctly")
++        return True
++    else:
++        print(f"❓ UNEXPECTED: c8='{obj.c8}', expected '{obj.name}' or 'F(name)'")
++        return False
++
++if __name__ == '__main__':
++    print("Django version:", django.VERSION)
++    print("Django path:", django.__file__)
++    print("Testing bulk_update() with F expressions...\n")
++    
++    # Test the issue
++    plain_f_works = test_plain_f_expression()
++    
++    if plain_f_works:
++        print("\n✅ The fix works correctly!")
++        sys.exit(0)
++    else:
++        print("\n❌ The issue still exists.")
++        sys.exit(1)
+\ No newline at end of file

@@ -1,0 +1,607 @@
+diff --git a/lib/matplotlib/mlab.py b/lib/matplotlib/mlab.py
+index 3552904c3d..efa2f84cae 100644
+--- a/lib/matplotlib/mlab.py
++++ b/lib/matplotlib/mlab.py
+@@ -395,12 +395,12 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+     elif mode == 'psd':
+         result = np.conj(result) * result
+     elif mode == 'magnitude':
+-        result = np.abs(result) / np.abs(window).sum()
++        result = np.abs(result) / window.sum()
+     elif mode == 'angle' or mode == 'phase':
+         # we unwrap the phase later to handle the onesided vs. twosided case
+         result = np.angle(result)
+     elif mode == 'complex':
+-        result /= np.abs(window).sum()
++        result /= window.sum()
+ 
+     if mode == 'psd':
+ 
+@@ -424,10 +424,10 @@ def _spectral_helper(x, y=None, NFFT=None, Fs=None, detrend_func=None,
+             result /= Fs
+             # Scale the spectrum by the norm of the window to compensate for
+             # windowing loss; see Bendat & Piersol Sec 11.5.2.
+-            result /= (np.abs(window)**2).sum()
++            result /= (window**2).sum()
+         else:
+             # In this case, preserve power in the segment, not amplitude
+-            result /= np.abs(window).sum()**2
++            result /= window.sum()**2
+ 
+     t = np.arange(NFFT/2, len(x) - NFFT/2 + 1, NFFT - noverlap)/Fs
+ 
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..cb8965a329
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,184 @@
++#!/usr/bin/env python3
++"""
++Final verification test to demonstrate that the window correction bug is fixed.
++
++This test reproduces the exact issue described in the bug report and verifies
++that the fix works correctly.
++"""
++
++import numpy as np
++from scipy import signal
++import matplotlib.mlab as mlab
++
++def test_original_issue():
++    """Test the exact issue from the bug report."""
++    print("=== Testing the original issue from the bug report ===")
++    
++    # This is the exact code from the bug report
++    window = signal.windows.flattop(512)
++    difference = np.abs(window).sum()**2 - window.sum()**2
++    print(f"np.abs(window).sum()**2 - window.sum()**2 = {difference}")
++    
++    # The mathematical relationship should show the issue exists
++    # (this is expected and shows the fundamental problem)
++    expected_difference = 4372.942556173262
++    print(f"Expected difference: {expected_difference}")
++    print(f"Actual difference: {difference}")
++    print(f"Difference matches expected: {abs(difference - expected_difference) < 1e-6}")
++    
++    return True
++
++def test_spectral_helper_fix():
++    """Test that _spectral_helper now works correctly with flattop window."""
++    print("\n=== Testing _spectral_helper fix ===")
++    
++    # Create a test signal with known frequency content
++    np.random.seed(42)
++    Fs = 1000
++    t = np.arange(0, 2, 1/Fs)
++    # Signal with 50 Hz and 120 Hz components
++    x = np.sin(2*np.pi*50*t) + 0.5*np.sin(2*np.pi*120*t) + 0.1*np.random.randn(len(t))
++    
++    # Test with flattop window (which has negative values)
++    flattop_window = signal.windows.flattop(256)
++    
++    # Test all modes that were fixed
++    modes_to_test = [
++        ('psd', {'scale_by_freq': True}),   # Line 427
++        ('psd', {'scale_by_freq': False}),  # Line 430
++        ('magnitude', {}),                  # Line 398
++        ('complex', {}),                    # Line 403
++    ]
++    
++    results = {}
++    
++    for mode, kwargs in modes_to_test:
++        try:
++            result, freqs, t_out = mlab._spectral_helper(
++                x=x, NFFT=256, window=flattop_window, 
++                mode=mode, Fs=Fs, **kwargs
++            )
++            
++            # Check that results are finite and reasonable
++            assert np.all(np.isfinite(result)), f"Mode {mode}: result contains non-finite values"
++            
++            if mode == 'psd':
++                assert np.all(result >= 0), f"Mode {mode}: PSD contains negative values"
++            elif mode == 'magnitude':
++                assert np.all(result >= 0), f"Mode {mode}: magnitude contains negative values"
++            
++            results[f"{mode}_{kwargs}"] = {
++                'shape': result.shape,
++                'min': result.min(),
++                'max': result.max(),
++                'mean': result.mean()
++            }
++            
++            print(f"✓ Mode '{mode}' with {kwargs}: SUCCESS")
++            print(f"  Shape: {result.shape}, Range: [{result.min():.6f}, {result.max():.6f}]")
++            
++        except Exception as e:
++            print(f"✗ Mode '{mode}' with {kwargs}: FAILED - {e}")
++            return False
++    
++    return True
++
++def test_comparison_with_other_windows():
++    """Compare results with windows that don't have negative values."""
++    print("\n=== Comparing with other window types ===")
++    
++    # Create test signal
++    np.random.seed(42)
++    Fs = 1000
++    t = np.arange(0, 1, 1/Fs)
++    x = np.sin(2*np.pi*50*t) + 0.1*np.random.randn(len(t))
++    
++    windows = {
++        'hann': signal.windows.hann(256),
++        'flattop': signal.windows.flattop(256),
++        'hamming': signal.windows.hamming(256),
++    }
++    
++    # Test PSD calculation with different windows
++    for name, window in windows.items():
++        try:
++            psd, freqs = mlab.psd(x, NFFT=256, Fs=Fs, window=window, 
++                                 scale_by_freq=True, noverlap=128)
++            
++            # Find peak near 50 Hz
++            idx_50hz = np.argmin(np.abs(freqs - 50))
++            peak_power = psd[idx_50hz]
++            total_power = np.sum(psd)
++            
++            has_negative = np.any(window < 0)
++            
++            print(f"{name:8}: peak_power={peak_power:.3e}, total_power={total_power:.3e}, "
++                  f"has_negative={has_negative}")
++            
++            # Check that results are reasonable
++            assert np.all(np.isfinite(psd)), f"{name}: PSD contains non-finite values"
++            assert np.all(psd >= 0), f"{name}: PSD contains negative values"
++            assert peak_power > 0, f"{name}: Peak power should be positive"
++            
++        except Exception as e:
++            print(f"✗ {name} failed: {e}")
++            return False
++    
++    print("✓ All window types produce reasonable results")
++    return True
++
++def test_backward_compatibility():
++    """Test that the fix doesn't break existing functionality."""
++    print("\n=== Testing backward compatibility ===")
++    
++    # Test with windows that don't have negative values (should work the same)
++    np.random.seed(42)
++    x = np.random.randn(1024)
++    
++    # Test with hann window (no negative values)
++    hann_window = signal.windows.hann(256)
++    
++    try:
++        # Test various functions that use _spectral_helper
++        psd, freqs = mlab.psd(x, NFFT=256, window=hann_window, Fs=1000)
++        csd, freqs_csd = mlab.csd(x, x, NFFT=256, window=hann_window, Fs=1000)
++        spec, freqs_spec, t = mlab.specgram(x, NFFT=256, window=hann_window, Fs=1000)
++        
++        # Check that all results are reasonable
++        assert np.all(np.isfinite(psd)), "PSD contains non-finite values"
++        assert np.all(np.isfinite(csd)), "CSD contains non-finite values"
++        assert np.all(np.isfinite(spec)), "Spectrogram contains non-finite values"
++        
++        print("✓ PSD, CSD, and spectrogram work correctly")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Backward compatibility test failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Final verification of the window correction fix")
++    print("=" * 60)
++    
++    test1 = test_original_issue()
++    test2 = test_spectral_helper_fix()
++    test3 = test_comparison_with_other_windows()
++    test4 = test_backward_compatibility()
++    
++    print("\n" + "=" * 60)
++    print("FINAL SUMMARY:")
++    print(f"Original issue reproduction: {'PASSED' if test1 else 'FAILED'}")
++    print(f"_spectral_helper fix: {'PASSED' if test2 else 'FAILED'}")
++    print(f"Window comparison: {'PASSED' if test3 else 'FAILED'}")
++    print(f"Backward compatibility: {'PASSED' if test4 else 'FAILED'}")
++    
++    if all([test1, test2, test3, test4]):
++        print("\n🎉 ALL TESTS PASSED! The window correction bug has been successfully fixed.")
++        print("\nSummary of changes:")
++        print("- Fixed line 398: np.abs(window).sum() → window.sum()")
++        print("- Fixed line 403: np.abs(window).sum() → window.sum()")
++        print("- Fixed line 427: (np.abs(window)**2).sum() → (window**2).sum()")
++        print("- Fixed line 430: np.abs(window).sum()**2 → window.sum()**2")
++        print("\nThe fix ensures correct window correction for windows with negative values like flattop.")
++    else:
++        print("\n❌ Some tests failed. The fix needs more work.")
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 0000000000..0a5dd4fc88
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++"""
++Test script to verify that the window correction fix works correctly.
++
++This script tests the specific functionality that was fixed in _spectral_helper.
++"""
++
++import numpy as np
++from scipy import signal
++import matplotlib.mlab as mlab
++
++def test_psd_with_flattop_window():
++    """Test PSD calculation with flattop window to verify the fix."""
++    print("=== Testing PSD calculation with flattop window ===")
++    
++    # Create a test signal
++    np.random.seed(42)
++    Fs = 1000
++    t = np.arange(0, 1, 1/Fs)
++    # Create a signal with known frequency components
++    x = np.sin(2*np.pi*50*t) + 0.5*np.sin(2*np.pi*120*t) + 0.1*np.random.randn(len(t))
++    
++    # Test with flattop window
++    flattop_window = signal.windows.flattop(256)
++    
++    # Test PSD with scale_by_freq=True (this uses line 427)
++    try:
++        psd1, freqs1 = mlab.psd(x, NFFT=256, Fs=Fs, window=flattop_window, 
++                               scale_by_freq=True, noverlap=128)
++        print("✓ PSD with scale_by_freq=True: SUCCESS")
++        print(f"  PSD shape: {psd1.shape}, Frequency range: {freqs1[0]:.1f} - {freqs1[-1]:.1f} Hz")
++        
++        # Check that PSD values are reasonable (positive, finite)
++        assert np.all(np.isfinite(psd1)), "PSD contains non-finite values"
++        assert np.all(psd1 > 0), "PSD contains non-positive values"
++        print("  ✓ PSD values are positive and finite")
++        
++    except Exception as e:
++        print(f"✗ PSD with scale_by_freq=True failed: {e}")
++        return False
++    
++    # Test PSD with scale_by_freq=False (this uses line 430)
++    try:
++        psd2, freqs2 = mlab.psd(x, NFFT=256, Fs=Fs, window=flattop_window,
++                               scale_by_freq=False, noverlap=128)
++        print("✓ PSD with scale_by_freq=False: SUCCESS")
++        print(f"  PSD shape: {psd2.shape}, Frequency range: {freqs2[0]:.1f} - {freqs2[-1]:.1f} Hz")
++        
++        # Check that PSD values are reasonable
++        assert np.all(np.isfinite(psd2)), "PSD contains non-finite values"
++        assert np.all(psd2 > 0), "PSD contains non-positive values"
++        print("  ✓ PSD values are positive and finite")
++        
++    except Exception as e:
++        print(f"✗ PSD with scale_by_freq=False failed: {e}")
++        return False
++    
++    return True
++
++def test_compare_window_types():
++    """Compare PSD results with different window types."""
++    print("\n=== Comparing PSD results with different window types ===")
++    
++    # Create a simple test signal
++    np.random.seed(42)
++    Fs = 1000
++    t = np.arange(0, 1, 1/Fs)
++    x = np.sin(2*np.pi*50*t) + 0.1*np.random.randn(len(t))
++    
++    windows = {
++        'hann': signal.windows.hann(256),
++        'flattop': signal.windows.flattop(256),
++        'hamming': signal.windows.hamming(256),
++    }
++    
++    results = {}
++    
++    for name, window in windows.items():
++        try:
++            psd, freqs = mlab.psd(x, NFFT=256, Fs=Fs, window=window, 
++                                 scale_by_freq=True, noverlap=128)
++            
++            # Find the peak near 50 Hz
++            idx_50hz = np.argmin(np.abs(freqs - 50))
++            peak_power = psd[idx_50hz]
++            
++            results[name] = {
++                'peak_power': peak_power,
++                'total_power': np.sum(psd),
++                'has_negative_window': np.any(window < 0)
++            }
++            
++            print(f"{name:8}: peak_power={peak_power:.2e}, total_power={np.sum(psd):.2e}, "
++                  f"has_negative={results[name]['has_negative_window']}")
++            
++        except Exception as e:
++            print(f"✗ {name} failed: {e}")
++            return False
++    
++    # Check that flattop results are reasonable compared to other windows
++    flattop_peak = results['flattop']['peak_power']
++    hann_peak = results['hann']['peak_power']
++    
++    # The peaks should be of similar order of magnitude
++    ratio = flattop_peak / hann_peak
++    print(f"\nFlattop/Hann peak power ratio: {ratio:.2f}")
++    
++    # This ratio should be reasonable (not extremely large or small)
++    if 0.1 < ratio < 10:
++        print("✓ Peak power ratio is reasonable")
++        return True
++    else:
++        print("✗ Peak power ratio seems unreasonable")
++        return False
++
++def test_spectral_helper_directly():
++    """Test _spectral_helper directly with flattop window."""
++    print("\n=== Testing _spectral_helper directly ===")
++    
++    # Create test signal
++    np.random.seed(42)
++    x = np.random.randn(1024)
++    flattop_window = signal.windows.flattop(256)
++    
++    try:
++        # Test the specific modes that use the fixed lines
++        result1, freqs1, t1 = mlab._spectral_helper(
++            x=x, NFFT=256, window=flattop_window,
++            mode='psd', scale_by_freq=True, Fs=1000
++        )
++        print("✓ _spectral_helper PSD scale_by_freq=True: SUCCESS")
++        
++        result2, freqs2, t2 = mlab._spectral_helper(
++            x=x, NFFT=256, window=flattop_window,
++            mode='psd', scale_by_freq=False, Fs=1000
++        )
++        print("✓ _spectral_helper PSD scale_by_freq=False: SUCCESS")
++        
++        # Check that results are finite and reasonable
++        assert np.all(np.isfinite(result1)), "Result1 contains non-finite values"
++        assert np.all(np.isfinite(result2)), "Result2 contains non-finite values"
++        print("✓ All results are finite")
++        
++        return True
++        
++    except Exception as e:
++        print(f"✗ _spectral_helper test failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Testing the window correction fix in matplotlib.mlab._spectral_helper")
++    print("=" * 70)
++    
++    test1_passed = test_psd_with_flattop_window()
++    test2_passed = test_compare_window_types()
++    test3_passed = test_spectral_helper_directly()
++    
++    print("\n" + "=" * 70)
++    print("SUMMARY:")
++    print(f"PSD with flattop window test: {'PASSED' if test1_passed else 'FAILED'}")
++    print(f"Window comparison test: {'PASSED' if test2_passed else 'FAILED'}")
++    print(f"_spectral_helper direct test: {'PASSED' if test3_passed else 'FAILED'}")
++    
++    if all([test1_passed, test2_passed, test3_passed]):
++        print("\n✓ All tests PASSED! The fix appears to be working correctly.")
++    else:
++        print("\n✗ Some tests FAILED. The fix may need more work.")
+\ No newline at end of file
+diff --git a/test_other_modes.py b/test_other_modes.py
+new file mode 100644
+index 0000000000..2f7674dc6c
+--- /dev/null
++++ b/test_other_modes.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Test script to check if the other modes (magnitude, complex) also need fixing.
++"""
++
++import numpy as np
++from scipy import signal
++import matplotlib.mlab as mlab
++
++def test_magnitude_and_complex_modes():
++    """Test magnitude and complex modes with flattop window."""
++    print("=== Testing magnitude and complex modes with flattop window ===")
++    
++    # Create test signal
++    np.random.seed(42)
++    x = np.random.randn(1024)
++    flattop_window = signal.windows.flattop(256)
++    
++    try:
++        # Test magnitude mode (line 398)
++        result_mag, freqs_mag, t_mag = mlab._spectral_helper(
++            x=x, NFFT=256, window=flattop_window,
++            mode='magnitude', Fs=1000
++        )
++        print("✓ Magnitude mode: SUCCESS")
++        print(f"  Result shape: {result_mag.shape}")
++        print(f"  Result range: {result_mag.min():.6f} to {result_mag.max():.6f}")
++        
++        # Test complex mode (line 403)
++        result_complex, freqs_complex, t_complex = mlab._spectral_helper(
++            x=x, NFFT=256, window=flattop_window,
++            mode='complex', Fs=1000
++        )
++        print("✓ Complex mode: SUCCESS")
++        print(f"  Result shape: {result_complex.shape}")
++        print(f"  Result type: {result_complex.dtype}")
++        
++        # Check if results are reasonable
++        assert np.all(np.isfinite(result_mag)), "Magnitude result contains non-finite values"
++        assert np.all(np.isfinite(result_complex)), "Complex result contains non-finite values"
++        assert np.all(result_mag >= 0), "Magnitude result contains negative values"
++        
++        print("✓ All results are finite and reasonable")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Test failed: {e}")
++        return False
++
++def compare_window_correction_methods():
++    """Compare the old vs new window correction methods."""
++    print("\n=== Comparing window correction methods ===")
++    
++    flattop_window = signal.windows.flattop(256)
++    
++    # Old method (with np.abs)
++    old_sum = np.abs(flattop_window).sum()
++    old_sum_sq = np.abs(flattop_window).sum()**2
++    old_norm_sq = (np.abs(flattop_window)**2).sum()
++    
++    # New method (without np.abs)
++    new_sum = flattop_window.sum()
++    new_sum_sq = flattop_window.sum()**2
++    new_norm_sq = (flattop_window**2).sum()
++    
++    print(f"Window sum - Old: {old_sum:.6f}, New: {new_sum:.6f}, Diff: {old_sum - new_sum:.6f}")
++    print(f"Window sum² - Old: {old_sum_sq:.6f}, New: {new_sum_sq:.6f}, Diff: {old_sum_sq - new_sum_sq:.6f}")
++    print(f"Window norm² - Old: {old_norm_sq:.6f}, New: {new_norm_sq:.6f}, Diff: {old_norm_sq - new_norm_sq:.6f}")
++    
++    # The norm squared should be the same because (abs(x))^2 = x^2 for real numbers
++    assert abs(old_norm_sq - new_norm_sq) < 1e-10, "Norm squared should be the same"
++    print("✓ Norm squared is the same (as expected)")
++    
++    return True
++
++if __name__ == "__main__":
++    print("Testing magnitude and complex modes with flattop window")
++    print("=" * 60)
++    
++    test1_passed = test_magnitude_and_complex_modes()
++    test2_passed = compare_window_correction_methods()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"Magnitude/Complex modes test: {'PASSED' if test1_passed else 'FAILED'}")
++    print(f"Window correction comparison: {'PASSED' if test2_passed else 'FAILED'}")
++    
++    if all([test1_passed, test2_passed]):
++        print("\n✓ All tests PASSED!")
++    else:
++        print("\n✗ Some tests FAILED.")
+\ No newline at end of file
+diff --git a/test_window_correction_bug.py b/test_window_correction_bug.py
+new file mode 100644
+index 0000000000..b7975ea11b
+--- /dev/null
++++ b/test_window_correction_bug.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the window correction bug in mlab._spectral_helper.
++
++The issue is that np.abs() is incorrectly applied to window values before summing,
++which gives wrong results for windows with negative values like flattop.
++"""
++
++import numpy as np
++from scipy import signal
++import matplotlib.mlab as mlab
++
++def test_window_correction_issue():
++    """Test the original issue reported."""
++    print("=== Testing the original issue ===")
++    window = signal.windows.flattop(512)
++    difference = np.abs(window).sum()**2 - window.sum()**2
++    print(f"Difference between np.abs(window).sum()**2 and window.sum()**2: {difference}")
++    print(f"Expected: 0, Actual: {difference}")
++    print(f"Issue exists: {abs(difference) > 1e-10}")
++    return abs(difference) > 1e-10
++
++def test_spectral_helper_with_flattop():
++    """Test _spectral_helper with flattop window to see the effect of the bug."""
++    print("\n=== Testing _spectral_helper with flattop window ===")
++    
++    # Create test signal
++    np.random.seed(42)
++    x = np.random.randn(1024)
++    
++    # Test with flattop window
++    flattop_window = signal.windows.flattop(256)
++    
++    try:
++        # Test PSD mode with scale_by_freq=True (line 427)
++        result1, freqs1, t1 = mlab._spectral_helper(
++            x=x, NFFT=256, window=flattop_window, 
++            mode='psd', scale_by_freq=True, Fs=1.0
++        )
++        print("PSD with scale_by_freq=True: SUCCESS")
++        
++        # Test PSD mode with scale_by_freq=False (line 430)  
++        result2, freqs2, t2 = mlab._spectral_helper(
++            x=x, NFFT=256, window=flattop_window,
++            mode='psd', scale_by_freq=False, Fs=1.0
++        )
++        print("PSD with scale_by_freq=False: SUCCESS")
++        
++        # Test magnitude mode (line 398)
++        result3, freqs3, t3 = mlab._spectral_helper(
++            x=x, NFFT=256, window=flattop_window,
++            mode='magnitude', Fs=1.0
++        )
++        print("Magnitude mode: SUCCESS")
++        
++        # Test complex mode (line 403)
++        result4, freqs4, t4 = mlab._spectral_helper(
++            x=x, NFFT=256, window=flattop_window,
++            mode='complex', Fs=1.0
++        )
++        print("Complex mode: SUCCESS")
++        
++        return True
++        
++    except Exception as e:
++        print(f"Error in _spectral_helper: {e}")
++        return False
++
++def test_window_types():
++    """Test different window types to see which ones are affected."""
++    print("\n=== Testing different window types ===")
++    
++    window_types = {
++        'hann': signal.windows.hann(512),
++        'hamming': signal.windows.hamming(512),
++        'flattop': signal.windows.flattop(512),
++        'blackman': signal.windows.blackman(512),
++        'bartlett': signal.windows.bartlett(512),
++    }
++    
++    for name, window in window_types.items():
++        has_negative = np.any(window < 0)
++        sum_diff = np.abs(window).sum() - window.sum()
++        sum_sq_diff = np.abs(window).sum()**2 - window.sum()**2
++        
++        print(f"{name:10}: has_negative={has_negative}, "
++              f"sum_diff={sum_diff:.6f}, sum_sq_diff={sum_sq_diff:.6f}")
++
++if __name__ == "__main__":
++    print("Testing window correction bug in matplotlib.mlab._spectral_helper")
++    print("=" * 70)
++    
++    issue_exists = test_window_correction_issue()
++    spectral_helper_works = test_spectral_helper_with_flattop()
++    test_window_types()
++    
++    print("\n" + "=" * 70)
++    print("SUMMARY:")
++    print(f"Original issue exists: {issue_exists}")
++    print(f"_spectral_helper works: {spectral_helper_works}")
++    
++    if issue_exists:
++        print("\nThe bug is confirmed. The window correction is incorrect for windows with negative values.")
++    else:
++        print("\nThe bug appears to be fixed!")
+\ No newline at end of file

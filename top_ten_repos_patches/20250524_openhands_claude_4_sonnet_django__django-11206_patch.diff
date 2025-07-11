@@ -1,0 +1,211 @@
+diff --git a/django/utils/numberformat.py b/django/utils/numberformat.py
+index 88b35fc435..4141f6a213 100644
+--- a/django/utils/numberformat.py
++++ b/django/utils/numberformat.py
+@@ -31,6 +31,20 @@ def format(number, decimal_sep, decimal_pos=None, grouping=0, thousand_sep='',
+         # scientific notation to avoid high memory usage in {:f}'.format().
+         _, digits, exponent = number.as_tuple()
+         if abs(exponent) + len(digits) > 200:
++            # When decimal_pos is specified, check if the number would round to zero
++            # at the given precision. If so, return zero-padded string instead of
++            # scientific notation.
++            if decimal_pos is not None:
++                # Check if the absolute value of the number is smaller than the
++                # smallest representable value at the given decimal precision
++                smallest_representable = Decimal(10) ** (-decimal_pos)
++                if abs(number) < smallest_representable:
++                    # Return zero with the specified decimal places
++                    if decimal_pos == 0:
++                        return '0'
++                    else:
++                        return '0' + decimal_sep + ('0' * decimal_pos)
++            
+             number = '{:e}'.format(number)
+             coefficient, exponent = number.split('e')
+             # Format the coefficient.
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..4deb5d99d5
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python
++"""
++Edge case tests for the numberformat fix.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(USE_L10N=False, USE_THOUSAND_SEPARATOR=False)
++django.setup()
++
++from decimal import Decimal
++from django.utils.numberformat import format as nformat
++
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix doesn't break existing functionality."""
++    print("Testing edge cases...")
++    print("=" * 50)
++    
++    # Test that normal cases still work
++    normal_cases = [
++        (Decimal('1.23'), '.', 2, '1.23'),
++        (Decimal('1.23'), '.', 4, '1.2300'),
++        (Decimal('0'), '.', 2, '0.00'),
++        (Decimal('0.1'), '.', 2, '0.10'),
++        (Decimal('-1.23'), '.', 2, '-1.23'),
++    ]
++    
++    print("Normal cases (should still work):")
++    for value, sep, decimal_pos, expected in normal_cases:
++        result = nformat(value, sep, decimal_pos=decimal_pos)
++        status = '✓ PASS' if result == expected else '✗ FAIL'
++        print(f"nformat({value}, '{sep}', decimal_pos={decimal_pos}) = {repr(result)} (expected {repr(expected)}) {status}")
++    
++    print()
++    
++    # Test that scientific notation still works when decimal_pos is None
++    scientific_cases = [
++        (Decimal('1e200'), '.', None),  # Should use scientific notation
++        (Decimal('1e-200'), '.', None),  # Should use scientific notation
++        (Decimal('1e300'), '.', None),  # Should use scientific notation
++    ]
++    
++    print("Scientific notation cases (decimal_pos=None):")
++    for value, sep, decimal_pos in scientific_cases:
++        result = nformat(value, sep, decimal_pos=decimal_pos)
++        has_e = 'e' in result.lower()
++        status = '✓ PASS' if has_e else '✗ FAIL'
++        print(f"nformat({value}, '{sep}', decimal_pos={decimal_pos}) = {repr(result)} (should contain 'e') {status}")
++    
++    print()
++    
++    # Test boundary cases around the threshold
++    boundary_cases = [
++        # Numbers that are just at the threshold
++        (Decimal('1e-2'), '.', 2, '0.01'),  # Should be 0.01, not 0.00
++        (Decimal('1e-3'), '.', 2, '0.00'),  # Should be 0.00
++        (Decimal('5e-3'), '.', 2, '0.00'),  # Should truncate to 0.00
++        (Decimal('4e-3'), '.', 2, '0.00'),  # Should round to 0.00
++        (Decimal('1e-1'), '.', 1, '0.1'),   # Should be 0.1
++        (Decimal('1e-2'), '.', 1, '0.0'),   # Should be 0.0
++    ]
++    
++    print("Boundary cases:")
++    for value, sep, decimal_pos, expected in boundary_cases:
++        result = nformat(value, sep, decimal_pos=decimal_pos)
++        status = '✓ PASS' if result == expected else '✗ FAIL'
++        print(f"nformat({value}, '{sep}', decimal_pos={decimal_pos}) = {repr(result)} (expected {repr(expected)}) {status}")
++    
++    print()
++    
++    # Test with different separators
++    separator_cases = [
++        (Decimal('1e-200'), ',', 2, '0,00'),
++        (Decimal('1e-200'), '|', 3, '0|000'),
++    ]
++    
++    print("Different separator cases:")
++    for value, sep, decimal_pos, expected in separator_cases:
++        result = nformat(value, sep, decimal_pos=decimal_pos)
++        status = '✓ PASS' if result == expected else '✗ FAIL'
++        print(f"nformat({value}, '{sep}', decimal_pos={decimal_pos}) = {repr(result)} (expected {repr(expected)}) {status}")
++
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..f52e434e70
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the numberformat issue with small decimals.
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(USE_L10N=False, USE_THOUSAND_SEPARATOR=False)
++django.setup()
++
++from decimal import Decimal
++from django.utils.numberformat import format as nformat
++
++
++def test_small_decimals():
++    """Test the issue with small decimals being rendered in exponential notation."""
++    print("Testing small decimal formatting issue...")
++    print("=" * 50)
++    
++    # Test cases around the boundary
++    test_cases = [
++        ('1e-198', 2),
++        ('1e-199', 2),
++        ('1e-200', 2),  # This should return '0.00' but currently returns '1.00e-200'
++        ('1e-201', 2),
++        ('1e-300', 3),
++        ('1e-400', 4),
++    ]
++    
++    for value_str, decimal_pos in test_cases:
++        value = Decimal(value_str)
++        result = nformat(value, '.', decimal_pos=decimal_pos)
++        expected = '0.' + '0' * decimal_pos  # What we expect for very small numbers
++        
++        print(f"nformat(Decimal('{value_str}'), '.', decimal_pos={decimal_pos})")
++        print(f"  Result:   {repr(result)}")
++        print(f"  Expected: {repr(expected)}")
++        print(f"  Status:   {'✓ PASS' if result == expected else '✗ FAIL'}")
++        print()
++    
++    # Additional test cases with different decimal positions
++    print("Additional test cases:")
++    print("-" * 30)
++    
++    additional_cases = [
++        ('1e-200', 0),  # Should be '0'
++        ('1e-200', 1),  # Should be '0.0'
++        ('1e-200', 5),  # Should be '0.00000'
++        ('5e-201', 2),  # Should be '0.00'
++        ('-1e-200', 2), # Should be '0.00' (negative very small number)
++    ]
++    
++    for value_str, decimal_pos in additional_cases:
++        value = Decimal(value_str)
++        result = nformat(value, '.', decimal_pos=decimal_pos)
++        if decimal_pos == 0:
++            expected = '0'
++        else:
++            expected = '0.' + '0' * decimal_pos
++        
++        print(f"nformat(Decimal('{value_str}'), '.', decimal_pos={decimal_pos})")
++        print(f"  Result:   {repr(result)}")
++        print(f"  Expected: {repr(expected)}")
++        print(f"  Status:   {'✓ PASS' if result == expected else '✗ FAIL'}")
++        print()
++
++
++if __name__ == '__main__':
++    test_small_decimals()
+\ No newline at end of file
+diff --git a/tests/utils_tests/test_numberformat.py b/tests/utils_tests/test_numberformat.py
+index 3d656025ab..1dac45e890 100644
+--- a/tests/utils_tests/test_numberformat.py
++++ b/tests/utils_tests/test_numberformat.py
+@@ -94,7 +94,7 @@ class TestNumberFormat(SimpleTestCase):
+             ('1e-10', 8, '0.00000000'),
+             ('1e-11', 8, '0.00000000'),
+             ('1' + ('0' * 300), 3, '1.000e+300'),
+-            ('0.{}1234'.format('0' * 299), 3, '1.234e-300'),
++            ('0.{}1234'.format('0' * 299), 3, '0.000'),
+         ]
+         for value, decimal_pos, expected_value in tests:
+             with self.subTest(value=value):

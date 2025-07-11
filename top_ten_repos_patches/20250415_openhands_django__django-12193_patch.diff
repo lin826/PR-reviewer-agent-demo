@@ -1,0 +1,270 @@
+diff --git a/django/contrib/postgres/forms/array.py b/django/contrib/postgres/forms/array.py
+index 2e19cd574a..d031f6fd9d 100644
+--- a/django/contrib/postgres/forms/array.py
++++ b/django/contrib/postgres/forms/array.py
+@@ -144,10 +144,13 @@ class SplitArrayWidget(forms.Widget):
+                 widget_value = value[i]
+             except IndexError:
+                 widget_value = None
++            # Create a new dictionary for each subwidget to prevent
++            # modifications by one widget from affecting others
++            widget_attrs = dict(final_attrs)
+             if id_:
+-                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}
++                widget_attrs['id'] = '%s_%s' % (id_, i)
+             context['widget']['subwidgets'].append(
+-                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']
++                self.widget.get_context(name + '_%s' % i, widget_value, widget_attrs)['widget']
+             )
+         return context
+ 
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 0000000000..5b2152e769
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-key',
++    )
++    django.setup()
++
++from django import forms
++from django.contrib.postgres.forms import SplitArrayField
++
++# Create a form with a SplitArrayField containing BooleanFields
++class BooleanArrayForm(forms.Form):
++    boolean_array = SplitArrayField(forms.BooleanField(required=False), size=4)
++
++def test_boolean_array_field():
++    """Test that Boolean values in SplitArrayField are correctly represented."""
++    # Create a form with initial data containing a mix of True and False
++    initial_data = [True, False, False, True]
++    form = BooleanArrayForm(initial={'boolean_array': initial_data})
++    
++    # Get the subwidgets
++    widget = form['boolean_array'].field.widget
++    context = widget.get_context(
++        name='boolean_array', 
++        value=initial_data, 
++        attrs={'id': 'id_boolean_array'}
++    )
++    subwidgets = context['widget']['subwidgets']
++    
++    # Print the status of each widget
++    print("\nTesting SplitArrayField with BooleanField:")
++    print(f"Initial data: {initial_data}")
++    
++    # Check if each widget has the correct checked status
++    all_correct = True
++    for i, subwidget in enumerate(subwidgets):
++        expected = initial_data[i] if i < len(initial_data) else False
++        actual = 'checked' in subwidget['attrs']
++        correct = (expected == actual)
++        
++        print(f"  Widget {i}: value={expected}, has_checked={actual}, correct={correct}")
++        
++        if not correct:
++            all_correct = False
++    
++    if all_correct:
++        print("\nSuccess! All widgets have the correct checked status.")
++    else:
++        print("\nFail! Some widgets have incorrect checked status.")
++    
++    return all_correct
++
++if __name__ == "__main__":
++    success = test_boolean_array_field()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_splitarrayfield_issue.py b/test_splitarrayfield_issue.py
+new file mode 100644
+index 0000000000..5c31ba5759
+--- /dev/null
++++ b/test_splitarrayfield_issue.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python
++import os
++import sys
++import copy
++from collections import Counter
++
++# Let's demonstrate the issue with a simple mock implementation
++class MockCheckboxInput:
++    def __init__(self):
++        self.attrs_counter = Counter()
++        
++    def get_context(self, name, value, attrs):
++        # This is a simplified version of CheckboxInput.get_context
++        # The bug happens because the input is modifying the attrs dict passed to it
++        if value:
++            if attrs is None:
++                attrs = {}
++            # This is the problematic line that modifies the passed-in attrs
++            attrs['checked'] = True
++            
++            # Count how many times we're modifying attrs
++            self.attrs_counter[id(attrs)] += 1
++            
++        # Create a widget object that will become part of the returned context
++        widget = {'name': name, 'value': value, 'attrs': attrs or {}}
++        return {'widget': widget}
++
++class MockSplitArrayWidget:
++    def __init__(self, size):
++        self.widget = MockCheckboxInput()
++        self.size = size
++        
++    def get_context(self, name, value, attrs=None):
++        # Simplified version of SplitArrayWidget.get_context
++        attrs = {} if attrs is None else attrs
++        value = value or []
++        subwidgets = []
++        
++        # This is the key part demonstrating the issue:
++        # We create a single attrs dict and reuse it for all subwidgets
++        final_attrs = dict(attrs)
++        
++        for i in range(max(len(value), self.size)):
++            try:
++                widget_value = value[i]
++            except IndexError:
++                widget_value = None
++                
++            # Pass the same final_attrs to each widget's get_context
++            # This is where the bug manifests, as the final_attrs dict is modified by the widget
++            widget_context = self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)
++            subwidgets.append(widget_context['widget'])
++        
++        # Return a context similar to what SplitArrayWidget would return
++        return {'widget': {'subwidgets': subwidgets}}
++
++def test_with_current_behavior():
++    """Test demonstrating the current buggy behavior."""
++    print("\n=== Current Behavior (with bug) ===")
++    
++    # Create the widget with a mix of True and False values
++    widget = MockSplitArrayWidget(size=4)
++    test_data = [True, False, False, True]
++    
++    # Get the context with the sample data
++    context = widget.get_context('test_field', test_data)
++    
++    # Check and print the state of each subwidget
++    print(f"Input data: {test_data}")
++    print("\nWidget states:")
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        expected_value = test_data[i] if i < len(test_data) else None
++        has_checked = 'checked' in subwidget['attrs']
++        print(f"  Widget {i}: value={expected_value}, has_checked_attr={has_checked} {subwidget['attrs']}")
++    
++    # Count how many times we modified the same attrs dictionary
++    attrs_counter = widget.widget.attrs_counter
++    if attrs_counter:
++        print("\nAttrs dictionary modifications:")
++        for attrs_id, count in attrs_counter.items():
++            print(f"  Dict id={attrs_id}: modified {count} times")
++    
++    # Check if we have the issue (any widget has checked=True when its value is False)
++    has_issue = any(
++        (i < len(test_data) and not test_data[i] and 'checked' in subwidget['attrs'])
++        for i, subwidget in enumerate(context['widget']['subwidgets'])
++    )
++    
++    print(f"\nIssue detected: {has_issue}")
++    return has_issue
++
++def test_proposed_fix():
++    """Test demonstrating the fixed behavior by creating separate attrs dictionaries."""
++    print("\n=== Proposed Fix Behavior ===")
++    
++    class FixedMockSplitArrayWidget(MockSplitArrayWidget):
++        def get_context(self, name, value, attrs=None):
++            # Same as the original but with the fix
++            attrs = {} if attrs is None else attrs
++            value = value or []
++            subwidgets = []
++            
++            for i in range(max(len(value), self.size)):
++                try:
++                    widget_value = value[i]
++                except IndexError:
++                    widget_value = None
++                
++                # Fix: Create a new copy of attrs for each widget
++                # This prevents modifications to one widget's attrs from affecting others
++                widget_attrs = dict(attrs)
++                
++                # Pass the separate attrs dict to each widget's get_context
++                widget_context = self.widget.get_context(name + '_%s' % i, widget_value, widget_attrs)
++                subwidgets.append(widget_context['widget'])
++            
++            return {'widget': {'subwidgets': subwidgets}}
++    
++    # Create the fixed widget with same test data
++    widget = FixedMockSplitArrayWidget(size=4)
++    test_data = [True, False, False, True]
++    
++    # Get the context with the sample data
++    context = widget.get_context('test_field', test_data)
++    
++    # Check and print the state of each subwidget
++    print(f"Input data: {test_data}")
++    print("\nWidget states:")
++    for i, subwidget in enumerate(context['widget']['subwidgets']):
++        expected_value = test_data[i] if i < len(test_data) else None
++        has_checked = 'checked' in subwidget['attrs']
++        print(f"  Widget {i}: value={expected_value}, has_checked_attr={has_checked} {subwidget['attrs']}")
++    
++    # Count how many times we modified each attrs dictionary
++    attrs_counter = widget.widget.attrs_counter
++    if attrs_counter:
++        print("\nAttrs dictionary modifications:")
++        for attrs_id, count in attrs_counter.items():
++            print(f"  Dict id={attrs_id}: modified {count} time(s)")
++    
++    # Check if the issue is fixed
++    has_issue = any(
++        (i < len(test_data) and not test_data[i] and 'checked' in subwidget['attrs'])
++        for i, subwidget in enumerate(context['widget']['subwidgets'])
++    )
++    
++    print(f"\nIssue detected: {has_issue}")
++    return not has_issue
++
++if __name__ == "__main__":
++    # Run the tests and demonstrate the issue and fix
++    issue_exists = test_with_current_behavior()
++    fix_works = test_proposed_fix()
++    
++    print("\n=== Summary ===")
++    print(f"Issue exists in current implementation: {issue_exists}")
++    print(f"Fix appears to resolve the issue: {fix_works}")
++    
++    # Exit with success only if we verified both the issue and the fix
++    if issue_exists and fix_works:
++        print("Successfully verified the issue and fix!")
++        sys.exit(0)
++    else:
++        print("Test failed - either didn't detect the issue or the fix didn't work")
++        sys.exit(1)
+\ No newline at end of file

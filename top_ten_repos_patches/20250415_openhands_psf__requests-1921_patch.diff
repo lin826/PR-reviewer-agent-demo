@@ -1,0 +1,159 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..6ae606e9
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Reproduce the issue with setting a header value to None in a Session.
++"""
++
++import requests
++import json
++import sys
++
++def main():
++    print("\n1. Regular session headers:")
++    session = requests.Session()
++    print(f"Default Accept-Encoding header: {session.headers.get('Accept-Encoding', 'Not present')}")
++    
++    print("\n2. Setting a session header to None:")
++    session = requests.Session()
++    session.headers['Accept-Encoding'] = None
++    print(f"After setting to None: {session.headers.get('Accept-Encoding', 'Not present')}")
++    
++    # This will demonstrate the issue - it will show 'None' as a string instead of removing the header
++    print("\n3. Showing prepared headers for a request (this will show 'Accept-Encoding: None'):")
++    
++    # Create a PreparedRequest manually to avoid the request actually being sent
++    # This is where the issue is happening
++    req = requests.Request('GET', 'https://example.com')
++    prepped = session.prepare_request(req)
++    
++    print("Headers in prepared request:")
++    for name, value in prepped.headers.items():
++        print(f"  {name}: {value}")
++    
++    print("\n4. Manually deleting a session header (correct approach):")
++    session = requests.Session()
++    if 'Accept-Encoding' in session.headers:
++        del session.headers['Accept-Encoding']
++    req = requests.Request('GET', 'https://example.com')
++    prepped = session.prepare_request(req)
++    
++    print("Headers in prepared request:")
++    for name, value in prepped.headers.items():
++        print(f"  {name}: {value}")
++        
++    # Demonstrate the issue with method parameters - should NOT send Accept-Encoding
++    print("\n5. Setting header to None in method parameters (works as expected):")
++    session = requests.Session()
++    req = requests.Request('GET', 'https://example.com', headers={'Accept-Encoding': None})
++    prepped = session.prepare_request(req)
++    
++    print("Headers in prepared request:")
++    for name, value in prepped.headers.items():
++        if name != 'Accept-Encoding':  # This header should NOT be present
++            print(f"  {name}: {value}")
++            
++    if 'Accept-Encoding' in prepped.headers:
++        print("  Accept-Encoding: Still present! This is wrong.")
++    else:
++        print("  Accept-Encoding: Not present (correct behavior)")
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/requests/sessions.py b/requests/sessions.py
+index a023e4ec..afd13598 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -281,6 +281,13 @@ class Session(SessionRedirectMixin):
+         auth = request.auth
+         if self.trust_env and not auth and not self.auth:
+             auth = get_netrc_auth(request.url)
++            
++        # Remove None-valued headers from session as they indicate they should
++        # not be included in the request
++        headers = self.headers.copy()
++        for header, value in self.headers.items():
++            if value is None:
++                del headers[header]
+ 
+         p = PreparedRequest()
+         p.prepare(
+@@ -288,7 +295,7 @@ class Session(SessionRedirectMixin):
+             url=request.url,
+             files=request.files,
+             data=request.data,
+-            headers=merge_setting(request.headers, self.headers, dict_class=CaseInsensitiveDict),
++            headers=merge_setting(request.headers, headers, dict_class=CaseInsensitiveDict),
+             params=merge_setting(request.params, self.params),
+             auth=merge_setting(auth, self.auth),
+             cookies=merged_cookies,
+diff --git a/test_none_header.py b/test_none_header.py
+new file mode 100644
+index 00000000..ccf2421c
+--- /dev/null
++++ b/test_none_header.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test that setting a header to None in a session removes it from requests.
++"""
++
++import unittest
++import requests
++from requests.structures import CaseInsensitiveDict
++
++class NoneHeaderTest(unittest.TestCase):
++    
++    def test_none_header_in_session(self):
++        """Test that setting a header to None in a session removes it from requests."""
++        session = requests.Session()
++        
++        # Verify Accept-Encoding is in default headers
++        default_accept_encoding = session.headers.get('Accept-Encoding')
++        self.assertIsNotNone(default_accept_encoding)
++        
++        # Set header to None
++        session.headers['Accept-Encoding'] = None
++        
++        # Create a prepared request to check the headers
++        req = requests.Request('GET', 'https://example.com')
++        prepped = session.prepare_request(req)
++        
++        # Verify Accept-Encoding is not in prepared headers
++        self.assertNotIn('Accept-Encoding', prepped.headers)
++        
++    def test_none_header_in_method_args(self):
++        """Test that setting a header to None in method args removes it from requests."""
++        session = requests.Session()
++        
++        # Create a request with Accept-Encoding set to None
++        req = requests.Request('GET', 'https://example.com', headers={'Accept-Encoding': None})
++        prepped = session.prepare_request(req)
++        
++        # Verify Accept-Encoding is not in prepared headers
++        self.assertNotIn('Accept-Encoding', prepped.headers)
++        
++    def test_none_header_override(self):
++        """Test that setting a header to None overrides session defaults."""
++        session = requests.Session()
++        session.headers['User-Agent'] = 'custom-agent'
++        
++        # Set User-Agent to None in a request
++        req = requests.Request('GET', 'https://example.com', headers={'User-Agent': None})
++        prepped = session.prepare_request(req)
++        
++        # Verify User-Agent is not in prepared headers
++        self.assertNotIn('User-Agent', prepped.headers)
++        
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file

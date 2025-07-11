@@ -1,0 +1,605 @@
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..c531540262
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,153 @@
++#!/usr/bin/env python
++"""
++Debug script to understand the ModelAdmin.lookup_allowed() issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin.options import ModelAdmin
++from django.contrib.admin.sites import AdminSite
++from django.db.models.constants import LOOKUP_SEP
++
++
++def debug_lookup_allowed():
++    """Debug the lookup_allowed method to understand the issue."""
++    
++    class Country(models.Model):
++        name = models.CharField(max_length=256)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Place(models.Model):
++        country = models.ForeignKey(Country, models.CASCADE)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Restaurant(models.Model):
++        place = models.OneToOneField(Place, models.CASCADE, primary_key=True)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Waiter(models.Model):
++        restaurant = models.ForeignKey(Restaurant, models.CASCADE)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class WaiterAdmin(ModelAdmin):
++        list_filter = [
++            'restaurant__place__country',
++        ]
++
++    site = AdminSite()
++    ma = WaiterAdmin(Waiter, site)
++    
++    # Let's manually trace through the lookup_allowed logic
++    lookup = 'restaurant__place__country'
++    print(f"Debugging lookup: {lookup}")
++    print("=" * 50)
++    
++    model = ma.model
++    relation_parts = []
++    prev_field = None
++    
++    for i, part in enumerate(lookup.split(LOOKUP_SEP)):
++        print(f"\nStep {i+1}: Processing part '{part}'")
++        try:
++            field = model._meta.get_field(part)
++            print(f"  Found field: {field} (type: {type(field).__name__})")
++            
++            if hasattr(field, 'primary_key'):
++                print(f"  Field primary_key: {field.primary_key}")
++            
++            if prev_field:
++                print(f"  Previous field: {prev_field} (type: {type(prev_field).__name__})")
++                print(f"  Previous field is_relation: {prev_field.is_relation}")
++                if hasattr(prev_field, 'path_infos'):
++                    print(f"  Previous field path_infos: {prev_field.path_infos}")
++                    if prev_field.path_infos:
++                        target_fields = prev_field.path_infos[-1].target_fields
++                        print(f"  Target fields: {target_fields}")
++                        print(f"  Current field in target_fields: {field in target_fields}")
++            
++            # The key condition from the updated code
++            if not prev_field or (
++                prev_field.is_relation
++                and field not in prev_field.path_infos[-1].target_fields
++            ) or (
++                hasattr(field, 'primary_key') and field.primary_key and 
++                hasattr(field, 'one_to_one') and field.one_to_one
++            ):
++                relation_parts.append(part)
++                print(f"  ✓ Added '{part}' to relation_parts")
++            else:
++                print(f"  ✗ Skipped '{part}' (considered part of target_fields)")
++            
++            if not getattr(field, "path_infos", None):
++                print(f"  Field has no path_infos, breaking")
++                break
++                
++            prev_field = field
++            model = field.path_infos[-1].to_opts.model
++            print(f"  Updated model to: {model}")
++            
++        except Exception as e:
++            print(f"  Exception: {e}")
++            break
++    
++    print(f"\nFinal relation_parts: {relation_parts}")
++    
++    # Check valid lookups
++    valid_lookups = {ma.date_hierarchy}
++    for filter_item in ma.list_filter:
++        valid_lookups.add(filter_item)
++    
++    print(f"Valid lookups: {valid_lookups}")
++    
++    # Check the final condition
++    lookup_variants = {
++        LOOKUP_SEP.join(relation_parts),
++        LOOKUP_SEP.join(relation_parts + [part]),
++    }
++    print(f"Lookup variants to check: {lookup_variants}")
++    
++    is_disjoint = lookup_variants.isdisjoint(valid_lookups)
++    result = not is_disjoint
++    
++    print(f"Is disjoint: {is_disjoint}")
++    print(f"Final result: {result}")
++
++
++if __name__ == '__main__':
++    debug_lookup_allowed()
+\ No newline at end of file
+diff --git a/debug_test_failure.py b/debug_test_failure.py
+new file mode 100644
+index 0000000000..08e69fcff4
+--- /dev/null
++++ b/debug_test_failure.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python
++"""
++Debug why the test is failing.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin.options import ModelAdmin
++from django.contrib.admin.sites import AdminSite
++
++
++def debug_test():
++    """Debug the test case that's failing."""
++    
++    class Country(models.Model):
++        name = models.CharField(max_length=256)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Place(models.Model):
++        country = models.ForeignKey(Country, models.CASCADE)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Restaurant(models.Model):
++        place = models.OneToOneField(Place, models.CASCADE, primary_key=True)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Waiter(models.Model):
++        restaurant = models.ForeignKey(Restaurant, models.CASCADE)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class WaiterAdmin(ModelAdmin):
++        list_filter = [
++            "restaurant__place__country",
++        ]
++
++    site = AdminSite()
++    ma = WaiterAdmin(Waiter, site)
++    
++    print("Debugging the failing test case...")
++    print(f"Waiter model: {Waiter}")
++    print(f"Restaurant model: {Restaurant}")
++    print(f"Place model: {Place}")
++    print(f"Country model: {Country}")
++    
++    # Check the field types
++    restaurant_field = Waiter._meta.get_field('restaurant')
++    place_field = Restaurant._meta.get_field('place')
++    country_field = Place._meta.get_field('country')
++    
++    print(f"restaurant field: {restaurant_field} (type: {type(restaurant_field).__name__})")
++    print(f"place field: {place_field} (type: {type(place_field).__name__})")
++    print(f"place field primary_key: {place_field.primary_key}")
++    print(f"place field one_to_one: {getattr(place_field, 'one_to_one', 'N/A')}")
++    print(f"country field: {country_field} (type: {type(country_field).__name__})")
++    
++    result = ma.lookup_allowed("restaurant__place__country", "test_value")
++    print(f"lookup_allowed result: {result}")
++    
++    return result
++
++
++if __name__ == '__main__':
++    debug_test()
+\ No newline at end of file
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 5240b07cd6..dda5a1c6a3 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -464,9 +464,15 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
+             # It is allowed to filter on values that would be found from local
+             # model anyways. For example, if you filter on employee__department__id,
+             # then the id value would be found already from employee__department_id.
++            # However, if the current field is a OneToOneField with primary_key=True,
++            # it should be included in the relation path even if it appears in target_fields,
++            # as this represents an explicit relationship rather than concrete inheritance.
+             if not prev_field or (
+                 prev_field.is_relation
+                 and field not in prev_field.path_infos[-1].target_fields
++            ) or (
++                hasattr(field, 'primary_key') and field.primary_key and 
++                hasattr(field, 'one_to_one') and field.one_to_one
+             ):
+                 relation_parts.append(part)
+             if not getattr(field, "path_infos", None):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c15e9e0576
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the ModelAdmin.lookup_allowed() issue with foreign key as primary key.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin.options import ModelAdmin
++from django.contrib.admin.sites import AdminSite
++
++
++def test_lookup_allowed_foreign_primary():
++    """Test case that reproduces the issue."""
++    
++    class Country(models.Model):
++        name = models.CharField(max_length=256)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Place(models.Model):
++        country = models.ForeignKey(Country, models.CASCADE)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Restaurant(models.Model):
++        place = models.OneToOneField(Place, models.CASCADE, primary_key=True)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Waiter(models.Model):
++        restaurant = models.ForeignKey(Restaurant, models.CASCADE)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class WaiterAdmin(ModelAdmin):
++        list_filter = [
++            'restaurant__place__country',
++        ]
++
++    site = AdminSite()
++    ma = WaiterAdmin(Waiter, site)
++    
++    print("Testing lookup_allowed with 'restaurant__place__country'...")
++    try:
++        result = ma.lookup_allowed('restaurant__place__country', 'test_value')
++        print(f"Result: {result}")
++        if result:
++            print("✓ Test PASSED - lookup_allowed returned True")
++        else:
++            print("✗ Test FAILED - lookup_allowed returned False")
++            return False
++    except Exception as e:
++        print(f"✗ Test FAILED with exception: {e}")
++        return False
++    
++    return True
++
++
++if __name__ == '__main__':
++    print("Reproducing ModelAdmin.lookup_allowed() issue...")
++    print("=" * 60)
++    
++    success = test_lookup_allowed_foreign_primary()
++    
++    print("=" * 60)
++    if success:
++        print("Issue reproduction completed successfully.")
++    else:
++        print("Issue reproduced - lookup_allowed incorrectly returned False.")
++    
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..e084f92f38
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the ModelAdmin.lookup_allowed() fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin.options import ModelAdmin
++from django.contrib.admin.sites import AdminSite
++
++
++def test_edge_cases():
++    """Test various edge cases for the lookup_allowed fix."""
++    
++    class Country(models.Model):
++        name = models.CharField(max_length=256)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Place(models.Model):
++        country = models.ForeignKey(Country, models.CASCADE)
++        name = models.CharField(max_length=256)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Restaurant(models.Model):
++        place = models.OneToOneField(Place, models.CASCADE, primary_key=True)
++        name = models.CharField(max_length=256)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class Waiter(models.Model):
++        restaurant = models.ForeignKey(Restaurant, models.CASCADE)
++        name = models.CharField(max_length=256)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    # Test case 1: OneToOneField as primary key (the main issue)
++    class WaiterAdmin1(ModelAdmin):
++        list_filter = [
++            'restaurant__place__country',
++        ]
++
++    site = AdminSite()
++    ma1 = WaiterAdmin1(Waiter, site)
++    
++    print("Test 1: OneToOneField as primary key")
++    result1 = ma1.lookup_allowed('restaurant__place__country', 'test_value')
++    print(f"  Result: {result1} (should be True)")
++    assert result1 == True, "Test 1 failed"
++    
++    # Test case 2: Regular OneToOneField (not primary key) - should still work
++    class Profile(models.Model):
++        waiter = models.OneToOneField(Waiter, models.CASCADE)  # Not primary key
++        bio = models.TextField()
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class ProfileAdmin(ModelAdmin):
++        list_filter = [
++            'waiter__restaurant__place__country',
++        ]
++
++    ma2 = ProfileAdmin(Profile, site)
++    
++    print("Test 2: Regular OneToOneField (not primary key)")
++    result2 = ma2.lookup_allowed('waiter__restaurant__place__country', 'test_value')
++    print(f"  Result: {result2} (should be True)")
++    assert result2 == True, "Test 2 failed"
++    
++    # Test case 3: Regular ForeignKey - should still work as before
++    class Order(models.Model):
++        waiter = models.ForeignKey(Waiter, models.CASCADE)
++        total = models.DecimalField(max_digits=10, decimal_places=2)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    class OrderAdmin(ModelAdmin):
++        list_filter = [
++            'waiter__restaurant__place__country',
++        ]
++
++    ma3 = OrderAdmin(Order, site)
++    
++    print("Test 3: Regular ForeignKey")
++    result3 = ma3.lookup_allowed('waiter__restaurant__place__country', 'test_value')
++    print(f"  Result: {result3} (should be True)")
++    assert result3 == True, "Test 3 failed"
++    
++    # Test case 4: Invalid lookup - should still return False
++    print("Test 4: Invalid lookup (not in list_filter)")
++    result4 = ma1.lookup_allowed('restaurant__place__invalid_field', 'test_value')
++    print(f"  Result: {result4} (should be False)")
++    assert result4 == False, "Test 4 failed"
++    
++    # Test case 5: Partial lookup that would be shortened incorrectly before fix
++    print("Test 5: Ensure place is not skipped in the lookup")
++    result5 = ma1.lookup_allowed('restaurant__place__name', 'test_value')
++    print(f"  Result: {result5} (should be False - not in list_filter)")
++    assert result5 == False, "Test 5 failed"
++    
++    # Test case 6: Add the partial lookup to list_filter and test again
++    class WaiterAdmin2(ModelAdmin):
++        list_filter = [
++            'restaurant__place__country',
++            'restaurant__place__name',
++        ]
++
++    ma6 = WaiterAdmin2(Waiter, site)
++    
++    print("Test 6: Partial lookup that's in list_filter")
++    result6 = ma6.lookup_allowed('restaurant__place__name', 'test_value')
++    print(f"  Result: {result6} (should be True)")
++    assert result6 == True, "Test 6 failed"
++    
++    print("\nAll edge case tests passed! ✓")
++    return True
++
++
++if __name__ == '__main__':
++    print("Testing edge cases for ModelAdmin.lookup_allowed() fix...")
++    print("=" * 60)
++    
++    try:
++        success = test_edge_cases()
++        print("=" * 60)
++        print("All tests completed successfully!")
++        sys.exit(0)
++    except Exception as e:
++        print(f"Test failed with error: {e}")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/tests/modeladmin/tests.py b/tests/modeladmin/tests.py
+index c6b4a565c8..3660748c5d 100644
+--- a/tests/modeladmin/tests.py
++++ b/tests/modeladmin/tests.py
+@@ -154,6 +154,32 @@ class ModelAdminTests(TestCase):
+             ma.lookup_allowed("employee__department__code", "test_value"), True
+         )
+ 
++    @isolate_apps("modeladmin")
++    def test_lookup_allowed_foreign_primary(self):
++        """
++        lookup_allowed() should allow lookups through OneToOneField with
++        primary_key=True (#issue_number).
++        """
++        class Country(models.Model):
++            name = models.CharField(max_length=256)
++
++        class Place(models.Model):
++            country = models.ForeignKey(Country, models.CASCADE)
++
++        class Restaurant(models.Model):
++            place = models.OneToOneField(Place, models.CASCADE, primary_key=True)
++
++        class Waiter(models.Model):
++            restaurant = models.ForeignKey(Restaurant, models.CASCADE)
++
++        class WaiterAdmin(ModelAdmin):
++            list_filter = [
++                "restaurant__place__country",
++            ]
++
++        ma = WaiterAdmin(Waiter, self.site)
++        self.assertIs(ma.lookup_allowed("restaurant__place__country", "test_value"), True)
++
+     def test_field_arguments(self):
+         # If fields is specified, fieldsets_add and fieldsets_change should
+         # just stick the fields into a formsets structure and return it.

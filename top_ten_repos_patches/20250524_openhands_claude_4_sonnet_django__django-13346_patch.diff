@@ -1,0 +1,61 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fafc1beee8..14da178bdc 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -479,6 +479,48 @@ class KeyTransformGte(KeyTransformNumericLookupMixin, lookups.GreaterThanOrEqual
+     pass
+ 
+ 
++class KeyTransformIn(lookups.In):
++    def get_db_prep_lookup(self, value, connection):
++        # Handle databases without native JSON field support
++        if not connection.features.has_native_json_field:
++            value = [json.loads(json.dumps(v)) for v in value]
++        return super().get_db_prep_lookup(value, connection)
++    
++    def batch_process_rhs(self, compiler, connection, rhs=None):
++        if rhs is None:
++            rhs = self.rhs
++        
++        # Get the base processing first
++        sqls, sqls_params = super().batch_process_rhs(compiler, connection, rhs)
++        
++        # Apply database-specific JSON wrapping to each parameter
++        if connection.vendor == 'oracle':
++            new_sqls = []
++            new_params = []
++            for sql, param in zip(sqls, sqls_params):
++                if param != 'null':
++                    value = json.loads(json.dumps(param))
++                    function = 'JSON_QUERY' if isinstance(value, (list, dict)) else 'JSON_VALUE'
++                    new_sqls.append("%s('%s', '$.value')" % (
++                        function,
++                        json.dumps({'value': value}),
++                    ))
++                else:
++                    new_sqls.append(sql)
++                    new_params.append(param)
++            return new_sqls, new_params
++        elif connection.vendor in ('sqlite', 'mysql'):
++            new_sqls = []
++            for sql, param in zip(sqls, sqls_params):
++                if param != 'null':
++                    new_sqls.append("JSON_EXTRACT(%s, '$')")
++                else:
++                    new_sqls.append(sql)
++            return new_sqls, sqls_params
++        
++        return sqls, sqls_params
++
++
+ KeyTransform.register_lookup(KeyTransformExact)
+ KeyTransform.register_lookup(KeyTransformIExact)
+ KeyTransform.register_lookup(KeyTransformIsNull)
+@@ -494,6 +536,7 @@ KeyTransform.register_lookup(KeyTransformLt)
+ KeyTransform.register_lookup(KeyTransformLte)
+ KeyTransform.register_lookup(KeyTransformGt)
+ KeyTransform.register_lookup(KeyTransformGte)
++KeyTransform.register_lookup(KeyTransformIn)
+ 
+ 
+ class KeyTransformFactory:

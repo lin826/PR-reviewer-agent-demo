@@ -1,0 +1,592 @@
+diff --git a/django/contrib/auth/__init__.py b/django/contrib/auth/__init__.py
+index 155330c596..4b55ddd6a0 100644
+--- a/django/contrib/auth/__init__.py
++++ b/django/contrib/auth/__init__.py
+@@ -5,7 +5,7 @@ from django.apps import apps as django_apps
+ from django.conf import settings
+ from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+ from django.middleware.csrf import rotate_token
+-from django.utils.crypto import constant_time_compare
++from django.utils.crypto import constant_time_compare, salted_hmac
+ from django.utils.module_loading import import_string
+ from django.views.decorators.debug import sensitive_variables
+ 
+@@ -179,6 +179,22 @@ def get_user_model():
+         )
+ 
+ 
++def _get_session_auth_hash(user, secret=None):
++    """
++    Return an HMAC of the user's password field using the specified secret.
++    If no secret is provided, use the current SECRET_KEY.
++    """
++    if secret is None:
++        secret = settings.SECRET_KEY
++    key_salt = "django.contrib.auth.models.AbstractBaseUser.get_session_auth_hash"
++    return salted_hmac(
++        key_salt,
++        user.password,
++        secret=secret,
++        algorithm="sha256",
++    ).hexdigest()
++
++
+ def get_user(request):
+     """
+     Return the user model instance associated with the given request session.
+@@ -199,9 +215,13 @@ def get_user(request):
+             # Verify the session
+             if hasattr(user, "get_session_auth_hash"):
+                 session_hash = request.session.get(HASH_SESSION_KEY)
+-                session_hash_verified = session_hash and constant_time_compare(
+-                    session_hash, user.get_session_auth_hash()
+-                )
++                session_hash_verified = False
++                if session_hash:
++                    # Try current secret key first, then fallbacks
++                    for secret in [settings.SECRET_KEY, *settings.SECRET_KEY_FALLBACKS]:
++                        if constant_time_compare(session_hash, _get_session_auth_hash(user, secret)):
++                            session_hash_verified = True
++                            break
+                 if not session_hash_verified:
+                     request.session.flush()
+                     user = None
+diff --git a/test_secret_key_fallbacks_edge_cases.py b/test_secret_key_fallbacks_edge_cases.py
+new file mode 100644
+index 0000000000..07b91b6d17
+--- /dev/null
++++ b/test_secret_key_fallbacks_edge_cases.py
+@@ -0,0 +1,202 @@
++#!/usr/bin/env python
++"""
++Test edge cases for SECRET_KEY_FALLBACKS with sessions.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='original-secret-key',
++        SECRET_KEY_FALLBACKS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.contrib.auth import get_user
++from django.test import RequestFactory
++from django.contrib.sessions.middleware import SessionMiddleware
++from django.contrib.auth.middleware import AuthenticationMiddleware
++from django.contrib.auth import login
++
++
++def create_test_request():
++    """Create a test request with session support."""
++    factory = RequestFactory()
++    request = factory.get('/')
++    
++    # Add session middleware
++    session_middleware = SessionMiddleware(lambda r: None)
++    session_middleware.process_request(request)
++    request.session.save()
++    
++    # Add auth middleware
++    auth_middleware = AuthenticationMiddleware(lambda r: None)
++    auth_middleware.process_request(request)
++    
++    return request
++
++
++def test_empty_fallbacks():
++    """Test with empty SECRET_KEY_FALLBACKS."""
++    print("=== Test 1: Empty SECRET_KEY_FALLBACKS ===")
++    
++    # Create a user
++    User.objects.create_user('testuser1', 'test1@example.com', 'testpass')
++    user = User.objects.get(username='testuser1')
++    
++    # Create a request and log the user in
++    request = create_test_request()
++    login(request, user)
++    
++    print(f"User logged in with SECRET_KEY: '{settings.SECRET_KEY}'")
++    
++    # Rotate secret key without fallbacks
++    settings.SECRET_KEY = 'new-secret-key'
++    settings.SECRET_KEY_FALLBACKS = []
++    
++    # User should be logged out
++    authenticated_user = get_user(request)
++    print(f"After rotation (no fallbacks): {authenticated_user.is_authenticated}")
++    
++    return not authenticated_user.is_authenticated
++
++
++def test_multiple_fallbacks():
++    """Test with multiple SECRET_KEY_FALLBACKS."""
++    print("\n=== Test 2: Multiple SECRET_KEY_FALLBACKS ===")
++    
++    # Reset settings
++    settings.SECRET_KEY = 'key1'
++    settings.SECRET_KEY_FALLBACKS = []
++    
++    # Create a user
++    User.objects.create_user('testuser2', 'test2@example.com', 'testpass')
++    user = User.objects.get(username='testuser2')
++    
++    # Create a request and log the user in with key1
++    request = create_test_request()
++    login(request, user)
++    
++    print(f"User logged in with SECRET_KEY: '{settings.SECRET_KEY}'")
++    
++    # Rotate through multiple keys
++    settings.SECRET_KEY = 'key3'
++    settings.SECRET_KEY_FALLBACKS = ['key2', 'key1']
++    
++    print(f"New SECRET_KEY: '{settings.SECRET_KEY}'")
++    print(f"SECRET_KEY_FALLBACKS: {settings.SECRET_KEY_FALLBACKS}")
++    
++    # User should still be authenticated (key1 is in fallbacks)
++    authenticated_user = get_user(request)
++    print(f"After rotation (key1 in fallbacks): {authenticated_user.is_authenticated}")
++    
++    return authenticated_user.is_authenticated
++
++
++def test_fallback_order():
++    """Test that fallback order doesn't matter for validation."""
++    print("\n=== Test 3: Fallback order ===")
++    
++    # Reset settings
++    settings.SECRET_KEY = 'original-key'
++    settings.SECRET_KEY_FALLBACKS = []
++    
++    # Create a user
++    User.objects.create_user('testuser3', 'test3@example.com', 'testpass')
++    user = User.objects.get(username='testuser3')
++    
++    # Create a request and log the user in
++    request = create_test_request()
++    login(request, user)
++    
++    print(f"User logged in with SECRET_KEY: '{settings.SECRET_KEY}'")
++    
++    # Put the original key at the end of fallbacks
++    settings.SECRET_KEY = 'new-key'
++    settings.SECRET_KEY_FALLBACKS = ['other-key1', 'other-key2', 'original-key']
++    
++    print(f"Original key is last in fallbacks: {settings.SECRET_KEY_FALLBACKS}")
++    
++    # User should still be authenticated
++    authenticated_user = get_user(request)
++    print(f"User authenticated (original key last): {authenticated_user.is_authenticated}")
++    
++    return authenticated_user.is_authenticated
++
++
++def test_no_session_hash():
++    """Test behavior when there's no session hash."""
++    print("\n=== Test 4: No session hash ===")
++    
++    # Create a user
++    User.objects.create_user('testuser4', 'test4@example.com', 'testpass')
++    user = User.objects.get(username='testuser4')
++    
++    # Create a request and manually set session data without hash
++    request = create_test_request()
++    request.session['_auth_user_id'] = str(user.pk)
++    request.session['_auth_user_backend'] = 'django.contrib.auth.backends.ModelBackend'
++    # Don't set '_auth_user_hash'
++    
++    # User should not be authenticated
++    authenticated_user = get_user(request)
++    print(f"User authenticated (no session hash): {authenticated_user.is_authenticated}")
++    
++    return not authenticated_user.is_authenticated
++
++
++if __name__ == '__main__':
++    # Create the database tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Run the tests
++    tests = [
++        test_empty_fallbacks,
++        test_multiple_fallbacks,
++        test_fallback_order,
++        test_no_session_hash,
++    ]
++    
++    all_passed = True
++    for test in tests:
++        try:
++            result = test()
++            if not result:
++                print(f"❌ {test.__name__} FAILED")
++                all_passed = False
++            else:
++                print(f"✅ {test.__name__} PASSED")
++        except Exception as e:
++            print(f"❌ {test.__name__} ERROR: {e}")
++            all_passed = False
++    
++    if all_passed:
++        print("\n🎉 All edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("\n💥 Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_secret_key_fallbacks_issue.py b/test_secret_key_fallbacks_issue.py
+new file mode 100644
+index 0000000000..aee801a9a3
+--- /dev/null
++++ b/test_secret_key_fallbacks_issue.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the SECRET_KEY_FALLBACKS issue with sessions.
++
++This script demonstrates that when SECRET_KEY is rotated and the old key
++is added to SECRET_KEY_FALLBACKS, existing sessions become invalid.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='original-secret-key',
++        SECRET_KEY_FALLBACKS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.contrib.auth import get_user
++from django.test import RequestFactory
++from django.contrib.sessions.middleware import SessionMiddleware
++from django.contrib.auth.middleware import AuthenticationMiddleware
++from django.contrib.auth import login
++from django.utils.crypto import constant_time_compare
++
++
++def create_test_request():
++    """Create a test request with session support."""
++    factory = RequestFactory()
++    request = factory.get('/')
++    
++    # Add session middleware
++    session_middleware = SessionMiddleware(lambda r: None)
++    session_middleware.process_request(request)
++    request.session.save()
++    
++    # Add auth middleware
++    auth_middleware = AuthenticationMiddleware(lambda r: None)
++    auth_middleware.process_request(request)
++    
++    return request
++
++
++def test_secret_key_fallbacks_issue():
++    """Test that demonstrates the SECRET_KEY_FALLBACKS issue."""
++    print("=== Testing SECRET_KEY_FALLBACKS issue with sessions ===\n")
++    
++    # Create a user
++    User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    user = User.objects.get(username='testuser')
++    
++    # Create a request and log the user in with original secret key
++    request = create_test_request()
++    login(request, user)
++    
++    print(f"1. User logged in with SECRET_KEY: '{settings.SECRET_KEY}'")
++    print(f"   Session auth hash: {request.session.get('_auth_user_hash', 'None')}")
++    
++    # Verify the user is authenticated
++    authenticated_user = get_user(request)
++    print(f"   User authenticated: {authenticated_user.is_authenticated}")
++    print(f"   Username: {authenticated_user.username if authenticated_user.is_authenticated else 'Anonymous'}")
++    
++    # Now simulate secret key rotation
++    print("\n2. Rotating SECRET_KEY...")
++    old_secret_key = settings.SECRET_KEY
++    settings.SECRET_KEY = 'new-secret-key'
++    settings.SECRET_KEY_FALLBACKS = [old_secret_key]
++    
++    print(f"   New SECRET_KEY: '{settings.SECRET_KEY}'")
++    print(f"   SECRET_KEY_FALLBACKS: {settings.SECRET_KEY_FALLBACKS}")
++    
++    # Show what the session auth hash looks like before rotation
++    stored_hash = request.session.get('_auth_user_hash', '')
++    print(f"   Stored session hash before rotation: {stored_hash}")
++    
++    # Try to get the user again (this should work with fallbacks, but currently doesn't)
++    authenticated_user_after_rotation = get_user(request)
++    print(f"\n3. After rotation:")
++    print(f"   User authenticated: {authenticated_user_after_rotation.is_authenticated}")
++    print(f"   Username: {authenticated_user_after_rotation.username if authenticated_user_after_rotation.is_authenticated else 'Anonymous'}")
++    
++    # Show what the session auth hash looks like with the new key
++    new_hash = user.get_session_auth_hash()
++    stored_hash_after = request.session.get('_auth_user_hash', '')
++    print(f"   Stored session hash after rotation: {stored_hash_after}")
++    print(f"   New hash with current key: {new_hash}")
++    print(f"   Hashes match: {constant_time_compare(stored_hash, new_hash) if stored_hash else False}")
++    
++    # Test what the hash would be with the old key
++    from django.utils.crypto import salted_hmac
++    key_salt = "django.contrib.auth.models.AbstractBaseUser.get_session_auth_hash"
++    old_key_hash = salted_hmac(key_salt, user.password, secret=old_secret_key, algorithm="sha256").hexdigest()
++    print(f"   Hash with old key: {old_key_hash}")
++    print(f"   Old key hash matches stored: {constant_time_compare(stored_hash, old_key_hash) if stored_hash else False}")
++    
++    # The issue: user should still be authenticated but isn't
++    if not authenticated_user_after_rotation.is_authenticated:
++        print("\n❌ ISSUE CONFIRMED: User is logged out after secret key rotation!")
++        print("   This happens because get_session_auth_hash() doesn't use SECRET_KEY_FALLBACKS")
++        return False
++    else:
++        print("\n✅ User remains authenticated after secret key rotation")
++        return True
++
++
++if __name__ == '__main__':
++    # Create the database tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Run the test
++    success = test_secret_key_fallbacks_issue()
++    
++    if not success:
++        print("\nThis demonstrates the issue described in the GitHub issue.")
++        print("The fix should make sessions work with SECRET_KEY_FALLBACKS.")
++        sys.exit(1)
++    else:
++        print("\nSUCCESS: The issue has been fixed!")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_session_auth_hash_fallbacks.py b/test_session_auth_hash_fallbacks.py
+new file mode 100644
+index 0000000000..d0a64cff38
+--- /dev/null
++++ b/test_session_auth_hash_fallbacks.py
+@@ -0,0 +1,173 @@
++#!/usr/bin/env python
++"""
++Test case for SECRET_KEY_FALLBACKS support in session authentication.
++
++This test should be added to Django's test suite to ensure the functionality
++works correctly and doesn't regress.
++"""
++
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the Python path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++        ],
++        SECRET_KEY='test-secret-key',
++        SECRET_KEY_FALLBACKS=[],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.test import TestCase, override_settings
++from django.contrib.auth.models import User
++from django.contrib.auth import get_user, login
++from django.test import RequestFactory
++from django.contrib.sessions.middleware import SessionMiddleware
++from django.contrib.auth.middleware import AuthenticationMiddleware
++
++
++class SessionAuthHashFallbacksTestCase(TestCase):
++    """Test SECRET_KEY_FALLBACKS support for session authentication."""
++    
++    def setUp(self):
++        self.factory = RequestFactory()
++        self.user = User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    
++    def _create_request_with_session(self):
++        """Create a test request with session support."""
++        request = self.factory.get('/')
++        
++        # Add session middleware
++        session_middleware = SessionMiddleware(lambda r: None)
++        session_middleware.process_request(request)
++        request.session.save()
++        
++        # Add auth middleware
++        auth_middleware = AuthenticationMiddleware(lambda r: None)
++        auth_middleware.process_request(request)
++        
++        return request
++    
++    @override_settings(
++        SECRET_KEY='original-key',
++        SECRET_KEY_FALLBACKS=[]
++    )
++    def test_session_auth_hash_with_current_key(self):
++        """Test that session authentication works with the current SECRET_KEY."""
++        request = self._create_request_with_session()
++        login(request, self.user)
++        
++        # User should be authenticated
++        authenticated_user = get_user(request)
++        self.assertTrue(authenticated_user.is_authenticated)
++        self.assertEqual(authenticated_user.username, 'testuser')
++    
++    @override_settings(
++        SECRET_KEY='new-key',
++        SECRET_KEY_FALLBACKS=['original-key']
++    )
++    def test_session_auth_hash_with_fallback_key(self):
++        """Test that session authentication works with SECRET_KEY_FALLBACKS."""
++        # First, log in with the original key
++        with override_settings(SECRET_KEY='original-key', SECRET_KEY_FALLBACKS=[]):
++            request = self._create_request_with_session()
++            login(request, self.user)
++        
++        # Now verify the user is still authenticated after key rotation
++        authenticated_user = get_user(request)
++        self.assertTrue(authenticated_user.is_authenticated)
++        self.assertEqual(authenticated_user.username, 'testuser')
++    
++    @override_settings(
++        SECRET_KEY='new-key',
++        SECRET_KEY_FALLBACKS=['other-key1', 'original-key', 'other-key2']
++    )
++    def test_session_auth_hash_with_multiple_fallbacks(self):
++        """Test that session authentication works with multiple fallback keys."""
++        # First, log in with the original key
++        with override_settings(SECRET_KEY='original-key', SECRET_KEY_FALLBACKS=[]):
++            request = self._create_request_with_session()
++            login(request, self.user)
++        
++        # Now verify the user is still authenticated with original key in fallbacks
++        authenticated_user = get_user(request)
++        self.assertTrue(authenticated_user.is_authenticated)
++        self.assertEqual(authenticated_user.username, 'testuser')
++    
++    @override_settings(
++        SECRET_KEY='new-key',
++        SECRET_KEY_FALLBACKS=['other-key1', 'other-key2']
++    )
++    def test_session_auth_hash_without_valid_fallback(self):
++        """Test that session authentication fails when no valid key is available."""
++        # First, log in with the original key
++        with override_settings(SECRET_KEY='original-key', SECRET_KEY_FALLBACKS=[]):
++            request = self._create_request_with_session()
++            login(request, self.user)
++        
++        # Now verify the user is NOT authenticated (original key not in fallbacks)
++        authenticated_user = get_user(request)
++        self.assertFalse(authenticated_user.is_authenticated)
++    
++    @override_settings(
++        SECRET_KEY='new-key',
++        SECRET_KEY_FALLBACKS=[]
++    )
++    def test_session_auth_hash_empty_fallbacks(self):
++        """Test that session authentication fails with empty SECRET_KEY_FALLBACKS."""
++        # First, log in with the original key
++        with override_settings(SECRET_KEY='original-key', SECRET_KEY_FALLBACKS=[]):
++            request = self._create_request_with_session()
++            login(request, self.user)
++        
++        # Now verify the user is NOT authenticated (no fallbacks)
++        authenticated_user = get_user(request)
++        self.assertFalse(authenticated_user.is_authenticated)
++    
++    def test_session_auth_hash_no_session_hash(self):
++        """Test behavior when there's no session hash stored."""
++        request = self._create_request_with_session()
++        
++        # Manually set session data without hash
++        request.session['_auth_user_id'] = str(self.user.pk)
++        request.session['_auth_user_backend'] = 'django.contrib.auth.backends.ModelBackend'
++        # Don't set '_auth_user_hash'
++        
++        # User should not be authenticated
++        authenticated_user = get_user(request)
++        self.assertFalse(authenticated_user.is_authenticated)
++
++
++if __name__ == '__main__':
++    # Create the database tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Run the tests
++    from django.test.utils import get_runner
++    TestRunner = get_runner(settings)
++    test_runner = TestRunner()
++    failures = test_runner.run_tests(['__main__'])
++    
++    if failures:
++        sys.exit(1)
++    else:
++        print("All tests passed!")
++        sys.exit(0)
+\ No newline at end of file

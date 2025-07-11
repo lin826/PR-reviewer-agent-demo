@@ -1,0 +1,173 @@
+diff --git a/django/db/backends/postgresql/operations.py b/django/db/backends/postgresql/operations.py
+index 62273fc43c..7934c1a0e9 100644
+--- a/django/db/backends/postgresql/operations.py
++++ b/django/db/backends/postgresql/operations.py
+@@ -353,14 +353,25 @@ class DatabaseOperations(BaseDatabaseOperations):
+         if on_conflict == OnConflict.IGNORE:
+             return "ON CONFLICT DO NOTHING"
+         if on_conflict == OnConflict.UPDATE:
++            # Create a mapping of field names to column names
++            field_columns = {field.name: field.column for field in fields}
++            
++            # Convert field names to their column names
++            quoted_unique = [
++                self.quote_name(field_columns.get(field_name, field_name))
++                for field_name in unique_fields
++            ]
++            
++            # Create the update expressions using the column names
++            update_expressions = [
++                f"{self.quote_name(field_columns.get(field_name, field_name))} = "
++                f"EXCLUDED.{self.quote_name(field_columns.get(field_name, field_name))}"
++                for field_name in update_fields
++            ]
++            
+             return "ON CONFLICT(%s) DO UPDATE SET %s" % (
+-                ", ".join(map(self.quote_name, unique_fields)),
+-                ", ".join(
+-                    [
+-                        f"{field} = EXCLUDED.{field}"
+-                        for field in map(self.quote_name, update_fields)
+-                    ]
+-                ),
++                ", ".join(quoted_unique),
++                ", ".join(update_expressions),
+             )
+         return super().on_conflict_suffix_sql(
+             fields,
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..66ebfeaf42
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,57 @@
++"""
++Test script to reproduce issue with on_conflict_suffix_sql in PostgreSQL
++"""
++from django.db.backends.postgresql.operations import DatabaseOperations
++from django.db.models.constants import OnConflict
++
++# Mock a connection object
++class MockConnection:
++    def __init__(self):
++        pass
++
++# Create a DatabaseOperations instance
++pg_ops = DatabaseOperations(MockConnection())
++
++# Define a class to simulate Field objects with column and db_column attributes
++class MockField:
++    def __init__(self, name, db_column):
++        self.name = name
++        self.db_column = db_column
++        # column is what should be used for SQL column names
++        # this is normally set to db_column or name
++        self.column = db_column or name
++
++# Create our mock fields - some with db_column, some without
++unique_field = MockField('blacklistid', 'BlacklistID')
++update_field1 = MockField('sectorid', 'SectorID')
++update_field2 = MockField('other_field', None)  # No db_column, should use field name
++
++# Create list of field objects
++fields = [unique_field, update_field1, update_field2]
++
++# Create list of field names for update_fields and unique_fields
++update_field_names = ['sectorid', 'other_field']
++unique_field_names = ['blacklistid']
++
++# Call on_conflict_suffix_sql to generate SQL
++sql = pg_ops.on_conflict_suffix_sql(
++    fields,
++    OnConflict.UPDATE,
++    update_field_names,
++    unique_field_names,
++)
++
++print("Current implementation generates SQL:")
++print(sql)
++
++# What should be generated
++print("\nBut with db_column support, it should generate:")
++print('ON CONFLICT("BlacklistID") DO UPDATE SET "SectorID" = EXCLUDED."SectorID", "OtherField" = EXCLUDED."OtherField"')
++
++print("\nField mappings:")
++print(f"blacklistid -> {unique_field.column}")
++print(f"sectorid -> {update_field1.column}")
++print(f"other_field -> {update_field2.column}")
++
++print("\nISSUE: The on_conflict_suffix_sql method uses unique_fields parameter values directly as column names,")
++print("      but should instead find the corresponding fields and use their db_column value (or name if db_column is None)")
+\ No newline at end of file
+diff --git a/tests/bulk_create/test_db_column.py b/tests/bulk_create/test_db_column.py
+new file mode 100644
+index 0000000000..d517df4136
+--- /dev/null
++++ b/tests/bulk_create/test_db_column.py
+@@ -0,0 +1,65 @@
++from django.db import connection, models
++from django.db.models.constants import OnConflict
++from django.test import TestCase
++
++# Model with custom db_column values
++class CustomColumnModel(models.Model):
++    id_field = models.IntegerField(primary_key=True, db_column="ID")
++    name_field = models.CharField(max_length=100, db_column="NAME")
++    value_field = models.IntegerField(db_column="VALUE")
++
++    class Meta:
++        app_label = 'bulk_create'
++        db_table = 'custom_column_model'
++
++
++class DBColumnTest(TestCase):
++    def test_bulk_create_respects_db_column(self):
++        """Test that bulk_create respects db_column attributes in ON CONFLICT clause."""
++        # Skip if not PostgreSQL or not using on_conflict support
++        if not connection.features.supports_update_conflicts_with_target:
++            return
++            
++        # The test just checks SQL generation, no need to execute queries
++        # First create a model instance
++        instance = CustomColumnModel(id_field=1, name_field="test", value_field=100)
++        
++        # Setup compiler directly to avoid executing SQL
++        from django.db.models.sql.subqueries import InsertQuery
++        
++        query = InsertQuery(CustomColumnModel)
++        compiler = connection.ops.compiler('SQLInsertCompiler')(
++            query,
++            connection,
++            'default'
++        )
++        
++        # Override field_as_sql to return predefined values for testing without DB
++        compiler.field_as_sql = lambda field, val: ("%s", [val])
++        
++        # Define fields for the query
++        fields = [
++            CustomColumnModel._meta.get_field('id_field'),
++            CustomColumnModel._meta.get_field('name_field'),
++            CustomColumnModel._meta.get_field('value_field'),
++        ]
++        
++        # Generate SQL with on_conflict
++        on_conflict_sql = connection.ops.on_conflict_suffix_sql(
++            fields,
++            OnConflict.UPDATE,
++            update_fields=['name_field', 'value_field'],
++            unique_fields=['id_field'],
++        )
++        
++        # The SQL should use the db_column values, not the field names
++        if connection.vendor == 'postgresql':
++            # Check that the custom db_column names are used instead of field names
++            self.assertIn('"ID"', on_conflict_sql)  # Should use "ID" not "id_field"
++            self.assertIn('"NAME"', on_conflict_sql)  # Should use "NAME" not "name_field"
++            self.assertIn('"VALUE"', on_conflict_sql)  # Should use "VALUE" not "value_field"
++            
++            # Should not contain field names in quotes
++            self.assertNotIn('"id_field"', on_conflict_sql)
++            self.assertNotIn('"name_field"', on_conflict_sql) 
++            self.assertNotIn('"value_field"', on_conflict_sql)
+\ No newline at end of file

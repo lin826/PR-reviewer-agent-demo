@@ -1,0 +1,394 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 5edbbd376f..f21576472f 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -48,9 +48,9 @@ def construct_instance(form, instance, fields=None, exclude=None):
+             continue
+         # Leave defaults for fields that aren't in POST data, except for
+         # checkbox inputs because they don't appear in POST data if not checked.
+-        if (f.has_default() and
+-                form[f.name].field.widget.value_omitted_from_data(form.data, form.files, form.add_prefix(f.name))):
+-            continue
++        # However, if the field is in cleaned_data, always use that value.
++        # Note: We've already checked that f.name is in cleaned_data above,
++        # so we should use the cleaned_data value regardless of defaults.
+         # Defer saving file-type fields until after the other fields, so a
+         # callable upload_to can use the values from other fields.
+         if isinstance(f, models.FileField):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..8b5d89d2c6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the issue where cleaned_data cannot overwrite fields' default values.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++from django.forms.models import construct_instance
++
++# Define a test model with a default value
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    status = models.CharField(max_length=20, default='draft')
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Define a form that modifies cleaned_data
++class TestForm(forms.ModelForm):
++    status = forms.CharField(max_length=20, required=False)  # Make status optional
++    
++    class Meta:
++        model = TestModel
++        fields = ['name', 'status']  # Include both fields in the form
++    
++    def clean(self):
++        cleaned_data = super().clean()
++        # Set status in cleaned_data, overriding any default or form value
++        cleaned_data['status'] = 'published'
++        return cleaned_data
++
++def test_issue():
++    print("Testing the issue where cleaned_data cannot overwrite fields' default values...")
++    
++    # Create form with data that doesn't include 'status'
++    form_data = {'name': 'Test Article'}
++    form = TestForm(form_data)
++    
++    print(f"Form data: {form_data}")
++    print(f"Form is valid: {form.is_valid()}")
++    print(f"Cleaned data: {form.cleaned_data}")
++    
++    # Create an instance using construct_instance
++    instance = TestModel()
++    construct_instance(form, instance)
++    
++    print(f"Instance name: {instance.name}")
++    print(f"Instance status: {instance.status}")
++    print(f"Expected status: 'published' (from cleaned_data)")
++    print(f"Actual status: '{instance.status}'")
++    
++    # Check if the issue exists
++    if instance.status == 'published':
++        print("✓ SUCCESS: cleaned_data value was used")
++        return True
++    else:
++        print("✗ ISSUE: default value was used instead of cleaned_data value")
++        return False
++
++def test_save_method():
++    print("\nTesting with form.save() method...")
++    
++    # Create form with data that doesn't include 'status'
++    form_data = {'name': 'Test Article 2'}
++    form = TestForm(form_data)
++    
++    print(f"Form data: {form_data}")
++    print(f"Form is valid: {form.is_valid()}")
++    print(f"Cleaned data: {form.cleaned_data}")
++    
++    # Check instance before save
++    print(f"Instance status before save: {form.instance.status}")
++    
++    # Save the form
++    instance = form.save(commit=False)
++    
++    print(f"Instance name: {instance.name}")
++    print(f"Instance status: {instance.status}")
++    print(f"Expected status: 'published' (from cleaned_data)")
++    print(f"Actual status: '{instance.status}'")
++    
++    # Check if the issue exists
++    if instance.status == 'published':
++        print("✓ SUCCESS: cleaned_data value was used")
++        return True
++    else:
++        print("✗ ISSUE: default value was used instead of cleaned_data value")
++        return False
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("REPRODUCING ISSUE: cleaned_data cannot overwrite default values")
++    print("=" * 60)
++    
++    success1 = test_issue()
++    success2 = test_save_method()
++    
++    print("\n" + "=" * 60)
++    if success1 and success2:
++        print("All tests passed - issue is fixed!")
++        sys.exit(0)
++    else:
++        print("Issue reproduced - needs to be fixed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_checkbox.py b/test_checkbox.py
+new file mode 100644
+index 0000000000..dcc98aba62
+--- /dev/null
++++ b/test_checkbox.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python
++"""
++Test to ensure checkbox behavior still works correctly after the fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++
++# Define a test model with a boolean field with default
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    is_active = models.BooleanField(default=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Define a form with checkbox
++class TestForm(forms.ModelForm):
++    class Meta:
++        model = TestModel
++        fields = ['name', 'is_active']
++
++def test_checkbox_unchecked():
++    """Test that unchecked checkbox uses default value"""
++    print("Testing unchecked checkbox behavior...")
++    
++    # When checkbox is unchecked, it's not in the form data
++    form_data = {'name': 'Test Item'}  # is_active not included
++    form = TestForm(form_data)
++    
++    print(f"Form data: {form_data}")
++    print(f"Form is valid: {form.is_valid()}")
++    print(f"Cleaned data: {form.cleaned_data}")
++    
++    if form.is_valid():
++        instance = form.save(commit=False)
++        print(f"Instance name: {instance.name}")
++        print(f"Instance is_active: {instance.is_active}")
++        print(f"Expected is_active: False (cleaned_data value)")
++        
++        if instance.is_active == False:
++            print("✓ SUCCESS: cleaned_data value used for unchecked checkbox")
++            return True
++        else:
++            print("✗ ISSUE: cleaned_data value not used for unchecked checkbox")
++            return False
++    else:
++        print("✗ ISSUE: Form is not valid")
++        return False
++
++def test_checkbox_checked():
++    """Test that checked checkbox overrides default value"""
++    print("\nTesting checked checkbox behavior...")
++    
++    # When checkbox is checked, it's in the form data
++    form_data = {'name': 'Test Item 2', 'is_active': 'on'}
++    form = TestForm(form_data)
++    
++    print(f"Form data: {form_data}")
++    print(f"Form is valid: {form.is_valid()}")
++    print(f"Cleaned data: {form.cleaned_data}")
++    
++    if form.is_valid():
++        instance = form.save(commit=False)
++        print(f"Instance name: {instance.name}")
++        print(f"Instance is_active: {instance.is_active}")
++        print(f"Expected is_active: True (from form data)")
++        
++        if instance.is_active == True:
++            print("✓ SUCCESS: Form value used for checked checkbox")
++            return True
++        else:
++            print("✗ ISSUE: Form value not used for checked checkbox")
++            return False
++    else:
++        print("✗ ISSUE: Form is not valid")
++        return False
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("TESTING CHECKBOX BEHAVIOR AFTER FIX")
++    print("=" * 60)
++    
++    success1 = test_checkbox_unchecked()
++    success2 = test_checkbox_checked()
++    
++    print("\n" + "=" * 60)
++    if success1 and success2:
++        print("All checkbox tests passed!")
++        sys.exit(0)
++    else:
++        print("Some checkbox tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_issue_scenario.py b/test_issue_scenario.py
+new file mode 100644
+index 0000000000..0a7097c2f3
+--- /dev/null
++++ b/test_issue_scenario.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python
++"""
++Test the exact scenario described in the issue:
++A field is not in the form (not in Meta.fields) but is set in cleaned_data.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++from django.forms.models import construct_instance
++
++# Define a test model with a default value
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    status = models.CharField(max_length=20, default='draft')
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Define a form that does NOT include 'status' in fields
++class TestForm(forms.ModelForm):
++    class Meta:
++        model = TestModel
++        fields = ['name']  # 'status' is NOT included
++    
++    def clean(self):
++        cleaned_data = super().clean()
++        # Set status in cleaned_data even though it's not in the form
++        # This simulates deriving the value from another field
++        cleaned_data['status'] = 'published'
++        return cleaned_data
++
++def test_field_not_in_form():
++    """Test that cleaned_data can set fields not in the form"""
++    print("Testing field not in form but set in cleaned_data...")
++    
++    form_data = {'name': 'Test Article'}
++    form = TestForm(form_data)
++    
++    print(f"Form fields: {list(form.fields.keys())}")
++    print(f"Form data: {form_data}")
++    print(f"Form is valid: {form.is_valid()}")
++    print(f"Cleaned data: {form.cleaned_data}")
++    
++    # Test direct construct_instance call
++    instance = TestModel()
++    construct_instance(form, instance)
++    
++    print(f"Instance name: {instance.name}")
++    print(f"Instance status: {instance.status}")
++    print(f"Expected status: 'published' (from cleaned_data)")
++    
++    if instance.status == 'published':
++        print("✓ SUCCESS: cleaned_data value was used for field not in form")
++        return True
++    else:
++        print("✗ ISSUE: cleaned_data value was not used for field not in form")
++        return False
++
++if __name__ == '__main__':
++    print("=" * 70)
++    print("TESTING ISSUE SCENARIO: Field not in form but set in cleaned_data")
++    print("=" * 70)
++    
++    success = test_field_not_in_form()
++    
++    print("\n" + "=" * 70)
++    if success:
++        print("Test passed - issue is fixed!")
++        sys.exit(0)
++    else:
++        print("Test failed - issue still exists!")
++        sys.exit(1)
+\ No newline at end of file

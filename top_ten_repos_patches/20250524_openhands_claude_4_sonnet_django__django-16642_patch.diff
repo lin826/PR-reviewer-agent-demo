@@ -1,0 +1,307 @@
+diff --git a/django/http/response.py b/django/http/response.py
+index f62dec8ce9..17e630be37 100644
+--- a/django/http/response.py
++++ b/django/http/response.py
+@@ -612,6 +612,8 @@ class FileResponse(StreamingHttpResponse):
+                     "bzip2": "application/x-bzip",
+                     "gzip": "application/gzip",
+                     "xz": "application/x-xz",
++                    "compress": "application/x-compress",
++                    "br": "application/x-brotli",
+                 }.get(encoding, content_type)
+                 self.headers["Content-Type"] = (
+                     content_type or "application/octet-stream"
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..98f2f52e9f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the MIME type guessing issue for .br and .Z file types.
++"""
++
++import os
++import tempfile
++from django.http import FileResponse
++
++def test_mime_type_issue():
++    """Test that demonstrates the MIME type issue with .br and .Z files."""
++    
++    print("Testing MIME type detection for compressed files...")
++    print("=" * 60)
++    
++    # Create temporary files with different extensions
++    test_cases = [
++        ("test.html", "text/html"),  # Expected: text/html
++        ("test.html.gz", "application/gzip"),  # Expected: application/gzip (should work)
++        ("test.html.bz2", "application/x-bzip"),  # Expected: application/x-bzip (should work)
++        ("test.html.xz", "application/x-xz"),  # Expected: application/x-xz (should work)
++        ("test.html.Z", "application/x-compress"),  # Expected: application/x-compress (BROKEN)
++        ("test.html.br", "application/x-brotli"),  # Expected: application/x-brotli (BROKEN)
++    ]
++    
++    results = []
++    
++    for filename, expected_mime in test_cases:
++        # Create a temporary file
++        with tempfile.NamedTemporaryFile(suffix=filename, delete=False) as tmp_file:
++            tmp_file.write(b"<html><body>Test content</body></html>")
++            tmp_file.flush()
++            
++            try:
++                # Create FileResponse and check content type
++                with open(tmp_file.name, 'rb') as f:
++                    response = FileResponse(f)
++                    actual_mime = response.headers.get("Content-Type", "NOT SET")
++                    
++                    status = "✓ PASS" if actual_mime == expected_mime else "✗ FAIL"
++                    results.append((filename, expected_mime, actual_mime, status))
++                    
++                    print(f"{status} {filename}")
++                    print(f"    Expected: {expected_mime}")
++                    print(f"    Actual:   {actual_mime}")
++                    print()
++                    
++            finally:
++                # Clean up
++                os.unlink(tmp_file.name)
++    
++    # Summary
++    print("=" * 60)
++    print("SUMMARY:")
++    failed_tests = [r for r in results if "FAIL" in r[3]]
++    passed_tests = [r for r in results if "PASS" in r[3]]
++    
++    print(f"Passed: {len(passed_tests)}")
++    print(f"Failed: {len(failed_tests)}")
++    
++    if failed_tests:
++        print("\nFailed tests:")
++        for filename, expected, actual, status in failed_tests:
++            print(f"  {filename}: expected {expected}, got {actual}")
++        return False
++    else:
++        print("All tests passed!")
++        return True
++
++if __name__ == "__main__":
++    # Configure Django settings
++    import django
++    from django.conf import settings
++    
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++        )
++    
++    django.setup()
++    
++    success = test_mime_type_issue()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..5a8a3073b3
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Additional edge case tests for the MIME type fix.
++"""
++
++import os
++import tempfile
++from django.http import FileResponse
++
++def test_edge_cases():
++    """Test edge cases for the MIME type fix."""
++    
++    print("Testing edge cases for MIME type detection...")
++    print("=" * 60)
++    
++    # Test cases with various file types and compression
++    test_cases = [
++        # Basic compression formats
++        ("file.Z", "application/x-compress"),
++        ("file.br", "application/x-brotli"),
++        
++        # Different base file types with compression
++        ("script.js.Z", "application/x-compress"),
++        ("script.js.br", "application/x-brotli"),
++        ("data.json.Z", "application/x-compress"),
++        ("data.json.br", "application/x-brotli"),
++        ("image.png.Z", "application/x-compress"),
++        ("image.png.br", "application/x-brotli"),
++        
++        # Multiple extensions
++        ("archive.tar.Z", "application/x-compress"),
++        ("archive.tar.br", "application/x-brotli"),
++        
++        # Case sensitivity (should work the same)
++        ("file.z", None),  # lowercase z is not compress format
++        ("file.BR", None),  # uppercase BR - depends on mimetypes behavior
++        
++        # Ensure existing formats still work
++        ("file.gz", "application/gzip"),
++        ("file.bz2", "application/x-bzip"),
++        ("file.xz", "application/x-xz"),
++    ]
++    
++    results = []
++    
++    for filename, expected_mime in test_cases:
++        # Create a temporary file
++        with tempfile.NamedTemporaryFile(suffix=filename, delete=False) as tmp_file:
++            tmp_file.write(b"Test content")
++            tmp_file.flush()
++            
++            try:
++                # Create FileResponse and check content type
++                with open(tmp_file.name, 'rb') as f:
++                    response = FileResponse(f)
++                    actual_mime = response.headers.get("Content-Type", "NOT SET")
++                    
++                    if expected_mime is None:
++                        # For cases where we don't expect specific compression handling
++                        status = "✓ INFO"
++                        print(f"{status} {filename}")
++                        print(f"    Actual:   {actual_mime}")
++                    else:
++                        status = "✓ PASS" if actual_mime == expected_mime else "✗ FAIL"
++                        results.append((filename, expected_mime, actual_mime, status))
++                        
++                        print(f"{status} {filename}")
++                        print(f"    Expected: {expected_mime}")
++                        print(f"    Actual:   {actual_mime}")
++                    print()
++                    
++            finally:
++                # Clean up
++                os.unlink(tmp_file.name)
++    
++    # Summary
++    print("=" * 60)
++    print("SUMMARY:")
++    failed_tests = [r for r in results if "FAIL" in r[3]]
++    passed_tests = [r for r in results if "PASS" in r[3]]
++    
++    print(f"Passed: {len(passed_tests)}")
++    print(f"Failed: {len(failed_tests)}")
++    
++    if failed_tests:
++        print("\nFailed tests:")
++        for filename, expected, actual, status in failed_tests:
++            print(f"  {filename}: expected {expected}, got {actual}")
++        return False
++    else:
++        print("All tests passed!")
++        return True
++
++if __name__ == "__main__":
++    # Configure Django settings
++    import django
++    from django.conf import settings
++    
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++        )
++    
++    django.setup()
++    
++    success = test_edge_cases()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_issue_examples.py b/test_issue_examples.py
+new file mode 100644
+index 0000000000..8703034a9e
+--- /dev/null
++++ b/test_issue_examples.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Test the exact examples from the issue description.
++"""
++
++import os
++import tempfile
++from django.http import FileResponse
++
++def test_issue_examples():
++    """Test the exact examples mentioned in the issue."""
++    
++    print("Testing exact examples from issue description...")
++    print("=" * 60)
++    
++    # Create test files
++    test_files = []
++    
++    # Create test.html.Z
++    with tempfile.NamedTemporaryFile(suffix='test.html.Z', delete=False) as f:
++        f.write(b'<html><body>Test content</body></html>')
++        test_files.append(f.name)
++    
++    # Create test.html.br  
++    with tempfile.NamedTemporaryFile(suffix='test.html.br', delete=False) as f:
++        f.write(b'<html><body>Test content</body></html>')
++        test_files.append(f.name)
++    
++    try:
++        # Test FileResponse(open('test.html.Z', 'rb'))
++        print("Testing: FileResponse(open('test.html.Z', 'rb'))")
++        with open(test_files[0], 'rb') as f:
++            response = FileResponse(f)
++            content_type = response.headers.get('Content-Type')
++            print(f"Content-Type: {content_type}")
++            
++            if content_type == 'application/x-compress':
++                print("✓ PASS - Correctly detected as application/x-compress")
++            elif content_type == 'text/html':
++                print("✗ FAIL - Incorrectly detected as text/html (this was the bug)")
++            else:
++                print(f"? UNEXPECTED - Got {content_type}")
++        
++        print()
++        
++        # Test FileResponse(open('test.html.br', 'rb'))
++        print("Testing: FileResponse(open('test.html.br', 'rb'))")
++        with open(test_files[1], 'rb') as f:
++            response = FileResponse(f)
++            content_type = response.headers.get('Content-Type')
++            print(f"Content-Type: {content_type}")
++            
++            if content_type == 'application/x-brotli':
++                print("✓ PASS - Correctly detected as application/x-brotli")
++            elif content_type == 'text/html':
++                print("✗ FAIL - Incorrectly detected as text/html (this was the bug)")
++            else:
++                print(f"? UNEXPECTED - Got {content_type}")
++                
++    finally:
++        # Clean up
++        for filepath in test_files:
++            os.unlink(filepath)
++    
++    print("\n" + "=" * 60)
++    print("Issue examples test completed!")
++
++if __name__ == "__main__":
++    # Configure Django settings
++    import django
++    from django.conf import settings
++    
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++        )
++    
++    django.setup()
++    
++    test_issue_examples()
+\ No newline at end of file

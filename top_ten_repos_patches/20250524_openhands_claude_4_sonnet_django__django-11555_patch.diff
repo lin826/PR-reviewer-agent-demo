@@ -1,0 +1,758 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index eaccc96d7d..9cc895b8b6 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -706,6 +706,11 @@ class SQLCompiler:
+         """
+         name, order = get_order_dir(name, default_order)
+         descending = order == 'DESC'
++        
++        # If name is an OrderBy object, return it directly
++        if isinstance(name, OrderBy):
++            return [(name, False)]
++        
+         pieces = name.split(LOOKUP_SEP)
+         field, targets, alias, joins, path, opts, transform_function = self._setup_joins(pieces, opts, alias)
+ 
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index e15e64cde4..bffbdeca46 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -23,7 +23,7 @@ from django.db import DEFAULT_DB_ALIAS, NotSupportedError, connections
+ from django.db.models.aggregates import Count
+ from django.db.models.constants import LOOKUP_SEP
+ from django.db.models.expressions import (
+-    BaseExpression, Col, F, OuterRef, Ref, SimpleCol,
++    BaseExpression, Col, F, OrderBy, OuterRef, Ref, SimpleCol,
+ )
+ from django.db.models.fields import Field
+ from django.db.models.fields.related_lookups import MultiColSource
+@@ -2218,6 +2218,8 @@ def get_order_dir(field, default='ASC'):
+     prefix) should sort. The '-' prefix always sorts the opposite way.
+     """
+     dirn = ORDER_DIR[default]
++    if isinstance(field, OrderBy):
++        return field, 'DESC' if field.descending else 'ASC'
+     if field[0] == '-':
+         return field[1:], dirn[1]
+     return field, dirn[0]
+diff --git a/final_verification_test.py b/final_verification_test.py
+new file mode 100644
+index 0000000000..2f11a30b5e
+--- /dev/null
++++ b/final_verification_test.py
+@@ -0,0 +1,209 @@
++#!/usr/bin/env python
++"""
++Final verification test that demonstrates the fix for the OrderBy Meta.ordering issue.
++This test reproduces the exact scenario from the GitHub issue and verifies it's fixed.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++# Define the exact models from the GitHub issue
++class MyModel(models.Model):
++    id = models.AutoField(primary_key=True)
++    time_stamp = models.DateTimeField(null=True)
++
++    class Meta:
++        app_label = '__main__'
++        ordering = [models.F('time_stamp').desc(nulls_last=True)]
++
++
++class MyChildModel(MyModel):
++    name = models.CharField(max_length=144)
++
++    class Meta:
++        app_label = '__main__'
++
++
++def test_original_issue():
++    """
++    Test the original issue: OrderBy objects in Meta.ordering causing TypeError
++    during test database serialization with multi-table inheritance.
++    """
++    from django.db import connection
++    from django.utils import timezone
++    from django.core import serializers
++    from io import StringIO
++    
++    print("=== Testing Original Issue Fix ===")
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(MyModel)
++        schema_editor.create_model(MyChildModel)
++    
++    print("✓ Tables created successfully")
++    
++    # Create some test data
++    MyChildModel.objects.create(name='first', time_stamp=timezone.now())
++    MyChildModel.objects.create(name='second', time_stamp=timezone.now())
++    MyChildModel.objects.create(name='third', time_stamp=None)
++    
++    print("✓ Test data created")
++    
++    # Test 1: Basic queryset evaluation (this was working before)
++    try:
++        queryset = MyChildModel.objects.all()
++        results = list(queryset)
++        print(f"✓ Queryset evaluation successful: {len(results)} objects retrieved")
++        
++        # Verify ordering works correctly
++        non_null_count = sum(1 for r in results if r.time_stamp is not None)
++        null_count = sum(1 for r in results if r.time_stamp is None)
++        print(f"✓ Ordering verified: {non_null_count} non-null, {null_count} null timestamps")
++        
++        # Check that null values come last (due to nulls_last=True)
++        last_obj = results[-1]
++        if last_obj.time_stamp is None:
++            print("✓ nulls_last=True working correctly")
++        else:
++            print("⚠ Warning: nulls_last=True might not be working as expected")
++            
++    except Exception as e:
++        print(f"✗ ERROR in queryset evaluation: {e}")
++        return False
++    
++    # Test 2: Database serialization (this was failing before our fix)
++    try:
++        print("Testing database serialization (the original failing scenario)...")
++        
++        # This simulates what happens during test database setup
++        out = StringIO()
++        serializers.serialize("json", MyChildModel.objects.all(), indent=None, stream=out)
++        serialized_data = out.getvalue()
++        
++        print(f"✓ Database serialization successful: {len(serialized_data)} characters")
++        
++        # Verify the serialized data is valid JSON
++        import json
++        parsed_data = json.loads(serialized_data)
++        print(f"✓ Serialized data is valid JSON with {len(parsed_data)} objects")
++        
++    except Exception as e:
++        print(f"✗ ERROR in database serialization: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    # Test 3: Direct function testing
++    try:
++        print("Testing the fixed functions directly...")
++        
++        from django.db.models.sql.query import get_order_dir
++        from django.db.models.sql import compiler
++        
++        # Test get_order_dir with OrderBy object
++        orderby_obj = models.F('time_stamp').desc(nulls_last=True)
++        field, direction = get_order_dir(orderby_obj, 'ASC')
++        
++        if field == orderby_obj and direction == 'DESC':
++            print("✓ get_order_dir handles OrderBy objects correctly")
++        else:
++            print(f"✗ get_order_dir returned unexpected result: {field}, {direction}")
++            return False
++        
++        # Test find_ordering_name with OrderBy object
++        query = MyChildModel.objects.all().query
++        sql_compiler = compiler.SQLCompiler(query, connection, 'default')
++        opts = MyModel._meta
++        
++        result = sql_compiler.find_ordering_name(orderby_obj, opts)
++        
++        if isinstance(result, list) and len(result) == 1 and result[0][0] == orderby_obj:
++            print("✓ find_ordering_name handles OrderBy objects correctly")
++        else:
++            print(f"✗ find_ordering_name returned unexpected result: {result}")
++            return False
++            
++    except Exception as e:
++        print(f"✗ ERROR in direct function testing: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    print("\n=== All Tests Passed! ===")
++    print("The original issue has been successfully fixed:")
++    print("- OrderBy objects in Meta.ordering no longer cause TypeError")
++    print("- Multi-table inheritance with expression ordering works correctly")
++    print("- Database serialization during test setup works without errors")
++    print("- Both get_order_dir and find_ordering_name handle OrderBy objects properly")
++    
++    return True
++
++
++def test_backward_compatibility():
++    """Test that our fix doesn't break existing functionality."""
++    from django.db.models.sql.query import get_order_dir
++    
++    print("\n=== Testing Backward Compatibility ===")
++    
++    # Test regular string field names still work
++    test_cases = [
++        ('field', 'ASC', ('field', 'ASC')),
++        ('-field', 'ASC', ('field', 'DESC')),
++        ('field', 'DESC', ('field', 'DESC')),
++        ('-field', 'DESC', ('field', 'ASC')),
++        ('+field', 'ASC', ('+field', 'ASC')),
++    ]
++    
++    for field_input, default, expected in test_cases:
++        try:
++            result = get_order_dir(field_input, default)
++            if result == expected:
++                print(f"✓ '{field_input}' with default='{default}' -> {result}")
++            else:
++                print(f"✗ '{field_input}' with default='{default}' -> {result}, expected {expected}")
++                return False
++        except Exception as e:
++            print(f"✗ ERROR with '{field_input}': {e}")
++            return False
++    
++    print("✓ All backward compatibility tests passed")
++    return True
++
++
++if __name__ == '__main__':
++    print("Django OrderBy Meta.ordering Fix - Final Verification")
++    print("=" * 60)
++    
++    success1 = test_original_issue()
++    success2 = test_backward_compatibility()
++    
++    if success1 and success2:
++        print("\n🎉 ALL TESTS PASSED! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..69a2faba10
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,126 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the OrderBy Meta.ordering issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test.utils import get_runner
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Define the models that reproduce the issue
++class MyModel(models.Model):
++    id = models.AutoField(primary_key=True)
++    time_stamp = models.DateTimeField(null=True)
++
++    class Meta:
++        app_label = '__main__'
++        ordering = [models.F('time_stamp').desc(nulls_last=True)]
++
++
++class MyChildModel(MyModel):
++    name = models.CharField(max_length=144)
++
++    class Meta:
++        app_label = '__main__'
++
++
++class RelatedModel(models.Model):
++    id = models.AutoField(primary_key=True)
++    parent = models.ForeignKey(MyModel, on_delete=models.CASCADE)
++    value = models.IntegerField()
++
++    class Meta:
++        app_label = '__main__'
++
++
++def test_issue():
++    """Test that reproduces the issue."""
++    from django.db import connection
++    
++    # Create the tables manually
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(MyModel)
++        schema_editor.create_model(MyChildModel)
++        schema_editor.create_model(RelatedModel)
++    
++    print("Tables created successfully")
++    
++    # Try to trigger the issue by creating a query that orders by a related field
++    # This should trigger the recursive call in find_ordering_name
++    try:
++        print("Testing direct find_ordering_name call...")
++        from django.db.models.sql import compiler
++        from django.db.models.sql.query import get_order_dir
++        
++        # Create a query and compiler
++        query = RelatedModel.objects.all().query
++        sql_compiler = compiler.SQLCompiler(query, connection, 'default')
++        
++        # Try to call find_ordering_name with an OrderBy object directly
++        # This simulates what happens when Meta.ordering contains expressions
++        orderby_obj = models.F('time_stamp').desc(nulls_last=True)
++        print(f"OrderBy object: {orderby_obj}")
++        print(f"OrderBy object type: {type(orderby_obj)}")
++        print(f"Has resolve_expression: {hasattr(orderby_obj, 'resolve_expression')}")
++        
++        # This should now work with our fix
++        try:
++            result = get_order_dir(orderby_obj, 'ASC')
++            print(f"SUCCESS: get_order_dir now works and returned: {result}")
++            # Verify the result is correct
++            field_obj, direction = result
++            if field_obj == orderby_obj and direction == 'DESC':
++                print("SUCCESS: get_order_dir returned correct OrderBy object and direction")
++            else:
++                print(f"ERROR: get_order_dir returned unexpected result: {result}")
++                return False
++        except Exception as e:
++            print(f"ERROR: get_order_dir failed unexpectedly: {e}")
++            return False
++            
++        # Now test the find_ordering_name function directly
++        try:
++            opts = MyModel._meta
++            result = sql_compiler.find_ordering_name(orderby_obj, opts)
++            print(f"SUCCESS: find_ordering_name now works and returned: {result}")
++            return True
++        except Exception as e:
++            print(f"ERROR: find_ordering_name failed: {e}")
++            import traceback
++            traceback.print_exc()
++            return False
++            
++    except Exception as e:
++        print(f"ERROR during direct test: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    return True
++
++
++if __name__ == '__main__':
++    success = test_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..8df50b95fa
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the OrderBy Meta.ordering fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_edge_cases():
++    """Test edge cases for the get_order_dir fix."""
++    from django.db.models.sql.query import get_order_dir
++    from django.db.models import F, Value
++    from django.db.models.expressions import OrderBy
++    
++    print("Testing edge cases for get_order_dir...")
++    
++    # Test 1: OrderBy with descending=True
++    orderby_desc = F('field').desc()
++    field, direction = get_order_dir(orderby_desc, 'ASC')
++    assert field == orderby_desc
++    assert direction == 'DESC'
++    print("✓ OrderBy descending=True works")
++    
++    # Test 2: OrderBy with descending=False
++    orderby_asc = F('field').asc()
++    field, direction = get_order_dir(orderby_asc, 'ASC')
++    assert field == orderby_asc
++    assert direction == 'ASC'
++    print("✓ OrderBy descending=False works")
++    
++    # Test 3: Regular string with '-' prefix
++    field, direction = get_order_dir('-field', 'ASC')
++    assert field == 'field'
++    assert direction == 'DESC'
++    print("✓ String with '-' prefix works")
++    
++    # Test 4: Regular string without prefix
++    field, direction = get_order_dir('field', 'ASC')
++    assert field == 'field'
++    assert direction == 'ASC'
++    print("✓ String without prefix works")
++    
++    # Test 5: Regular string with '+' prefix
++    field, direction = get_order_dir('+field', 'ASC')
++    assert field == '+field'
++    assert direction == 'ASC'
++    print("✓ String with '+' prefix works")
++    
++    # Test 6: Default parameter variations
++    field, direction = get_order_dir('field', 'DESC')
++    assert field == 'field'
++    assert direction == 'DESC'
++    print("✓ Default='DESC' works")
++    
++    # Test 7: OrderBy with complex expression
++    complex_orderby = (F('field1') + F('field2')).desc()
++    field, direction = get_order_dir(complex_orderby, 'ASC')
++    assert field == complex_orderby
++    assert direction == 'DESC'
++    print("✓ Complex OrderBy expression works")
++    
++    # Test 8: OrderBy with nulls_first/nulls_last
++    nulls_orderby = F('field').desc(nulls_last=True)
++    field, direction = get_order_dir(nulls_orderby, 'ASC')
++    assert field == nulls_orderby
++    assert direction == 'DESC'
++    print("✓ OrderBy with nulls_last works")
++    
++    print("All edge cases passed!")
++    return True
++
++
++if __name__ == '__main__':
++    success = test_edge_cases()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_orderby_meta_inheritance.py b/test_orderby_meta_inheritance.py
+new file mode 100644
+index 0000000000..6a0e5c65ec
+--- /dev/null
++++ b/test_orderby_meta_inheritance.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python
++"""
++Test case specifically for the OrderBy Meta.ordering inheritance issue.
++This test reproduces the exact scenario from the GitHub issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++# Define the exact models from the issue
++class MyModel(models.Model):
++    id = models.AutoField(primary_key=True)
++    time_stamp = models.DateTimeField(null=True)
++
++    class Meta:
++        app_label = '__main__'
++        ordering = [models.F('time_stamp').desc(nulls_last=True)]
++
++
++class MyChildModel(MyModel):
++    name = models.CharField(max_length=144)
++
++    class Meta:
++        app_label = '__main__'
++
++
++class OrderByMetaInheritanceTest(TestCase):
++    """Test case for the OrderBy Meta.ordering inheritance issue."""
++    
++    def test_meta_ordering_with_expressions_inheritance(self):
++        """
++        Test that Meta.ordering with expressions works correctly with inheritance.
++        This reproduces the issue where OrderBy objects in Meta.ordering caused
++        TypeError during test database serialization.
++        """
++        from django.utils import timezone
++        
++        # Create some test data
++        MyChildModel.objects.create(name='first', time_stamp=timezone.now())
++        MyChildModel.objects.create(name='second', time_stamp=timezone.now())
++        MyChildModel.objects.create(name='third', time_stamp=None)
++        
++        # This should work without raising TypeError
++        queryset = MyChildModel.objects.all()
++        results = list(queryset)
++        
++        # Verify we got the expected number of results
++        self.assertEqual(len(results), 3)
++        
++        # Verify the ordering is working (nulls should come last)
++        self.assertIsNotNone(results[0].time_stamp)
++        self.assertIsNotNone(results[1].time_stamp)
++        self.assertIsNone(results[2].time_stamp)
++    
++    def test_get_order_dir_with_orderby_object(self):
++        """Test that get_order_dir handles OrderBy objects correctly."""
++        from django.db.models.sql.query import get_order_dir
++        from django.db.models import F
++        
++        # Test with OrderBy object (descending)
++        orderby_desc = F('time_stamp').desc(nulls_last=True)
++        field, direction = get_order_dir(orderby_desc, 'ASC')
++        self.assertEqual(field, orderby_desc)
++        self.assertEqual(direction, 'DESC')
++        
++        # Test with OrderBy object (ascending)
++        orderby_asc = F('time_stamp').asc()
++        field, direction = get_order_dir(orderby_asc, 'ASC')
++        self.assertEqual(field, orderby_asc)
++        self.assertEqual(direction, 'ASC')
++        
++        # Test with regular string (should still work)
++        field, direction = get_order_dir('-name', 'ASC')
++        self.assertEqual(field, 'name')
++        self.assertEqual(direction, 'DESC')
++        
++        field, direction = get_order_dir('name', 'ASC')
++        self.assertEqual(field, 'name')
++        self.assertEqual(direction, 'ASC')
++    
++    def test_find_ordering_name_with_orderby_object(self):
++        """Test that find_ordering_name handles OrderBy objects correctly."""
++        from django.db.models.sql import compiler
++        from django.db import connection
++        from django.db.models import F
++        
++        # Create a query and compiler
++        query = MyChildModel.objects.all().query
++        sql_compiler = compiler.SQLCompiler(query, connection, 'default')
++        
++        # Test with OrderBy object
++        orderby_obj = F('time_stamp').desc(nulls_last=True)
++        opts = MyModel._meta
++        
++        # This should work without raising AttributeError
++        result = sql_compiler.find_ordering_name(orderby_obj, opts)
++        
++        # Should return a list with the OrderBy object
++        self.assertIsInstance(result, list)
++        self.assertEqual(len(result), 1)
++        self.assertEqual(result[0][0], orderby_obj)
++        self.assertEqual(result[0][1], False)
++
++
++if __name__ == '__main__':
++    # Run the tests
++    from django.test.utils import get_runner
++    from django.db import connection
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(MyModel)
++        schema_editor.create_model(MyChildModel)
++    
++    # Run the test
++    test_runner = get_runner(settings)()
++    test_suite = test_runner.build_suite(['__main__'])
++    result = test_runner.run_tests(['__main__'])
++    
++    sys.exit(0 if result == 0 else 1)
+\ No newline at end of file
+diff --git a/test_real_scenario.py b/test_real_scenario.py
+new file mode 100644
+index 0000000000..59bd3458d1
+--- /dev/null
++++ b/test_real_scenario.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python
++"""
++Test the real scenario from the issue: multi-table inheritance with Meta.ordering containing expressions.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Define the exact models from the issue
++class MyModel(models.Model):
++    id = models.AutoField(primary_key=True)
++    time_stamp = models.DateTimeField(null=True)
++
++    class Meta:
++        app_label = '__main__'
++        ordering = [models.F('time_stamp').desc(nulls_last=True)]
++
++
++class MyChildModel(MyModel):
++    name = models.CharField(max_length=144)
++
++    class Meta:
++        app_label = '__main__'
++
++
++def test_real_scenario():
++    """Test the real scenario that was failing."""
++    from django.db import connection
++    from django.utils import timezone
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(MyModel)
++        schema_editor.create_model(MyChildModel)
++    
++    print("Tables created successfully")
++    
++    # Create some test data
++    MyChildModel.objects.create(name='first', time_stamp=timezone.now())
++    MyChildModel.objects.create(name='second', time_stamp=timezone.now())
++    MyChildModel.objects.create(name='third', time_stamp=None)
++    
++    print("Test data created")
++    
++    # Test that we can query the child model (this should use the parent's ordering)
++    try:
++        print("Testing queryset evaluation...")
++        queryset = MyChildModel.objects.all()
++        results = list(queryset)
++        print(f"SUCCESS: Retrieved {len(results)} objects")
++        
++        # Test that the ordering is working correctly
++        # Objects with null time_stamp should come last due to nulls_last=True
++        for i, obj in enumerate(results):
++            print(f"  Object {i+1}: name='{obj.name}', time_stamp={obj.time_stamp}")
++            
++    except Exception as e:
++        print(f"ERROR during queryset evaluation: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    # Test the specific scenario that was failing: database serialization
++    try:
++        print("Testing database serialization (simulating test setup)...")
++        from django.core import serializers
++        from io import StringIO
++        
++        # This simulates what happens during test database setup
++        out = StringIO()
++        serializers.serialize("json", MyChildModel.objects.all(), indent=None, stream=out)
++        serialized_data = out.getvalue()
++        print(f"SUCCESS: Serialization completed, data length: {len(serialized_data)}")
++        
++    except Exception as e:
++        print(f"ERROR during serialization: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    print("All tests passed!")
++    return True
++
++
++if __name__ == '__main__':
++    success = test_real_scenario()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

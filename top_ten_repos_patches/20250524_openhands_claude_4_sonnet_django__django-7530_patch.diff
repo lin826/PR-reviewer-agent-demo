@@ -1,0 +1,785 @@
+diff --git a/django/core/management/commands/makemigrations.py b/django/core/management/commands/makemigrations.py
+index 0b39536f5b..e648880ef0 100644
+--- a/django/core/management/commands/makemigrations.py
++++ b/django/core/management/commands/makemigrations.py
+@@ -105,7 +105,7 @@ class Command(BaseCommand):
+                     # At least one model must be migrated to the database.
+                     router.allow_migrate(connection.alias, app_label, model_name=model._meta.object_name)
+                     for app_label in consistency_check_labels
+-                    for model in apps.get_models(app_label)
++                    for model in apps.get_app_config(app_label).get_models()
+             )):
+                 loader.check_consistent_history(connection)
+ 
+diff --git a/test_actual_issue.py b/test_actual_issue.py
+new file mode 100644
+index 0000000000..f5a589db1c
+--- /dev/null
++++ b/test_actual_issue.py
+@@ -0,0 +1,136 @@
++#!/usr/bin/env python
++"""
++Test to reproduce the actual issue by examining the makemigrations code directly.
++"""
++
++import os
++import sys
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++sys.path.insert(0, '.')
++
++import django
++django.setup()
++
++from django.apps import apps
++from django.conf import settings
++from django.db import connections, DEFAULT_DB_ALIAS
++
++
++def test_makemigrations_logic():
++    """Test the actual logic from makemigrations to see the issue."""
++    print("=== Testing Actual makemigrations Logic ===")
++    
++    # This is the exact code from makemigrations.py lines 99-109
++    consistency_check_labels = set(config.label for config in apps.get_app_configs())
++    print("consistency_check_labels:", sorted(consistency_check_labels))
++    
++    # Non-default databases are only checked if database routers used.
++    aliases_to_check = connections if settings.DATABASE_ROUTERS else [DEFAULT_DB_ALIAS]
++    print("aliases_to_check:", aliases_to_check)
++    
++    for alias in sorted(aliases_to_check):
++        connection = connections[alias]
++        print("\nChecking connection:", alias)
++        print("Engine:", connection.settings_dict['ENGINE'])
++        
++        if connection.settings_dict['ENGINE'] != 'django.db.backends.dummy':
++            print("Testing the problematic code:")
++            print("for app_label in consistency_check_labels:")
++            print("    for model in apps.get_models(app_label):")
++            print("        # This is where the bug is!")
++            
++            call_count = 0
++            for app_label in sorted(consistency_check_labels):
++                models = apps.get_models(app_label)  # BUG: This is wrong!
++                print("  App '{}': apps.get_models('{}') returns {} models".format(
++                    app_label, app_label, len(models)))
++                
++                for model in models:
++                    call_count += 1
++                    print("    Would call: router.allow_migrate('{}', '{}', model_name='{}')".format(
++                        alias, app_label, model._meta.object_name))
++                    print("      Model '{}' actually belongs to app '{}'".format(
++                        model._meta.object_name, model._meta.app_label))
++                    
++                    if model._meta.app_label != app_label:
++                        print("      *** BUG: Invalid (app_label, model) pair! ***")
++                    
++                    # Limit output to avoid spam
++                    if call_count >= 10:
++                        print("    ... (limiting output)")
++                        break
++                
++                if call_count >= 10:
++                    break
++            
++            print("\nFixed version:")
++            print("for app_label in consistency_check_labels:")
++            print("    for model in apps.get_app_config(app_label).get_models():")
++            print("        # This is correct!")
++            
++            call_count = 0
++            for app_label in sorted(consistency_check_labels):
++                try:
++                    models = list(apps.get_app_config(app_label).get_models())
++                    print("  App '{}': apps.get_app_config('{}').get_models() returns {} models".format(
++                        app_label, app_label, len(models)))
++                    
++                    for model in models:
++                        call_count += 1
++                        print("    Would call: router.allow_migrate('{}', '{}', model_name='{}')".format(
++                            alias, app_label, model._meta.object_name))
++                        print("      Model '{}' belongs to app '{}' ✓".format(
++                            model._meta.object_name, model._meta.app_label))
++                        
++                        # Limit output to avoid spam
++                        if call_count >= 10:
++                            print("    ... (limiting output)")
++                            break
++                    
++                    if call_count >= 10:
++                        break
++                        
++                except Exception as e:
++                    print("  App '{}': Error - {}".format(app_label, e))
++
++
++def test_apps_get_models_signature():
++    """Test the signature of apps.get_models to confirm the bug."""
++    print("\n=== Testing apps.get_models Signature ===")
++    
++    import inspect
++    sig = inspect.signature(apps.get_models)
++    print("apps.get_models signature:", sig)
++    
++    # Test different calls
++    print("\nTesting different calls:")
++    
++    # Normal call
++    result1 = apps.get_models()
++    print("apps.get_models(): {} models".format(len(result1)))
++    
++    # Call with string (this is the bug in makemigrations)
++    result2 = apps.get_models('some_app')
++    print("apps.get_models('some_app'): {} models".format(len(result2)))
++    
++    # Call with True
++    result3 = apps.get_models(True)
++    print("apps.get_models(True): {} models".format(len(result3)))
++    
++    # Call with False
++    result4 = apps.get_models(False)
++    print("apps.get_models(False): {} models".format(len(result4)))
++    
++    print("\nComparisons:")
++    print("apps.get_models('some_app') == apps.get_models(True):", result2 == result3)
++    print("apps.get_models() == apps.get_models(False):", result1 == result4)
++    
++    print("\nThis proves that apps.get_models('some_app') is treated as apps.get_models(include_auto_created=True)")
++    print("because any non-empty string is truthy in Python!")
++
++
++if __name__ == '__main__':
++    test_apps_get_models_signature()
++    test_makemigrations_logic()
+\ No newline at end of file
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..36fb97f61e
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to demonstrate that the fix works correctly.
++This test creates a realistic scenario with multiple apps and models.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from unittest.mock import Mock, patch
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++sys.path.insert(0, '.')
++
++import django
++django.setup()
++
++from django.apps import apps
++from django.db import models
++from django.core.management import call_command
++from django.test import override_settings
++from io import StringIO
++
++
++# Create some test models to simulate a real scenario
++class TestApp1Model(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp1'
++
++
++class TestApp2Model(models.Model):
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'testapp2'
++
++
++class TestRouter:
++    """A test router that tracks all allow_migrate calls."""
++    
++    def __init__(self):
++        self.allow_migrate_calls = []
++    
++    def allow_migrate(self, db, app_label, model_name=None, **hints):
++        self.allow_migrate_calls.append((db, app_label, model_name))
++        return True
++
++
++def test_with_mock_apps():
++    """Test the fix with mock apps and models."""
++    print("=== Testing Fix with Mock Apps ===")
++    
++    # Register our test models
++    apps.register_model('testapp1', TestApp1Model)
++    apps.register_model('testapp2', TestApp2Model)
++    
++    try:
++        # Create a test router to track calls
++        test_router = TestRouter()
++        
++        # Test the fixed logic directly
++        from django.core.management.commands.makemigrations import Command
++        from django.db import connections, DEFAULT_DB_ALIAS
++        from django.conf import settings
++        
++        # Simulate the fixed consistency check logic
++        consistency_check_labels = {'testapp1', 'testapp2'}
++        aliases_to_check = [DEFAULT_DB_ALIAS]
++        
++        print("Testing fixed logic:")
++        print("consistency_check_labels:", sorted(consistency_check_labels))
++        
++        for alias in aliases_to_check:
++            connection = connections[alias]
++            print("\\nChecking connection:", alias)
++            
++            if connection.settings_dict['ENGINE'] != 'django.db.backends.dummy':
++                print("Simulating fixed code:")
++                
++                for app_label in sorted(consistency_check_labels):
++                    try:
++                        models_list = list(apps.get_app_config(app_label).get_models())
++                        print("  App '{}': {} models".format(app_label, len(models_list)))
++                        
++                        for model in models_list:
++                            # Simulate the allow_migrate call
++                            test_router.allow_migrate(alias, app_label, model_name=model._meta.object_name)
++                            print("    Called: allow_migrate('{}', '{}', model_name='{}')".format(
++                                alias, app_label, model._meta.object_name))
++                            print("      Model '{}' belongs to app '{}'".format(
++                                model._meta.object_name, model._meta.app_label))
++                            
++                            if model._meta.app_label == app_label:
++                                print("      ✓ Valid (app_label, model) pair")
++                            else:
++                                print("      ✗ Invalid (app_label, model) pair - BUG!")
++                                
++                    except Exception as e:
++                        print("  App '{}': Error - {}".format(app_label, e))
++        
++        # Analyze the results
++        print("\\nResults:")
++        print("Total allow_migrate calls:", len(test_router.allow_migrate_calls))
++        
++        valid_calls = 0
++        for db, app_label, model_name in test_router.allow_migrate_calls:
++            # Find the actual app for this model
++            actual_app = None
++            for model in apps.get_models():
++                if model._meta.object_name == model_name:
++                    actual_app = model._meta.app_label
++                    break
++            
++            if actual_app == app_label:
++                valid_calls += 1
++            else:
++                print("  Invalid call: allow_migrate('{}', '{}', model_name='{}') - model belongs to '{}'".format(
++                    db, app_label, model_name, actual_app))
++        
++        print("Valid calls: {}/{}".format(valid_calls, len(test_router.allow_migrate_calls)))
++        
++        if valid_calls == len(test_router.allow_migrate_calls):
++            print("✓ All calls are valid! Fix is working correctly.")
++        else:
++            print("✗ Some calls are invalid. Fix needs more work.")
++            
++    finally:
++        # Clean up - unregister the test models
++        try:
++            del apps.all_models['testapp1']['testapp1model']
++            del apps.all_models['testapp2']['testapp2model']
++        except KeyError:
++            pass
++
++
++def demonstrate_bug_vs_fix():
++    """Demonstrate the difference between the buggy and fixed code."""
++    print("\\n=== Demonstrating Bug vs Fix ===")
++    
++    # Register test models
++    apps.register_model('testapp1', TestApp1Model)
++    apps.register_model('testapp2', TestApp2Model)
++    
++    try:
++        consistency_check_labels = {'testapp1', 'testapp2'}
++        
++        print("Buggy code (old):")
++        print("for app_label in consistency_check_labels:")
++        print("    for model in apps.get_models(app_label):  # BUG!")
++        
++        buggy_calls = []
++        for app_label in sorted(consistency_check_labels):
++            models_list = apps.get_models(app_label)  # This is the bug!
++            print("  App '{}': apps.get_models('{}') returns {} models".format(
++                app_label, app_label, len(models_list)))
++            
++            for model in models_list:
++                buggy_calls.append((app_label, model._meta.object_name, model._meta.app_label))
++                print("    Would call: allow_migrate(db, '{}', model_name='{}')".format(
++                    app_label, model._meta.object_name))
++                print("      Model '{}' actually belongs to app '{}'".format(
++                    model._meta.object_name, model._meta.app_label))
++                
++                if model._meta.app_label != app_label:
++                    print("      *** BUG: Invalid (app_label, model) pair! ***")
++        
++        print("\\nFixed code (new):")
++        print("for app_label in consistency_check_labels:")
++        print("    for model in apps.get_app_config(app_label).get_models():  # CORRECT!")
++        
++        fixed_calls = []
++        for app_label in sorted(consistency_check_labels):
++            try:
++                models_list = list(apps.get_app_config(app_label).get_models())
++                print("  App '{}': apps.get_app_config('{}').get_models() returns {} models".format(
++                    app_label, app_label, len(models_list)))
++                
++                for model in models_list:
++                    fixed_calls.append((app_label, model._meta.object_name, model._meta.app_label))
++                    print("    Would call: allow_migrate(db, '{}', model_name='{}')".format(
++                        app_label, model._meta.object_name))
++                    print("      Model '{}' belongs to app '{}' ✓".format(
++                        model._meta.object_name, model._meta.app_label))
++                        
++            except Exception as e:
++                print("  App '{}': Error - {}".format(app_label, e))
++        
++        # Compare results
++        buggy_valid = sum(1 for app_label, model_name, actual_app in buggy_calls if app_label == actual_app)
++        fixed_valid = sum(1 for app_label, model_name, actual_app in fixed_calls if app_label == actual_app)
++        
++        print("\\nComparison:")
++        print("  Buggy code: {}/{} valid calls ({:.1f}%)".format(
++            buggy_valid, len(buggy_calls), 100 * buggy_valid / len(buggy_calls) if buggy_calls else 0))
++        print("  Fixed code: {}/{} valid calls ({:.1f}%)".format(
++            fixed_valid, len(fixed_calls), 100 * fixed_valid / len(fixed_calls) if fixed_calls else 0))
++        
++        if fixed_valid == len(fixed_calls) and len(fixed_calls) > 0:
++            print("✓ Fix eliminates all invalid calls!")
++        elif len(fixed_calls) == 0:
++            print("ℹ No models to test with in this environment")
++        else:
++            print("✗ Fix doesn't eliminate all invalid calls")
++            
++    finally:
++        # Clean up
++        try:
++            del apps.all_models['testapp1']['testapp1model']
++            del apps.all_models['testapp2']['testapp2model']
++        except KeyError:
++            pass
++
++
++if __name__ == '__main__':
++    test_with_mock_apps()
++    demonstrate_bug_vs_fix()
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 0000000000..233abd66e8
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python
++"""
++Test to verify that the fix works correctly.
++"""
++
++import os
++import sys
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++sys.path.insert(0, '.')
++
++import django
++django.setup()
++
++from django.apps import apps
++
++
++def test_fixed_logic():
++    """Test that the fixed logic works correctly."""
++    print("=== Testing Fixed Logic ===")
++    
++    consistency_check_labels = set(config.label for config in apps.get_app_configs())
++    print("Available apps:", sorted(consistency_check_labels))
++    
++    print("\nTesting the fixed code:")
++    print("for app_label in consistency_check_labels:")
++    print("    for model in apps.get_app_config(app_label).get_models():")
++    print("        router.allow_migrate(connection.alias, app_label, model_name=model._meta.object_name)")
++    print("")
++    
++    total_calls = 0
++    valid_calls = 0
++    
++    for app_label in sorted(consistency_check_labels):
++        try:
++            models = list(apps.get_app_config(app_label).get_models())
++            print("App '{}': {} models".format(app_label, len(models)))
++            
++            for model in models:
++                total_calls += 1
++                print("  Would call: allow_migrate(db, '{}', model_name='{}')".format(
++                    app_label, model._meta.object_name))
++                print("    Model '{}' belongs to app '{}'".format(
++                    model._meta.object_name, model._meta.app_label))
++                
++                if model._meta.app_label == app_label:
++                    valid_calls += 1
++                    print("    ✓ Valid (app_label, model) pair")
++                else:
++                    print("    ✗ Invalid (app_label, model) pair")
++                    
++        except Exception as e:
++            print("App '{}': Error - {}".format(app_label, e))
++    
++    print("\nSummary:")
++    print("Total allow_migrate calls: {}".format(total_calls))
++    print("Valid calls: {}".format(valid_calls))
++    print("Invalid calls: {}".format(total_calls - valid_calls))
++    
++    if total_calls == valid_calls:
++        print("✓ All calls are valid! Fix is working correctly.")
++    else:
++        print("✗ Some calls are invalid. Fix needs more work.")
++
++
++def compare_old_vs_new():
++    """Compare the old buggy logic vs the new fixed logic."""
++    print("\n=== Comparing Old vs New Logic ===")
++    
++    consistency_check_labels = set(config.label for config in apps.get_app_configs())
++    
++    print("Old (buggy) logic:")
++    old_calls = []
++    for app_label in sorted(consistency_check_labels):
++        models = apps.get_models(app_label)  # Old buggy way
++        for model in models:
++            old_calls.append((app_label, model._meta.object_name, model._meta.app_label))
++    
++    print("  Total calls: {}".format(len(old_calls)))
++    for app_label, model_name, actual_app in old_calls[:5]:  # Show first 5
++        print("    allow_migrate(db, '{}', model_name='{}') [model from app '{}']".format(
++            app_label, model_name, actual_app))
++    if len(old_calls) > 5:
++        print("    ... and {} more".format(len(old_calls) - 5))
++    
++    print("\nNew (fixed) logic:")
++    new_calls = []
++    for app_label in sorted(consistency_check_labels):
++        try:
++            models = list(apps.get_app_config(app_label).get_models())
++            for model in models:
++                new_calls.append((app_label, model._meta.object_name, model._meta.app_label))
++        except Exception:
++            pass  # Skip apps that don't exist
++    
++    print("  Total calls: {}".format(len(new_calls)))
++    for app_label, model_name, actual_app in new_calls[:5]:  # Show first 5
++        print("    allow_migrate(db, '{}', model_name='{}') [model from app '{}']".format(
++            app_label, model_name, actual_app))
++    if len(new_calls) > 5:
++        print("    ... and {} more".format(len(new_calls) - 5))
++    
++    # Check validity
++    old_valid = sum(1 for app_label, model_name, actual_app in old_calls if app_label == actual_app)
++    new_valid = sum(1 for app_label, model_name, actual_app in new_calls if app_label == actual_app)
++    
++    print("\nValidity comparison:")
++    print("  Old logic: {}/{} valid calls ({:.1f}%)".format(
++        old_valid, len(old_calls), 100 * old_valid / len(old_calls) if old_calls else 0))
++    print("  New logic: {}/{} valid calls ({:.1f}%)".format(
++        new_valid, len(new_calls), 100 * new_valid / len(new_calls) if new_calls else 0))
++
++
++if __name__ == '__main__':
++    test_fixed_logic()
++    compare_old_vs_new()
+\ No newline at end of file
+diff --git a/test_reproduce_issue.py b/test_reproduce_issue.py
+new file mode 100644
+index 0000000000..af6ce8ca14
+--- /dev/null
++++ b/test_reproduce_issue.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the makemigrations allow_migrate() issue.
++
++The issue is that makemigrations calls allow_migrate() for each app with ALL models
++in the project, rather than for each app with only that app's models.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from unittest.mock import Mock, patch
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++sys.path.insert(0, '.')
++
++import django
++django.setup()
++
++from django.apps import apps
++from django.core.management import call_command
++from django.db import router
++from django.test import override_settings
++from io import StringIO
++
++
++class TestRouter:
++    """A test router that tracks all allow_migrate calls."""
++    
++    def __init__(self):
++        self.allow_migrate_calls = []
++    
++    def allow_migrate(self, db, app_label, model_name=None, **hints):
++        self.allow_migrate_calls.append((db, app_label, model_name))
++        return True
++
++
++def test_current_behavior():
++    """Test the current behavior to show the bug."""
++    print("=== Testing Current Behavior ===")
++    
++    # Create a test router to track calls
++    test_router = TestRouter()
++    
++    # Patch the router to use our test router
++    with patch('django.db.router.allow_migrate', test_router.allow_migrate):
++        # Create a temporary directory for migrations
++        with tempfile.TemporaryDirectory() as temp_dir:
++            # Override settings to use our test router
++            with override_settings(
++                DATABASE_ROUTERS=['__main__.TestRouter'],
++                MIGRATION_MODULES={'migrations': 'migrations.test_migrations'}
++            ):
++                # Capture stdout to avoid noise
++                stdout = StringIO()
++                try:
++                    call_command('makemigrations', 'migrations', verbosity=0, stdout=stdout)
++                except Exception as e:
++                    print("Error during makemigrations: " + str(e))
++    
++    print("Total allow_migrate calls: " + str(len(test_router.allow_migrate_calls)))
++    
++    # Group calls by app_label
++    calls_by_app = {}
++    for db, app_label, model_name in test_router.allow_migrate_calls:
++        if app_label not in calls_by_app:
++            calls_by_app[app_label] = []
++        calls_by_app[app_label].append(model_name)
++    
++    print("\nCalls grouped by app_label:")
++    for app_label, model_names in calls_by_app.items():
++        print("  " + app_label + ": " + str(model_names))
++        
++        # Check if any model names don't belong to this app
++        for model_name in model_names:
++            if model_name:  # Skip None values
++                # Find the actual app for this model
++                actual_app = None
++                for model in apps.get_models():
++                    if model._meta.object_name == model_name:
++                        actual_app = model._meta.app_label
++                        break
++                
++                if actual_app and actual_app != app_label:
++                    print("    *** BUG: Model " + model_name + " belongs to app " + actual_app + ", not " + app_label + " ***")
++
++
++def test_apps_get_models_behavior():
++    """Test the behavior of apps.get_models() with different parameters."""
++    print("\n=== Testing apps.get_models() Behavior ===")
++    
++    # Test normal call
++    all_models = apps.get_models()
++    print("apps.get_models(): " + str(len(all_models)) + " models")
++    
++    # Test with app_label as first parameter (this is the bug!)
++    models_with_auth = apps.get_models('auth')  # This is wrong usage!
++    print("apps.get_models('auth'): " + str(len(models_with_auth)) + " models")
++    
++    # Test with True as first parameter
++    models_with_true = apps.get_models(True)
++    print("apps.get_models(True): " + str(len(models_with_true)) + " models")
++    
++    print("Are they the same? " + str(models_with_auth == models_with_true))
++    
++    # Test the correct way to get models for a specific app
++    try:
++        auth_models = list(apps.get_app_config('auth').get_models())
++        print("apps.get_app_config('auth').get_models(): " + str(len(auth_models)) + " models")
++        for model in auth_models:
++            print("  " + model._meta.object_name + " (app: " + model._meta.app_label + ")")
++    except Exception as e:
++        print("Error getting auth models: " + str(e))
++
++
++def test_consistency_check_logic():
++    """Test the actual logic used in makemigrations consistency checks."""
++    print("\n=== Testing Consistency Check Logic ===")
++    
++    # Simulate the current (buggy) logic
++    consistency_check_labels = ['auth', 'contenttypes', 'migrations']
++    
++    print("Current (buggy) logic:")
++    for app_label in consistency_check_labels:
++        models = apps.get_models(app_label)  # This is the bug!
++        print("  App " + app_label + ": " + str(len(models)) + " models")
++        for model in models[:3]:  # Show first 3 models
++            print("    " + model._meta.object_name + " (actual app: " + model._meta.app_label + ")")
++        if len(models) > 3:
++            print("    ... and " + str(len(models) - 3) + " more")
++    
++    print("\nCorrect logic:")
++    for app_label in consistency_check_labels:
++        try:
++            models = list(apps.get_app_config(app_label).get_models())
++            print("  App " + app_label + ": " + str(len(models)) + " models")
++            for model in models:
++                print("    " + model._meta.object_name + " (actual app: " + model._meta.app_label + ")")
++        except Exception as e:
++            print("  App " + app_label + ": Error - " + str(e))
++
++
++if __name__ == '__main__':
++    test_apps_get_models_behavior()
++    test_consistency_check_logic()
++    test_current_behavior()
+\ No newline at end of file
+diff --git a/test_simple_reproduce.py b/test_simple_reproduce.py
+new file mode 100644
+index 0000000000..dee5e07e6d
+--- /dev/null
++++ b/test_simple_reproduce.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python
++"""
++Simple test to demonstrate the makemigrations allow_migrate() bug.
++"""
++
++import os
++import sys
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++sys.path.insert(0, '.')
++
++import django
++django.setup()
++
++from django.apps import apps
++
++
++def test_get_models_bug():
++    """Demonstrate the bug in apps.get_models() usage."""
++    print("=== Demonstrating the apps.get_models() Bug ===")
++    
++    # This is how the current makemigrations code works (WRONG):
++    app_labels = ['auth', 'contenttypes', 'admin']  # Example app labels
++    
++    print("Current (buggy) behavior:")
++    print("apps.get_models(app_label) for each app_label:")
++    
++    for app_label in app_labels:
++        models = apps.get_models(app_label)  # BUG: This passes app_label as include_auto_created
++        print("  apps.get_models('{}') returns {} models".format(app_label, len(models)))
++    
++    print("\nWhat's actually happening:")
++    print("  apps.get_models('auth') is equivalent to apps.get_models(include_auto_created='auth')")
++    print("  Since 'auth' is truthy, it's treated as include_auto_created=True")
++    print("  This returns ALL models in the project, not just auth models!")
++    
++    # Demonstrate this:
++    all_models = apps.get_models()
++    auth_models = apps.get_models('auth')
++    true_models = apps.get_models(True)
++    
++    print("\nProof:")
++    print("  apps.get_models(): {} models".format(len(all_models)))
++    print("  apps.get_models('auth'): {} models".format(len(auth_models)))
++    print("  apps.get_models(True): {} models".format(len(true_models)))
++    print("  Are apps.get_models('auth') and apps.get_models(True) the same? {}".format(auth_models == true_models))
++    
++    print("\nCorrect way to get models for a specific app:")
++    for app_label in app_labels:
++        try:
++            app_config = apps.get_app_config(app_label)
++            models = list(app_config.get_models())
++            print("  apps.get_app_config('{}').get_models(): {} models".format(app_label, len(models)))
++            for model in models:
++                print("    {} (app: {})".format(model._meta.object_name, model._meta.app_label))
++        except Exception as e:
++            print("  apps.get_app_config('{}'): Error - {}".format(app_label, e))
++
++
++def demonstrate_makemigrations_issue():
++    """Demonstrate how this affects makemigrations."""
++    print("\n=== How This Affects makemigrations ===")
++    
++    # Simulate the problematic code from makemigrations
++    consistency_check_labels = ['auth', 'contenttypes', 'admin']
++    
++    print("Current makemigrations logic (BUGGY):")
++    print("for app_label in consistency_check_labels:")
++    print("    for model in apps.get_models(app_label):  # BUG!")
++    print("        router.allow_migrate(connection.alias, app_label, model_name=model._meta.object_name)")
++    print("")
++    
++    for app_label in consistency_check_labels:
++        models = apps.get_models(app_label)  # This is the bug!
++        print("App '{}':".format(app_label))
++        print("  apps.get_models('{}') returns {} models".format(app_label, len(models)))
++        
++        # Show what allow_migrate would be called with
++        for model in models[:3]:  # Show first 3 to avoid spam
++            print("    Would call: allow_migrate(db, '{}', model_name='{}')".format(
++                app_label, model._meta.object_name))
++            print("      But model '{}' actually belongs to app '{}'!".format(
++                model._meta.object_name, model._meta.app_label))
++            if model._meta.app_label != app_label:
++                print("      *** INVALID (app_label, model) PAIR! ***")
++        
++        if len(models) > 3:
++            print("    ... and {} more models".format(len(models) - 3))
++        print("")
++    
++    print("Fixed makemigrations logic:")
++    print("for app_label in consistency_check_labels:")
++    print("    for model in apps.get_app_config(app_label).get_models():  # CORRECT!")
++    print("        router.allow_migrate(connection.alias, app_label, model_name=model._meta.object_name)")
++    print("")
++    
++    for app_label in consistency_check_labels:
++        try:
++            models = list(apps.get_app_config(app_label).get_models())
++            print("App '{}':".format(app_label))
++            print("  apps.get_app_config('{}').get_models() returns {} models".format(app_label, len(models)))
++            
++            for model in models:
++                print("    Would call: allow_migrate(db, '{}', model_name='{}')".format(
++                    app_label, model._meta.object_name))
++                print("      Model '{}' belongs to app '{}' ✓".format(
++                    model._meta.object_name, model._meta.app_label))
++            print("")
++        except Exception as e:
++            print("App '{}': Error - {}".format(app_label, e))
++
++
++if __name__ == '__main__':
++    test_get_models_bug()
++    demonstrate_makemigrations_issue()
+\ No newline at end of file

@@ -1,0 +1,596 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 59a5d6abbb..81ebac3bf4 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1855,6 +1855,27 @@ class SQLUpdateCompiler(SQLCompiler):
+                 idents.extend(r[0] for r in rows)
+             self.query.add_filter("pk__in", idents)
+             self.query.related_ids = idents
++            
++            # For multiple inheritance, collect the correct foreign key values
++            # for each parent model
++            if self.query.related_updates:
++                self.query.related_ids_map = {}
++                for model in self.query.related_updates.keys():
++                    parent_link = self.query.get_meta().get_ancestor_link(model)
++                    if parent_link:
++                        # Create a query to get the foreign key values for this parent
++                        fk_query = self.query.chain(klass=Query)
++                        fk_query.select_related = False
++                        fk_query.clear_ordering(force=True)
++                        fk_query.extra = {}
++                        fk_query.select = []
++                        fk_query.add_fields([parent_link.attname])
++                        
++                        # Execute the query to get the foreign key values
++                        fk_idents = []
++                        for rows in fk_query.get_compiler(self.using).execute_sql(MULTI):
++                            fk_idents.extend(r[0] for r in rows)
++                        self.query.related_ids_map[model] = fk_idents
+         else:
+             # The fast path. Filters and updates in one query.
+             self.query.add_filter("pk__in", query)
+diff --git a/django/db/models/sql/subqueries.py b/django/db/models/sql/subqueries.py
+index 04063f73bc..6ef3680073 100644
+--- a/django/db/models/sql/subqueries.py
++++ b/django/db/models/sql/subqueries.py
+@@ -61,11 +61,13 @@ class UpdateQuery(Query):
+         """
+         self.values = []
+         self.related_ids = None
++        self.related_ids_map = {}
+         self.related_updates = {}
+ 
+     def clone(self):
+         obj = super().clone()
+         obj.related_updates = self.related_updates.copy()
++        obj.related_ids_map = self.related_ids_map.copy()
+         return obj
+ 
+     def update_batch(self, pk_list, values, using):
+@@ -134,7 +136,16 @@ class UpdateQuery(Query):
+             query = UpdateQuery(model)
+             query.values = values
+             if self.related_ids is not None:
+-                query.add_filter("pk__in", self.related_ids)
++                # For multiple inheritance, we need to use the correct foreign key
++                # values for each parent model, not the child's primary key values
++                parent_link = self.get_meta().get_ancestor_link(model)
++                if parent_link and hasattr(self, 'related_ids_map'):
++                    # Use the specific foreign key values for this parent model
++                    fk_values = self.related_ids_map.get(model, self.related_ids)
++                    query.add_filter("pk__in", fk_values)
++                else:
++                    # Fallback to the original behavior for single inheritance
++                    query.add_filter("pk__in", self.related_ids)
+             result.append(query)
+         return result
+ 
+diff --git a/test_comprehensive_inheritance.py b/test_comprehensive_inheritance.py
+new file mode 100644
+index 0000000000..fc06c1c8a7
+--- /dev/null
++++ b/test_comprehensive_inheritance.py
+@@ -0,0 +1,252 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script for inheritance update scenarios.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test models for different inheritance scenarios
++
++# 1. Single inheritance (should still work)
++class SingleParent(models.Model):
++    parent_field = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class SingleChild(SingleParent):
++    child_field = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# 2. Multiple inheritance (the main fix)
++class Base(models.Model):
++    base_id = models.AutoField(primary_key=True)
++    field_base = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class OtherBase(models.Model):
++    otherbase_id = models.AutoField(primary_key=True)
++    field_otherbase = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class MultiChild(Base, OtherBase):
++    child_field = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# 3. Triple inheritance (edge case)
++class ThirdBase(models.Model):
++    thirdbase_id = models.AutoField(primary_key=True)
++    field_thirdbase = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class TripleChild(Base, OtherBase, ThirdBase):
++    triple_field = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_single_inheritance():
++    """Test that single inheritance still works correctly."""
++    print("\n=== Testing Single Inheritance ===")
++    
++    # Create parent and child instances
++    parent = SingleParent.objects.create(parent_field=100)
++    child1 = SingleChild.objects.create(parent_field=1, child_field=10)
++    child2 = SingleChild.objects.create(parent_field=2, child_field=20)
++    
++    print(f"Before update - Parent: {parent.parent_field}, Children: {list(SingleChild.objects.values_list('parent_field', flat=True))}")
++    
++    # Update child instances
++    rows = SingleChild.objects.update(parent_field=99)
++    print(f"Updated {rows} rows")
++    
++    # Verify results
++    parent.refresh_from_db()
++    child_values = list(SingleChild.objects.values_list('parent_field', flat=True))
++    
++    print(f"After update - Parent: {parent.parent_field}, Children: {child_values}")
++    
++    if parent.parent_field == 100 and all(v == 99 for v in child_values):
++        print("✅ Single inheritance works correctly")
++        return True
++    else:
++        print("❌ Single inheritance broken")
++        return False
++
++def test_multiple_inheritance():
++    """Test the main multiple inheritance fix."""
++    print("\n=== Testing Multiple Inheritance ===")
++    
++    # Create standalone parent instances
++    base1 = Base.objects.create(field_base=100)
++    base2 = Base.objects.create(field_base=101)
++    other1 = OtherBase.objects.create(field_otherbase=200)
++    other2 = OtherBase.objects.create(field_otherbase=201)
++    
++    # Create child instances
++    child1 = MultiChild.objects.create(field_base=1, field_otherbase=10)
++    child2 = MultiChild.objects.create(field_base=2, field_otherbase=20)
++    
++    print(f"Before update:")
++    print(f"  Standalone Base: {list(Base.objects.filter(base_id__in=[1,2]).values_list('field_base', flat=True))}")
++    print(f"  Standalone OtherBase: {list(OtherBase.objects.filter(otherbase_id__in=[1,2]).values_list('field_otherbase', flat=True))}")
++    print(f"  Children field_base: {list(MultiChild.objects.values_list('field_base', flat=True))}")
++    print(f"  Children field_otherbase: {list(MultiChild.objects.values_list('field_otherbase', flat=True))}")
++    
++    # Test updating Base field
++    rows1 = MultiChild.objects.update(field_base=88)
++    print(f"Updated {rows1} rows for field_base")
++    
++    # Test updating OtherBase field
++    rows2 = MultiChild.objects.update(field_otherbase=77)
++    print(f"Updated {rows2} rows for field_otherbase")
++    
++    print(f"After update:")
++    base1.refresh_from_db()
++    base2.refresh_from_db()
++    other1.refresh_from_db()
++    other2.refresh_from_db()
++    
++    standalone_base_values = [base1.field_base, base2.field_base]
++    standalone_other_values = [other1.field_otherbase, other2.field_otherbase]
++    child_base_values = list(MultiChild.objects.values_list('field_base', flat=True))
++    child_other_values = list(MultiChild.objects.values_list('field_otherbase', flat=True))
++    
++    print(f"  Standalone Base: {standalone_base_values}")
++    print(f"  Standalone OtherBase: {standalone_other_values}")
++    print(f"  Children field_base: {child_base_values}")
++    print(f"  Children field_otherbase: {child_other_values}")
++    
++    # Verify results
++    success = True
++    if standalone_base_values != [100, 101]:
++        print("❌ Standalone Base objects were incorrectly updated")
++        success = False
++    if standalone_other_values != [200, 201]:
++        print("❌ Standalone OtherBase objects were incorrectly updated")
++        success = False
++    if not all(v == 88 for v in child_base_values):
++        print("❌ Child Base fields were not updated correctly")
++        success = False
++    if not all(v == 77 for v in child_other_values):
++        print("❌ Child OtherBase fields were not updated correctly")
++        success = False
++    
++    if success:
++        print("✅ Multiple inheritance works correctly")
++    
++    return success
++
++def test_triple_inheritance():
++    """Test triple inheritance edge case."""
++    print("\n=== Testing Triple Inheritance ===")
++    
++    # Create child instances
++    child1 = TripleChild.objects.create(field_base=1, field_otherbase=10, field_thirdbase=100)
++    child2 = TripleChild.objects.create(field_base=2, field_otherbase=20, field_thirdbase=200)
++    
++    print(f"Before update:")
++    print(f"  Children field_base: {list(TripleChild.objects.values_list('field_base', flat=True))}")
++    print(f"  Children field_otherbase: {list(TripleChild.objects.values_list('field_otherbase', flat=True))}")
++    print(f"  Children field_thirdbase: {list(TripleChild.objects.values_list('field_thirdbase', flat=True))}")
++    
++    # Test updating all three parent fields
++    rows1 = TripleChild.objects.update(field_base=11)
++    rows2 = TripleChild.objects.update(field_otherbase=22)
++    rows3 = TripleChild.objects.update(field_thirdbase=33)
++    
++    print(f"Updated {rows1}, {rows2}, {rows3} rows")
++    
++    print(f"After update:")
++    child_base_values = list(TripleChild.objects.values_list('field_base', flat=True))
++    child_other_values = list(TripleChild.objects.values_list('field_otherbase', flat=True))
++    child_third_values = list(TripleChild.objects.values_list('field_thirdbase', flat=True))
++    
++    print(f"  Children field_base: {child_base_values}")
++    print(f"  Children field_otherbase: {child_other_values}")
++    print(f"  Children field_thirdbase: {child_third_values}")
++    
++    # Verify results
++    success = (
++        all(v == 11 for v in child_base_values) and
++        all(v == 22 for v in child_other_values) and
++        all(v == 33 for v in child_third_values)
++    )
++    
++    if success:
++        print("✅ Triple inheritance works correctly")
++    else:
++        print("❌ Triple inheritance failed")
++    
++    return success
++
++def run_all_tests():
++    """Run all inheritance tests."""
++    from django.db import connection
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SingleParent)
++        schema_editor.create_model(SingleChild)
++        schema_editor.create_model(Base)
++        schema_editor.create_model(OtherBase)
++        schema_editor.create_model(MultiChild)
++        schema_editor.create_model(ThirdBase)
++        schema_editor.create_model(TripleChild)
++    
++    print("=== Comprehensive Inheritance Update Tests ===")
++    
++    results = []
++    results.append(test_single_inheritance())
++    results.append(test_multiple_inheritance())
++    results.append(test_triple_inheritance())
++    
++    print(f"\n=== Summary ===")
++    print(f"Tests passed: {sum(results)}/{len(results)}")
++    
++    if all(results):
++        print("🎉 All tests passed!")
++        return True
++    else:
++        print("❌ Some tests failed")
++        return False
++
++if __name__ == '__main__':
++    run_all_tests()
+\ No newline at end of file
+diff --git a/test_exact_issue_reproduction.py b/test_exact_issue_reproduction.py
+new file mode 100644
+index 0000000000..babe10c3a9
+--- /dev/null
++++ b/test_exact_issue_reproduction.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python
++"""
++Test script that exactly reproduces the issue from the GitHub issue description.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Exact models from the issue description
++class Base(models.Model):
++    base_id = models.AutoField(primary_key=True)
++    field_base = models.IntegerField()
++    
++    class Meta:
++        app_label = 'appliances'
++
++class OtherBase(models.Model):
++    otherbase_id = models.AutoField(primary_key=True)
++    field_otherbase = models.IntegerField()
++    
++    class Meta:
++        app_label = 'appliances'
++
++class Child(Base, OtherBase):
++    class Meta:
++        app_label = 'appliances'
++
++def test_exact_issue_scenario():
++    """Test the exact scenario from the GitHub issue."""
++    from django.db import connection
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Base)
++        schema_editor.create_model(OtherBase)
++        schema_editor.create_model(Child)
++    
++    print("=== Reproducing Exact Issue Scenario ===")
++    
++    # Step 1: OtherBase.objects.create(field_otherbase=100)
++    print("\nIn [1]: OtherBase.objects.create(field_otherbase=100)")
++    ob1 = OtherBase.objects.create(field_otherbase=100)
++    print(f"<QuerySet [{{'otherbase_id': {ob1.otherbase_id}, 'field_otherbase': {ob1.field_otherbase}}}]>")
++    
++    # Step 2: OtherBase.objects.create(field_otherbase=101)
++    print("\nIn [2]: OtherBase.objects.create(field_otherbase=101)")
++    ob2 = OtherBase.objects.create(field_otherbase=101)
++    print(f"<QuerySet [{{'otherbase_id': {ob2.otherbase_id}, 'field_otherbase': {ob2.field_otherbase}}}]>")
++    
++    # Step 3: Child.objects.create(field_base=0, field_otherbase=0)
++    print("\nIn [3]: Child.objects.create(field_base=0, field_otherbase=0)")
++    c1 = Child.objects.create(field_base=0, field_otherbase=0)
++    print(f"<Child: Child object ({c1.base_id})>")
++    
++    # Step 4: Child.objects.create(field_base=1, field_otherbase=1)
++    print("\nIn [4]: Child.objects.create(field_base=1, field_otherbase=1)")
++    c2 = Child.objects.create(field_base=1, field_otherbase=1)
++    print(f"<Child: Child object ({c2.base_id})>")
++    
++    # Step 5: Child.objects.update(field_otherbase=55)
++    print("\nIn [5]: Child.objects.update(field_otherbase=55)")
++    
++    # Enable SQL logging to see what queries are executed
++    import logging
++    logging.basicConfig()
++    logger = logging.getLogger('django.db.backends')
++    logger.setLevel(logging.DEBUG)
++    logger.addHandler(logging.StreamHandler())
++    
++    rows_updated = Child.objects.update(field_otherbase=55)
++    print(f"Out[5]: {rows_updated}")
++    
++    # Step 6: Child.objects.values('field_otherbase')
++    print("\nIn [6]: Child.objects.values('field_otherbase')")
++    child_values = list(Child.objects.values('field_otherbase'))
++    print(f"<QuerySet {child_values}>")
++    
++    # Step 7: OtherBase.objects.filter(otherbase_id__in=[1,2]).values('field_otherbase')
++    print("\nIn [7]: OtherBase.objects.filter(otherbase_id__in=[1,2]).values('field_otherbase')")
++    otherbase_values = list(OtherBase.objects.filter(otherbase_id__in=[1,2]).values('field_otherbase'))
++    print(f"<QuerySet {otherbase_values}>")
++    
++    # Verify the fix
++    print("\n=== Verification ===")
++    
++    # Check that Child objects were updated
++    if all(item['field_otherbase'] == 55 for item in child_values):
++        print("✅ Child objects were updated correctly")
++    else:
++        print("❌ Child objects were NOT updated correctly")
++    
++    # Check that standalone OtherBase objects were NOT updated
++    if all(item['field_otherbase'] in [100, 101] for item in otherbase_values):
++        print("✅ Standalone OtherBase objects were NOT affected (correct behavior)")
++    else:
++        print("❌ Standalone OtherBase objects were incorrectly updated")
++    
++    # Summary
++    print("\n=== Summary ===")
++    if (all(item['field_otherbase'] == 55 for item in child_values) and 
++        all(item['field_otherbase'] in [100, 101] for item in otherbase_values)):
++        print("🎉 Issue is FIXED! Multiple inheritance update works correctly.")
++        return True
++    else:
++        print("❌ Issue is NOT fixed.")
++        return False
++
++if __name__ == '__main__':
++    test_exact_issue_scenario()
+\ No newline at end of file
+diff --git a/test_multiple_inheritance_update.py b/test_multiple_inheritance_update.py
+new file mode 100644
+index 0000000000..c80d97d0e5
+--- /dev/null
++++ b/test_multiple_inheritance_update.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the multiple inheritance update issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models as described in the issue
++class Base(models.Model):
++    base_id = models.AutoField(primary_key=True)
++    field_base = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class OtherBase(models.Model):
++    otherbase_id = models.AutoField(primary_key=True)
++    field_otherbase = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++class Child(Base, OtherBase):
++    class Meta:
++        app_label = 'test_app'
++
++def test_multiple_inheritance_update():
++    """Test the multiple inheritance update issue."""
++    from django.db import connection
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Base)
++        schema_editor.create_model(OtherBase)
++        schema_editor.create_model(Child)
++    
++    print("=== Testing Multiple Inheritance Update Issue ===")
++    
++    # Step 1: Create some OtherBase instances
++    print("\n1. Creating OtherBase instances...")
++    ob1 = OtherBase.objects.create(field_otherbase=100)
++    ob2 = OtherBase.objects.create(field_otherbase=101)
++    print(f"Created OtherBase instances: {list(OtherBase.objects.values())}")
++    
++    # Step 2: Create some Child instances
++    print("\n2. Creating Child instances...")
++    c1 = Child.objects.create(field_base=0, field_otherbase=0)
++    c2 = Child.objects.create(field_base=1, field_otherbase=1)
++    print(f"Created Child instances: {list(Child.objects.values())}")
++    
++    # Step 3: Show the current state
++    print("\n3. Current state before update:")
++    print(f"Child objects field_otherbase: {list(Child.objects.values('field_otherbase'))}")
++    print(f"OtherBase objects field_otherbase: {list(OtherBase.objects.values('field_otherbase'))}")
++    
++    # Step 4: Perform the problematic update
++    print("\n4. Performing Child.objects.update(field_otherbase=55)...")
++    
++    # Enable SQL logging to see what queries are executed
++    import logging
++    logging.basicConfig()
++    logger = logging.getLogger('django.db.backends')
++    logger.setLevel(logging.DEBUG)
++    logger.addHandler(logging.StreamHandler())
++    
++    rows_updated = Child.objects.update(field_otherbase=55)
++    print(f"Rows updated: {rows_updated}")
++    
++    # Step 5: Check the results
++    print("\n5. State after update:")
++    print(f"Child objects field_otherbase: {list(Child.objects.values('field_otherbase'))}")
++    print(f"OtherBase objects field_otherbase: {list(OtherBase.objects.values('field_otherbase'))}")
++    
++    # Step 6: Verify the issue
++    child_values = list(Child.objects.values_list('field_otherbase', flat=True))
++    standalone_otherbase_values = list(OtherBase.objects.filter(otherbase_id__in=[1, 2]).values_list('field_otherbase', flat=True))
++    
++    print("\n6. Issue verification:")
++    if 55 not in child_values:
++        print("❌ BUG CONFIRMED: Child objects were NOT updated")
++    else:
++        print("✅ Child objects were updated correctly")
++        
++    # Check if the standalone OtherBase objects (IDs 1,2) were incorrectly updated
++    if 55 in standalone_otherbase_values:
++        print("❌ BUG CONFIRMED: Standalone OtherBase objects were incorrectly updated")
++    else:
++        print("✅ Standalone OtherBase objects were not affected")
++    
++    return child_values, standalone_otherbase_values
++
++if __name__ == '__main__':
++    test_multiple_inheritance_update()
+\ No newline at end of file

@@ -1,0 +1,176 @@
+diff --git a/sklearn/linear_model/logistic.py b/sklearn/linear_model/logistic.py
+index e4ea696ce..4e929edbb 100644
+--- a/sklearn/linear_model/logistic.py
++++ b/sklearn/linear_model/logistic.py
+@@ -922,7 +922,9 @@ def _log_reg_scoring_path(X, y, train, test, pos_class=None, Cs=10,
+         check_input=False, max_squared_sum=max_squared_sum,
+         sample_weight=sample_weight)
+ 
+-    log_reg = LogisticRegression(fit_intercept=fit_intercept)
++    log_reg = LogisticRegression(fit_intercept=fit_intercept, multi_class=multi_class,
++                                 penalty=penalty, dual=dual,
++                                 solver=solver, intercept_scaling=float(intercept_scaling))
+ 
+     # The score method of Logistic Regression has a classes_ attribute.
+     if multi_class == 'ovr':
+diff --git a/test_cv_issue.py b/test_cv_issue.py
+new file mode 100644
+index 000000000..5e3a15a5b
+--- /dev/null
++++ b/test_cv_issue.py
+@@ -0,0 +1,50 @@
++"""
++Test to verify the fix for issue #8720 - LogisticRegressionCV with multinomial and probabilistic scorers.
++"""
++import numpy as np
++from sklearn.linear_model import LogisticRegressionCV
++from sklearn.metrics import log_loss, make_scorer
++from sklearn.model_selection import train_test_split
++from sklearn.datasets import make_classification
++
++# Create dataset with 3 classes
++X, y = make_classification(n_samples=500, n_features=10, n_informative=8,
++                           n_redundant=2, n_classes=3, random_state=42)
++
++# Split into train and test sets
++X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
++
++# Create a neg_log_loss scorer
++neg_log_loss = make_scorer(log_loss, greater_is_better=False, needs_proba=True)
++
++# Train LogisticRegressionCV with multinomial
++clf_multi = LogisticRegressionCV(multi_class='multinomial', solver='lbfgs', 
++                                 scoring=neg_log_loss, cv=5, random_state=42)
++clf_multi.fit(X_train, y_train)
++
++# Get predicted probabilities
++y_proba_multi = clf_multi.predict_proba(X_test)
++
++# Calculate log loss directly
++direct_loss = -log_loss(y_test, y_proba_multi)
++
++# The score from the model should use the same approach as direct calculation
++cv_score = clf_multi.score(X_test, y_test)
++
++print(f"Log loss from direct calculation: {direct_loss:.6f}")
++print(f"Log loss from CV model scoring: {cv_score:.6f}")
++print(f"Are they close? {np.isclose(direct_loss, cv_score)}")
++
++# Check with ovr method as well
++clf_ovr = LogisticRegressionCV(multi_class='ovr', solver='lbfgs', 
++                              scoring=neg_log_loss, cv=5, random_state=42)
++clf_ovr.fit(X_train, y_train)
++
++y_proba_ovr = clf_ovr.predict_proba(X_test)
++direct_loss_ovr = -log_loss(y_test, y_proba_ovr)
++cv_score_ovr = clf_ovr.score(X_test, y_test)
++
++print("\nWith ovr method:")
++print(f"Log loss from direct calculation: {direct_loss_ovr:.6f}")
++print(f"Log loss from CV model scoring: {cv_score_ovr:.6f}")
++print(f"Are they close? {np.isclose(direct_loss_ovr, cv_score_ovr)}")
+\ No newline at end of file
+diff --git a/test_issue.py b/test_issue.py
+new file mode 100644
+index 000000000..caa44d2d4
+--- /dev/null
++++ b/test_issue.py
+@@ -0,0 +1,98 @@
++import numpy as np
++from sklearn import preprocessing, linear_model, utils
++
++# Create a function that applies OvR approach manually
++def ovr_approach(decision_function):
++    probs = 1. / (1. + np.exp(-decision_function))
++    probs = probs / probs.sum(axis=1).reshape((probs.shape[0], -1))
++    return probs
++
++# Function to calculate score from probabilities
++def score_from_probs(probs, y_bin):
++    return (y_bin*np.log(probs)).sum(axis=1).mean()
++    
++# Set random seed for reproducibility
++np.random.seed(seed=1234)
++
++# Set up parameters
++samples = 200
++features = 5
++folds = 10
++
++# Use a "probabilistic" scorer
++scorer = 'neg_log_loss'
++
++# Generate synthetic data
++x = np.random.random(size=(samples, features))
++y = np.random.choice(['a', 'b', 'c'], size=samples)
++
++# Create train/test split
++test = np.random.choice(range(samples), size=int(samples/float(folds)), replace=False)
++train = [idx for idx in range(samples) if idx not in test]
++
++# Binarize the labels for y[test]
++lb = preprocessing.label.LabelBinarizer()
++lb.fit(y[test])
++y_bin = lb.transform(y[test])
++
++# Get the scoring path with multinomial approach
++coefs, _, scores, _ = linear_model.logistic._log_reg_scoring_path(
++    x, y, train, test, 
++    fit_intercept=True, 
++    scoring=scorer, 
++    multi_class='multinomial'
++)
++
++# Choose a single C to look at
++c_index = 0
++coefs = coefs[c_index]
++scores = scores[c_index]
++
++print("Score returned by _log_reg_scoring_path:", scores)
++
++# Create a LogisticRegression with default arguments (OvR)
++existing_log_reg = linear_model.LogisticRegression(fit_intercept=True)
++existing_log_reg.coef_ = coefs[:, :-1]
++existing_log_reg.intercept_ = coefs[:, -1]
++
++# Get decision function and probabilities
++existing_dec_fn = existing_log_reg.decision_function(x[test])
++existing_probs_builtin = existing_log_reg.predict_proba(x[test])
++
++# Calculate probabilities using OvR approach
++existing_probs_ovr = ovr_approach(existing_dec_fn)
++
++# Calculate probabilities using multinomial approach
++existing_probs_multi = utils.extmath.softmax(existing_dec_fn)
++
++# Create a LogisticRegression with multinomial argument
++new_log_reg = linear_model.LogisticRegression(fit_intercept=True, multi_class='multinomial')
++new_log_reg.coef_ = coefs[:, :-1]
++new_log_reg.intercept_ = coefs[:, -1]
++
++# Get decision function and probabilities
++new_dec_fn = new_log_reg.decision_function(x[test])
++new_probs_builtin = new_log_reg.predict_proba(x[test])
++
++# Calculate probabilities using OvR approach
++new_probs_ovr = ovr_approach(new_dec_fn)
++
++# Calculate probabilities using multinomial approach
++new_probs_multi = utils.extmath.softmax(new_dec_fn)
++
++# Compare scores
++print("Score calculated via OvR method:", score_from_probs(existing_probs_ovr, y_bin))
++print("Score calculated via multinomial method:", score_from_probs(existing_probs_multi, y_bin))
++
++# Check if built-in prediction methods match expected approaches
++print("\nDo built-in predict_proba methods match expected approaches?")
++print("existing_log_reg.predict_proba() == OvR approach?", 
++      np.allclose(existing_probs_builtin, existing_probs_ovr))
++print("existing_log_reg.predict_proba() == multinomial approach?", 
++      np.allclose(existing_probs_builtin, existing_probs_multi))
++print("new_log_reg.predict_proba() == OvR approach?", 
++      np.allclose(new_probs_builtin, new_probs_ovr))
++print("new_log_reg.predict_proba() == multinomial approach?", 
++      np.allclose(new_probs_builtin, new_probs_multi))
++
++print("\nDecision functions equal?", np.allclose(existing_dec_fn, new_dec_fn))

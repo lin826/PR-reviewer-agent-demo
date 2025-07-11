@@ -1,0 +1,198 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 6c9e9d3707..4c75af0180 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1747,7 +1747,19 @@ class Model(metaclass=ModelBase):
+                     else:
+                         _cls = None
+                 except (FieldDoesNotExist, AttributeError):
+-                    if fld is None or fld.get_transform(part) is None:
++                    if fld is None:
++                        errors.append(
++                            checks.Error(
++                                "'ordering' refers to the nonexistent field, "
++                                "related field, or lookup '%s'." % field,
++                                obj=cls,
++                                id='models.E015',
++                            )
++                        )
++                    # Check for both transform and lookup - transforms are for operations
++                    # that return another field type, lookups are for operations like
++                    # __isnull, __exact, etc. that perform filtering
++                    elif fld.get_transform(part) is None and fld.get_lookup(part) is None:
+                         errors.append(
+                             checks.Error(
+                                 "'ordering' refers to the nonexistent field, "
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/reproduce_models.py b/reproduce_models.py
+new file mode 100644
+index 0000000000..8e45036d7a
+--- /dev/null
++++ b/reproduce_models.py
+@@ -0,0 +1,17 @@
++
++from django.db import models
++
++class Product(models.Model):
++    name = models.CharField(max_length=50)
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++
++class Supply(models.Model):
++    product = models.ForeignKey(Product, models.CASCADE)
++    name = models.CharField(max_length=50)
++
++class Stock(models.Model):
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    quantity = models.IntegerField()
++
++    class Meta:
++        ordering = ['supply__product__parent__isnull']
+diff --git a/reproduce_settings.py b/reproduce_settings.py
+new file mode 100644
+index 0000000000..495ad09df3
+--- /dev/null
++++ b/reproduce_settings.py
+@@ -0,0 +1,17 @@
++
++SECRET_KEY = 'fake-key'
++INSTALLED_APPS = [
++    'django.contrib.auth',
++    'django.contrib.contenttypes',
++    'django.contrib.sessions',
++    'django.contrib.sites',
++    'django.contrib.admin',
++    'django.contrib.messages',
++]
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': 'db.sqlite3',
++    }
++}
+diff --git a/test_app/__init__.py b/test_app/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/test_app/apps.py b/test_app/apps.py
+new file mode 100644
+index 0000000000..04ba5af569
+--- /dev/null
++++ b/test_app/apps.py
+@@ -0,0 +1,5 @@
++
++from django.apps import AppConfig
++
++class TestAppConfig(AppConfig):
++    name = 'test_app'
+diff --git a/test_app/models.py b/test_app/models.py
+new file mode 100644
+index 0000000000..0070dc2342
+--- /dev/null
++++ b/test_app/models.py
+@@ -0,0 +1,30 @@
++
++from django.db import models
++
++class Product(models.Model):
++    name = models.CharField(max_length=50)
++    parent = models.ForeignKey('self', models.CASCADE, null=True)
++    created_at = models.DateTimeField(auto_now_add=True, null=True)
++
++class Supply(models.Model):
++    product = models.ForeignKey(Product, models.CASCADE)
++    name = models.CharField(max_length=50)
++
++class Stock(models.Model):
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    quantity = models.IntegerField()
++
++    class Meta:
++        ordering = ['supply__product__parent__isnull']
++
++class StockWithComplexOrdering(models.Model):
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    quantity = models.IntegerField()
++
++    class Meta:
++        ordering = [
++            'supply__product__parent__isnull',
++            'supply__product__name__contains',
++            'supply__product__parent__created_at__year',
++            'supply__product__parent__created_at__in',
++        ]
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..92ede1c3cd
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,14 @@
++
++SECRET_KEY = 'fake-key'
++INSTALLED_APPS = [
++    'test_app',
++    'django.contrib.auth',
++    'django.contrib.contenttypes',
++]
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': 'db.sqlite3',
++    }
++}
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..8f9a741976
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python
++import os
++import sys
++import django
++
++# Configure Django settings
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "test_settings")
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++try:
++    django.setup()
++
++    # Import our models
++    from test_app.models import Stock, StockWithComplexOrdering
++
++    # Run system checks for the simple case
++    errors = Stock._meta.model._check_ordering()
++    if errors:
++        print("System check errors for Stock model:")
++        for error in errors:
++            print(f"- {error.id}: {error.msg}")
++        print("\nHowever, the same ordering path would work with order_by().")
++        success = False
++    else:
++        print("PASS: No errors found for Stock model with 'supply__product__parent__isnull' ordering.")
++        success = True
++
++    # Run system checks for the complex case
++    errors = StockWithComplexOrdering._meta.model._check_ordering()
++    if errors:
++        print("\nSystem check errors for StockWithComplexOrdering model:")
++        for error in errors:
++            print(f"- {error.id}: {error.msg}")
++        success = False
++    else:
++        print("PASS: No errors found for StockWithComplexOrdering model with complex ordering including:")
++        print("  - supply__product__parent__isnull")
++        print("  - supply__product__name__contains")
++        print("  - supply__product__parent__created_at__year")
++        print("  - supply__product__parent__created_at__in")
++        
++    if success:
++        print("\nFix was successful! The system now correctly validates ordering with transforms and lookups.")
++    else:
++        print("\nFix was not completely successful. Some errors still remain.")
++except Exception as e:
++    print(f"Error: {e}")
+\ No newline at end of file

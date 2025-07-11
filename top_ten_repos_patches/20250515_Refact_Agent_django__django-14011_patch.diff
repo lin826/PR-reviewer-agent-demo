@@ -1,0 +1,138 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index 14dab517c9..5aae27bab9 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -167,14 +167,25 @@ class WSGIRequestHandler(simple_server.WSGIRequestHandler):
+         return super().get_environ()
+ 
+     def handle(self):
+-        self.close_connection = True
+-        self.handle_one_request()
+-        while not self.close_connection:
+-            self.handle_one_request()
+         try:
+-            self.connection.shutdown(socket.SHUT_WR)
+-        except (AttributeError, OSError):
+-            pass
++            self.close_connection = True
++            self.handle_one_request()
++            while not self.close_connection:
++                self.handle_one_request()
++            try:
++                self.connection.shutdown(socket.SHUT_WR)
++            except (AttributeError, OSError):
++                pass
++        finally:
++            # Close database connections opened by the request thread
++            # to prevent connection leaks when using ThreadedWSGIServer
++            from django.db import connections
++            try:
++                connections.close_all()
++            except Exception:
++                # If an error happens during closing connections, don't prevent
++                # the request from being closed
++                pass
+ 
+     def handle_one_request(self):
+         """Copy of WSGIRequestHandler.handle() but with different ServerHandler"""
+diff --git a/tests/servers/__init__.py b/tests/servers/__init__.py
+index e69de29bb2..1e07a34ee3 100644
+--- a/tests/servers/__init__.py
++++ b/tests/servers/__init__.py
+@@ -0,0 +1 @@
++# This file is intentionally left empty to make the directory a Python package.
+diff --git a/tests/servers/models.py b/tests/servers/models.py
+index b523bae6f2..8e72e1319b 100644
+--- a/tests/servers/models.py
++++ b/tests/servers/models.py
+@@ -2,4 +2,7 @@ from django.db import models
+ 
+ 
+ class Person(models.Model):
+-    name = models.CharField(max_length=255)
++    name = models.CharField(max_length=100)
++
++    def __str__(self):
++        return self.name
+diff --git a/tests/servers/urls.py b/tests/servers/urls.py
+index d07712776a..6130491245 100644
+--- a/tests/servers/urls.py
++++ b/tests/servers/urls.py
+@@ -7,9 +7,8 @@ urlpatterns = [
+     path('streaming_example_view/', views.streaming_example_view),
+     path('model_view/', views.model_view),
+     path('create_model_instance/', views.create_model_instance),
++    path('method_view/', views.method_view),
+     path('environ_view/', views.environ_view),
+     path('subview_calling_view/', views.subview_calling_view),
+-    path('subview/', views.subview),
+     path('check_model_instance_from_subview/', views.check_model_instance_from_subview),
+-    path('method_view/', views.method_view),
+ ]
+diff --git a/tests/servers/views.py b/tests/servers/views.py
+index fa30b0ce7b..64ec3b03f6 100644
+--- a/tests/servers/views.py
++++ b/tests/servers/views.py
+@@ -1,7 +1,6 @@
+-from urllib.request import urlopen
++import urllib.request
+ 
+ from django.http import HttpResponse, StreamingHttpResponse
+-from django.views.decorators.csrf import csrf_exempt
+ 
+ from .models import Person
+ 
+@@ -11,7 +10,7 @@ def example_view(request):
+ 
+ 
+ def streaming_example_view(request):
+-    return StreamingHttpResponse((b'I', b'am', b'a', b'stream'))
++    return StreamingHttpResponse(['Iamastream'])
+ 
+ 
+ def model_view(request):
+@@ -20,31 +19,27 @@ def model_view(request):
+ 
+ 
+ def create_model_instance(request):
+-    person = Person(name='emily')
+-    person.save()
+-    return HttpResponse()
++    Person.objects.create(name='emily')
++    return HttpResponse('')
+ 
+ 
+-def environ_view(request):
+-    return HttpResponse("\n".join("%s: %r" % (k, v) for k, v in request.environ.items()))
++def method_view(request):
++    return HttpResponse(request.method)
+ 
+ 
+-def subview(request):
+-    return HttpResponse('subview')
++def environ_view(request):
++    return HttpResponse('\n'.join('%s: %r' % (k, v) for k, v in request.META.items()))
+ 
+ 
+ def subview_calling_view(request):
+-    with urlopen(request.GET['url'] + '/subview/') as response:
+-        return HttpResponse('subview calling view: {}'.format(response.read().decode()))
++    url = request.GET.get('url')
++    with urllib.request.urlopen(url + '/example_view/') as f:
++        return HttpResponse('subview calling view: %s' % f.read().decode('utf-8'))
+ 
+ 
+ def check_model_instance_from_subview(request):
+-    with urlopen(request.GET['url'] + '/create_model_instance/'):
++    url = request.GET.get('url')
++    with urllib.request.urlopen(url + '/create_model_instance/'):
+         pass
+-    with urlopen(request.GET['url'] + '/model_view/') as response:
+-        return HttpResponse('subview calling view: {}'.format(response.read().decode()))
+-
+-
+-@csrf_exempt
+-def method_view(request):
+-    return HttpResponse(request.method)
++    with urllib.request.urlopen(url + '/model_view/') as f:
++        return HttpResponse(f.read())

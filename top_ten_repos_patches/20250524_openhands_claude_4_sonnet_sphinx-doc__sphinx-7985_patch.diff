@@ -1,0 +1,892 @@
+diff --git a/sphinx/builders/linkcheck.py b/sphinx/builders/linkcheck.py
+index dd5317087..d20af6a7f 100644
+--- a/sphinx/builders/linkcheck.py
++++ b/sphinx/builders/linkcheck.py
+@@ -109,6 +109,81 @@ class CheckExternalLinksBuilder(Builder):
+             thread.start()
+             self.workers.append(thread)
+ 
++    def check_local_link(self, uri: str, docname: str) -> Tuple[str, str]:
++        """Check if a local link target exists.
++        
++        Returns a tuple of (status, info) where status is 'working' or 'broken'
++        and info contains additional information about the result.
++        """
++        # Handle different types of local links
++        if uri.startswith('#'):
++            # Fragment-only link (anchor in current document)
++            target = uri[1:]  # Remove the '#'
++            if not target:
++                # Empty fragment, refers to top of document
++                return 'working', ''
++            
++            # Check if the anchor exists in the current document
++            std_domain = self.env.domains.get('std')
++            if std_domain:
++                # Check in labels (named references)
++                if target in std_domain.labels:
++                    target_docname, labelid, sectname = std_domain.labels[target]
++                    if target_docname == docname:
++                        return 'working', ''
++                # Check in anonlabels (anonymous references)
++                if target in std_domain.anonlabels:
++                    target_docname, labelid = std_domain.anonlabels[target]
++                    if target_docname == docname:
++                        return 'working', ''
++            
++            return 'broken', f"Anchor '{target}' not found"
++        
++        else:
++            # Document reference or named reference
++            std_domain = self.env.domains.get('std')
++            if std_domain:
++                # Check if it's a named reference (label)
++                if uri in std_domain.labels:
++                    return 'working', ''
++                if uri in std_domain.anonlabels:
++                    return 'working', ''
++                
++                # Check if it's a cross-document reference with anchor (doc.rst#anchor)
++                if '#' in uri:
++                    doc_part, anchor_part = uri.split('#', 1)
++                    # Check if document exists
++                    doc_name = doc_part
++                    if doc_part.endswith('.rst') or doc_part.endswith('.md'):
++                        doc_name = doc_part.rsplit('.', 1)[0]
++                    
++                    if doc_name in self.env.all_docs:
++                        # Document exists, check if anchor exists in that document
++                        if anchor_part in std_domain.labels:
++                            target_docname, labelid, sectname = std_domain.labels[anchor_part]
++                            if target_docname == doc_name:
++                                return 'working', ''
++                        if anchor_part in std_domain.anonlabels:
++                            target_docname, labelid = std_domain.anonlabels[anchor_part]
++                            if target_docname == doc_name:
++                                return 'working', ''
++                        # Document exists but anchor doesn't
++                        return 'broken', f"Anchor '{anchor_part}' not found in document '{doc_name}'"
++                    else:
++                        return 'broken', f"Document '{doc_name}' not found"
++                
++                # Check if it's a document reference
++                if uri in self.env.all_docs:
++                    return 'working', ''
++                
++                # Check if it's a document with extension
++                if uri.endswith('.rst') or uri.endswith('.md'):
++                    doc_without_ext = uri.rsplit('.', 1)[0]
++                    if doc_without_ext in self.env.all_docs:
++                        return 'working', ''
++            
++            return 'broken', f"Reference target '{uri}' not found"
++
+     def check_thread(self) -> None:
+         kwargs = {
+             'allow_redirects': True,
+@@ -210,10 +285,12 @@ class CheckExternalLinksBuilder(Builder):
+ 
+         def check() -> Tuple[str, str, int]:
+             # check for various conditions without bothering the network
+-            if len(uri) == 0 or uri.startswith(('#', 'mailto:', 'ftp:')):
++            if len(uri) == 0 or uri.startswith(('mailto:', 'ftp:')):
+                 return 'unchecked', '', 0
+             elif not uri.startswith(('http:', 'https:')):
+-                return 'local', '', 0
++                # Check local links (including fragment-only links starting with #)
++                status, info = self.check_local_link(uri, docname)
++                return status, info, 0
+             elif uri in self.good:
+                 return 'working', 'old', 0
+             elif uri in self.broken:
+diff --git a/test_comprehensive_local_links.py b/test_comprehensive_local_links.py
+new file mode 100644
+index 000000000..d20edd9a0
+--- /dev/null
++++ b/test_comprehensive_local_links.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test script for local link checking functionality.
++"""
++
++import tempfile
++import os
++import shutil
++from pathlib import Path
++from sphinx.cmd.build import build_main
++
++def test_comprehensive_local_links():
++    """Test various types of local links."""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create source directory
++        srcdir = tmpdir / "source"
++        srcdir.mkdir()
++        
++        # Create output directory
++        outdir = tmpdir / "output"
++        outdir.mkdir()
++        
++        # Create conf.py
++        conf_content = '''
++master_doc = 'index'
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create a second document
++        other_content = '''
++Other Document
++==============
++
++.. _valid-target:
++
++This is a valid target.
++
++.. _another-valid-target:
++
++Another Valid Target
++--------------------
++
++This is another valid target.
++'''
++        (srcdir / "other.rst").write_text(other_content)
++        
++        # Create index.rst with various types of links
++        index_content = '''
++Test Document
++=============
++
++.. _existing-target:
++
++This document contains various types of links to test linkcheck functionality.
++
++Valid Links
++-----------
++
++* Link to existing target: existing-target_
++* Link to valid target in other doc: valid-target_
++* Link to another valid target: another-valid-target_
++* Link to other document: other_
++* Fragment link to existing target: `#existing-target`_
++
++Invalid Links
++-------------
++
++* Link to non-existent target: nonexistent-target_
++* Link to non-existent document: nonexistent_
++* Fragment link to non-existent target: `#nonexistent-fragment`_
++
++External Links (for comparison)
++-------------------------------
++
++* Valid external link: `Google <https://www.google.com>`_
++* Invalid external link: `Broken <https://lkfqhlkghflkhs>`_
++
++.. _existing-target: #existing-target
++.. _valid-target: other.rst#valid-target
++.. _another-valid-target: other.rst#another-valid-target
++.. _other: other.rst
++.. _nonexistent-target: nonexistent
++.. _nonexistent: nonexistent.rst
++'''
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Run linkcheck
++        print("Running comprehensive linkcheck test...")
++        result = build_main([
++            '-b', 'linkcheck',
++            '-E',  # don't use a saved environment
++            str(srcdir),
++            str(outdir)
++        ])
++        
++        # Read the output
++        output_file = outdir / "output.txt"
++        if output_file.exists():
++            output_content = output_file.read_text()
++            print("Linkcheck output:")
++            print(output_content)
++            print("=" * 50)
++            
++            lines = output_content.strip().split('\n')
++            
++            # Count different types of results
++            working_count = 0
++            broken_count = 0
++            local_count = 0
++            
++            expected_broken = ['nonexistent', 'nonexistent.rst', '#nonexistent-fragment', 'https://lkfqhlkghflkhs']
++            found_broken = []
++            
++            for line in lines:
++                if '[working]' in line or '[redirected]' in line:
++                    working_count += 1
++                elif '[broken]' in line:
++                    broken_count += 1
++                    # Extract the URI from the line
++                    parts = line.split(': [broken] ')
++                    if len(parts) > 1:
++                        uri_part = parts[1].split(':')[0]
++                        found_broken.append(uri_part)
++                elif '[local]' in line:
++                    local_count += 1
++            
++            print(f"Working links: {working_count}")
++            print(f"Broken links: {broken_count}")
++            print(f"Local links (unvalidated): {local_count}")
++            print(f"Found broken: {found_broken}")
++            
++            # Check that we found the expected broken links
++            success = True
++            for expected in expected_broken:
++                if not any(expected in broken for broken in found_broken):
++                    print(f"✗ Expected broken link '{expected}' not found")
++                    success = False
++                else:
++                    print(f"✓ Found expected broken link containing '{expected}'")
++            
++            # Check that we have no unvalidated local links
++            if local_count > 0:
++                print(f"✗ Found {local_count} unvalidated local links")
++                success = False
++            else:
++                print("✓ All local links were validated")
++            
++            return success
++        else:
++            print("✗ No output.txt file was created")
++            return False
++
++if __name__ == "__main__":
++    success = test_comprehensive_local_links()
++    if success:
++        print("\n✓ All tests passed! Local link checking is working correctly.")
++    else:
++        print("\n✗ Some tests failed.")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..21b608092
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python3
++"""
++Test script for edge cases in local link checking.
++"""
++
++import tempfile
++import os
++import shutil
++from pathlib import Path
++from sphinx.cmd.build import build_main
++
++def test_edge_cases():
++    """Test edge cases for local link checking."""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create source directory
++        srcdir = tmpdir / "source"
++        srcdir.mkdir()
++        
++        # Create output directory
++        outdir = tmpdir / "output"
++        outdir.mkdir()
++        
++        # Create conf.py
++        conf_content = '''
++master_doc = 'index'
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create a second document
++        other_content = '''
++Other Document
++==============
++
++.. _valid-label:
++
++This is a valid label.
++
++Section Title
++-------------
++
++This is a section.
++'''
++        (srcdir / "other.rst").write_text(other_content)
++        
++        # Create index.rst with various edge cases
++        index_content = '''
++Test Document
++=============
++
++.. _self-reference:
++
++Edge Cases for Local Link Checking
++-----------------------------------
++
++Valid Cases (should work):
++* Self-reference: self-reference_
++* Document reference: other_
++* Valid label in other doc: valid-label_
++* Empty fragment: `#`_
++* Fragment to self: `#self-reference`_
++
++Invalid Cases (should be broken):
++* Non-existent label: nonexistent-label_
++* Non-existent document: nonexistent-doc_
++* Non-existent fragment: `#nonexistent-fragment`_
++
++.. _self-reference: #self-reference
++.. _other: other.rst
++.. _valid-label: other.rst#valid-label
++.. _nonexistent-label: nonexistent
++.. _nonexistent-doc: nonexistent.rst
++'''
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Run linkcheck
++        print("Running edge case tests...")
++        result = build_main([
++            '-b', 'linkcheck',
++            '-E',  # don't use a saved environment
++            str(srcdir),
++            str(outdir)
++        ])
++        
++        # Read the output
++        output_file = outdir / "output.txt"
++        if output_file.exists():
++            output_content = output_file.read_text()
++            print("Linkcheck output:")
++            print(output_content)
++            print("=" * 50)
++            
++            lines = output_content.strip().split('\n')
++            
++            # Count results
++            broken_count = 0
++            working_count = 0
++            
++            expected_broken = ['nonexistent', 'nonexistent.rst', '#nonexistent-fragment']
++            found_broken = []
++            
++            for line in lines:
++                if '[broken]' in line:
++                    broken_count += 1
++                    # Extract the target
++                    parts = line.split(': [broken] ')
++                    if len(parts) > 1:
++                        target = parts[1].split(':')[0]
++                        found_broken.append(target)
++                elif '[working]' in line or 'ok' in line:
++                    working_count += 1
++            
++            print(f"Working links: {working_count}")
++            print(f"Broken links: {broken_count}")
++            print(f"Found broken targets: {found_broken}")
++            
++            # Check expectations
++            success = True
++            for expected in expected_broken:
++                if not any(expected in broken for broken in found_broken):
++                    print(f"✗ Expected broken target containing '{expected}' not found")
++                    success = False
++                else:
++                    print(f"✓ Found expected broken target containing '{expected}'")
++            
++            # Check that other.rst is working (not broken)
++            if not any('other.rst' in broken for broken in found_broken):
++                print("✓ Document reference 'other.rst' is working")
++            else:
++                print("✗ Document reference 'other.rst' should be working")
++                success = False
++            
++            return success
++        else:
++            print("✗ No output.txt file was created")
++            return False
++
++if __name__ == "__main__":
++    success = test_edge_cases()
++    if success:
++        print("\n✓ All edge case tests passed!")
++    else:
++        print("\n✗ Some edge case tests failed.")
+\ No newline at end of file
+diff --git a/test_issue_reproduction.py b/test_issue_reproduction.py
+new file mode 100644
+index 000000000..5adcffa41
+--- /dev/null
++++ b/test_issue_reproduction.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++"""
++Test script that reproduces the exact issue from the GitHub issue description.
++"""
++
++import tempfile
++import os
++import shutil
++from pathlib import Path
++from sphinx.cmd.build import build_main
++
++def test_issue_reproduction():
++    """Test that reproduces the exact issue from the GitHub issue description."""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create source directory
++        srcdir = tmpdir / "source"
++        srcdir.mkdir()
++        
++        # Create output directory
++        outdir = tmpdir / "output"
++        outdir.mkdir()
++        
++        # Create conf.py (minimal configuration)
++        conf_content = '''
++master_doc = 'index'
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create index.rst with the exact content from the issue
++        index_content = '''broken external-link_
++broken local-link_
++
++.. _external-link: https://lkfqhlkghflkhs
++.. _local-link: doesntexist
++'''
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Run linkcheck
++        print("Running linkcheck on the exact issue reproduction...")
++        result = build_main([
++            '-b', 'linkcheck',
++            '-E',  # don't use a saved environment
++            str(srcdir),
++            str(outdir)
++        ])
++        
++        # Read the output
++        output_file = outdir / "output.txt"
++        if output_file.exists():
++            output_content = output_file.read_text()
++            print("Linkcheck output:")
++            print(output_content)
++            print("=" * 50)
++            
++            lines = output_content.strip().split('\n')
++            
++            # Check that both links are reported as broken
++            external_broken = False
++            local_broken = False
++            
++            for line in lines:
++                if '[broken]' in line:
++                    if 'https://lkfqhlkghflkhs' in line:
++                        external_broken = True
++                        print("✓ External broken link detected")
++                    elif 'doesntexist' in line:
++                        local_broken = True
++                        print("✓ Local broken link detected")
++            
++            # Verify both are broken
++            if external_broken and local_broken:
++                print("\n✓ SUCCESS: Both external and local broken links are now detected!")
++                print("✓ The issue has been fixed!")
++                return True
++            else:
++                print(f"\n✗ FAILURE: external_broken={external_broken}, local_broken={local_broken}")
++                return False
++        else:
++            print("✗ No output.txt file was created")
++            return False
++
++if __name__ == "__main__":
++    success = test_issue_reproduction()
++    if success:
++        print("\n🎉 The GitHub issue has been successfully resolved!")
++    else:
++        print("\n❌ The issue is not yet resolved.")
+\ No newline at end of file
+diff --git a/test_local_links.py b/test_local_links.py
+new file mode 100644
+index 000000000..f7a05fc98
+--- /dev/null
++++ b/test_local_links.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the local link checking issue.
++"""
++
++import tempfile
++import os
++import shutil
++from pathlib import Path
++from sphinx.cmd.build import build_main
++
++def test_local_link_checking():
++    """Test that reproduces the issue with local link checking."""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create source directory
++        srcdir = tmpdir / "source"
++        srcdir.mkdir()
++        
++        # Create output directory
++        outdir = tmpdir / "output"
++        outdir.mkdir()
++        
++        # Create conf.py
++        conf_content = '''
++master_doc = 'index'
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create index.rst with broken external and local links
++        index_content = '''
++Test Document
++=============
++
++This document contains broken links to test linkcheck functionality.
++
++broken external-link_
++broken local-link_
++
++.. _external-link: https://lkfqhlkghflkhs
++.. _local-link: doesntexist
++'''
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Run linkcheck
++        print("Running linkcheck...")
++        result = build_main([
++            '-b', 'linkcheck',
++            '-E',  # don't use a saved environment
++            str(srcdir),
++            str(outdir)
++        ])
++        
++        # Read the output
++        output_file = outdir / "output.txt"
++        if output_file.exists():
++            output_content = output_file.read_text()
++            print("Linkcheck output:")
++            print(output_content)
++            print("=" * 50)
++            
++            # Check if local link was checked and reported as broken
++            lines = output_content.strip().split('\n')
++            local_link_line = None
++            for line in lines:
++                if "doesntexist" in line:
++                    local_link_line = line
++                    break
++            
++            if local_link_line:
++                print(f"Found local link line: {local_link_line}")
++                if "[broken]" in local_link_line:
++                    print("✓ Local link was checked and reported as broken")
++                    return True
++                elif "[local]" in local_link_line:
++                    print("✗ Local link was detected but not validated (marked as [local] instead of [broken])")
++                    return False
++                else:
++                    print("✗ Local link was found but status is unclear")
++                    return False
++            else:
++                print("✗ Local link 'doesntexist' was not found in output")
++                return False
++        else:
++            print("✗ No output.txt file was created")
++            return False
++
++if __name__ == "__main__":
++    success = test_local_link_checking()
++    if not success:
++        print("\nThe issue is reproduced: local links are not being checked!")
++    else:
++        print("\nLocal links are being checked correctly!")
+\ No newline at end of file
+diff --git a/test_simple_local_links.py b/test_simple_local_links.py
+new file mode 100644
+index 000000000..c2e8e5da8
+--- /dev/null
++++ b/test_simple_local_links.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""
++Simple test script for local link checking functionality.
++"""
++
++import tempfile
++import os
++import shutil
++from pathlib import Path
++from sphinx.cmd.build import build_main
++
++def test_simple_local_links():
++    """Test basic local link functionality."""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create source directory
++        srcdir = tmpdir / "source"
++        srcdir.mkdir()
++        
++        # Create output directory
++        outdir = tmpdir / "output"
++        outdir.mkdir()
++        
++        # Create conf.py
++        conf_content = '''
++master_doc = 'index'
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create a second document
++        other_content = '''
++Other Document
++==============
++
++.. _valid-target:
++
++This is a valid target.
++'''
++        (srcdir / "other.rst").write_text(other_content)
++        
++        # Create index.rst with various types of links
++        index_content = '''
++Test Document
++=============
++
++.. _existing-target:
++
++This document contains various types of links.
++
++Valid Links
++-----------
++
++* Link to existing target: existing-target_
++* Link to other document: other_
++
++Invalid Links
++-------------
++
++* Link to non-existent target: nonexistent-target_
++* Link to non-existent document: nonexistent_
++
++External Links (for comparison)
++-------------------------------
++
++* Invalid external link: `Broken <https://lkfqhlkghflkhs>`_
++
++.. _existing-target: #existing-target
++.. _other: other.rst
++.. _nonexistent-target: nonexistent
++.. _nonexistent: nonexistent.rst
++'''
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Run linkcheck
++        print("Running simple linkcheck test...")
++        result = build_main([
++            '-b', 'linkcheck',
++            '-E',  # don't use a saved environment
++            str(srcdir),
++            str(outdir)
++        ])
++        
++        # Read the output
++        output_file = outdir / "output.txt"
++        if output_file.exists():
++            output_content = output_file.read_text()
++            print("Linkcheck output:")
++            print(output_content)
++            print("=" * 50)
++            
++            lines = output_content.strip().split('\n')
++            
++            # Check specific expectations
++            broken_links = []
++            working_links = []
++            
++            for line in lines:
++                if '[broken]' in line:
++                    # Extract the URI
++                    parts = line.split(': [broken] ')
++                    if len(parts) > 1:
++                        uri = parts[1].split(':')[0]
++                        broken_links.append(uri)
++                elif '[working]' in line or 'ok' in line:
++                    working_links.append(line)
++            
++            print(f"Broken links found: {broken_links}")
++            print(f"Working links: {len(working_links)}")
++            
++            # Verify expectations
++            expected_broken = ['nonexistent', 'nonexistent.rst', 'https']
++            success = True
++            
++            for expected in expected_broken:
++                if not any(expected in broken for broken in broken_links):
++                    print(f"✗ Expected broken link containing '{expected}' not found")
++                    success = False
++                else:
++                    print(f"✓ Found expected broken link containing '{expected}'")
++            
++            # Check that other.rst is working (it should not be in broken links)
++            if 'other.rst' not in broken_links:
++                print("✓ Document reference 'other.rst' is working (not in broken links)")
++            else:
++                print("✗ Document reference 'other.rst' should be working")
++                success = False
++            
++            return success
++        else:
++            print("✗ No output.txt file was created")
++            return False
++
++if __name__ == "__main__":
++    success = test_simple_local_links()
++    if success:
++        print("\n✓ Simple test passed! Local link checking is working correctly.")
++    else:
++        print("\n✗ Simple test failed.")
+\ No newline at end of file
+diff --git a/test_valid_local_links.py b/test_valid_local_links.py
+new file mode 100644
+index 000000000..d80437eb3
+--- /dev/null
++++ b/test_valid_local_links.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Test script for valid local links to ensure they're not incorrectly marked as broken.
++"""
++
++import tempfile
++import os
++import shutil
++from pathlib import Path
++from sphinx.cmd.build import build_main
++
++def test_valid_local_links():
++    """Test that valid local links are correctly identified as working."""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create source directory
++        srcdir = tmpdir / "source"
++        srcdir.mkdir()
++        
++        # Create output directory
++        outdir = tmpdir / "output"
++        outdir.mkdir()
++        
++        # Create conf.py
++        conf_content = '''
++master_doc = 'index'
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create a second document
++        other_content = '''
++Other Document
++==============
++
++.. _valid-target:
++
++This is a valid target.
++
++Another Section
++---------------
++
++This is another section.
++'''
++        (srcdir / "other.rst").write_text(other_content)
++        
++        # Create index.rst with valid local links
++        index_content = '''
++Test Document
++=============
++
++.. _existing-target:
++
++This document tests valid local links.
++
++Valid Local Links
++-----------------
++
++* Link to existing target: existing-target_
++* Link to other document: other_
++* Link to valid target in other doc: valid-target_
++
++.. _existing-target: #existing-target
++.. _other: other.rst
++.. _valid-target: other.rst#valid-target
++'''
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Run linkcheck
++        print("Running valid local links test...")
++        result = build_main([
++            '-b', 'linkcheck',
++            '-E',  # don't use a saved environment
++            str(srcdir),
++            str(outdir)
++        ])
++        
++        # Read the output
++        output_file = outdir / "output.txt"
++        if output_file.exists():
++            output_content = output_file.read_text()
++            print("Linkcheck output:")
++            print(output_content)
++            print("=" * 50)
++            
++            # Check that there are no broken links
++            if '[broken]' in output_content:
++                print("✗ Found broken links when all should be valid:")
++                for line in output_content.split('\n'):
++                    if '[broken]' in line:
++                        print(f"  {line}")
++                return False
++            else:
++                print("✓ No broken links found - all valid local links are working correctly!")
++                return True
++        else:
++            print("✗ No output.txt file was created")
++            return False
++
++if __name__ == "__main__":
++    success = test_valid_local_links()
++    if success:
++        print("\n✓ Valid local links test passed!")
++    else:
++        print("\n✗ Valid local links test failed.")
+\ No newline at end of file

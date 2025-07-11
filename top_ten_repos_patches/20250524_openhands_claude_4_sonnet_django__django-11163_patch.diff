@@ -1,0 +1,646 @@
+diff --git a/check_datetime_fields.py b/check_datetime_fields.py
+new file mode 100644
+index 0000000000..4373a36f5d
+--- /dev/null
++++ b/check_datetime_fields.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python
++"""
++Check if auto_now and auto_now_add fields are editable by default.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class TestModel(models.Model):
++    title = models.CharField(max_length=200)
++    created_at = models.DateTimeField(auto_now_add=True)
++    updated_at = models.DateTimeField(auto_now=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Check field properties
++for field in TestModel._meta.fields:
++    print(f"Field: {field.name}, Editable: {field.editable}")
+\ No newline at end of file
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..e10baeb0a8
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,212 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for model_to_dict() fix to ensure no regressions.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import model_to_dict
++
++
++# Define test models with various field types
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    email = models.EmailField()
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++
++class ComplexModel(models.Model):
++    title = models.CharField(max_length=200)
++    content = models.TextField()
++    published = models.BooleanField(default=False)
++    created_at = models.DateTimeField(auto_now_add=True)
++    updated_at = models.DateTimeField(auto_now=True)
++    # Non-editable field
++    internal_id = models.CharField(max_length=50, editable=False)
++    
++    class Meta:
++        app_label = 'test'
++
++
++def run_comprehensive_tests():
++    """Run comprehensive tests for model_to_dict"""
++    print("Running comprehensive model_to_dict tests...")
++    
++    # Create tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++        schema_editor.create_model(ComplexModel)
++    
++    # Create test instances
++    simple = SimpleModel.objects.create(name="John", email="john@test.com", age=25)
++    complex_obj = ComplexModel.objects.create(
++        title="Test Article", 
++        content="Test content", 
++        published=True,
++        internal_id="internal123"
++    )
++    
++    tests_passed = 0
++    tests_total = 0
++    
++    def test_case(description, expected, actual):
++        nonlocal tests_passed, tests_total
++        tests_total += 1
++        if expected == actual:
++            print(f"✅ {description}")
++            tests_passed += 1
++        else:
++            print(f"❌ {description}")
++            print(f"   Expected: {expected}")
++            print(f"   Actual: {actual}")
++    
++    # Test 1: Default behavior (no parameters)
++    result = model_to_dict(simple)
++    expected_keys = {'id', 'name', 'email', 'age'}
++    test_case(
++        "Default behavior - all editable fields",
++        expected_keys,
++        set(result.keys())
++    )
++    
++    # Test 2: fields=None (explicit None)
++    result = model_to_dict(simple, fields=None)
++    test_case(
++        "fields=None - all editable fields",
++        expected_keys,
++        set(result.keys())
++    )
++    
++    # Test 3: fields=[] (empty list) - THE FIX
++    result = model_to_dict(simple, fields=[])
++    test_case(
++        "fields=[] - empty dict",
++        set(),
++        set(result.keys())
++    )
++    
++    # Test 4: fields with specific field names
++    result = model_to_dict(simple, fields=['name', 'email'])
++    test_case(
++        "fields=['name', 'email'] - specific fields",
++        {'name', 'email'},
++        set(result.keys())
++    )
++    
++    # Test 5: fields with single field
++    result = model_to_dict(simple, fields=['name'])
++    test_case(
++        "fields=['name'] - single field",
++        {'name'},
++        set(result.keys())
++    )
++    
++    # Test 6: exclude parameter
++    result = model_to_dict(simple, exclude=['age'])
++    test_case(
++        "exclude=['age'] - exclude specific field",
++        {'id', 'name', 'email'},
++        set(result.keys())
++    )
++    
++    # Test 7: exclude=[] (empty exclude list)
++    result = model_to_dict(simple, exclude=[])
++    test_case(
++        "exclude=[] - no exclusions",
++        {'id', 'name', 'email', 'age'},
++        set(result.keys())
++    )
++    
++    # Test 8: Both fields and exclude
++    result = model_to_dict(simple, fields=['name', 'email', 'age'], exclude=['age'])
++    test_case(
++        "fields=['name', 'email', 'age'], exclude=['age'] - exclude takes precedence",
++        {'name', 'email'},
++        set(result.keys())
++    )
++    
++    # Test 9: fields=[] with exclude (should still be empty)
++    result = model_to_dict(simple, fields=[], exclude=['name'])
++    test_case(
++        "fields=[], exclude=['name'] - empty fields overrides exclude",
++        set(),
++        set(result.keys())
++    )
++    
++    # Test 10: Complex model with non-editable fields
++    result = model_to_dict(complex_obj)
++    # internal_id, created_at, updated_at should not be included because they're not editable
++    expected_complex_keys = {'id', 'title', 'content', 'published'}
++    test_case(
++        "Complex model - non-editable fields excluded",
++        expected_complex_keys,
++        set(result.keys())
++    )
++    
++    # Test 11: Complex model with fields=[]
++    result = model_to_dict(complex_obj, fields=[])
++    test_case(
++        "Complex model with fields=[] - empty dict",
++        set(),
++        set(result.keys())
++    )
++    
++    # Test 12: Non-existent field in fields list (should not crash)
++    result = model_to_dict(simple, fields=['name', 'nonexistent'])
++    test_case(
++        "fields with non-existent field - only existing fields",
++        {'name'},
++        set(result.keys())
++    )
++    
++    # Test 13: Verify actual values are correct
++    result = model_to_dict(simple, fields=['name', 'age'])
++    expected_values = {'name': 'John', 'age': 25}
++    test_case(
++        "Verify field values are correct",
++        expected_values,
++        result
++    )
++    
++    print(f"\n{'='*60}")
++    print(f"TEST SUMMARY: {tests_passed}/{tests_total} tests passed")
++    print(f"{'='*60}")
++    
++    if tests_passed == tests_total:
++        print("🎉 All tests passed! The fix is working correctly.")
++        return True
++    else:
++        print("❌ Some tests failed. There may be issues with the fix.")
++        return False
++
++
++if __name__ == "__main__":
++    success = run_comprehensive_tests()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/django/forms/models.py b/django/forms/models.py
+index d157c291ef..5edbbd376f 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -83,7 +83,7 @@ def model_to_dict(instance, fields=None, exclude=None):
+     for f in chain(opts.concrete_fields, opts.private_fields, opts.many_to_many):
+         if not getattr(f, 'editable', False):
+             continue
+-        if fields and f.name not in fields:
++        if fields is not None and f.name not in fields:
+             continue
+         if exclude and f.name in exclude:
+             continue
+diff --git a/test_model_to_dict_fields_empty.py b/test_model_to_dict_fields_empty.py
+new file mode 100644
+index 0000000000..09d00883bb
+--- /dev/null
++++ b/test_model_to_dict_fields_empty.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python
++"""
++Test case for model_to_dict() with fields=[] that can be added to Django's test suite.
++This test ensures that model_to_dict(instance, fields=[]) returns an empty dict.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import model_to_dict
++from django.test import TestCase
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    email = models.EmailField()
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++
++class ModelToDictFieldsEmptyTest(TestCase):
++    """Test model_to_dict() with fields=[] parameter."""
++    
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        # Create the table
++        from django.db import connection
++        from django.db import transaction
++        with transaction.atomic():
++            with connection.schema_editor() as schema_editor:
++                schema_editor.create_model(TestModel)
++    
++    def setUp(self):
++        self.instance = TestModel.objects.create(
++            name="John Doe",
++            email="john@example.com", 
++            age=30
++        )
++    
++    def test_model_to_dict_with_empty_fields_list(self):
++        """model_to_dict(instance, fields=[]) should return empty dict."""
++        result = model_to_dict(self.instance, fields=[])
++        self.assertEqual(result, {})
++    
++    def test_model_to_dict_with_none_fields(self):
++        """model_to_dict(instance, fields=None) should return all fields."""
++        result = model_to_dict(self.instance, fields=None)
++        expected_keys = {'id', 'name', 'email', 'age'}
++        self.assertEqual(set(result.keys()), expected_keys)
++    
++    def test_model_to_dict_with_specific_fields(self):
++        """model_to_dict(instance, fields=['name']) should return only specified fields."""
++        result = model_to_dict(self.instance, fields=['name'])
++        self.assertEqual(result, {'name': 'John Doe'})
++    
++    def test_model_to_dict_with_empty_fields_and_exclude(self):
++        """model_to_dict(instance, fields=[], exclude=['name']) should return empty dict."""
++        result = model_to_dict(self.instance, fields=[], exclude=['name'])
++        self.assertEqual(result, {})
++
++
++if __name__ == "__main__":
++    # Run the test
++    import unittest
++    
++    # Create test suite
++    suite = unittest.TestLoader().loadTestsFromTestCase(ModelToDictFieldsEmptyTest)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    
++    # Exit with appropriate code
++    sys.exit(0 if result.wasSuccessful() else 1)
+\ No newline at end of file
+diff --git a/test_model_to_dict_issue.py b/test_model_to_dict_issue.py
+new file mode 100644
+index 0000000000..47b951eccd
+--- /dev/null
++++ b/test_model_to_dict_issue.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the model_to_dict() issue with empty fields list.
++
++The issue: model_to_dict(instance, fields=[]) should return an empty dict,
++but currently returns all fields due to the condition `if fields` being False
++for empty lists.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import model_to_dict
++
++
++# Define a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    email = models.EmailField()
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++
++def test_model_to_dict_with_empty_fields():
++    """Test model_to_dict with fields=[]"""
++    print("Testing model_to_dict() with empty fields list...")
++    
++    # Create the table (since we're using in-memory SQLite)
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create a test instance
++    instance = TestModel(name="John Doe", email="john@example.com", age=30)
++    instance.save()
++    
++    print(f"Created instance: {instance}")
++    print(f"Instance fields: name='{instance.name}', email='{instance.email}', age={instance.age}")
++    
++    # Test 1: model_to_dict with no parameters (should return all fields)
++    result_all = model_to_dict(instance)
++    print(f"\nTest 1 - model_to_dict(instance): {result_all}")
++    print(f"Number of fields returned: {len(result_all)}")
++    
++    # Test 2: model_to_dict with fields=None (should return all fields)
++    result_none = model_to_dict(instance, fields=None)
++    print(f"\nTest 2 - model_to_dict(instance, fields=None): {result_none}")
++    print(f"Number of fields returned: {len(result_none)}")
++    
++    # Test 3: model_to_dict with fields=[] (ISSUE: should return empty dict)
++    result_empty = model_to_dict(instance, fields=[])
++    print(f"\nTest 3 - model_to_dict(instance, fields=[]): {result_empty}")
++    print(f"Number of fields returned: {len(result_empty)}")
++    
++    # Test 4: model_to_dict with specific fields
++    result_specific = model_to_dict(instance, fields=['name', 'email'])
++    print(f"\nTest 4 - model_to_dict(instance, fields=['name', 'email']): {result_specific}")
++    print(f"Number of fields returned: {len(result_specific)}")
++    
++    # Test 5: model_to_dict with exclude parameter
++    result_exclude = model_to_dict(instance, exclude=['age'])
++    print(f"\nTest 5 - model_to_dict(instance, exclude=['age']): {result_exclude}")
++    print(f"Number of fields returned: {len(result_exclude)}")
++    
++    # Check if the issue exists
++    print("\n" + "="*60)
++    print("ISSUE ANALYSIS:")
++    print("="*60)
++    
++    if len(result_empty) == 0:
++        print("✅ PASS: model_to_dict(instance, fields=[]) correctly returns empty dict")
++    else:
++        print("❌ FAIL: model_to_dict(instance, fields=[]) should return empty dict")
++        print(f"   Expected: {{}}")
++        print(f"   Actual: {result_empty}")
++        print("   This confirms the bug exists!")
++    
++    return len(result_empty) == 0
++
++
++def test_edge_cases():
++    """Test additional edge cases"""
++    print("\n" + "="*60)
++    print("EDGE CASE TESTS:")
++    print("="*60)
++    
++    # Create a test instance
++    instance = TestModel.objects.first()
++    
++    # Test with empty exclude list
++    result_empty_exclude = model_to_dict(instance, exclude=[])
++    print(f"model_to_dict(instance, exclude=[]): {len(result_empty_exclude)} fields")
++    
++    # Test with both fields=[] and exclude=[]
++    result_both_empty = model_to_dict(instance, fields=[], exclude=[])
++    print(f"model_to_dict(instance, fields=[], exclude=[]): {len(result_both_empty)} fields")
++    
++    # Test with fields=[] and exclude with some fields
++    result_fields_empty_exclude_some = model_to_dict(instance, fields=[], exclude=['name'])
++    print(f"model_to_dict(instance, fields=[], exclude=['name']): {len(result_fields_empty_exclude_some)} fields")
++
++
++if __name__ == "__main__":
++    print("Model to Dict Issue Reproduction Script")
++    print("="*60)
++    
++    try:
++        success = test_model_to_dict_with_empty_fields()
++        test_edge_cases()
++        
++        print("\n" + "="*60)
++        print("SUMMARY:")
++        print("="*60)
++        if success:
++            print("✅ All tests passed - no issue detected")
++        else:
++            print("❌ Issue confirmed - model_to_dict(instance, fields=[]) does not return empty dict")
++            
++    except Exception as e:
++        print(f"Error running tests: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_model_to_dict_regression.py b/test_model_to_dict_regression.py
+new file mode 100644
+index 0000000000..c2bedf112d
+--- /dev/null
++++ b/test_model_to_dict_regression.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python
++"""
++Simple test for the model_to_dict() fix without complex Django test setup.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import model_to_dict
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    email = models.EmailField()
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test'
++
++
++def test_model_to_dict_regression():
++    """Test the specific regression: model_to_dict(instance, fields=[]) should return {}"""
++    
++    # Create the table
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create test instance
++    instance = TestModel.objects.create(
++        name="John Doe",
++        email="john@example.com", 
++        age=30
++    )
++    
++    # Test the specific regression case
++    result = model_to_dict(instance, fields=[])
++    expected = {}
++    
++    print(f"model_to_dict(instance, fields=[]): {result}")
++    print(f"Expected: {expected}")
++    
++    if result == expected:
++        print("✅ PASS: Regression test passed!")
++        return True
++    else:
++        print("❌ FAIL: Regression test failed!")
++        return False
++
++
++if __name__ == "__main__":
++    success = test_model_to_dict_regression()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/tests/model_forms/tests.py b/tests/model_forms/tests.py
+index f4f3169bc1..b80e6cde24 100644
+--- a/tests/model_forms/tests.py
++++ b/tests/model_forms/tests.py
+@@ -2912,3 +2912,22 @@ class ModelToDictTests(TestCase):
+         # If data were a QuerySet, it would be reevaluated here and give "red"
+         # instead of the original value.
+         self.assertEqual(data, [blue])
++
++    def test_model_to_dict_with_empty_fields_list(self):
++        """model_to_dict() with fields=[] should return an empty dict."""
++        writer = Writer.objects.create(name='John Doe')
++        
++        # Test the specific regression: fields=[] should return empty dict
++        result = model_to_dict(writer, fields=[])
++        self.assertEqual(result, {})
++        
++        # Ensure other cases still work correctly
++        result_all = model_to_dict(writer)
++        self.assertIn('name', result_all)
++        self.assertIn('id', result_all)
++        
++        result_specific = model_to_dict(writer, fields=['name'])
++        self.assertEqual(result_specific, {'name': 'John Doe'})
++        
++        result_none = model_to_dict(writer, fields=None)
++        self.assertEqual(result_none, result_all)

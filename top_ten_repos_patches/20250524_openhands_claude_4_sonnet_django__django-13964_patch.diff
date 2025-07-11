@@ -1,0 +1,448 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..4843cfd521
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,175 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the foreign key fix with different primary key types.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import transaction, models
++import uuid
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.model_fields',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from tests.model_fields.models import PrimaryKeyCharModel, FkToChar, PrimaryKeyUUIDModel, RelatedToUUIDModel
++
++def test_charfield_pk():
++    """Test with CharField primary key (original issue)."""
++    print("=== Testing CharField Primary Key ===")
++    
++    # Clear data
++    FkToChar.objects.all().delete()
++    PrimaryKeyCharModel.objects.all().delete()
++    
++    try:
++        with transaction.atomic():
++            order = FkToChar()
++            product = PrimaryKeyCharModel()
++            
++            # Assign before setting PK
++            order.out = product
++            print(f"   After assignment: order.out_id = {repr(order.out_id)}")
++            
++            # Set PK and save
++            product.string = "test-sku"
++            product.save()
++            print(f"   After product.save(): order.out_id = {repr(order.out_id)}")
++            
++            order.save()
++            print(f"   After order.save(): order.out_id = {repr(order.out_id)}")
++            
++            # Verify database state
++            assert FkToChar.objects.filter(out=product).exists()
++            assert not FkToChar.objects.filter(out_id="").exists()
++            print("   ✅ CharField PK test passed")
++            
++    except Exception as e:
++        print(f"   ❌ CharField PK test failed: {e}")
++
++def test_uuid_pk():
++    """Test with UUID primary key."""
++    print("\n=== Testing UUID Primary Key ===")
++    
++    # Clear data
++    RelatedToUUIDModel.objects.all().delete()
++    PrimaryKeyUUIDModel.objects.all().delete()
++    
++    try:
++        with transaction.atomic():
++            related = RelatedToUUIDModel()
++            uuid_obj = PrimaryKeyUUIDModel()
++            
++            # Assign before setting PK
++            related.uuid_fk = uuid_obj
++            print(f"   After assignment: related.uuid_fk_id = {repr(related.uuid_fk_id)}")
++            
++            # Set PK and save
++            test_uuid = uuid.uuid4()
++            uuid_obj.id = test_uuid
++            uuid_obj.save()
++            print(f"   After uuid_obj.save(): related.uuid_fk_id = {repr(related.uuid_fk_id)}")
++            
++            related.save()
++            print(f"   After related.save(): related.uuid_fk_id = {repr(related.uuid_fk_id)}")
++            
++            # Verify database state
++            assert RelatedToUUIDModel.objects.filter(uuid_fk=uuid_obj).exists()
++            assert related.uuid_fk_id == test_uuid
++            print("   ✅ UUID PK test passed")
++            
++    except Exception as e:
++        print(f"   ❌ UUID PK test failed: {e}")
++
++def test_none_case():
++    """Test that None case still works (backward compatibility)."""
++    print("\n=== Testing None Case (Backward Compatibility) ===")
++    
++    # Clear data
++    FkToChar.objects.all().delete()
++    PrimaryKeyCharModel.objects.all().delete()
++    
++    try:
++        with transaction.atomic():
++            order = FkToChar()
++            product = PrimaryKeyCharModel(string="existing-sku")
++            product.save()
++            
++            # Set foreign key to None explicitly
++            order.out_id = None
++            order.out = product  # This should update the foreign key
++            
++            print(f"   After assignment: order.out_id = {repr(order.out_id)}")
++            
++            order.save()
++            print(f"   After order.save(): order.out_id = {repr(order.out_id)}")
++            
++            # Verify database state
++            assert FkToChar.objects.filter(out=product).exists()
++            assert order.out_id == "existing-sku"
++            print("   ✅ None case test passed")
++            
++    except Exception as e:
++        print(f"   ❌ None case test failed: {e}")
++
++def test_pk_change_after_assignment():
++    """Test that foreign key updates when related object's PK changes."""
++    print("\n=== Testing PK Change After Assignment ===")
++    
++    # Clear data
++    FkToChar.objects.all().delete()
++    PrimaryKeyCharModel.objects.all().delete()
++    
++    try:
++        with transaction.atomic():
++            order = FkToChar()
++            product = PrimaryKeyCharModel(string="initial-sku")
++            product.save()
++            
++            # Assign with existing PK
++            order.out = product
++            print(f"   After assignment: order.out_id = {repr(order.out_id)}")
++            
++            # Change the PK
++            product.string = "changed-sku"
++            product.save()
++            print(f"   After PK change: order.out_id = {repr(order.out_id)}")
++            
++            order.save()
++            print(f"   After order.save(): order.out_id = {repr(order.out_id)}")
++            
++            # Verify the foreign key was updated
++            assert order.out_id == "changed-sku"
++            print("   ✅ PK change test passed")
++            
++    except Exception as e:
++        print(f"   ❌ PK change test failed: {e}")
++
++if __name__ == "__main__":
++    # Create the database tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    test_charfield_pk()
++    test_uuid_pk()
++    test_none_case()
++    test_pk_change_after_assignment()
++    
++    print("\n🎉 All tests completed!")
+\ No newline at end of file
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..994f4d592b
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python
++"""
++Debug script to understand what's happening with the foreign key update.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import transaction
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.model_fields',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from tests.model_fields.models import PrimaryKeyCharModel, FkToChar
++
++def debug_fk_update():
++    """Debug the foreign key update process."""
++    print("=== Debugging Foreign Key Update ===")
++    
++    # Clear data
++    FkToChar.objects.all().delete()
++    PrimaryKeyCharModel.objects.all().delete()
++    
++    # Create related object without primary key
++    char_model = PrimaryKeyCharModel()
++    print(f"1. Created char_model, pk = {repr(char_model.pk)}")
++    
++    # Create object and assign related object before PK is set
++    fk_model = FkToChar()
++    print(f"2. Created fk_model, out_id = {repr(fk_model.out_id)}")
++    
++    fk_model.out = char_model
++    print(f"3. After assignment, fk_model.out_id = {repr(fk_model.out_id)}")
++    print(f"   char_model.pk = {repr(char_model.pk)}")
++    
++    # Set the primary key on the related object
++    char_model.string = 'test-pk'
++    print(f"4. After setting string, char_model.pk = {repr(char_model.pk)}")
++    print(f"   fk_model.out_id = {repr(fk_model.out_id)}")
++    
++    char_model.save()
++    print(f"5. After char_model.save(), char_model.pk = {repr(char_model.pk)}")
++    print(f"   fk_model.out_id = {repr(fk_model.out_id)}")
++    
++    # Check if the related object is cached
++    print(f"6. fk_model.out = {repr(fk_model.out)}")
++    print(f"   fk_model.out.pk = {repr(fk_model.out.pk)}")
++    
++    # Save the object with foreign key
++    print("7. About to save fk_model...")
++    fk_model.save()
++    print(f"8. After fk_model.save(), fk_model.out_id = {repr(fk_model.out_id)}")
++
++if __name__ == "__main__":
++    # Create the database tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    debug_fk_update()
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 2428218696..7681fdf99e 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -915,10 +915,21 @@ class Model(metaclass=ModelBase):
+         for field in self._meta.concrete_fields:
+             # If the related field isn't cached, then an instance hasn't been
+             # assigned and there's no need to worry about this check.
+-            if field.is_relation and field.is_cached(self):
+-                obj = getattr(self, field.name, None)
++            if field.is_relation:
++                # Check if field is cached or if we can get the related object
++                obj = None
++                if field.is_cached(self):
++                    obj = getattr(self, field.name, None)
++                elif hasattr(self, field.name):
++                    # Try to get the related object even if not cached
++                    try:
++                        obj = getattr(self, field.name, None)
++                    except Exception:
++                        obj = None
++
+                 if not obj:
+                     continue
++
+                 # A pk may have been assigned manually to a model instance not
+                 # saved to the database (or auto-generated in a case like
+                 # UUIDField), but we allow the save to proceed and rely on the
+@@ -933,7 +944,7 @@ class Model(metaclass=ModelBase):
+                         "%s() prohibited to prevent data loss due to unsaved "
+                         "related object '%s'." % (operation_name, field.name)
+                     )
+-                elif getattr(self, field.attname) is None:
++                elif obj.pk is not None and getattr(self, field.attname) != obj.pk:
+                     # Use pk from related object if it has been saved after
+                     # an assignment.
+                     setattr(self, field.attname, obj.pk)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a31695dbe1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,126 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the foreign key issue with non-numeric primary keys.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import transaction
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.model_fields',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from tests.model_fields.models import PrimaryKeyCharModel, FkToChar
++
++def test_issue_reproduction():
++    """Test case that reproduces the issue described in the bug report."""
++    print("=== Testing Foreign Key Issue with Non-Numeric Primary Key ===")
++    
++    # Clear any existing data
++    FkToChar.objects.all().delete()
++    PrimaryKeyCharModel.objects.all().delete()
++    
++    print("\n1. Testing the problematic case (setting PK after assignment):")
++    
++    try:
++        with transaction.atomic():
++            # Create an Order-like object (FkToChar)
++            order = FkToChar()
++            
++            # Create a Product-like object (PrimaryKeyCharModel) without setting PK
++            product = PrimaryKeyCharModel()
++            
++            # Assign the product to the order BEFORE setting the primary key
++            order.out = product
++            print(f"   After assignment, order.out_id = {repr(order.out_id)}")
++            
++            # Now set the primary key on the product
++            product.string = "foo"
++            print(f"   After setting product.string = 'foo', order.out_id = {repr(order.out_id)}")
++            
++            # Save the product first
++            product.save()
++            print(f"   After product.save(), order.out_id = {repr(order.out_id)}")
++            
++            # Save the order
++            order.save()
++            print(f"   After order.save(), order.out_id = {repr(order.out_id)}")
++            
++            # Check what's in the database
++            empty_string_exists = FkToChar.objects.filter(out_id="").exists()
++            correct_relation_exists = FkToChar.objects.filter(out=product).exists()
++            
++            print(f"   FkToChar.objects.filter(out_id='').exists() = {empty_string_exists}")
++            print(f"   FkToChar.objects.filter(out=product).exists() = {correct_relation_exists}")
++            
++            if empty_string_exists:
++                print("   ❌ ISSUE REPRODUCED: Foreign key field contains empty string!")
++            else:
++                print("   ✅ Issue not reproduced - foreign key field is correct")
++                
++    except Exception as e:
++        print(f"   Exception occurred: {e}")
++    
++    print("\n2. Testing the working case (setting PK before assignment):")
++    
++    # Clear data again
++    FkToChar.objects.all().delete()
++    PrimaryKeyCharModel.objects.all().delete()
++    
++    try:
++        with transaction.atomic():
++            # Create an Order-like object (FkToChar)
++            order2 = FkToChar()
++            
++            # Create a Product-like object WITH the primary key set
++            product2 = PrimaryKeyCharModel(string="bar")
++            
++            # Assign the product to the order AFTER setting the primary key
++            order2.out = product2
++            print(f"   After assignment, order2.out_id = {repr(order2.out_id)}")
++            
++            # Save the product first
++            product2.save()
++            print(f"   After product2.save(), order2.out_id = {repr(order2.out_id)}")
++            
++            # Save the order
++            order2.save()
++            print(f"   After order2.save(), order2.out_id = {repr(order2.out_id)}")
++            
++            # Check what's in the database
++            correct_relation_exists = FkToChar.objects.filter(out=product2).exists()
++            print(f"   FkToChar.objects.filter(out=product2).exists() = {correct_relation_exists}")
++            
++            if correct_relation_exists:
++                print("   ✅ This case works correctly")
++            else:
++                print("   ❌ Unexpected: This case should work")
++                
++    except Exception as e:
++        print(f"   Exception occurred: {e}")
++
++if __name__ == "__main__":
++    # Create the database tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    test_issue_reproduction()
+\ No newline at end of file
+diff --git a/tests/model_fields/test_foreignkey.py b/tests/model_fields/test_foreignkey.py
+index d30cca9b5c..36e9fb809f 100644
+--- a/tests/model_fields/test_foreignkey.py
++++ b/tests/model_fields/test_foreignkey.py
+@@ -28,6 +28,8 @@ class ForeignKeyTests(TestCase):
+         fk_model_empty = FkToChar.objects.select_related('out').get(id=fk_model_empty.pk)
+         self.assertEqual(fk_model_empty.out, char_model_empty)
+ 
++
++
+     @isolate_apps('model_fields')
+     def test_warning_when_unique_true_on_fk(self):
+         class Foo(models.Model):

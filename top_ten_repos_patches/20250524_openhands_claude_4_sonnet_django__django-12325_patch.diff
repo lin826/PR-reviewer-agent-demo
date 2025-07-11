@@ -1,0 +1,1020 @@
+diff --git a/debug_parent_links.py b/debug_parent_links.py
+new file mode 100644
+index 0000000000..ef4c5b2cb0
+--- /dev/null
++++ b/debug_parent_links.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python
++"""
++Debug script to understand how parent_links are collected.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Let's monkey patch the parent_links collection to see what's happening
++original_new = type.__new__
++
++def debug_new(cls, name, bases, namespace, **kwargs):
++    if name in ['Picking', 'Picking2']:
++        print(f"\n=== Creating model {name} ===")
++        
++        # Let's see the field order
++        fields = []
++        for key, value in namespace.items():
++            if isinstance(value, models.OneToOneField):
++                fields.append((key, value, getattr(value.remote_field, 'parent_link', False)))
++        
++        print(f"OneToOneFields in declaration order:")
++        for field_name, field, is_parent_link in fields:
++            print(f"  {field_name}: parent_link={is_parent_link}")
++    
++    return original_new(cls, name, bases, namespace, **kwargs)
++
++type.__new__ = debug_new
++
++def test_case():
++    print("=== Testing parent_links collection ===")
++    
++    class Document(models.Model):
++        class Meta:
++            app_label = 'test'
++    
++    # Case 1: document_ptr first (fails)
++    class Picking(Document):
++        document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
++        origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
++        
++        class Meta:
++            app_label = 'test'
++    
++    print(f"Picking._meta.parents: {Picking._meta.parents}")
++    for parent, field in Picking._meta.parents.items():
++        print(f"  Parent: {parent.__name__}, Field: {field.name}, parent_link: {field.remote_field.parent_link}")
++    
++    # Case 2: origin first (works)
++    class Document2(models.Model):
++        class Meta:
++            app_label = 'test'
++    
++    class Picking2(Document2):
++        origin = models.OneToOneField(Document2, related_name='picking', on_delete=models.PROTECT)
++        document_ptr = models.OneToOneField(Document2, on_delete=models.CASCADE, parent_link=True, related_name='+')
++        
++        class Meta:
++            app_label = 'test'
++    
++    print(f"\nPicking2._meta.parents: {Picking2._meta.parents}")
++    for parent, field in Picking2._meta.parents.items():
++        print(f"  Parent: {parent.__name__}, Field: {field.name}, parent_link: {field.remote_field.parent_link}")
++
++if __name__ == '__main__':
++    test_case()
+\ No newline at end of file
+diff --git a/debug_simple.py b/debug_simple.py
+new file mode 100644
+index 0000000000..12f1b0cc10
+--- /dev/null
++++ b/debug_simple.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python
++"""
++Simple debug script to understand parent_links behavior.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++def test_case():
++    print("=== Testing parent_links collection ===")
++    
++    class Document(models.Model):
++        class Meta:
++            app_label = 'test'
++    
++    # Case 1: document_ptr first (fails)
++    try:
++        class Picking(Document):
++            document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
++            
++            class Meta:
++                app_label = 'test'
++        
++        print("Case 1 (document_ptr first): SUCCESS")
++        print(f"  Picking._meta.parents: {Picking._meta.parents}")
++        for parent, field in Picking._meta.parents.items():
++            print(f"    Parent: {parent.__name__}, Field: {field.name}, parent_link: {field.remote_field.parent_link}")
++    except Exception as e:
++        print(f"Case 1 (document_ptr first): FAILED - {e}")
++    
++    # Case 2: origin first (works)
++    try:
++        class Document2(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking2(Document2):
++            origin = models.OneToOneField(Document2, related_name='picking', on_delete=models.PROTECT)
++            document_ptr = models.OneToOneField(Document2, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            
++            class Meta:
++                app_label = 'test'
++        
++        print("\nCase 2 (origin first): SUCCESS")
++        print(f"  Picking2._meta.parents: {Picking2._meta.parents}")
++        for parent, field in Picking2._meta.parents.items():
++            print(f"    Parent: {parent.__name__}, Field: {field.name}, parent_link: {field.remote_field.parent_link}")
++    except Exception as e:
++        print(f"\nCase 2 (origin first): FAILED - {e}")
++
++if __name__ == '__main__':
++    test_case()
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 8ea6c05ef9..bb40291d1e 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -204,7 +204,12 @@ class ModelBase(type):
+             for field in base._meta.local_fields:
+                 if isinstance(field, OneToOneField):
+                     related = resolve_relation(new_class, field.remote_field.model)
+-                    parent_links[make_model_tuple(related)] = field
++                    related_key = make_model_tuple(related)
++                    # Prefer fields with parent_link=True over those without
++                    if (related_key not in parent_links or 
++                        (field.remote_field.parent_link and 
++                         not parent_links[related_key].remote_field.parent_link)):
++                        parent_links[related_key] = field
+ 
+         # Track fields inherited from base models.
+         inherited_attributes = set()
+diff --git a/reproduce_exact_issue.py b/reproduce_exact_issue.py
+new file mode 100644
+index 0000000000..89ac90e3d9
+--- /dev/null
++++ b/reproduce_exact_issue.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++"""
++Exact reproduction of the issue from the bug report.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++def test_failing_case():
++    """
++    Exact reproduction from the issue description - this should fail.
++    """
++    print("=== Failing case from issue description ===")
++    
++    try:
++        class Document(models.Model):
++            class Meta:
++                app_label = 'appname'
++        
++        class Picking(Document):
++            document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
++            
++            class Meta:
++                app_label = 'appname'
++        
++        print("✓ Model creation succeeded")
++        return True
++        
++    except ImproperlyConfigured as e:
++        print(f"✗ Model creation failed with: {e}")
++        return False
++
++def test_working_case():
++    """
++    Working case from the issue description.
++    """
++    print("\n=== Working case from issue description ===")
++    
++    try:
++        class Document2(models.Model):
++            class Meta:
++                app_label = 'appname'
++        
++        class Picking2(Document2):
++            origin = models.OneToOneField(Document2, related_name='picking', on_delete=models.PROTECT)
++            document_ptr = models.OneToOneField(Document2, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            
++            class Meta:
++                app_label = 'appname'
++        
++        print("✓ Model creation succeeded")
++        return True
++        
++    except ImproperlyConfigured as e:
++        print(f"✗ Model creation failed with: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Reproducing exact issue from bug report...")
++    
++    failing_result = test_failing_case()
++    working_result = test_working_case()
++    
++    print(f"\n=== Summary ===")
++    print(f"Failing case (document_ptr first): {'PASS' if failing_result else 'FAIL'}")
++    print(f"Working case (origin first): {'PASS' if working_result else 'FAIL'}")
++    
++    if not failing_result and working_result:
++        print("\n✓ Issue reproduced exactly as described")
++    elif failing_result and not working_result:
++        print("\n? Issue reproduced but in reverse order")
++    else:
++        print("\n? Issue behavior different than expected")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..16a30d47da
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,153 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the MTI parent_link issue.
++
++This script reproduces the issue where Django gets confused about which
++OneToOneField should be the parent link when there are multiple OneToOneFields
++pointing to the same parent model and they are declared in a specific order.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++def test_case_1_failing():
++    """
++    Test case that should fail with the current implementation.
++    The origin field comes first, document_ptr comes second.
++    """
++    print("=== Test Case 1: origin field first (should fail) ===")
++    
++    try:
++        class Document(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking(Document):
++            origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
++            document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Check which field was chosen as parent link
++        parent_link_field = Picking._meta.parents[Document]
++        print(f"Parent link field chosen: {parent_link_field.name}")
++        print(f"Has parent_link=True: {parent_link_field.remote_field.parent_link}")
++        
++        if parent_link_field.name == 'document_ptr':
++            print("✓ Correct parent link field chosen")
++            return True
++        else:
++            print("✗ Wrong parent link field chosen")
++            return False
++        
++    except ImproperlyConfigured as e:
++        print(f"✗ Model creation failed with: {e}")
++        return False
++
++def test_case_2_working():
++    """
++    Test case that should work with the current implementation.
++    The document_ptr field comes first, origin comes second.
++    """
++    print("\n=== Test Case 2: document_ptr field first (should work) ===")
++    
++    try:
++        class Document2(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking2(Document2):
++            document_ptr = models.OneToOneField(Document2, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            origin = models.OneToOneField(Document2, related_name='picking', on_delete=models.PROTECT)
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Check which field was chosen as parent link
++        parent_link_field = Picking2._meta.parents[Document2]
++        print(f"Parent link field chosen: {parent_link_field.name}")
++        print(f"Has parent_link=True: {parent_link_field.remote_field.parent_link}")
++        
++        if parent_link_field.name == 'document_ptr':
++            print("✓ Correct parent link field chosen")
++            return True
++        else:
++            print("✗ Wrong parent link field chosen")
++            return False
++        
++    except ImproperlyConfigured as e:
++        print(f"✗ Model creation failed with: {e}")
++        return False
++
++def test_case_3_explicit_parent_link():
++    """
++    Test case with explicit parent_link=True that should work regardless of order.
++    """
++    print("\n=== Test Case 3: Explicit parent_link=True (should work) ===")
++    
++    try:
++        class Document3(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking3(Document3):
++            origin = models.OneToOneField(Document3, related_name='picking', on_delete=models.PROTECT)
++            document_ptr = models.OneToOneField(Document3, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Check that the correct field was chosen as parent link
++        parent_link_field = Picking3._meta.parents[Document3]
++        if parent_link_field.name == 'document_ptr':
++            print("✓ Correct parent link field chosen")
++        else:
++            print(f"✗ Wrong parent link field chosen: {parent_link_field.name}")
++            
++        return True
++        
++    except ImproperlyConfigured as e:
++        print(f"✗ Model creation failed with: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Reproducing MTI parent_link issue...")
++    
++    case1_result = test_case_1_failing()
++    case2_result = test_case_2_working()
++    case3_result = test_case_3_explicit_parent_link()
++    
++    print(f"\n=== Summary ===")
++    print(f"Case 1 (origin first): {'PASS' if case1_result else 'FAIL'}")
++    print(f"Case 2 (document_ptr first): {'PASS' if case2_result else 'FAIL'}")
++    print(f"Case 3 (explicit parent_link): {'PASS' if case3_result else 'FAIL'}")
++    
++    if not case1_result and case2_result:
++        print("\n✓ Issue reproduced: Field order affects parent link detection")
++    else:
++        print("\n? Issue not reproduced as expected")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..190f28ce35
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,225 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to ensure the fix works correctly and doesn't break existing functionality.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++def test_case_1():
++    """Test case 1: Multiple OneToOneFields, parent_link=True comes first"""
++    print("=== Test 1: parent_link=True field first ===")
++    
++    try:
++        class Document1(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking1(Document1):
++            document_ptr = models.OneToOneField(Document1, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            origin = models.OneToOneField(Document1, related_name='picking', on_delete=models.PROTECT)
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Verify correct field is chosen
++        parent_field = Picking1._meta.parents[Document1]
++        assert parent_field.name == 'document_ptr', f"Expected document_ptr, got {parent_field.name}"
++        assert parent_field.remote_field.parent_link == True, "Expected parent_link=True"
++        
++        print("✓ PASS")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++
++def test_case_2():
++    """Test case 2: Multiple OneToOneFields, parent_link=True comes second"""
++    print("\n=== Test 2: parent_link=True field second ===")
++    
++    try:
++        class Document2(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking2(Document2):
++            origin = models.OneToOneField(Document2, related_name='picking', on_delete=models.PROTECT)
++            document_ptr = models.OneToOneField(Document2, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Verify correct field is chosen
++        parent_field = Picking2._meta.parents[Document2]
++        assert parent_field.name == 'document_ptr', f"Expected document_ptr, got {parent_field.name}"
++        assert parent_field.remote_field.parent_link == True, "Expected parent_link=True"
++        
++        print("✓ PASS")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++
++def test_case_3():
++    """Test case 3: Single OneToOneField with parent_link=True"""
++    print("\n=== Test 3: Single parent_link field ===")
++    
++    try:
++        class Document3(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking3(Document3):
++            document_ptr = models.OneToOneField(Document3, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Verify correct field is chosen
++        parent_field = Picking3._meta.parents[Document3]
++        assert parent_field.name == 'document_ptr', f"Expected document_ptr, got {parent_field.name}"
++        assert parent_field.remote_field.parent_link == True, "Expected parent_link=True"
++        
++        print("✓ PASS")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++
++def test_case_4():
++    """Test case 4: No explicit parent_link field (should auto-create)"""
++    print("\n=== Test 4: No explicit parent_link (auto-create) ===")
++    
++    try:
++        class Document4(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking4(Document4):
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Should have auto-created parent link
++        assert Document4 in Picking4._meta.parents, "Parent relationship not found"
++        parent_field = Picking4._meta.parents[Document4]
++        assert parent_field.remote_field.parent_link == True, "Auto-created field should have parent_link=True"
++        
++        print("✓ PASS")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++
++def test_case_5():
++    """Test case 5: Multiple OneToOneFields, none with parent_link=True (should fail)"""
++    print("\n=== Test 5: Multiple fields, none with parent_link=True ===")
++    
++    try:
++        class Document5(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking5(Document5):
++            origin = models.OneToOneField(Document5, related_name='picking', on_delete=models.PROTECT)
++            destination = models.OneToOneField(Document5, related_name='picking_dest', on_delete=models.PROTECT)
++            
++            class Meta:
++                app_label = 'test'
++        
++        print("✗ FAIL: Should have raised ImproperlyConfigured")
++        return False
++        
++    except ImproperlyConfigured as e:
++        print(f"✓ PASS: Correctly raised ImproperlyConfigured: {e}")
++        return True
++    except Exception as e:
++        print(f"✗ FAIL: Unexpected error: {e}")
++        return False
++
++def test_case_6():
++    """Test case 6: Multiple OneToOneFields to different parents"""
++    print("\n=== Test 6: Multiple fields to different parents ===")
++    
++    try:
++        class Document6(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class OtherDoc(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking6(Document6):
++            document_ptr = models.OneToOneField(Document6, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            other = models.OneToOneField(OtherDoc, on_delete=models.PROTECT)
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Should have parent relationship only with Document6
++        assert Document6 in Picking6._meta.parents, "Parent relationship with Document6 not found"
++        assert OtherDoc not in Picking6._meta.parents, "Should not have parent relationship with OtherDoc"
++        
++        parent_field = Picking6._meta.parents[Document6]
++        assert parent_field.name == 'document_ptr', f"Expected document_ptr, got {parent_field.name}"
++        
++        print("✓ PASS")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Running comprehensive tests...")
++    
++    results = [
++        test_case_1(),
++        test_case_2(),
++        test_case_3(),
++        test_case_4(),
++        test_case_5(),
++        test_case_6(),
++    ]
++    
++    passed = sum(results)
++    total = len(results)
++    
++    print(f"\n=== Summary ===")
++    print(f"Passed: {passed}/{total}")
++    
++    if passed == total:
++        print("🎉 All tests passed!")
++    else:
++        print("❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1fdee5218d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,173 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the parent_link fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++def test_multiple_parent_link_true():
++    """
++    Test what happens when multiple fields have parent_link=True.
++    Should use the first one encountered.
++    """
++    print("=== Test: Multiple parent_link=True fields ===")
++    
++    try:
++        class Document(models.Model):
++            class Meta:
++                app_label = 'test'
++        
++        class Picking(Document):
++            document_ptr1 = models.OneToOneField(
++                Document, 
++                on_delete=models.CASCADE, 
++                parent_link=True, 
++                related_name='+'
++            )
++            document_ptr2 = models.OneToOneField(
++                Document, 
++                on_delete=models.CASCADE, 
++                parent_link=True, 
++                related_name='+'
++            )
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Should use the first parent_link=True field
++        parent_field = Picking._meta.parents[Document]
++        print(f"Chosen field: {parent_field.name}")
++        print("✓ PASS")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++
++def test_no_parent_link_fields():
++    """
++    Test normal inheritance without explicit OneToOneFields.
++    """
++    print("\n=== Test: Normal inheritance (no explicit fields) ===")
++    
++    try:
++        class Document(models.Model):
++            title = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test'
++        
++        class Picking(Document):
++            notes = models.TextField()
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Should have auto-created parent link
++        assert Document in Picking._meta.parents
++        parent_field = Picking._meta.parents[Document]
++        assert parent_field.remote_field.parent_link == True
++        print(f"Auto-created field: {parent_field.name}")
++        print("✓ PASS")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++
++def test_mixed_inheritance():
++    """
++    Test inheritance with both auto-created and explicit fields.
++    """
++    print("\n=== Test: Mixed inheritance ===")
++    
++    try:
++        class Document(models.Model):
++            title = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test'
++        
++        class BaseDocument(Document):
++            # This should auto-create a parent link
++            description = models.TextField()
++            
++            class Meta:
++                app_label = 'test'
++        
++        class Picking(BaseDocument):
++            # This should use explicit parent link
++            basedocument_ptr = models.OneToOneField(
++                BaseDocument, 
++                on_delete=models.CASCADE, 
++                parent_link=True, 
++                related_name='+'
++            )
++            notes = models.TextField()
++            
++            class Meta:
++                app_label = 'test'
++        
++        # Check BaseDocument has auto-created parent link to Document
++        assert Document in BaseDocument._meta.parents
++        base_parent_field = BaseDocument._meta.parents[Document]
++        assert base_parent_field.remote_field.parent_link == True
++        
++        # Check Picking has explicit parent link to BaseDocument
++        assert BaseDocument in Picking._meta.parents
++        picking_parent_field = Picking._meta.parents[BaseDocument]
++        assert picking_parent_field.name == 'basedocument_ptr'
++        assert picking_parent_field.remote_field.parent_link == True
++        
++        print("✓ PASS")
++        return True
++        
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("Testing edge cases...")
++    
++    results = [
++        test_multiple_parent_link_true(),
++        test_no_parent_link_fields(),
++        test_mixed_inheritance(),
++    ]
++    
++    passed = sum(results)
++    total = len(results)
++    
++    print(f"\n=== Summary ===")
++    print(f"Passed: {passed}/{total}")
++    
++    if passed == total:
++        print("🎉 All edge case tests passed!")
++    else:
++        print("❌ Some edge case tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_parent_link_fix.py b/test_parent_link_fix.py
+new file mode 100644
+index 0000000000..ff205ae3f4
+--- /dev/null
++++ b/test_parent_link_fix.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python
++"""
++Test for the parent_link fix to ensure it works correctly.
++This test can be added to the Django test suite.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import SimpleTestCase
++from django.test.utils import isolate_apps
++
++# Configure Django settings if not already configured
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++@isolate_apps('test_parent_link_fix')
++class ParentLinkOrderTests(SimpleTestCase):
++    """
++    Test that parent_link=True is respected regardless of field declaration order.
++    
++    This addresses the issue where Django would incorrectly choose which OneToOneField
++    should serve as the parent link based on declaration order rather than the explicit
++    parent_link=True marker.
++    """
++    
++    def test_parent_link_true_field_first(self):
++        """
++        Test that when parent_link=True field comes first, it's correctly chosen.
++        """
++        class Document(models.Model):
++            class Meta:
++                app_label = 'test_parent_link_fix'
++        
++        class Picking(Document):
++            document_ptr = models.OneToOneField(
++                Document, 
++                on_delete=models.CASCADE, 
++                parent_link=True, 
++                related_name='+'
++            )
++            origin = models.OneToOneField(
++                Document, 
++                related_name='picking', 
++                on_delete=models.PROTECT
++            )
++            
++            class Meta:
++                app_label = 'test_parent_link_fix'
++        
++        # Verify the correct field was chosen as parent link
++        parent_field = Picking._meta.parents[Document]
++        self.assertEqual(parent_field.name, 'document_ptr')
++        self.assertTrue(parent_field.remote_field.parent_link)
++    
++    def test_parent_link_true_field_second(self):
++        """
++        Test that when parent_link=True field comes second, it's correctly chosen.
++        """
++        class Document(models.Model):
++            class Meta:
++                app_label = 'test_parent_link_fix'
++        
++        class Picking(Document):
++            origin = models.OneToOneField(
++                Document, 
++                related_name='picking', 
++                on_delete=models.PROTECT
++            )
++            document_ptr = models.OneToOneField(
++                Document, 
++                on_delete=models.CASCADE, 
++                parent_link=True, 
++                related_name='+'
++            )
++            
++            class Meta:
++                app_label = 'test_parent_link_fix'
++        
++        # Verify the correct field was chosen as parent link
++        parent_field = Picking._meta.parents[Document]
++        self.assertEqual(parent_field.name, 'document_ptr')
++        self.assertTrue(parent_field.remote_field.parent_link)
++    
++    def test_parent_link_true_field_middle(self):
++        """
++        Test that when parent_link=True field is in the middle, it's correctly chosen.
++        """
++        class Document(models.Model):
++            class Meta:
++                app_label = 'test_parent_link_fix'
++        
++        class Picking(Document):
++            origin = models.OneToOneField(
++                Document, 
++                related_name='picking_origin', 
++                on_delete=models.PROTECT
++            )
++            document_ptr = models.OneToOneField(
++                Document, 
++                on_delete=models.CASCADE, 
++                parent_link=True, 
++                related_name='+'
++            )
++            destination = models.OneToOneField(
++                Document, 
++                related_name='picking_dest', 
++                on_delete=models.PROTECT
++            )
++            
++            class Meta:
++                app_label = 'test_parent_link_fix'
++        
++        # Verify the correct field was chosen as parent link
++        parent_field = Picking._meta.parents[Document]
++        self.assertEqual(parent_field.name, 'document_ptr')
++        self.assertTrue(parent_field.remote_field.parent_link)
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

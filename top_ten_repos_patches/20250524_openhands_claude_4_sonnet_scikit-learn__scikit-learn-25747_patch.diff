@@ -1,0 +1,567 @@
+diff --git a/CHANGES_SUMMARY.md b/CHANGES_SUMMARY.md
+new file mode 100644
+index 000000000..6dcc45043
+--- /dev/null
++++ b/CHANGES_SUMMARY.md
+@@ -0,0 +1,37 @@
++# Fix for FeatureUnion pandas output with aggregating transformers
++
++## Problem
++FeatureUnion failed when using pandas transform output with custom transformers that aggregate data (change the number of rows). The error occurred because the pandas output wrapping logic tried to preserve the original input's index even when the output had a different number of rows.
++
++## Root Cause
++In `sklearn/utils/_set_output.py`, the `_wrap_in_pandas_container` function assumed that transformed data would have the same number of rows as the input data. When aggregating transformers reduced the number of rows, trying to assign the original index caused a length mismatch error.
++
++## Solution
++Added length checks in `_wrap_in_pandas_container` to handle cases where output shape differs from input shape:
++
++1. **Line 58**: Added length check when setting index on existing DataFrame:
++   ```python
++   if index is not None and len(data_to_wrap) == len(index):
++   ```
++
++2. **Lines 63-64**: Added length check when creating new DataFrame:
++   ```python
++   if index is not None and hasattr(data_to_wrap, '__len__') and len(data_to_wrap) != len(index):
++       index = None
++   ```
++
++## Behavior
++- **When shapes match**: Index is preserved (existing behavior maintained)
++- **When shapes don't match**: Index is not forced, pandas uses default index (graceful handling)
++- **Backward compatibility**: No breaking changes to existing functionality
++
++## Files Modified
++- `sklearn/utils/_set_output.py`: Added length checks in `_wrap_in_pandas_container`
++
++## Tests Verified
++- Original issue reproduction script
++- Existing test suites (all pass)
++- Edge cases with various data types and aggregation scenarios
++- Mixed transformers (aggregating and non-aggregating)
++
++The fix is minimal, focused, and addresses the root cause while maintaining backward compatibility.
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..f49f4af02
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the FeatureUnion pandas output issue.
++"""
++
++import pandas as pd
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++
++# Create test data
++index = pd.date_range(start="2020-01-01", end="2020-01-05", inclusive="left", freq="H")
++data = pd.DataFrame(index=index, data=[10] * len(index), columns=["value"])
++data["date"] = index.date
++
++print(f"Original data shape: {data.shape}")
++print(f"Original data index length: {len(data.index)}")
++print("First few rows:")
++print(data.head())
++print()
++
++class MyTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X: pd.DataFrame, y=None, **kwargs):
++        return self
++
++    def transform(self, X: pd.DataFrame, y=None) -> pd.DataFrame:
++        result = X["value"].groupby(X["date"]).sum()
++        print(f"Transformed data shape: {result.shape}")
++        print(f"Transformed data index length: {len(result.index)}")
++        print(f"Transformed data type: {type(result)}")
++        return result
++
++print("Testing with default output...")
++set_config(transform_output="default")
++try:
++    result_default = make_union(MyTransformer()).fit_transform(data)
++    print(f"Default output successful. Shape: {result_default.shape}")
++    print(f"Type: {type(result_default)}")
++    print()
++except Exception as e:
++    print(f"Default output failed: {e}")
++    print()
++
++print("Testing with pandas output...")
++set_config(transform_output="pandas")
++try:
++    result_pandas = make_union(MyTransformer()).fit_transform(data)
++    print(f"Pandas output successful. Shape: {result_pandas.shape}")
++    print(f"Type: {type(result_pandas)}")
++    print()
++except Exception as e:
++    print(f"Pandas output failed: {e}")
++    import traceback
++    traceback.print_exc()
++    print()
+\ No newline at end of file
+diff --git a/reproduce_issue_exact.py b/reproduce_issue_exact.py
+new file mode 100644
+index 000000000..536d08821
+--- /dev/null
++++ b/reproduce_issue_exact.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""
++Exact reproduction script for the FeatureUnion pandas output issue.
++"""
++
++import pandas as pd
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++
++index = pd.date_range(start="2020-01-01", end="2020-01-05", inclusive="left", freq="H")
++data = pd.DataFrame(index=index, data=[10] * len(index), columns=["value"])
++data["date"] = index.date
++
++print(f"Original data shape: {data.shape}")
++print(f"Original data index length: {len(data.index)}")
++
++class MyTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X: pd.DataFrame, y=None, **kwargs):
++        return self
++
++    def transform(self, X: pd.DataFrame, y=None) -> pd.DataFrame:
++        result = X["value"].groupby(X["date"]).sum()
++        print(f"Transformed data shape: {result.shape}")
++        print(f"Transformed data type: {type(result)}")
++        return result
++
++# This works.
++print("\nTesting with default output...")
++set_config(transform_output="default")
++try:
++    result = make_union(MyTransformer()).fit_transform(data)
++    print(f"Success! Result shape: {result.shape}, type: {type(result)}")
++except Exception as e:
++    print(f"Failed: {e}")
++
++# This does not work.
++print("\nTesting with pandas output...")
++set_config(transform_output="pandas")
++try:
++    result = make_union(MyTransformer()).fit_transform(data)
++    print(f"Success! Result shape: {result.shape}, type: {type(result)}")
++except Exception as e:
++    print(f"Failed: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..82c793516 100644
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -55,10 +55,13 @@ def _wrap_in_pandas_container(
+     if isinstance(data_to_wrap, pd.DataFrame):
+         if columns is not None:
+             data_to_wrap.columns = columns
+-        if index is not None:
++        if index is not None and len(data_to_wrap) == len(index):
+             data_to_wrap.index = index
+         return data_to_wrap
+ 
++    # Check if index length matches data length to avoid length mismatch errors
++    if index is not None and hasattr(data_to_wrap, '__len__') and len(data_to_wrap) != len(index):
++        index = None
+     return pd.DataFrame(data_to_wrap, index=index, columns=columns)
+ 
+ 
+diff --git a/test_aggregation_fix.py b/test_aggregation_fix.py
+new file mode 100644
+index 000000000..9c5a8e2ed
+--- /dev/null
++++ b/test_aggregation_fix.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""
++Test for the aggregation fix in pandas output.
++This test should be added to the test suite.
++"""
++
++import pandas as pd
++import numpy as np
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++import pytest
++
++
++class AggregatingTransformer(BaseEstimator, TransformerMixin):
++    """Transformer that aggregates data, changing the number of rows."""
++    
++    def fit(self, X, y=None):
++        return self
++    
++    def transform(self, X):
++        # Aggregate every 2 rows
++        if isinstance(X, pd.DataFrame):
++            return X.groupby(np.arange(len(X)) // 2).sum()
++        else:
++            # For numpy arrays, just take every other row
++            return X[::2]
++
++
++def test_feature_union_pandas_output_with_aggregation():
++    """Test that FeatureUnion works with pandas output when transformers aggregate data."""
++    # Create test data with datetime index
++    index = pd.date_range(start="2020-01-01", periods=4, freq="H")
++    data = pd.DataFrame({"A": [1, 2, 3, 4], "B": [5, 6, 7, 8]}, index=index)
++    
++    # Test with pandas output
++    set_config(transform_output="pandas")
++    
++    # This should not raise an error
++    transformer = AggregatingTransformer()
++    union = make_union(transformer)
++    result = union.fit_transform(data)
++    
++    # Check that result is a DataFrame
++    assert isinstance(result, pd.DataFrame)
++    
++    # Check that the shape is correct (aggregated from 4 to 2 rows)
++    assert result.shape == (2, 2)
++    
++    # Check that the values are correct (sums of pairs)
++    expected_values = np.array([[3, 11], [7, 15]])  # [1+2, 5+6], [3+4, 7+8]
++    np.testing.assert_array_equal(result.values, expected_values)
++
++
++def test_feature_union_pandas_output_preserves_index_when_possible():
++    """Test that FeatureUnion preserves index when output shape matches input shape."""
++    # Create test data with datetime index
++    index = pd.date_range(start="2020-01-01", periods=4, freq="H")
++    data = pd.DataFrame({"A": [1, 2, 3, 4], "B": [5, 6, 7, 8]}, index=index)
++    
++    class IdentityTransformer(BaseEstimator, TransformerMixin):
++        def fit(self, X, y=None):
++            return self
++        
++        def transform(self, X):
++            return X
++    
++    # Test with pandas output
++    set_config(transform_output="pandas")
++    
++    transformer = IdentityTransformer()
++    union = make_union(transformer)
++    result = union.fit_transform(data)
++    
++    # Check that result is a DataFrame
++    assert isinstance(result, pd.DataFrame)
++    
++    # Check that the index is preserved
++    pd.testing.assert_index_equal(result.index, data.index)
++
++
++if __name__ == "__main__":
++    test_feature_union_pandas_output_with_aggregation()
++    test_feature_union_pandas_output_preserves_index_when_possible()
++    print("All tests passed!")
+\ No newline at end of file
+diff --git a/test_default_output.py b/test_default_output.py
+new file mode 100644
+index 000000000..dc468eb3c
+--- /dev/null
++++ b/test_default_output.py
+@@ -0,0 +1,30 @@
++#!/usr/bin/env python3
++"""
++Test that default output still works correctly.
++"""
++
++import pandas as pd
++import numpy as np
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++from sklearn.preprocessing import StandardScaler
++
++# Test with default output
++print("=== Testing with default output ===")
++set_config(transform_output="default")
++
++data = pd.DataFrame({'A': [1, 2, 3, 4], 'B': [5, 6, 7, 8]}, 
++                   index=pd.date_range('2020-01-01', periods=4))
++
++class SeriesTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None):
++        return self
++    
++    def transform(self, X):
++        return X['A'].groupby(np.arange(len(X)) // 2).sum()
++
++result = make_union(SeriesTransformer()).fit_transform(data)
++print(f"Input shape: {data.shape}, Output shape: {result.shape}")
++print(f"Result type: {type(result)}")
++print("Default output test passed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..6e4b0b301
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the pandas output fix.
++"""
++
++import pandas as pd
++import numpy as np
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++from sklearn.preprocessing import StandardScaler
++
++# Test 1: Normal transformer that preserves shape
++print("=== Test 1: Normal transformer (shape preserved) ===")
++data = pd.DataFrame({'A': [1, 2, 3, 4], 'B': [5, 6, 7, 8]}, 
++                   index=pd.date_range('2020-01-01', periods=4))
++
++set_config(transform_output="pandas")
++scaler = StandardScaler()
++result = scaler.fit_transform(data)
++print(f"Input shape: {data.shape}, Output shape: {result.shape}")
++print(f"Input index: {list(data.index)}")
++print(f"Output index: {list(result.index)}")
++print(f"Index preserved: {list(data.index) == list(result.index)}")
++print()
++
++# Test 2: Aggregating transformer
++print("=== Test 2: Aggregating transformer ===")
++class AggregatingTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None):
++        return self
++    
++    def transform(self, X):
++        # Aggregate to half the rows
++        return X.groupby(np.arange(len(X)) // 2).sum()
++
++data = pd.DataFrame({'A': [1, 2, 3, 4], 'B': [5, 6, 7, 8]}, 
++                   index=pd.date_range('2020-01-01', periods=4))
++
++result = make_union(AggregatingTransformer()).fit_transform(data)
++print(f"Input shape: {data.shape}, Output shape: {result.shape}")
++print(f"Input index length: {len(data.index)}, Output index length: {len(result.index)}")
++print(f"Result type: {type(result)}")
++print()
++
++# Test 3: Transformer returning Series (like the original issue)
++print("=== Test 3: Transformer returning Series ===")
++class SeriesTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None):
++        return self
++    
++    def transform(self, X):
++        return X['A'].groupby(np.arange(len(X)) // 2).sum()
++
++data = pd.DataFrame({'A': [1, 2, 3, 4], 'B': [5, 6, 7, 8]}, 
++                   index=pd.date_range('2020-01-01', periods=4))
++
++result = make_union(SeriesTransformer()).fit_transform(data)
++print(f"Input shape: {data.shape}, Output shape: {result.shape}")
++print(f"Result type: {type(result)}")
++print()
++
++# Test 4: Multiple transformers in union
++print("=== Test 4: Multiple transformers in union ===")
++class IdentityTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None):
++        return self
++    
++    def transform(self, X):
++        return X
++
++data = pd.DataFrame({'A': [1, 2, 3, 4], 'B': [5, 6, 7, 8]}, 
++                   index=pd.date_range('2020-01-01', periods=4))
++
++# Mix of shape-preserving and aggregating transformers
++result = make_union(IdentityTransformer(), SeriesTransformer()).fit_transform(data)
++print(f"Input shape: {data.shape}, Output shape: {result.shape}")
++print(f"Result type: {type(result)}")
++print()
++
++print("All tests completed successfully!")
+\ No newline at end of file
+diff --git a/test_edge_cases_comprehensive.py b/test_edge_cases_comprehensive.py
+new file mode 100644
+index 000000000..8f83a8da3
+--- /dev/null
++++ b/test_edge_cases_comprehensive.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""
++Comprehensive edge case tests for the pandas output fix.
++"""
++
++import pandas as pd
++import numpy as np
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++from sklearn.utils._set_output import _wrap_in_pandas_container
++
++
++def test_wrap_in_pandas_container_edge_cases():
++    """Test _wrap_in_pandas_container with various edge cases."""
++    
++    # Test 1: DataFrame with mismatched index length
++    df = pd.DataFrame({"A": [1, 2]})
++    index = pd.date_range("2020-01-01", periods=5)
++    
++    # Should not raise error and should not set the index
++    result = _wrap_in_pandas_container(df, columns=None, index=index)
++    assert isinstance(result, pd.DataFrame)
++    assert len(result) == 2
++    assert not result.index.equals(index)
++    
++    # Test 2: DataFrame with matching index length
++    df = pd.DataFrame({"A": [1, 2, 3, 4, 5]})
++    index = pd.date_range("2020-01-01", periods=5)
++    
++    result = _wrap_in_pandas_container(df, columns=None, index=index)
++    assert isinstance(result, pd.DataFrame)
++    assert result.index.equals(index)
++    
++    # Test 3: Series with mismatched index length
++    series = pd.Series([1, 2])
++    index = pd.date_range("2020-01-01", periods=5)
++    
++    result = _wrap_in_pandas_container(series, columns=["col"], index=index)
++    assert isinstance(result, pd.DataFrame)
++    assert len(result) == 2
++    assert not result.index.equals(index)
++    
++    # Test 4: Numpy array with mismatched index length
++    arr = np.array([[1, 2], [3, 4]])
++    index = pd.date_range("2020-01-01", periods=5)
++    
++    result = _wrap_in_pandas_container(arr, columns=["A", "B"], index=index)
++    assert isinstance(result, pd.DataFrame)
++    assert len(result) == 2
++    assert not result.index.equals(index)
++    
++    # Test 5: Numpy array with matching index length
++    arr = np.array([[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]])
++    index = pd.date_range("2020-01-01", periods=5)
++    
++    result = _wrap_in_pandas_container(arr, columns=["A", "B"], index=index)
++    assert isinstance(result, pd.DataFrame)
++    assert result.index.equals(index)
++    
++    print("All edge case tests passed!")
++
++
++def test_feature_union_with_different_aggregation_levels():
++    """Test FeatureUnion with transformers that aggregate to different levels."""
++    
++    set_config(transform_output="pandas")
++    
++    # Create test data
++    data = pd.DataFrame({"A": range(8), "B": range(8, 16)})
++    
++    class Aggregator2(BaseEstimator, TransformerMixin):
++        def fit(self, X, y=None):
++            return self
++        def transform(self, X):
++            return X.groupby(np.arange(len(X)) // 2).sum()
++    
++    class Aggregator4(BaseEstimator, TransformerMixin):
++        def fit(self, X, y=None):
++            return self
++        def transform(self, X):
++            return X.groupby(np.arange(len(X)) // 4).sum()
++    
++    # This should work - both transformers aggregate but to different levels
++    union = make_union(Aggregator2(), Aggregator4())
++    result = union.fit_transform(data)
++    
++    assert isinstance(result, pd.DataFrame)
++    # Aggregator2 produces 4 rows, Aggregator4 produces 2 rows
++    # FeatureUnion should handle this gracefully
++    print(f"Result shape: {result.shape}")
++    print("Mixed aggregation test passed!")
++
++
++if __name__ == "__main__":
++    test_wrap_in_pandas_container_edge_cases()
++    test_feature_union_with_different_aggregation_levels()
++    print("All comprehensive tests passed!")
+\ No newline at end of file
+diff --git a/test_original_issue_scenarios.py b/test_original_issue_scenarios.py
+new file mode 100644
+index 000000000..528f592e2
+--- /dev/null
++++ b/test_original_issue_scenarios.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++"""
++Test the exact scenarios from the original issue.
++"""
++
++import pandas as pd
++from sklearn.base import BaseEstimator, TransformerMixin
++from sklearn import set_config
++from sklearn.pipeline import make_union
++
++# Exact reproduction from the issue
++index = pd.date_range(start="2020-01-01", end="2020-01-05", inclusive="left", freq="H")
++data = pd.DataFrame(index=index, data=[10] * len(index), columns=["value"])
++data["date"] = index.date
++
++print(f"Data shape: {data.shape}")
++print(f"Data index length: {len(data.index)}")
++
++class MyTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X: pd.DataFrame, y=None, **kwargs):
++        return self
++
++    def transform(self, X: pd.DataFrame, y=None) -> pd.DataFrame:
++        return X["value"].groupby(X["date"]).sum()
++
++# This works.
++print("\n=== Testing default output ===")
++set_config(transform_output="default")
++result_default = make_union(MyTransformer()).fit_transform(data)
++print(f"Default result: {result_default}")
++print(f"Default result shape: {result_default.shape}")
++print(f"Default result type: {type(result_default)}")
++
++# This should now work too.
++print("\n=== Testing pandas output ===")
++set_config(transform_output="pandas")
++result_pandas = make_union(MyTransformer()).fit_transform(data)
++print(f"Pandas result shape: {result_pandas.shape}")
++print(f"Pandas result type: {type(result_pandas)}")
++print(f"Pandas result:\n{result_pandas}")
++
++print("\n=== SUCCESS: Both outputs work! ===")
++
++# Test with multiple transformers
++print("\n=== Testing with multiple transformers ===")
++
++class IdentityTransformer(BaseEstimator, TransformerMixin):
++    def fit(self, X, y=None):
++        return self
++    
++    def transform(self, X):
++        return X[["value"]]  # Return just the value column
++
++# Mix aggregating and non-aggregating transformers
++union = make_union(MyTransformer(), IdentityTransformer())
++result_mixed = union.fit_transform(data)
++print(f"Mixed transformers result shape: {result_mixed.shape}")
++print(f"Mixed transformers result type: {type(result_mixed)}")
++
++print("\n=== All tests completed successfully! ===")
+\ No newline at end of file

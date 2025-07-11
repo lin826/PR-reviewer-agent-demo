@@ -1,0 +1,254 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..35b1c95000
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the F expression bulk_update fix.
++Tests both simple F expressions and more complex F expressions.
++"""
++import os
++import sys
++import django
++
++# Configure Django settings with a simple SQLite database
++os.environ['DJANGO_SETTINGS_MODULE'] = 'django.conf.settings'
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++# Import Django components after setup
++from django.db import models, connection
++from django.db.models import F, Value
++from django.db.models.functions import Concat
++
++# Create a simple test model
++class TestModel(models.Model):
++    first_name = models.CharField(max_length=100)
++    last_name = models.CharField(max_length=100)
++    full_name = models.CharField(max_length=200)
++    age = models.IntegerField(default=30)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the database table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test objects
++TestModel.objects.create(first_name="John", last_name="Doe", full_name="", age=30)
++TestModel.objects.create(first_name="Jane", last_name="Smith", full_name="", age=25)
++
++# Test 1: Simple F expression
++print("=== Test 1: Simple F expression ===")
++test_obj1 = TestModel.objects.first()
++print(f"Before: first_name={test_obj1.first_name}, full_name={test_obj1.full_name}")
++
++# Set full_name to first_name using F expression
++test_obj1.full_name = F('first_name')
++TestModel.objects.bulk_update([test_obj1], ['full_name'])
++
++# Refresh from database
++test_obj1.refresh_from_db()
++print(f"After: first_name={test_obj1.first_name}, full_name={test_obj1.full_name}")
++print("Last SQL Query:")
++print(connection.queries[-2]['sql'])
++print()
++
++# Test 2: Complex expression with F
++print("=== Test 2: Complex expression with F/Value ===")
++test_obj2 = TestModel.objects.get(pk=2)
++print(f"Before: first_name={test_obj2.first_name}, last_name={test_obj2.last_name}, full_name={test_obj2.full_name}")
++
++# Set full_name to the concatenation of first_name and last_name
++test_obj2.full_name = Concat(F('first_name'), Value(' '), F('last_name'))  
++TestModel.objects.bulk_update([test_obj2], ['full_name'])
++
++# Refresh from database
++test_obj2.refresh_from_db()
++print(f"After: first_name={test_obj2.first_name}, last_name={test_obj2.last_name}, full_name={test_obj2.full_name}")
++print("Last SQL Query:")
++print(connection.queries[-2]['sql'])
++print()
++
++# Test 3: F expression with arithmetic
++print("=== Test 3: F expression with arithmetic ===")
++test_obj1 = TestModel.objects.first()
++print(f"Before: age={test_obj1.age}")
++
++# Add 5 to the age using F expression
++test_obj1.age = F('age') + 5
++TestModel.objects.bulk_update([test_obj1], ['age'])
++
++# Refresh from database
++test_obj1.refresh_from_db()
++print(f"After: age={test_obj1.age}")
++print("Last SQL Query:")
++print(connection.queries[-2]['sql'])
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index f8d848e926..3c234d8241 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -670,7 +670,7 @@ class QuerySet:
+                 when_statements = []
+                 for obj in batch_objs:
+                     attr = getattr(obj, field.attname)
+-                    if not isinstance(attr, Expression):
++                    if not isinstance(attr, (Expression, F)):
+                         attr = Value(attr, output_field=field)
+                     when_statements.append(When(pk=obj.pk, then=attr))
+                 case_statement = Case(*when_statements, output_field=field)
+diff --git a/test_f_bulk_update.py b/test_f_bulk_update.py
+new file mode 100644
+index 0000000000..956d252a9d
+--- /dev/null
++++ b/test_f_bulk_update.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python
++"""
++Test script to demonstrate the issue with bulk_update() and F expressions.
++"""
++import os
++import sys
++import django
++from django.db.models import F
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
++django.setup()
++
++# Import after Django setup to access models
++from django.db import models, connection
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.CharField(max_length=100)
++    
++    class Meta:
++        # Use in-memory SQLite for testing
++        app_label = 'test_f_bulk_update'
++        db_table = 'test_model'
++
++# Create a table for our model
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test data
++TestModel.objects.create(name="test name", value="original value")
++
++# Get the object and set F expression
++obj = TestModel.objects.first()
++print(f"Before update - name: {obj.name}, value: {obj.value}")
++
++# Test 1: Use F expression in bulk_update
++obj.value = F('name')  # This should set value to "test name"
++TestModel.objects.bulk_update([obj], ['value'])
++
++# Clear Django's query cache to force a fresh DB read
++del obj
++
++# Check result
++obj = TestModel.objects.first()
++print(f"After update - name: {obj.name}, value: {obj.value}")
++
++# Print the SQL query that was executed
++print("\nSQL Query:")
++print(connection.queries[-2]['sql'])
++
++# Clean up
++with connection.schema_editor() as schema_editor:
++    schema_editor.delete_model(TestModel)
+\ No newline at end of file
+diff --git a/test_f_bulk_update_simple.py b/test_f_bulk_update_simple.py
+new file mode 100644
+index 0000000000..c988c3c780
+--- /dev/null
++++ b/test_f_bulk_update_simple.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python
++"""
++A simple test to reproduce the issue with F expressions and bulk_update.
++"""
++import os
++import sys
++import django
++
++# Configure Django settings with a simple SQLite database
++os.environ['DJANGO_SETTINGS_MODULE'] = 'django.conf.settings'
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++# Import Django components after setup
++from django.db import models, connection
++from django.db.models import F
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the database table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create a test object
++TestModel.objects.create(name="test name", value="original value")
++
++# Test the issue
++test_obj = TestModel.objects.first()
++print(f"Before update - name: {test_obj.name}, value: {test_obj.value}")
++
++# This should copy the value from 'name' field to 'value' field
++test_obj.value = F('name')
++TestModel.objects.bulk_update([test_obj], ['value'])
++
++# Refresh from database to see the result
++test_obj.refresh_from_db()
++print(f"After update - name: {test_obj.name}, value: {test_obj.value}")
++
++# Print the SQL query that was executed
++print("\nLast SQL Query:")
++print(connection.queries[-2]['sql'])
+\ No newline at end of file

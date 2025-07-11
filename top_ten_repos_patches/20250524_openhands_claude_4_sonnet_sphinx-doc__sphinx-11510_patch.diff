@@ -1,0 +1,848 @@
+diff --git a/sphinx/directives/other.py b/sphinx/directives/other.py
+index 19f7c0a8d..308edec93 100644
+--- a/sphinx/directives/other.py
++++ b/sphinx/directives/other.py
+@@ -376,7 +376,171 @@ class Include(BaseInclude, SphinxDirective):
+         rel_filename, filename = self.env.relfn2path(self.arguments[0])
+         self.arguments[0] = filename
+         self.env.note_included(filename)
+-        return super().run()
++        
++        # Check if this is a Sphinx document that should have source-read event
++        docname = self.env.path2doc(filename)
++        if docname is not None:
++            # This is a Sphinx document, we need to emit source-read event
++            return self._run_with_source_read_event(filename, docname)
++        else:
++            # Not a Sphinx document, use normal docutils processing
++            return super().run()
++
++    def _run_with_source_read_event(self, filename: str, docname: str) -> list[Node]:
++        """Run the include directive with source-read event emission."""
++        from docutils import io, statemachine, utils
++        from docutils.parsers.rst.directives.misc import CodeBlock
++        from docutils.parsers.rst.directives.body import NumberLines
++        from docutils import nodes
++        from pathlib import Path
++        
++        # This is based on docutils BaseInclude.run() but with source-read event
++        if not self.state.document.settings.file_insertion_enabled:
++            raise self.warning('"%s" directive disabled.' % self.name)
++        
++        # Get file settings
++        encoding = self.options.get(
++            'encoding', self.state.document.settings.input_encoding)
++        e_handler = self.state.document.settings.input_encoding_error_handler
++        tab_width = self.options.get(
++            'tab-width', self.state.document.settings.tab_width)
++        
++        # Read file and emit source-read event
++        try:
++            include_file = io.FileInput(source_path=filename,
++                                        encoding=encoding,
++                                        error_handler=e_handler)
++        except UnicodeEncodeError:
++            raise self.severe(f'Problems with "{self.name}" directive path:\n'
++                              f'Cannot encode input file path "{filename}" '
++                              '(wrong locale?).')
++        except OSError as error:
++            raise self.severe(f'Problems with "{self.name}" directive '
++                              f'path:\n{io.error_string(error)}.')
++        else:
++            self.state.document.settings.record_dependencies.add(filename)
++
++        # Get to-be-included content with source-read event
++        startline = self.options.get('start-line', None)
++        endline = self.options.get('end-line', None)
++        try:
++            if startline or (endline is not None):
++                lines = include_file.readlines()
++                rawtext = ''.join(lines[startline:endline])
++            else:
++                rawtext = include_file.read()
++        except UnicodeError as error:
++            raise self.severe(f'Problem with "{self.name}" directive:\n'
++                              + io.error_string(error))
++        
++        # Emit source-read event for the included file
++        arg = [rawtext]
++        self.env.events.emit('source-read', docname, arg)
++        rawtext = arg[0]
++        
++        # Process start-after/end-before options
++        after_text = self.options.get('start-after', None)
++        if after_text:
++            after_index = rawtext.find(after_text)
++            if after_index < 0:
++                raise self.severe('Problem with "start-after" option of "%s" '
++                                  'directive:\nText not found.' % self.name)
++            rawtext = rawtext[after_index + len(after_text):]
++        before_text = self.options.get('end-before', None)
++        if before_text:
++            before_index = rawtext.find(before_text)
++            if before_index < 0:
++                raise self.severe('Problem with "end-before" option of "%s" '
++                                  'directive:\nText not found.' % self.name)
++            rawtext = rawtext[:before_index]
++
++        include_lines = statemachine.string2lines(rawtext, tab_width,
++                                                  convert_whitespace=True)
++        for i, line in enumerate(include_lines):
++            if len(line) > self.state.document.settings.line_length_limit:
++                raise self.warning('"%s": line %d exceeds the'
++                                   ' line-length-limit.' % (filename, i+1))
++
++        if 'literal' in self.options:
++            # Don't convert tabs to spaces, if `tab_width` is negative.
++            if tab_width >= 0:
++                text = rawtext.expandtabs(tab_width)
++            else:
++                text = rawtext
++            literal_block = nodes.literal_block(
++                                rawtext, source=filename,
++                                classes=self.options.get('class', []))
++            literal_block.line = 1
++            self.add_name(literal_block)
++            if 'number-lines' in self.options:
++                try:
++                    startline = int(self.options['number-lines'] or 1)
++                except ValueError:
++                    raise self.error(':number-lines: with non-integer '
++                                     'start value')
++                endline = startline + len(include_lines)
++                if text.endswith('\n'):
++                    text = text[:-1]
++                tokens = NumberLines([([], text)], startline, endline)
++                for classes, value in tokens:
++                    if classes:
++                        literal_block += nodes.inline(value, value,
++                                                      classes=classes)
++                    else:
++                        literal_block += nodes.Text(value)
++            else:
++                literal_block += nodes.Text(text)
++            return [literal_block]
++
++        if 'code' in self.options:
++            self.options['source'] = filename
++            # Don't convert tabs to spaces, if `tab_width` is negative:
++            if tab_width < 0:
++                include_lines = rawtext.splitlines()
++            codeblock = CodeBlock(self.name,
++                                  [self.options.pop('code')],  # arguments
++                                  self.options,
++                                  include_lines,  # content
++                                  self.lineno,
++                                  self.content_offset,
++                                  self.block_text,
++                                  self.state,
++                                  self.state_machine)
++            return codeblock.run()
++
++        # Prevent circular inclusion:
++        current_source = self.state.document.current_source
++        clip_options = (startline, endline, before_text, after_text)
++        include_log = self.state.document.include_log
++        # log entries are tuples (<source>, <clip-options>)
++        if not include_log:  # new document, initialize with document source
++            include_log.append((utils.relative_path(None, current_source),
++                                (None, None, None, None)))
++        if (filename, clip_options) in include_log:
++            master_paths = (pth for (pth, opt) in reversed(include_log))
++            inclusion_chain = '\n> '.join((filename, *master_paths))
++            raise self.warning('circular inclusion in "%s" directive:\n%s'
++                               % (self.name, inclusion_chain))
++
++        if 'parser' in self.options:
++            # parse into a dummy document and return created nodes
++            document = utils.new_document(filename, self.state.document.settings)
++            document.include_log = include_log + [(filename, clip_options)]
++            parser = self.options['parser']()
++            parser.parse('\n'.join(include_lines), document)
++            # clean up doctree and complete parsing
++            document.transformer.populate_from_components((parser,))
++            document.transformer.apply_transforms()
++            return document.children
++
++        # Include as rST source:
++        #
++        # mark end (cf. parsers.rst.states.Body.comment())
++        include_lines += ['', '.. end of inclusion from "%s"' % filename]
++        self.state_machine.insert_input(include_lines, filename)
++        # update include-log
++        include_log.append((filename, clip_options))
++        return []
+ 
+ 
+ def setup(app: Sphinx) -> dict[str, Any]:
+diff --git a/test_include_edge_cases.py b/test_include_edge_cases.py
+new file mode 100644
+index 000000000..347473a87
+--- /dev/null
++++ b/test_include_edge_cases.py
+@@ -0,0 +1,182 @@
++#!/usr/bin/env python3
++"""
++Test script to test edge cases for the include directive fix.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++
++def test_non_sphinx_file():
++    """Test including a file that's not a Sphinx document."""
++    test_dir = Path(tempfile.mkdtemp())
++    print(f"Testing non-Sphinx file in: {test_dir}")
++    
++    try:
++        # Create conf.py
++        (test_dir / "conf.py").write_text("""
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++extensions = ['my_extension']
++master_doc = 'index'
++""")
++        
++        # Create index.rst
++        (test_dir / "index.rst").write_text("""
++Test
++====
++
++.. include:: non-sphinx-file.txt
++
++&REPLACE_ME;
++""")
++        
++        # Create non-sphinx-file.txt (no .rst extension)
++        (test_dir / "non-sphinx-file.txt").write_text("""
++This is a plain text file.
++&REPLACE_ME;
++""")
++        
++        # Create extension
++        (test_dir / "my_extension.py").write_text("""
++def subst_vars_replace(app, docname, source):
++    print(f"Processing: {docname}")
++    source[0] = source[0].replace("&REPLACE_ME;", "REPLACED")
++
++def setup(app):
++    app.connect('source-read', subst_vars_replace)
++    return dict(version='1.0', parallel_read_safe=True, parallel_write_safe=True)
++""")
++        
++        # Run sphinx-build
++        import subprocess
++        result = subprocess.run([
++            'sphinx-build', '-b', 'html', str(test_dir), str(test_dir / 'build')
++        ], capture_output=True, text=True, cwd=test_dir, 
++           env={**os.environ, 'PYTHONPATH': f'/workspace/sphinx-doc__sphinx__7.2:{os.environ.get("PYTHONPATH", "")}'})
++        
++        print("Build result:", result.returncode)
++        if result.returncode != 0:
++            print("STDERR:", result.stderr)
++            return False
++        
++        # Check output
++        index_html = test_dir / "build" / "index.html"
++        if index_html.exists():
++            content = index_html.read_text()
++            # For non-Sphinx files, the content should be included as-is (not processed by source-read)
++            # So we should see the original &REPLACE_ME; from the .txt file
++            replace_me_count = content.count("&amp;REPLACE_ME;")
++            replaced_count = content.count("REPLACED")
++            print(f"Non-Sphinx file test: {replace_me_count} REPLACE_ME, {replaced_count} REPLACED")
++            # We expect 1 REPLACE_ME (from .txt file) and 1 REPLACED (from main .rst file)
++            return replace_me_count == 1 and replaced_count == 1
++        
++        return False
++        
++    finally:
++        shutil.rmtree(test_dir)
++
++def test_nested_includes():
++    """Test nested include directives."""
++    test_dir = Path(tempfile.mkdtemp())
++    print(f"Testing nested includes in: {test_dir}")
++    
++    try:
++        # Create conf.py
++        (test_dir / "conf.py").write_text("""
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++extensions = ['my_extension']
++master_doc = 'index'
++""")
++        
++        # Create index.rst
++        (test_dir / "index.rst").write_text("""
++Test
++====
++
++.. include:: level1.rst
++
++&REPLACE_ME;
++""")
++        
++        # Create level1.rst
++        (test_dir / "level1.rst").write_text("""
++Level 1
++=======
++
++.. include:: level2.rst
++
++&REPLACE_ME;
++""")
++        
++        # Create level2.rst
++        (test_dir / "level2.rst").write_text("""
++Level 2
++=======
++
++&REPLACE_ME;
++""")
++        
++        # Create extension
++        (test_dir / "my_extension.py").write_text("""
++def subst_vars_replace(app, docname, source):
++    print(f"Processing: {docname}")
++    source[0] = source[0].replace("&REPLACE_ME;", "REPLACED")
++
++def setup(app):
++    app.connect('source-read', subst_vars_replace)
++    return dict(version='1.0', parallel_read_safe=True, parallel_write_safe=True)
++""")
++        
++        # Run sphinx-build
++        import subprocess
++        result = subprocess.run([
++            'sphinx-build', '-b', 'html', str(test_dir), str(test_dir / 'build')
++        ], capture_output=True, text=True, cwd=test_dir,
++           env={**os.environ, 'PYTHONPATH': f'/workspace/sphinx-doc__sphinx__7.2:{os.environ.get("PYTHONPATH", "")}'})
++        
++        print("Build result:", result.returncode)
++        if result.returncode != 0:
++            print("STDERR:", result.stderr)
++            return False
++        
++        # Check output
++        index_html = test_dir / "build" / "index.html"
++        if index_html.exists():
++            content = index_html.read_text()
++            replace_me_count = content.count("&amp;REPLACE_ME;")
++            replaced_count = content.count("REPLACED")
++            print(f"Nested includes test: {replace_me_count} REPLACE_ME, {replaced_count} REPLACED")
++            # We expect 0 REPLACE_ME and 3 REPLACED (from index, level1, and level2)
++            return replace_me_count == 0 and replaced_count == 3
++        
++        return False
++        
++    finally:
++        shutil.rmtree(test_dir)
++
++def main():
++    """Run all edge case tests."""
++    print("Testing edge cases for include directive fix...")
++    
++    test1_passed = test_non_sphinx_file()
++    test2_passed = test_nested_includes()
++    
++    print(f"\nResults:")
++    print(f"Non-Sphinx file test: {'PASS' if test1_passed else 'FAIL'}")
++    print(f"Nested includes test: {'PASS' if test2_passed else 'FAIL'}")
++    
++    if test1_passed and test2_passed:
++        print("\n✓ All edge case tests passed!")
++        return True
++    else:
++        print("\n✗ Some edge case tests failed!")
++        return False
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_include_issue.py b/test_include_issue.py
+new file mode 100644
+index 000000000..659da734f
+--- /dev/null
++++ b/test_include_issue.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the issue with source-read event not modifying included files.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++
++def create_test_project():
++    """Create a test Sphinx project to reproduce the issue."""
++    # Create temporary directory
++    test_dir = Path(tempfile.mkdtemp())
++    print(f"Creating test project in: {test_dir}")
++    
++    # Create conf.py
++    conf_py = test_dir / "conf.py"
++    conf_py.write_text("""
++import sys
++import os
++
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = [
++    'my_extension'
++]
++
++master_doc = 'index'
++""")
++    
++    # Create index.rst
++    index_rst = test_dir / "index.rst"
++    index_rst.write_text("""
++This is a test
++==============
++
++.. include:: something-to-include.rst
++
++&REPLACE_ME;
++""")
++    
++    # Create something-to-include.rst
++    include_rst = test_dir / "something-to-include.rst"
++    include_rst.write_text("""
++Testing
++=======
++
++&REPLACE_ME;
++""")
++    
++    # Create my_extension.py
++    extension_py = test_dir / "my_extension.py"
++    extension_py.write_text("""
++#!/usr/bin/env python3
++
++from sphinx.application import Sphinx
++
++
++__version__ = '1.0'
++
++
++def subst_vars_replace(app: Sphinx, docname, source):
++    print(f"Processing docname: {docname}")
++    print(f"Original source: {repr(source[0][:100])}")
++    result = source[0]
++    result = result.replace("&REPLACE_ME;", "REPLACED")
++    source[0] = result
++    print(f"Modified source: {repr(source[0][:100])}")
++
++
++def setup(app: Sphinx):
++    app.connect('source-read', subst_vars_replace)
++
++    return dict(
++        version=__version__,
++        parallel_read_safe=True,
++        parallel_write_safe=True
++    )
++""")
++    
++    return test_dir
++
++def run_sphinx_build(test_dir):
++    """Run sphinx-build on the test project."""
++    import subprocess
++    
++    build_dir = test_dir / "build"
++    
++    # Run sphinx-build
++    cmd = ["sphinx-build", "-b", "html", str(test_dir), str(build_dir)]
++    print(f"Running: {' '.join(cmd)}")
++    
++    result = subprocess.run(cmd, capture_output=True, text=True, cwd=test_dir)
++    print("STDOUT:")
++    print(result.stdout)
++    print("STDERR:")
++    print(result.stderr)
++    
++    return build_dir
++
++def check_output(build_dir):
++    """Check if the issue is reproduced."""
++    index_html = build_dir / "index.html"
++    
++    if not index_html.exists():
++        print("ERROR: index.html not found!")
++        return False
++    
++    content = index_html.read_text()
++    print("\nChecking output...")
++    
++    # Count occurrences of REPLACE_ME and REPLACED
++    replace_me_count = content.count("&amp;REPLACE_ME;")
++    replaced_count = content.count("REPLACED")
++    
++    print(f"Found {replace_me_count} occurrences of '&amp;REPLACE_ME;'")
++    print(f"Found {replaced_count} occurrences of 'REPLACED'")
++    
++    # Extract the relevant section
++    if "Testing" in content:
++        start = content.find('<div class="section" id="testing">')
++        if start != -1:
++            end = content.find('</div>', start)
++            if end != -1:
++                section = content[start:end+6]
++                print("\nTesting section content:")
++                print(section)
++    
++    # The issue is reproduced if we have both REPLACE_ME and REPLACED
++    # (meaning main file was processed but included file was not)
++    issue_reproduced = replace_me_count > 0 and replaced_count > 0
++    
++    if issue_reproduced:
++        print("\n✓ ISSUE REPRODUCED: Include file was not processed by source-read event")
++    else:
++        print("\n✗ Issue not reproduced or already fixed")
++    
++    return issue_reproduced
++
++def main():
++    """Main test function."""
++    print("Testing source-read event with include directive...")
++    
++    # Create test project
++    test_dir = create_test_project()
++    
++    try:
++        # Run sphinx build
++        build_dir = run_sphinx_build(test_dir)
++        
++        # Check output
++        issue_reproduced = check_output(build_dir)
++        
++        return issue_reproduced
++        
++    finally:
++        # Clean up
++        shutil.rmtree(test_dir)
++        print(f"\nCleaned up test directory: {test_dir}")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_include_issue_detailed.py b/test_include_issue_detailed.py
+new file mode 100644
+index 000000000..dc8af5b75
+--- /dev/null
++++ b/test_include_issue_detailed.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++"""
++Detailed test script to understand when the include directive is called.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++
++def create_test_project():
++    """Create a test Sphinx project to reproduce the issue."""
++    # Create temporary directory
++    test_dir = Path(tempfile.mkdtemp())
++    print(f"Creating test project in: {test_dir}")
++    
++    # Create conf.py
++    conf_py = test_dir / "conf.py"
++    conf_py.write_text("""
++import sys
++import os
++
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = [
++    'my_extension'
++]
++
++master_doc = 'index'
++""")
++    
++    # Create index.rst
++    index_rst = test_dir / "index.rst"
++    index_rst.write_text("""
++This is a test
++==============
++
++.. include:: something-to-include.rst
++
++&REPLACE_ME;
++""")
++    
++    # Create something-to-include.rst
++    include_rst = test_dir / "something-to-include.rst"
++    include_rst.write_text("""
++Testing
++=======
++
++&REPLACE_ME;
++""")
++    
++    # Create my_extension.py
++    extension_py = test_dir / "my_extension.py"
++    extension_py.write_text("""
++#!/usr/bin/env python3
++
++from sphinx.application import Sphinx
++
++
++__version__ = '1.0'
++
++
++def subst_vars_replace(app: Sphinx, docname, source):
++    print(f"source-read event: Processing docname: {docname}")
++    print(f"source-read event: Original source: {repr(source[0][:100])}")
++    result = source[0]
++    result = result.replace("&REPLACE_ME;", "REPLACED")
++    source[0] = result
++    print(f"source-read event: Modified source: {repr(source[0][:100])}")
++
++
++def setup(app: Sphinx):
++    app.connect('source-read', subst_vars_replace)
++
++    return dict(
++        version=__version__,
++        parallel_read_safe=True,
++        parallel_write_safe=True
++    )
++""")
++    
++    return test_dir
++
++def run_sphinx_build(test_dir):
++    """Run sphinx-build on the test project."""
++    import subprocess
++    
++    build_dir = test_dir / "build"
++    
++    # Run sphinx-build with verbose output
++    cmd = ["sphinx-build", "-v", "-b", "html", str(test_dir), str(build_dir)]
++    print(f"Running: {' '.join(cmd)}")
++    
++    result = subprocess.run(cmd, capture_output=True, text=True, cwd=test_dir)
++    print("STDOUT:")
++    print(result.stdout)
++    print("STDERR:")
++    print(result.stderr)
++    
++    return build_dir
++
++def check_output(build_dir):
++    """Check if the issue is reproduced."""
++    index_html = build_dir / "index.html"
++    
++    if not index_html.exists():
++        print("ERROR: index.html not found!")
++        return False
++    
++    content = index_html.read_text()
++    print("\nChecking output...")
++    
++    # Count occurrences of REPLACE_ME and REPLACED
++    replace_me_count = content.count("&amp;REPLACE_ME;")
++    replaced_count = content.count("REPLACED")
++    
++    print(f"Found {replace_me_count} occurrences of '&amp;REPLACE_ME;'")
++    print(f"Found {replaced_count} occurrences of 'REPLACED'")
++    
++    # Extract the relevant section
++    if "Testing" in content:
++        start = content.find('<div class="section" id="testing">')
++        if start != -1:
++            end = content.find('</div>', start)
++            if end != -1:
++                section = content[start:end+6]
++                print("\nTesting section content:")
++                print(section)
++    
++    # The issue is reproduced if we have both REPLACE_ME and REPLACED
++    # (meaning main file was processed but included file was not)
++    issue_reproduced = replace_me_count > 0 and replaced_count > 0
++    
++    if issue_reproduced:
++        print("\n✓ ISSUE REPRODUCED: Include file was not processed by source-read event")
++    else:
++        print("\n✗ Issue not reproduced or already fixed")
++    
++    return issue_reproduced
++
++def main():
++    """Main test function."""
++    print("Testing source-read event with include directive...")
++    
++    # Create test project
++    test_dir = create_test_project()
++    
++    try:
++        # Run sphinx build
++        build_dir = run_sphinx_build(test_dir)
++        
++        # Check output
++        issue_reproduced = check_output(build_dir)
++        
++        return issue_reproduced
++        
++    finally:
++        # Clean up
++        shutil.rmtree(test_dir)
++        print(f"\nCleaned up test directory: {test_dir}")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_include_issue_inspect.py b/test_include_issue_inspect.py
+new file mode 100644
+index 000000000..c2d5be705
+--- /dev/null
++++ b/test_include_issue_inspect.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python3
++"""
++Test script to inspect the actual HTML output.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++
++def create_test_project():
++    """Create a test Sphinx project to reproduce the issue."""
++    # Create temporary directory
++    test_dir = Path(tempfile.mkdtemp())
++    print(f"Creating test project in: {test_dir}")
++    
++    # Create conf.py
++    conf_py = test_dir / "conf.py"
++    conf_py.write_text("""
++import sys
++import os
++
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = [
++    'my_extension'
++]
++
++master_doc = 'index'
++""")
++    
++    # Create index.rst
++    index_rst = test_dir / "index.rst"
++    index_rst.write_text("""
++This is a test
++==============
++
++.. include:: something-to-include.rst
++
++&REPLACE_ME;
++""")
++    
++    # Create something-to-include.rst
++    include_rst = test_dir / "something-to-include.rst"
++    include_rst.write_text("""
++Testing
++=======
++
++&REPLACE_ME;
++""")
++    
++    # Create my_extension.py
++    extension_py = test_dir / "my_extension.py"
++    extension_py.write_text("""
++#!/usr/bin/env python3
++
++from sphinx.application import Sphinx
++
++
++__version__ = '1.0'
++
++
++def subst_vars_replace(app: Sphinx, docname, source):
++    print(f"source-read event: Processing docname: {docname}")
++    result = source[0]
++    result = result.replace("&REPLACE_ME;", "REPLACED")
++    source[0] = result
++
++
++def setup(app: Sphinx):
++    app.connect('source-read', subst_vars_replace)
++
++    return dict(
++        version=__version__,
++        parallel_read_safe=True,
++        parallel_write_safe=True
++    )
++""")
++    
++    return test_dir
++
++def run_sphinx_build(test_dir):
++    """Run sphinx-build on the test project."""
++    import subprocess
++    
++    build_dir = test_dir / "build"
++    
++    # Run sphinx-build
++    cmd = ["sphinx-build", "-b", "html", str(test_dir), str(build_dir)]
++    print(f"Running: {' '.join(cmd)}")
++    
++    result = subprocess.run(cmd, capture_output=True, text=True, cwd=test_dir)
++    print("STDOUT:")
++    print(result.stdout)
++    if result.stderr:
++        print("STDERR:")
++        print(result.stderr)
++    
++    return build_dir
++
++def inspect_output(build_dir):
++    """Inspect the actual HTML output."""
++    index_html = build_dir / "index.html"
++    
++    if not index_html.exists():
++        print("ERROR: index.html not found!")
++        return
++    
++    content = index_html.read_text()
++    print("\n" + "="*50)
++    print("FULL HTML CONTENT:")
++    print("="*50)
++    print(content)
++    print("="*50)
++
++def main():
++    """Main test function."""
++    print("Inspecting HTML output...")
++    
++    # Create test project
++    test_dir = create_test_project()
++    
++    try:
++        # Run sphinx build
++        build_dir = run_sphinx_build(test_dir)
++        
++        # Inspect output
++        inspect_output(build_dir)
++        
++    finally:
++        # Don't clean up so we can inspect manually if needed
++        print(f"\nTest directory: {test_dir}")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file

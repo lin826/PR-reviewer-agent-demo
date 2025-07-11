@@ -1,0 +1,855 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 90fc31bee5..8a5c04393b 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -170,6 +170,19 @@ class CreateModel(ModelOperation):
+                     managers=self.managers,
+                 ),
+             ]
++        elif (
++            isinstance(operation, AlterModelManagers)
++            and self.name_lower == operation.name_lower
++        ):
++            return [
++                CreateModel(
++                    self.name,
++                    fields=self.fields,
++                    options=self.options,
++                    bases=self.bases,
++                    managers=operation.managers,
++                ),
++            ]
+         elif (
+             isinstance(operation, AlterTogetherOptionOperation)
+             and self.name_lower == operation.name_lower
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..784abcc226
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,249 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script for CreateModel + AlterModelManagers optimization.
++Tests various edge cases and scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++
++
++class CustomManager(models.Manager):
++    def get_queryset(self):
++        return super().get_queryset().filter(active=True)
++
++
++class AnotherManager(models.Manager):
++    def get_queryset(self):
++        return super().get_queryset().order_by('name')
++
++
++def test_basic_optimization():
++    """Test basic CreateModel + AlterModelManagers optimization."""
++    print("Test 1: Basic optimization")
++    
++    operations = [
++        migrations.CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++        ),
++        migrations.AlterModelManagers(
++            name="TestModel",
++            managers=[("custom", CustomManager())],
++        ),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    result = optimizer.optimize(operations, "testapp")
++    
++    assert len(result) == 1, f"Expected 1 operation, got {len(result)}"
++    assert isinstance(result[0], migrations.CreateModel), "Expected CreateModel operation"
++    assert len(result[0].managers) == 1, f"Expected 1 manager, got {len(result[0].managers)}"
++    assert result[0].managers[0][0] == "custom", "Manager name should be 'custom'"
++    print("✅ PASSED")
++
++
++def test_with_existing_managers():
++    """Test optimization when CreateModel already has managers."""
++    print("Test 2: CreateModel with existing managers")
++    
++    operations = [
++        migrations.CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            managers=[("objects", models.Manager())],
++        ),
++        migrations.AlterModelManagers(
++            name="TestModel",
++            managers=[("custom", CustomManager()), ("another", AnotherManager())],
++        ),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    result = optimizer.optimize(operations, "testapp")
++    
++    assert len(result) == 1, f"Expected 1 operation, got {len(result)}"
++    assert isinstance(result[0], migrations.CreateModel), "Expected CreateModel operation"
++    assert len(result[0].managers) == 2, f"Expected 2 managers, got {len(result[0].managers)}"
++    # The managers from AlterModelManagers should replace the original ones
++    manager_names = [name for name, _ in result[0].managers]
++    assert "custom" in manager_names, "Should have 'custom' manager"
++    assert "another" in manager_names, "Should have 'another' manager"
++    assert "objects" not in manager_names, "Original 'objects' manager should be replaced"
++    print("✅ PASSED")
++
++
++def test_with_options_and_managers():
++    """Test that both options and managers optimizations work together."""
++    print("Test 3: CreateModel + AlterModelOptions + AlterModelManagers")
++    
++    operations = [
++        migrations.CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++        ),
++        migrations.AlterModelOptions(
++            name="TestModel",
++            options={"verbose_name": "Test Model"},
++        ),
++        migrations.AlterModelManagers(
++            name="TestModel",
++            managers=[("custom", CustomManager())],
++        ),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    result = optimizer.optimize(operations, "testapp")
++    
++    assert len(result) == 1, f"Expected 1 operation, got {len(result)}"
++    assert isinstance(result[0], migrations.CreateModel), "Expected CreateModel operation"
++    assert result[0].options.get("verbose_name") == "Test Model", "Options should be preserved"
++    assert len(result[0].managers) == 1, f"Expected 1 manager, got {len(result[0].managers)}"
++    assert result[0].managers[0][0] == "custom", "Manager name should be 'custom'"
++    print("✅ PASSED")
++
++
++def test_different_model_names():
++    """Test that optimization doesn't happen for different model names."""
++    print("Test 4: Different model names (should not optimize)")
++    
++    operations = [
++        migrations.CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++        ),
++        migrations.AlterModelManagers(
++            name="DifferentModel",  # Different model name
++            managers=[("custom", CustomManager())],
++        ),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    result = optimizer.optimize(operations, "testapp")
++    
++    assert len(result) == 2, f"Expected 2 operations (no optimization), got {len(result)}"
++    assert isinstance(result[0], migrations.CreateModel), "First should be CreateModel"
++    assert isinstance(result[1], migrations.AlterModelManagers), "Second should be AlterModelManagers"
++    print("✅ PASSED")
++
++
++def test_empty_managers():
++    """Test optimization with empty managers list."""
++    print("Test 5: Empty managers list")
++    
++    operations = [
++        migrations.CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            managers=[("objects", models.Manager())],
++        ),
++        migrations.AlterModelManagers(
++            name="TestModel",
++            managers=[],  # Empty managers list
++        ),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    result = optimizer.optimize(operations, "testapp")
++    
++    assert len(result) == 1, f"Expected 1 operation, got {len(result)}"
++    assert isinstance(result[0], migrations.CreateModel), "Expected CreateModel operation"
++    assert len(result[0].managers) == 0, f"Expected 0 managers, got {len(result[0].managers)}"
++    print("✅ PASSED")
++
++
++def test_multiple_alter_managers():
++    """Test multiple AlterModelManagers operations."""
++    print("Test 6: Multiple AlterModelManagers operations")
++    
++    operations = [
++        migrations.CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++        ),
++        migrations.AlterModelManagers(
++            name="TestModel",
++            managers=[("first", CustomManager())],
++        ),
++        migrations.AlterModelManagers(
++            name="TestModel",
++            managers=[("second", AnotherManager())],
++        ),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    result = optimizer.optimize(operations, "testapp")
++    
++    # Should optimize CreateModel + first AlterModelManagers, then the second AlterModelManagers
++    # should be optimized with the result, ending up with just CreateModel
++    assert len(result) == 1, f"Expected 1 operation, got {len(result)}"
++    assert isinstance(result[0], migrations.CreateModel), "Expected CreateModel operation"
++    assert len(result[0].managers) == 1, f"Expected 1 manager, got {len(result[0].managers)}"
++    assert result[0].managers[0][0] == "second", "Should have the last manager"
++    print("✅ PASSED")
++
++
++def run_all_tests():
++    """Run all test cases."""
++    print("Running comprehensive tests for CreateModel + AlterModelManagers optimization")
++    print("=" * 80)
++    
++    tests = [
++        test_basic_optimization,
++        test_with_existing_managers,
++        test_with_options_and_managers,
++        test_different_model_names,
++        test_empty_managers,
++        test_multiple_alter_managers,
++    ]
++    
++    passed = 0
++    failed = 0
++    
++    for test in tests:
++        try:
++            test()
++            passed += 1
++        except Exception as e:
++            print(f"❌ FAILED: {e}")
++            failed += 1
++        print()
++    
++    print("=" * 80)
++    print(f"SUMMARY: {passed} passed, {failed} failed")
++    
++    if failed == 0:
++        print("🎉 All tests passed!")
++        return True
++    else:
++        print("💥 Some tests failed!")
++        return False
++
++
++if __name__ == "__main__":
++    success = run_all_tests()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_debug.py b/test_debug.py
+new file mode 100644
+index 0000000000..da4194b65d
+--- /dev/null
++++ b/test_debug.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++"""
++Debug script to test the exact same scenario as the failing test.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++from django.db.migrations.serializer import serializer_factory
++from tests.migrations.models import EmptyManager
++
++
++def serialize(value):
++    return serializer_factory(value).serialize()[0]
++
++
++def test_exact_same_as_failing_test():
++    """Test the exact same operations as the failing test."""
++    
++    operations = [
++        migrations.CreateModel("Foo", fields=[]),
++        migrations.AlterModelManagers(
++            name="Foo", managers=[("objects", EmptyManager())]
++        ),
++    ]
++    
++    expected = [
++        migrations.CreateModel(
++            "Foo", fields=[], managers=[("objects", EmptyManager())]
++        ),
++    ]
++    
++    print("Original operations:")
++    for i, op in enumerate(operations):
++        print(f"  {i}: {op}")
++    
++    # Test with app_label "migrations" (same as the test)
++    optimizer = MigrationOptimizer()
++    result = optimizer.optimize(operations, "migrations")
++    
++    print(f"\nOptimized operations (app_label='migrations'):")
++    for i, op in enumerate(result):
++        print(f"  {i}: {op}")
++    
++    print(f"\nSerialized result:")
++    result_serialized = [serialize(f) for f in result]
++    for i, op in enumerate(result_serialized):
++        print(f"  {i}: {op}")
++    
++    print(f"\nSerialized expected:")
++    expected_serialized = [serialize(f) for f in expected]
++    for i, op in enumerate(expected_serialized):
++        print(f"  {i}: {op}")
++    
++    print(f"\nOptimization successful: {len(result) == 1}")
++    
++    # Test the reduce method directly
++    print(f"\nDirect reduce test:")
++    direct_result = operations[0].reduce(operations[1], "migrations")
++    print(f"Direct reduce result: {direct_result}")
++
++
++if __name__ == "__main__":
++    test_exact_same_as_failing_test()
+\ No newline at end of file
+diff --git a/test_debug_simple.py b/test_debug_simple.py
+new file mode 100644
+index 0000000000..4ba6efb27b
+--- /dev/null
++++ b/test_debug_simple.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python
++"""
++Debug script to test the exact same scenario as the failing test.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++from django.db.migrations.serializer import serializer_factory
++
++
++class EmptyManager(models.Manager):
++    use_in_migrations = True
++
++
++def serialize(value):
++    return serializer_factory(value).serialize()[0]
++
++
++def test_exact_same_as_failing_test():
++    """Test the exact same operations as the failing test."""
++    
++    operations = [
++        migrations.CreateModel("Foo", fields=[]),
++        migrations.AlterModelManagers(
++            name="Foo", managers=[("objects", EmptyManager())]
++        ),
++    ]
++    
++    expected = [
++        migrations.CreateModel(
++            "Foo", fields=[], managers=[("objects", EmptyManager())]
++        ),
++    ]
++    
++    print("Original operations:")
++    for i, op in enumerate(operations):
++        print(f"  {i}: {op}")
++        print(f"      Type: {type(op)}")
++        if hasattr(op, 'managers'):
++            print(f"      Managers: {op.managers}")
++    
++    # Test with app_label "migrations" (same as the test)
++    optimizer = MigrationOptimizer()
++    result = optimizer.optimize(operations, "migrations")
++    
++    print(f"\nOptimized operations (app_label='migrations'):")
++    for i, op in enumerate(result):
++        print(f"  {i}: {op}")
++        print(f"      Type: {type(op)}")
++        if hasattr(op, 'managers'):
++            print(f"      Managers: {op.managers}")
++    
++    print(f"\nOptimization successful: {len(result) == 1}")
++    
++    # Test the reduce method directly
++    print(f"\nDirect reduce test:")
++    direct_result = operations[0].reduce(operations[1], "migrations")
++    print(f"Direct reduce result: {direct_result}")
++    if direct_result:
++        print(f"Direct reduce result type: {type(direct_result)}")
++        if isinstance(direct_result, list) and len(direct_result) > 0:
++            print(f"First result: {direct_result[0]}")
++            if hasattr(direct_result[0], 'managers'):
++                print(f"First result managers: {direct_result[0].managers}")
++
++
++if __name__ == "__main__":
++    test_exact_same_as_failing_test()
+\ No newline at end of file
+diff --git a/test_isinstance.py b/test_isinstance.py
+new file mode 100644
+index 0000000000..b657ca7cae
+--- /dev/null
++++ b/test_isinstance.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python
++"""
++Test script to check if isinstance works with AlterModelManagers.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, migrations
++from django.db.migrations.operations.models import CreateModel, AlterModelManagers
++
++# Test isinstance check
++create_op = CreateModel(
++    name="TestModel",
++    fields=[("id", models.AutoField(primary_key=True))],
++)
++
++alter_op = AlterModelManagers(
++    name="TestModel",
++    managers=[("objects", models.Manager())],
++)
++
++print(f"AlterModelManagers class: {AlterModelManagers}")
++print(f"alter_op type: {type(alter_op)}")
++print(f"isinstance check: {isinstance(alter_op, AlterModelManagers)}")
++
++# Test the reduce method directly
++result = create_op.reduce(alter_op, "testapp")
++print(f"Reduce result: {result}")
++print(f"Result type: {type(result)}")
++if result and len(result) == 1:
++    print(f"Result operation: {result[0]}")
++    print(f"Result managers: {result[0].managers}")
+\ No newline at end of file
+diff --git a/test_mimic_test.py b/test_mimic_test.py
+new file mode 100644
+index 0000000000..a52db42289
+--- /dev/null
++++ b/test_mimic_test.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python
++"""
++Test script that mimics exactly what the Django test does.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++from django.db.migrations.serializer import serializer_factory
++
++
++def optimize(operations, app_label):
++    """
++    Handy shortcut for getting results + number of loops
++    """
++    optimizer = MigrationOptimizer()
++    return optimizer.optimize(operations, app_label), optimizer._iterations
++
++
++def serialize(value):
++    return serializer_factory(value).serialize()[0]
++
++
++def assertOptimizesTo(operations, expected, app_label=None):
++    result, iterations = optimize(operations, app_label or "migrations")
++    result = [serialize(f) for f in result]
++    expected = [serialize(f) for f in expected]
++    
++    print("Expected:")
++    for i, op in enumerate(expected):
++        print(f"  {i}: {op}")
++    
++    print("\nActual:")
++    for i, op in enumerate(result):
++        print(f"  {i}: {op}")
++    
++    print(f"\nEqual: {expected == result}")
++    return expected == result
++
++
++def test_create_alter_model_options():
++    """Test the working AlterModelOptions optimization."""
++    print("Testing AlterModelOptions optimization:")
++    
++    operations = [
++        migrations.CreateModel("Foo", fields=[]),
++        migrations.AlterModelOptions(
++            name="Foo", options={"verbose_name_plural": "Foozes"}
++        ),
++    ]
++    
++    expected = [
++        migrations.CreateModel(
++            "Foo", fields=[], options={"verbose_name_plural": "Foozes"}
++        ),
++    ]
++    
++    result = assertOptimizesTo(operations, expected)
++    print(f"AlterModelOptions test: {'PASSED' if result else 'FAILED'}")
++    return result
++
++
++def test_create_alter_model_managers():
++    """Test the AlterModelManagers optimization."""
++    print("\nTesting AlterModelManagers optimization:")
++    
++    operations = [
++        migrations.CreateModel("Foo", fields=[]),
++        migrations.AlterModelManagers(
++            name="Foo", managers=[("objects", models.Manager())]
++        ),
++    ]
++    
++    expected = [
++        migrations.CreateModel(
++            "Foo", fields=[], managers=[("objects", models.Manager())]
++        ),
++    ]
++    
++    result = assertOptimizesTo(operations, expected)
++    print(f"AlterModelManagers test: {'PASSED' if result else 'FAILED'}")
++    return result
++
++
++if __name__ == "__main__":
++    options_result = test_create_alter_model_options()
++    managers_result = test_create_alter_model_managers()
++    
++    print(f"\nSummary:")
++    print(f"AlterModelOptions: {'PASSED' if options_result else 'FAILED'}")
++    print(f"AlterModelManagers: {'PASSED' if managers_result else 'FAILED'}")
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..1d3a4c3c1e
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue and verify the fix.
++This script tests the optimization of CreateModel + AlterModelManagers.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++from django.db.migrations.serializer import serializer_factory
++
++
++class CustomManager(models.Manager):
++    def get_queryset(self):
++        return super().get_queryset().filter(active=True)
++
++
++def serialize(value):
++    return serializer_factory(value).serialize()[0]
++
++
++def test_create_model_alter_managers_optimization():
++    """Test that CreateModel + AlterModelManagers gets optimized to just CreateModel."""
++    
++    print("Testing CreateModel + AlterModelManagers optimization...")
++    
++    # Create the operations
++    operations = [
++        migrations.CreateModel(
++            name="TestModel",
++            fields=[
++                ("id", models.AutoField(primary_key=True)),
++                ("name", models.CharField(max_length=100)),
++                ("active", models.BooleanField(default=True)),
++            ],
++        ),
++        migrations.AlterModelManagers(
++            name="TestModel",
++            managers=[
++                ("objects", models.Manager()),
++                ("active_objects", CustomManager()),
++            ],
++        ),
++    ]
++    
++    # Optimize the operations
++    optimizer = MigrationOptimizer()
++    optimized_operations = optimizer.optimize(operations, "testapp")
++    
++    print(f"Original operations count: {len(operations)}")
++    print(f"Optimized operations count: {len(optimized_operations)}")
++    
++    # Print the operations for debugging
++    print("\nOriginal operations:")
++    for i, op in enumerate(operations):
++        print(f"  {i}: {op.__class__.__name__} - {op.describe()}")
++    
++    print("\nOptimized operations:")
++    for i, op in enumerate(optimized_operations):
++        print(f"  {i}: {op.__class__.__name__} - {op.describe()}")
++        if hasattr(op, 'managers'):
++            print(f"      Managers: {op.managers}")
++    
++    # Check if optimization worked
++    if len(optimized_operations) == 1:
++        optimized_op = optimized_operations[0]
++        if (isinstance(optimized_op, migrations.CreateModel) and 
++            optimized_op.name == "TestModel" and
++            len(optimized_op.managers) == 2):
++            print("\n✅ SUCCESS: CreateModel + AlterModelManagers was optimized correctly!")
++            return True
++        else:
++            print("\n❌ FAILED: Optimization didn't work as expected")
++            return False
++    else:
++        print("\n❌ FAILED: Operations were not combined into a single CreateModel")
++        return False
++
++
++def test_existing_create_model_alter_options_optimization():
++    """Test that the existing CreateModel + AlterModelOptions optimization still works."""
++    
++    print("\n" + "="*60)
++    print("Testing existing CreateModel + AlterModelOptions optimization...")
++    
++    # Create the operations
++    operations = [
++        migrations.CreateModel(
++            name="TestModel",
++            fields=[
++                ("id", models.AutoField(primary_key=True)),
++                ("name", models.CharField(max_length=100)),
++            ],
++        ),
++        migrations.AlterModelOptions(
++            name="TestModel",
++            options={"verbose_name_plural": "Test Models"},
++        ),
++    ]
++    
++    # Optimize the operations
++    optimizer = MigrationOptimizer()
++    optimized_operations = optimizer.optimize(operations, "testapp")
++    
++    print(f"Original operations count: {len(operations)}")
++    print(f"Optimized operations count: {len(optimized_operations)}")
++    
++    # Check if optimization worked
++    if len(optimized_operations) == 1:
++        optimized_op = optimized_operations[0]
++        if (isinstance(optimized_op, migrations.CreateModel) and 
++            optimized_op.name == "TestModel" and
++            optimized_op.options.get("verbose_name_plural") == "Test Models"):
++            print("\n✅ SUCCESS: CreateModel + AlterModelOptions optimization still works!")
++            return True
++        else:
++            print("\n❌ FAILED: AlterModelOptions optimization didn't work as expected")
++            return False
++    else:
++        print("\n❌ FAILED: AlterModelOptions operations were not combined")
++        return False
++
++
++if __name__ == "__main__":
++    print("Django Migration Optimization Test")
++    print("="*60)
++    
++    # Test existing functionality first
++    options_test_passed = test_existing_create_model_alter_options_optimization()
++    
++    # Test the new functionality
++    managers_test_passed = test_create_model_alter_managers_optimization()
++    
++    print("\n" + "="*60)
++    print("SUMMARY:")
++    print(f"AlterModelOptions test: {'PASSED' if options_test_passed else 'FAILED'}")
++    print(f"AlterModelManagers test: {'PASSED' if managers_test_passed else 'FAILED'}")
++    
++    if managers_test_passed:
++        print("\n🎉 The optimization is working correctly!")
++        sys.exit(0)
++    else:
++        print("\n💡 The optimization needs to be implemented.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/tests/migrations/test_optimizer.py b/tests/migrations/test_optimizer.py
+index 59dd401a3c..5319ca8ec4 100644
+--- a/tests/migrations/test_optimizer.py
++++ b/tests/migrations/test_optimizer.py
+@@ -129,6 +129,21 @@ class OptimizerTests(SimpleTestCase):
+             ],
+         )
+ 
++    def test_create_alter_model_managers(self):
++        self.assertOptimizesTo(
++            [
++                migrations.CreateModel("Foo", fields=[]),
++                migrations.AlterModelManagers(
++                    name="Foo", managers=[("objects", EmptyManager())]
++                ),
++            ],
++            [
++                migrations.CreateModel(
++                    "Foo", fields=[], managers=[("objects", EmptyManager())]
++                ),
++            ],
++        )
++
+     def test_create_model_and_remove_model_options(self):
+         self.assertOptimizesTo(
+             [

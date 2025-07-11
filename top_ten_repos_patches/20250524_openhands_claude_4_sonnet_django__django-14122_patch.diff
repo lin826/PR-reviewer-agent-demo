@@ -1,0 +1,592 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 850734709d..4cbdb03e14 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -68,6 +68,7 @@ class SQLCompiler:
+         to describe in other words than "if it passes the test suite,
+         then it is correct".
+         """
++
+         # Some examples:
+         #     SomeModel.objects.annotate(Count('somecol'))
+         #     GROUP BY: all fields of the model
+@@ -125,11 +126,16 @@ class SQLCompiler:
+             cols = expr.get_group_by_cols()
+             for col in cols:
+                 expressions.append(col)
+-        for expr, (sql, params, is_ref) in order_by:
+-            # Skip References to the select clause, as all expressions in the
+-            # select clause are already part of the group by.
+-            if not is_ref:
+-                expressions.extend(expr.get_group_by_cols())
++
++        # Don't add order by expressions to GROUP BY if they come from Meta.ordering
++        if not self._meta_ordering:
++            for expr, (sql, params, is_ref) in order_by:
++                # Skip References to the select clause, as all expressions in the
++                # select clause are already part of the group by.
++                if not is_ref:
++                    expressions.extend(expr.get_group_by_cols())
++
++
+         having_group_by = self.having.get_group_by_cols() if self.having else ()
+         for expr in having_group_by:
+             expressions.append(expr)
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..259b4c0cab
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the Meta.ordering GROUP BY fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['name', 'age']
++        
++    def __str__(self):
++        return self.name
++
++class Book(models.Model):
++    title = models.CharField(max_length=200)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    pages = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++        
++    def __str__(self):
++        return self.title
++
++def test_edge_cases():
++    """Test edge cases for the Meta.ordering GROUP BY fix."""
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Author)
++        schema_editor.create_model(Book)
++    
++    # Create test data
++    author1 = Author.objects.create(name="Alice", age=30)
++    author2 = Author.objects.create(name="Bob", age=25)
++    
++    Book.objects.create(title="Book 1", author=author1, pages=100)
++    Book.objects.create(title="Book 2", author=author1, pages=200)
++    Book.objects.create(title="Book 3", author=author2, pages=150)
++    
++    print("=== Testing edge cases ===")
++    
++    # Test 1: Explicit order_by should still work
++    print("\n1. Testing explicit order_by with aggregation:")
++    queryset = Author.objects.values('id').annotate(book_count=Count('book')).order_by('name')
++    compiler = queryset.query.get_compiler('default')
++    extra_select, order_by, group_by = compiler.pre_sql_setup()
++    group_by_sql = [sql for sql, params in group_by]
++    print(f"GROUP BY: {group_by_sql}")
++    print(f"Has explicit order_by: {bool(order_by)}")
++    
++    # Test 2: No Meta.ordering should work normally
++    print("\n2. Testing model without Meta.ordering:")
++    queryset = Book.objects.values('author').annotate(book_count=Count('id'))
++    compiler = queryset.query.get_compiler('default')
++    extra_select, order_by, group_by = compiler.pre_sql_setup()
++    group_by_sql = [sql for sql, params in group_by]
++    print(f"GROUP BY: {group_by_sql}")
++    print(f"Has order_by: {bool(order_by)}")
++    
++    # Test 3: Multiple values() fields
++    print("\n3. Testing multiple values() fields:")
++    queryset = Author.objects.values('name', 'age').annotate(book_count=Count('book'))
++    compiler = queryset.query.get_compiler('default')
++    extra_select, order_by, group_by = compiler.pre_sql_setup()
++    group_by_sql = [sql for sql, params in group_by]
++    print(f"GROUP BY: {group_by_sql}")
++    # Should contain name and age from values(), not from Meta.ordering
++    
++    print("\n✅ All edge cases tested successfully!")
++
++if __name__ == '__main__':
++    try:
++        test_edge_cases()
++        sys.exit(0)
++    except Exception as e:
++        print(f"Error running tests: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_meta_ordering_fix.py b/test_meta_ordering_fix.py
+new file mode 100644
+index 0000000000..d482309871
+--- /dev/null
++++ b/test_meta_ordering_fix.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python
++"""
++Test script to verify the Meta.ordering GROUP BY fix.
++"""
++
++import os
++import sys
++import django
++from django.test import TestCase
++from django.db.models import Count
++
++# Add the tests directory to the path
++sys.path.insert(0, '/workspace/django__django__4.0/tests')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++
++django.setup()
++
++from ordering.models import Article, Author
++
++def test_meta_ordering_group_by_fix():
++    """Test that Meta.ordering fields are not included in GROUP BY for values().annotate()."""
++    
++    print("=== Testing Meta.ordering GROUP BY fix ===")
++    
++    # Create test data
++    author1 = Author.objects.create(name="Author 1")
++    author2 = Author.objects.create(name="Author 2")
++    
++    Article.objects.create(author=author1, headline="Article 1", pub_date="2023-01-01")
++    Article.objects.create(author=author1, headline="Article 2", pub_date="2023-01-02")
++    Article.objects.create(author=author2, headline="Article 3", pub_date="2023-01-03")
++    
++    # This was the test case that was removed from the original test suite
++    # It should group by author only, not by Meta.ordering fields
++    queryset = Article.objects.values('author').annotate(headline_count=Count('headline'))
++    
++    print(f"Query: {queryset.query}")
++    print(f"SQL: {str(queryset.query)}")
++    
++    # Get the SQL after pre_sql_setup to ensure our fix is applied
++    compiler = queryset.query.get_compiler('default')
++    extra_select, order_by, group_by = compiler.pre_sql_setup()
++    
++    # Check the group_by expressions
++    group_by_sql = []
++    for sql, params in group_by:
++        group_by_sql.append(sql)
++    
++    print(f"GROUP BY expressions: {group_by_sql}")
++    print(f"Meta.ordering: {Article._meta.ordering}")
++    
++    # The GROUP BY should only contain the author field, not Meta.ordering fields
++    # Meta.ordering contains: '-pub_date', F('headline'), F('author__name').asc(), OrderBy(F('second_author__name'))
++    
++    # Check if Meta.ordering fields are incorrectly in GROUP BY
++    has_pub_date = any('pub_date' in sql for sql in group_by_sql)
++    has_headline = any('headline' in sql for sql in group_by_sql)
++    has_author_name = any('author"."name' in sql for sql in group_by_sql)
++    has_second_author_name = any('second_author"."name' in sql for sql in group_by_sql)
++    
++    if has_pub_date or has_headline or has_author_name or has_second_author_name:
++        print("❌ BUG DETECTED: Meta.ordering fields found in GROUP BY clause")
++        print(f"  pub_date in GROUP BY: {has_pub_date}")
++        print(f"  headline in GROUP BY: {has_headline}")
++        print(f"  author__name in GROUP BY: {has_author_name}")
++        print(f"  second_author__name in GROUP BY: {has_second_author_name}")
++        return False
++    else:
++        print("✅ GOOD: Meta.ordering fields are not in GROUP BY clause")
++        return True
++
++if __name__ == '__main__':
++    try:
++        # Test the GROUP BY issue
++        group_by_ok = test_meta_ordering_group_by_fix()
++        
++        if group_by_ok:
++            print("\n🎉 Test passed!")
++            sys.exit(0)
++        else:
++            print("\n💥 Test failed!")
++            sys.exit(1)
++            
++    except Exception as e:
++        print(f"Error running test: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_meta_ordering_group_by.py b/test_meta_ordering_group_by.py
+new file mode 100644
+index 0000000000..f04258b781
+--- /dev/null
++++ b/test_meta_ordering_group_by.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue where Meta.ordering fields are incorrectly 
++included in GROUP BY clause during aggregation queries.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['name', 'age']  # This should NOT be included in GROUP BY
++        
++    def __str__(self):
++        return self.name
++
++class Book(models.Model):
++    title = models.CharField(max_length=200)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    pages = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++        
++    def __str__(self):
++        return self.title
++
++def test_meta_ordering_group_by_issue():
++    """Test that Meta.ordering fields are not included in GROUP BY clause."""
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Author)
++        schema_editor.create_model(Book)
++    
++    # Create test data
++    author1 = Author.objects.create(name="Alice", age=30)
++    author2 = Author.objects.create(name="Bob", age=25)
++    author3 = Author.objects.create(name="Charlie", age=35)
++    
++    Book.objects.create(title="Book 1", author=author1, pages=100)
++    Book.objects.create(title="Book 2", author=author1, pages=200)
++    Book.objects.create(title="Book 3", author=author2, pages=150)
++    Book.objects.create(title="Book 4", author=author3, pages=300)
++    
++    print("=== Testing Meta.ordering in GROUP BY issue ===")
++    
++    # This query should group by author only, not by author + name + age
++    # The Meta.ordering fields (name, age) should NOT be in GROUP BY
++    queryset = Author.objects.values('id').annotate(book_count=Count('book'))
++    
++    print(f"Query: {queryset.query}")
++    print(f"SQL: {str(queryset.query)}")
++    
++    # Debug: Check the compiler state
++    from django.db.models.sql.compiler import SQLCompiler
++    compiler = queryset.query.get_compiler('default')
++    print(f"_meta_ordering: {getattr(compiler, '_meta_ordering', 'NOT SET')}")
++    print(f"query.order_by: {queryset.query.order_by}")
++    print(f"query.default_ordering: {queryset.query.default_ordering}")
++    print(f"query.get_meta().ordering: {queryset.query.get_meta().ordering}")
++    
++    # Force the compiler to process the query
++    compiler.pre_sql_setup()
++    print(f"After pre_sql_setup - _meta_ordering: {getattr(compiler, '_meta_ordering', 'NOT SET')}")
++    
++    # Get the SQL after pre_sql_setup to ensure our fix is applied
++    compiler = queryset.query.get_compiler('default')
++    extra_select, order_by, group_by = compiler.pre_sql_setup()
++    
++    # Check the group_by expressions
++    group_by_sql = []
++    for sql, params in group_by:
++        group_by_sql.append(sql)
++    
++    print(f"GROUP BY expressions: {group_by_sql}")
++    
++    # The issue is that GROUP BY will contain name and age fields from Meta.ordering
++    # when it should only contain the id field
++    has_name_in_group_by = any('"__main___author"."name"' in sql for sql in group_by_sql)
++    has_age_in_group_by = any('"__main___author"."age"' in sql for sql in group_by_sql)
++    
++    if has_name_in_group_by:
++        print("❌ BUG DETECTED: Meta.ordering field 'name' found in GROUP BY clause")
++        print("This causes incorrect aggregation results!")
++        return False
++    elif has_age_in_group_by:
++        print("❌ BUG DETECTED: Meta.ordering field 'age' found in GROUP BY clause") 
++        print("This causes incorrect aggregation results!")
++        return False
++    else:
++        print("✅ GOOD: Meta.ordering fields are not in GROUP BY clause")
++        return True
++
++def test_aggregation_results():
++    """Test that aggregation results are correct when Meta.ordering is present."""
++    
++    print("\n=== Testing aggregation results ===")
++    
++    # Get book counts per author
++    results = list(Author.objects.annotate(book_count=Count('book')).values('name', 'book_count'))
++    print(f"Results: {results}")
++    
++    # Expected results: Alice=2, Bob=1, Charlie=1
++    expected = {'Alice': 2, 'Bob': 1, 'Charlie': 1}
++    actual = {r['name']: r['book_count'] for r in results}
++    
++    if actual == expected:
++        print("✅ GOOD: Aggregation results are correct")
++        return True
++    else:
++        print(f"❌ BAD: Expected {expected}, got {actual}")
++        return False
++
++if __name__ == '__main__':
++    try:
++        # Test the GROUP BY issue
++        group_by_ok = test_meta_ordering_group_by_issue()
++        
++        # Test aggregation results
++        results_ok = test_aggregation_results()
++        
++        if group_by_ok and results_ok:
++            print("\n🎉 All tests passed!")
++            sys.exit(0)
++        else:
++            print("\n💥 Some tests failed!")
++            sys.exit(1)
++            
++    except Exception as e:
++        print(f"Error running tests: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_ordering_group_by.py b/test_ordering_group_by.py
+new file mode 100644
+index 0000000000..2c36a89076
+--- /dev/null
++++ b/test_ordering_group_by.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue using the ordering models.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.ordering',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Count
++from tests.ordering.models import Article, Author
++
++def test_values_annotate_group_by():
++    """Test that Meta.ordering fields are not included in GROUP BY for values().annotate()."""
++    
++    # Create test data
++    author1 = Author.objects.create(name="Author 1")
++    author2 = Author.objects.create(name="Author 2")
++    
++    Article.objects.create(author=author1, headline="Article 1", pub_date="2023-01-01")
++    Article.objects.create(author=author1, headline="Article 2", pub_date="2023-01-02")
++    Article.objects.create(author=author2, headline="Article 3", pub_date="2023-01-03")
++    
++    print("=== Testing values().annotate() with Meta.ordering ===")
++    
++    # This was the test case that was removed from the original test suite
++    # It should group by author only, not by Meta.ordering fields
++    queryset = Article.objects.values('author').annotate(headline_count=Count('headline'))
++    
++    print(f"Query: {queryset.query}")
++    print(f"SQL: {str(queryset.query)}")
++    
++    # Get the SQL after pre_sql_setup to ensure our fix is applied
++    compiler = queryset.query.get_compiler('default')
++    extra_select, order_by, group_by = compiler.pre_sql_setup()
++    
++    # Check the group_by expressions
++    group_by_sql = []
++    for sql, params in group_by:
++        group_by_sql.append(sql)
++    
++    print(f"GROUP BY expressions: {group_by_sql}")
++    print(f"Meta.ordering: {Article._meta.ordering}")
++    
++    # The GROUP BY should only contain the author field, not Meta.ordering fields
++    # Meta.ordering contains: '-pub_date', F('headline'), F('author__name').asc(), OrderBy(F('second_author__name'))
++    
++    # Check if Meta.ordering fields are incorrectly in GROUP BY
++    has_pub_date = any('pub_date' in sql for sql in group_by_sql)
++    has_headline = any('headline' in sql for sql in group_by_sql)
++    has_author_name = any('author__name' in sql or 'author"."name' in sql for sql in group_by_sql)
++    has_second_author_name = any('second_author__name' in sql or 'second_author"."name' in sql for sql in group_by_sql)
++    
++    if has_pub_date or has_headline or has_author_name or has_second_author_name:
++        print("❌ BUG DETECTED: Meta.ordering fields found in GROUP BY clause")
++        print(f"  pub_date in GROUP BY: {has_pub_date}")
++        print(f"  headline in GROUP BY: {has_headline}")
++        print(f"  author__name in GROUP BY: {has_author_name}")
++        print(f"  second_author__name in GROUP BY: {has_second_author_name}")
++        return False
++    else:
++        print("✅ GOOD: Meta.ordering fields are not in GROUP BY clause")
++        return True
++
++if __name__ == '__main__':
++    try:
++        # Test the GROUP BY issue
++        group_by_ok = test_values_annotate_group_by()
++        
++        if group_by_ok:
++            print("\n🎉 Test passed!")
++            sys.exit(0)
++        else:
++            print("\n💥 Test failed!")
++            sys.exit(1)
++            
++    except Exception as e:
++        print(f"Error running test: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/tests/ordering/test_meta_ordering_group_by.py b/tests/ordering/test_meta_ordering_group_by.py
+new file mode 100644
+index 0000000000..5a64e0973c
+--- /dev/null
++++ b/tests/ordering/test_meta_ordering_group_by.py
+@@ -0,0 +1,57 @@
++"""
++Test for Meta.ordering GROUP BY fix.
++"""
++
++from django.db.models import Count
++from django.test import TestCase
++
++from .models import Article, Author
++
++
++class MetaOrderingGroupByTest(TestCase):
++    """Test that Meta.ordering fields are not included in GROUP BY for values().annotate()."""
++    
++    def test_values_annotate_group_by_excludes_meta_ordering(self):
++        """Test that Meta.ordering fields are not included in GROUP BY for values().annotate()."""
++        
++        # Create test data
++        author1 = Author.objects.create(name="Author 1")
++        author2 = Author.objects.create(name="Author 2")
++        
++        Article.objects.create(author=author1, headline="Article 1", pub_date="2023-01-01")
++        Article.objects.create(author=author1, headline="Article 2", pub_date="2023-01-02")
++        Article.objects.create(author=author2, headline="Article 3", pub_date="2023-01-03")
++        
++        # This was the test case that was removed from the original test suite
++        # It should group by author only, not by Meta.ordering fields
++        queryset = Article.objects.values('author').annotate(headline_count=Count('headline'))
++        
++        # Get the SQL after pre_sql_setup to ensure our fix is applied
++        compiler = queryset.query.get_compiler('default')
++        extra_select, order_by, group_by = compiler.pre_sql_setup()
++        
++        # Check the group_by expressions
++        group_by_sql = []
++        for sql, params in group_by:
++            group_by_sql.append(sql)
++        
++
++        
++        # The GROUP BY should only contain the author field, not Meta.ordering fields
++        # Meta.ordering contains: '-pub_date', F('headline'), F('author__name').asc(), OrderBy(F('second_author__name'))
++        
++        # Check if Meta.ordering fields are incorrectly in GROUP BY
++        has_pub_date = any('pub_date' in sql for sql in group_by_sql)
++        has_headline = any('headline' in sql for sql in group_by_sql)
++        has_author_name = any('author"."name' in sql for sql in group_by_sql)
++        has_second_author_name = any('second_author"."name' in sql for sql in group_by_sql)
++        
++        # Assert that Meta.ordering fields are NOT in GROUP BY
++        self.assertFalse(has_pub_date, "pub_date from Meta.ordering should not be in GROUP BY")
++        self.assertFalse(has_headline, "headline from Meta.ordering should not be in GROUP BY")
++        self.assertFalse(has_author_name, "author__name from Meta.ordering should not be in GROUP BY")
++        self.assertFalse(has_second_author_name, "second_author__name from Meta.ordering should not be in GROUP BY")
++        
++        # The GROUP BY should only contain the author field
++        self.assertEqual(len(group_by_sql), 1, "GROUP BY should only contain one field (author)")
++        self.assertIn('author', group_by_sql[0], "GROUP BY should contain the author field")
+\ No newline at end of file

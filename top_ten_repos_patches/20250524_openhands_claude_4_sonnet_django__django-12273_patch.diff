@@ -1,0 +1,634 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..b7c1f9f41b
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script for the primary key reset issue with child models.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++
++
++class Item(models.Model):
++    uid = models.AutoField(primary_key=True, editable=False)
++    f = models.BooleanField(default=False)
++    
++    def reset(self):
++        self.uid = None
++        self.f = False
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Derived(Item):
++    extra_field = models.CharField(max_length=50, default="test")
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def setup_tables():
++    """Create tables for our models."""
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Item)
++        schema_editor.create_model(Derived)
++
++
++def test_pk_reset_creates_new_object():
++    """Test that resetting primary key on child model creates new object."""
++    print("=== Test 1: PK Reset Creates New Object ===")
++    
++    # Create the first object
++    derived = Derived.objects.create(f=True, extra_field="original")
++    original_pk = derived.pk
++    print(f"Created Derived object with pk={original_pk}, f={derived.f}, extra_field='{derived.extra_field}'")
++    
++    # Get the object as Item and access it as derived
++    item = Item.objects.get(pk=derived.pk)
++    obj1 = item.derived
++    print(f"Retrieved as Item.derived: pk={obj1.pk}, f={obj1.f}")
++    
++    # Reset the object
++    obj1.reset()
++    obj1.extra_field = "reset"
++    print(f"After reset: pk={obj1.pk}, uid={obj1.uid}, f={obj1.f}")
++    
++    # Save the object - this should create a new object
++    obj1.save()
++    new_pk = obj1.pk
++    print(f"After save: pk={new_pk}, uid={obj1.uid}, f={obj1.f}, extra_field='{obj1.extra_field}'")
++    
++    # Check if original object still exists with f=True
++    original_obj = Item.objects.get(pk=original_pk)
++    print(f"Original object: pk={original_obj.pk}, f={original_obj.f}")
++    
++    # Verify the fix worked
++    assert original_obj.f == True, "Original object should still have f=True"
++    assert original_pk != new_pk, "New object should have different pk"
++    assert Item.objects.count() == 2, "Should have 2 Item objects"
++    assert Derived.objects.count() == 2, "Should have 2 Derived objects"
++    
++    print("✓ Test 1 passed!")
++
++
++def test_normal_save_still_works():
++    """Test that normal save operations still work correctly."""
++    print("\n=== Test 2: Normal Save Still Works ===")
++    
++    # Create an object
++    derived = Derived.objects.create(f=True, extra_field="normal")
++    original_pk = derived.pk
++    print(f"Created object with pk={original_pk}")
++    
++    # Modify and save (should update, not create new)
++    derived.f = False
++    derived.extra_field = "modified"
++    derived.save()
++    
++    # Should still have same pk
++    assert derived.pk == original_pk, "Normal save should keep same pk"
++    
++    # Should only have one object
++    assert Item.objects.filter(pk=original_pk).count() == 1, "Should still have only one object"
++    
++    # Check the values were updated
++    obj = Item.objects.get(pk=original_pk)
++    assert obj.f == False, "Field should be updated"
++    
++    print("✓ Test 2 passed!")
++
++
++def test_new_object_creation():
++    """Test that creating new objects still works correctly."""
++    print("\n=== Test 3: New Object Creation ===")
++    
++    initial_count = Item.objects.count()
++    
++    # Create a new object
++    derived = Derived.objects.create(f=True, extra_field="new")
++    
++    # Should have incremented count
++    assert Item.objects.count() == initial_count + 1, "Should have one more object"
++    assert derived.pk is not None, "New object should have a pk"
++    
++    print("✓ Test 3 passed!")
++
++
++def test_direct_item_pk_reset():
++    """Test resetting pk on Item (parent) directly."""
++    print("\n=== Test 4: Direct Item PK Reset ===")
++    
++    # Create an Item directly
++    item = Item.objects.create(f=True)
++    original_pk = item.pk
++    print(f"Created Item with pk={original_pk}")
++    
++    # Reset pk and save
++    item.uid = None
++    item.f = False
++    item.save()
++    
++    new_pk = item.pk
++    print(f"After reset and save: pk={new_pk}")
++    
++    # Should create new object
++    assert new_pk != original_pk, "Should create new object"
++    
++    # Original should still exist
++    original_item = Item.objects.get(pk=original_pk)
++    assert original_item.f == True, "Original should still have f=True"
++    
++    print("✓ Test 4 passed!")
++
++
++if __name__ == '__main__':
++    setup_tables()
++    
++    test_pk_reset_creates_new_object()
++    test_normal_save_still_works()
++    test_new_object_creation()
++    test_direct_item_pk_reset()
++    
++    print("\n🎉 All tests passed!")
+\ No newline at end of file
+diff --git a/debug_pk_property.py b/debug_pk_property.py
+new file mode 100644
+index 0000000000..ca35e09773
+--- /dev/null
++++ b/debug_pk_property.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python
++"""
++Debug script to understand how pk property works with inheritance.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.model_inheritance',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import connection
++from tests.model_inheritance.models import Place, Restaurant, ItalianRestaurant, Chef
++
++# Create tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Chef)
++    schema_editor.create_model(Place)
++    schema_editor.create_model(Restaurant)
++    schema_editor.create_model(ItalianRestaurant)
++
++# Create an ItalianRestaurant
++italian = ItalianRestaurant.objects.create(
++    name="Test Restaurant",
++    address="123 Main St",
++    serves_hot_dogs=True,
++    serves_pizza=True,
++    serves_gnocchi=True
++)
++
++print(f"Created ItalianRestaurant with pk={italian.pk}")
++print(f"italian._meta.pk.attname: {italian._meta.pk.attname}")
++print(f"Place._meta.pk.attname: {Place._meta.pk.attname}")
++print(f"Restaurant._meta.pk.attname: {Restaurant._meta.pk.attname}")
++
++# Check what happens when we set pk to None
++print("\n--- Setting pk to None ---")
++italian.pk = None
++print(f"After setting pk=None: italian.pk={italian.pk}")
++print(f"place_ptr_id: {getattr(italian, 'place_ptr_id', 'N/A')}")
++print(f"restaurant_ptr_id: {getattr(italian, 'restaurant_ptr_id', 'N/A')}")
++
++# Check the actual field values
++for field in italian._meta.fields:
++    if field.primary_key or 'ptr' in field.name:
++        value = getattr(italian, field.attname)
++        print(f"{field.name} ({field.attname}): {value}")
++
++# Check parent fields
++print("\n--- Parent fields ---")
++print(f"Place id: {getattr(italian, Place._meta.pk.attname, 'N/A')}")
++print(f"Restaurant id: {getattr(italian, Restaurant._meta.pk.attname, 'N/A')}")
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 844c01e95e..6d45299b7f 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -569,7 +569,23 @@ class Model(metaclass=ModelBase):
+         return getattr(self, meta.pk.attname)
+ 
+     def _set_pk_val(self, value):
+-        return setattr(self, self._meta.pk.attname, value)
++        setattr(self, self._meta.pk.attname, value)
++        # If setting pk to None and this model has parents, also reset parent pks
++        if value is None and self._meta.parents:
++            self._reset_parent_pks()
++    
++    def _reset_parent_pks(self):
++        """Reset primary keys of all parent models in the inheritance chain."""
++        for parent, field in self._meta.parents.items():
++            if field:  # Only for concrete inheritance, not abstract
++                setattr(self, parent._meta.pk.attname, None)
++                # Recursively reset parent's parents
++                if parent._meta.parents:
++                    # Create a temporary instance to call _reset_parent_pks on parent
++                    # We can't call it directly because we need the parent's meta
++                    for grandparent, grandparent_field in parent._meta.parents.items():
++                        if grandparent_field:
++                            setattr(self, grandparent._meta.pk.attname, None)
+ 
+     pk = property(_get_pk_val, _set_pk_val)
+ 
+@@ -804,9 +820,18 @@ class Model(metaclass=ModelBase):
+         inserted = False
+         for parent, field in meta.parents.items():
+             # Make sure the link fields are synced between parent and self.
+-            if (field and getattr(self, parent._meta.pk.attname) is None and
+-                    getattr(self, field.attname) is not None):
+-                setattr(self, parent._meta.pk.attname, getattr(self, field.attname))
++            if field and getattr(self, parent._meta.pk.attname) is None:
++                child_fk_val = getattr(self, field.attname)
++                if child_fk_val is not None:
++                    # Check if this is a case where the parent pk was explicitly reset
++                    # In such cases, we should reset the child fk to None as well
++                    # to ensure new objects are created
++                    if hasattr(self, '_state') and not self._state.adding:
++                        # This is an existing object being saved, so parent pk was likely reset
++                        setattr(self, field.attname, None)
++                    else:
++                        # This is a new object, so sync parent pk from child fk
++                        setattr(self, parent._meta.pk.attname, child_fk_val)
+             parent_inserted = self._save_parents(cls=parent, using=using, update_fields=update_fields)
+             updated = self._save_table(
+                 cls=parent, using=using, update_fields=update_fields,
+diff --git a/test_pk_reset_issue.py b/test_pk_reset_issue.py
+new file mode 100644
+index 0000000000..dfa474bcd8
+--- /dev/null
++++ b/test_pk_reset_issue.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the primary key reset issue with child models.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++
++
++class Item(models.Model):
++    uid = models.AutoField(primary_key=True, editable=False)
++    f = models.BooleanField(default=False)
++    
++    def reset(self):
++        self.uid = None
++        self.f = False
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Derived(Item):
++    class Meta:
++        app_label = '__main__'
++
++
++class SaveTestCase(TestCase):
++    def setUp(self):
++        # Create tables for our models
++        from django.db import connection
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(Item)
++            schema_editor.create_model(Derived)
++    
++    def test_pk_reset_issue(self):
++        """Test that resetting primary key on child model creates new object."""
++        # Create the first object
++        self.derived = Derived.objects.create(f=True)
++        original_pk = self.derived.pk
++        print(f"Created Derived object with pk={original_pk}, f={self.derived.f}")
++        
++        # Get the object as Item and access it as derived
++        item = Item.objects.get(pk=self.derived.pk)
++        obj1 = item.derived
++        print(f"Retrieved as Item.derived: pk={obj1.pk}, f={obj1.f}")
++        
++        # Reset the object
++        obj1.reset()
++        print(f"After reset: pk={obj1.pk}, uid={obj1.uid}, f={obj1.f}")
++        
++        # Debug: Check what _get_pk_val returns for different meta
++        print(f"obj1._meta: {obj1._meta}")
++        print(f"obj1._meta.pk.attname: {obj1._meta.pk.attname}")
++        print(f"obj1._get_pk_val(): {obj1._get_pk_val()}")
++        print(f"obj1._get_pk_val(obj1._meta): {obj1._get_pk_val(obj1._meta)}")
++        
++        # Check parent meta
++        parent_meta = obj1._meta.parents[Item]
++        if parent_meta:
++            print(f"Parent field: {parent_meta}")
++            print(f"Parent meta pk: {Item._meta.pk.attname}")
++            print(f"obj1._get_pk_val(Item._meta): {obj1._get_pk_val(Item._meta)}")
++        
++        # Save the object - this should create a new object
++        print("About to save...")
++        print(f"Before save: item_ptr_id={getattr(obj1, 'item_ptr_id', 'N/A')}")
++        obj1.save()
++        new_pk = obj1.pk
++        print(f"After save: pk={new_pk}, uid={obj1.uid}, f={obj1.f}")
++        print(f"After save: item_ptr_id={getattr(obj1, 'item_ptr_id', 'N/A')}")
++        
++        # Check if original object still exists with f=True
++        try:
++            original_obj = Item.objects.get(pk=original_pk)
++            print(f"Original object still exists: pk={original_obj.pk}, f={original_obj.f}")
++            
++            # This should pass if the bug is fixed
++            self.assertTrue(original_obj.f, "Original object should still have f=True")
++            self.assertNotEqual(original_pk, new_pk, "New object should have different pk")
++            
++        except Item.DoesNotExist:
++            print("ERROR: Original object was overwritten!")
++            self.fail("Original object was overwritten instead of creating new one")
++
++
++if __name__ == '__main__':
++    # Run the test
++    test_case = SaveTestCase()
++    test_case.setUp()
++    test_case.test_pk_reset_issue()
+\ No newline at end of file
+diff --git a/test_pk_reset_regression.py b/test_pk_reset_regression.py
+new file mode 100644
+index 0000000000..90d41f7870
+--- /dev/null
++++ b/test_pk_reset_regression.py
+@@ -0,0 +1,121 @@
++"""
++Regression test for primary key reset issue with child models.
++
++This test should be added to the Django test suite to prevent regression
++of the fix for resetting primary keys on child models in multi-table inheritance.
++"""
++from django.test import TestCase
++from .models import Place, Restaurant, ItalianRestaurant
++
++
++class PrimaryKeyResetTests(TestCase):
++    """Test that resetting primary key to None works correctly with inheritance."""
++    
++    def test_child_model_pk_reset_creates_new_object(self):
++        """
++        Test that setting a child model's primary key to None and saving
++        creates a new object instead of updating the existing one.
++        
++        This is a regression test for the issue where resetting the primary
++        key on a child model in multi-table inheritance would update the
++        existing object instead of creating a new one.
++        """
++        # Create an ItalianRestaurant (child of Restaurant, which is child of Place)
++        original = ItalianRestaurant.objects.create(
++            name="Original Restaurant",
++            address="123 Main St",
++            serves_hot_dogs=True,
++            serves_pizza=True,
++            serves_gnocchi=True
++        )
++        original_pk = original.pk
++        
++        # Get the object through the parent model and access as child
++        place = Place.objects.get(pk=original_pk)
++        restaurant = place.restaurant
++        italian = restaurant.italianrestaurant
++        
++        # Reset the primary key and modify some fields
++        italian.pk = None
++        italian.name = "New Restaurant"
++        italian.serves_gnocchi = False
++        
++        # Save - this should create a new object
++        italian.save()
++        new_pk = italian.pk
++        
++        # Verify a new object was created
++        self.assertNotEqual(original_pk, new_pk)
++        
++        # Verify the original object still exists with original values
++        original_obj = ItalianRestaurant.objects.get(pk=original_pk)
++        self.assertEqual(original_obj.name, "Original Restaurant")
++        self.assertTrue(original_obj.serves_gnocchi)
++        
++        # Verify the new object has the new values
++        new_obj = ItalianRestaurant.objects.get(pk=new_pk)
++        self.assertEqual(new_obj.name, "New Restaurant")
++        self.assertFalse(new_obj.serves_gnocchi)
++        
++        # Verify we have 2 objects total
++        self.assertEqual(ItalianRestaurant.objects.count(), 2)
++        self.assertEqual(Restaurant.objects.count(), 2)
++        self.assertEqual(Place.objects.count(), 2)
++    
++    def test_parent_model_pk_reset_creates_new_object(self):
++        """
++        Test that setting a parent model's primary key to None works correctly.
++        """
++        # Create a Place (parent model)
++        original = Place.objects.create(name="Original Place", address="123 Main St")
++        original_pk = original.pk
++        
++        # Reset the primary key and modify
++        original.pk = None
++        original.name = "New Place"
++        
++        # Save - this should create a new object
++        original.save()
++        new_pk = original.pk
++        
++        # Verify a new object was created
++        self.assertNotEqual(original_pk, new_pk)
++        
++        # Verify the original object still exists
++        original_obj = Place.objects.get(pk=original_pk)
++        self.assertEqual(original_obj.name, "Original Place")
++        
++        # Verify the new object has the new values
++        new_obj = Place.objects.get(pk=new_pk)
++        self.assertEqual(new_obj.name, "New Place")
++        
++        # Verify we have 2 objects total
++        self.assertEqual(Place.objects.count(), 2)
++    
++    def test_normal_save_still_updates(self):
++        """
++        Test that normal save operations (without pk reset) still work correctly.
++        """
++        # Create an object
++        restaurant = Restaurant.objects.create(
++            name="Test Restaurant",
++            address="123 Main St",
++            serves_hot_dogs=True
++        )
++        original_pk = restaurant.pk
++        
++        # Modify and save (should update, not create new)
++        restaurant.name = "Modified Restaurant"
++        restaurant.serves_hot_dogs = False
++        restaurant.save()
++        
++        # Should still have same pk
++        self.assertEqual(restaurant.pk, original_pk)
++        
++        # Should only have one object
++        self.assertEqual(Restaurant.objects.count(), 1)
++        
++        # Check the values were updated
++        obj = Restaurant.objects.get(pk=original_pk)
++        self.assertEqual(obj.name, "Modified Restaurant")
++        self.assertFalse(obj.serves_hot_dogs)
+\ No newline at end of file
+diff --git a/tests/model_inheritance/tests.py b/tests/model_inheritance/tests.py
+index 5eef0f5bfa..77787fb33a 100644
+--- a/tests/model_inheritance/tests.py
++++ b/tests/model_inheritance/tests.py
+@@ -12,6 +12,68 @@ from .models import (
+ )
+ 
+ 
++class PrimaryKeyResetTests(TestCase):
++    """Test that resetting primary key to None works correctly with inheritance."""
++    
++    def test_parent_model_pk_reset_creates_new_object(self):
++        """
++        Test that setting a parent model's primary key to None works correctly.
++        """
++        # Create a Place (parent model)
++        original = Place.objects.create(name="Original Place", address="123 Main St")
++        original_pk = original.pk
++        
++        # Reset the primary key and modify
++        original.pk = None
++        original.name = "New Place"
++        
++        # Save - this should create a new object
++        original.save()
++        new_pk = original.pk
++        
++        # Verify a new object was created
++        self.assertNotEqual(original_pk, new_pk)
++        
++        # Verify the original object still exists
++        original_obj = Place.objects.get(pk=original_pk)
++        self.assertEqual(original_obj.name, "Original Place")
++        
++        # Verify the new object has the new values
++        new_obj = Place.objects.get(pk=new_pk)
++        self.assertEqual(new_obj.name, "New Place")
++        
++        # Verify we have 2 objects total
++        self.assertEqual(Place.objects.count(), 2)
++    
++    def test_normal_save_still_updates(self):
++        """
++        Test that normal save operations (without pk reset) still work correctly.
++        """
++        # Create an object
++        restaurant = Restaurant.objects.create(
++            name="Test Restaurant",
++            address="123 Main St",
++            serves_hot_dogs=True
++        )
++        original_pk = restaurant.pk
++        
++        # Modify and save (should update, not create new)
++        restaurant.name = "Modified Restaurant"
++        restaurant.serves_hot_dogs = False
++        restaurant.save()
++        
++        # Should still have same pk
++        self.assertEqual(restaurant.pk, original_pk)
++        
++        # Should only have one object
++        self.assertEqual(Restaurant.objects.count(), 1)
++        
++        # Check the values were updated
++        obj = Restaurant.objects.get(pk=original_pk)
++        self.assertEqual(obj.name, "Modified Restaurant")
++        self.assertFalse(obj.serves_hot_dogs)
++
++
+ class ModelInheritanceTests(TestCase):
+     def test_abstract(self):
+         # The Student and Worker models both have 'name' and 'age' fields on

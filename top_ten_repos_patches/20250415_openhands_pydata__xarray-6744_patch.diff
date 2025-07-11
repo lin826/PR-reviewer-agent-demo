@@ -1,0 +1,141 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..5dae6156
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,27 @@
++import xarray as xr
++import numpy as np
++
++# Create a simple DataArray with sequential values
++my_data = xr.DataArray(np.arange(1, 10), dims="x")
++
++# Approach 1: Using the aggregation method directly with center=True
++print("=== Approach 1: Direct aggregation with center=True ===")
++result1 = my_data.rolling(x=3, center=True).mean().values
++print(result1)
++
++# Approach 2: Manually iterating over the rolling object with center=True
++print("\n=== Approach 2: Manual iteration with center=True ===")
++my_data_rolling = my_data.rolling(x=3, center=True)
++result2 = [window.mean().values.item() for label, window in my_data_rolling]
++print(result2)
++
++# Print item-by-item comparison
++print("\n=== Detailed comparison ===")
++print("index | Direct  | Manual")
++print("---------------------")
++for i in range(len(result1)):
++    val1 = "nan" if np.isnan(result1[i]) else f"{result1[i]:.1f}"
++    val2 = "nan" if i >= len(result2) or np.isnan(result2[i]) else f"{result2[i]:.1f}"
++    print(f"{i:5d} | {val1:7s} | {val2:7s}")
++
++print("\nThe issue: When manually iterating with center=True, the window centering is not applied.")
+\ No newline at end of file
+diff --git a/test_center_rolling.py b/test_center_rolling.py
+new file mode 100644
+index 00000000..728f85e6
+--- /dev/null
++++ b/test_center_rolling.py
+@@ -0,0 +1,43 @@
++import xarray as xr
++import numpy as np
++import pytest
++
++def test_center_rolling_iter():
++    """Test that iteration over DataArrayRolling with center=True works correctly."""
++    data = xr.DataArray(np.arange(1, 10), dims="x")
++    
++    # Test with center=True
++    rolling = data.rolling(x=3, center=True)
++    
++    # Get the results from the direct mean method (already known to work)
++    direct_result = rolling.mean().values
++    
++    # Get the results from manual iteration
++    manual_result = [window.mean().values.item() for label, window in rolling]
++    
++    # Check that they match
++    np.testing.assert_allclose(direct_result, manual_result, equal_nan=True)
++    
++    # Check specific known values for window=3, center=True
++    expected = [np.nan, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, np.nan]
++    np.testing.assert_allclose(manual_result, expected, equal_nan=True)
++    
++    # Test with center=False for comparison
++    rolling_no_center = data.rolling(x=3, center=False)
++    
++    # Get the results from the direct mean method
++    direct_result_no_center = rolling_no_center.mean().values
++    
++    # Get the results from manual iteration
++    manual_result_no_center = [window.mean().values.item() for label, window in rolling_no_center]
++    
++    # Check that they match
++    np.testing.assert_allclose(direct_result_no_center, manual_result_no_center, equal_nan=True)
++    
++    # Check specific known values for window=3, center=False
++    expected_no_center = [np.nan, np.nan, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
++    np.testing.assert_allclose(manual_result_no_center, expected_no_center, equal_nan=True)
++
++if __name__ == "__main__":
++    test_center_rolling_iter()
++    print("All tests passed!")
+\ No newline at end of file
+diff --git a/xarray/core/rolling.py b/xarray/core/rolling.py
+index aef290f6..48feed12 100644
+--- a/xarray/core/rolling.py
++++ b/xarray/core/rolling.py
+@@ -270,16 +270,42 @@ class DataArrayRolling(Rolling["DataArray"]):
+     def __iter__(self) -> Iterator[tuple[RollingKey, DataArray]]:
+         if self.ndim > 1:
+             raise ValueError("__iter__ is only supported for 1d-rolling")
+-        stops = np.arange(1, len(self.window_labels) + 1)
+-        starts = stops - int(self.window[0])
+-        starts[: int(self.window[0])] = 0
+-        for (label, start, stop) in zip(self.window_labels, starts, stops):
+-            window = self.obj.isel({self.dim[0]: slice(start, stop)})
+-
+-            counts = window.count(dim=self.dim[0])
+-            window = window.where(counts >= self.min_periods)
+-
+-            yield (label, window)
++            
++        window_size = int(self.window[0])
++        data_size = len(self.window_labels)
++        center = self.center[0]
++        
++        if center:
++            # For centered windows, we need to adjust both the start and end positions
++            radius = window_size // 2
++            indices = np.arange(data_size) 
++            
++            # The main logic for centering: shift the window to be centered on each point
++            for i, label in enumerate(self.window_labels):
++                # Calculate window bounds that are properly centered
++                start = max(0, i - radius)
++                # The right side of the window
++                stop = min(data_size, i + radius + 1)
++                
++                window = self.obj.isel({self.dim[0]: slice(start, stop)})
++                
++                counts = window.count(dim=self.dim[0])
++                window = window.where(counts >= self.min_periods)
++                
++                yield (label, window)
++        else:
++            # Original implementation for when center=False
++            stops = np.arange(1, data_size + 1)
++            starts = stops - window_size
++            starts[: window_size] = 0
++            
++            for (label, start, stop) in zip(self.window_labels, starts, stops):
++                window = self.obj.isel({self.dim[0]: slice(start, stop)})
++                
++                counts = window.count(dim=self.dim[0])
++                window = window.where(counts >= self.min_periods)
++                
++                yield (label, window)
+ 
+     def construct(
+         self,

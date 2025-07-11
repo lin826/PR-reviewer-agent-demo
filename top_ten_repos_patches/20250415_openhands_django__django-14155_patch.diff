@@ -1,0 +1,135 @@
+diff --git a/django/urls/resolvers.py b/django/urls/resolvers.py
+index 9b00e24509..3d7308cf40 100644
+--- a/django/urls/resolvers.py
++++ b/django/urls/resolvers.py
+@@ -45,6 +45,15 @@ class ResolverMatch:
+         self.namespaces = [x for x in namespaces if x] if namespaces else []
+         self.namespace = ':'.join(self.namespaces)
+ 
++        # Handle functools.partial objects
++        if isinstance(func, functools.partial):
++            self._partial_args = func.args
++            self._partial_keywords = func.keywords
++            func = func.func
++        else:
++            self._partial_args = ()
++            self._partial_keywords = {}
++
+         if not hasattr(func, '__name__'):
+             # A class-based view
+             self._func_path = func.__class__.__module__ + '.' + func.__class__.__name__
+@@ -59,8 +68,17 @@ class ResolverMatch:
+         return (self.func, self.args, self.kwargs)[index]
+ 
+     def __repr__(self):
++        func_repr = self._func_path
++        if self._partial_args or self._partial_keywords:
++            partial_str = []
++            if self._partial_args:
++                partial_str.append(", ".join(repr(arg) for arg in self._partial_args))
++            if self._partial_keywords:
++                partial_str.append(", ".join(f"{k}={repr(v)}" for k, v in self._partial_keywords.items()))
++            func_repr = f"{func_repr} [{', '.join(partial_str)}]"
++        
+         return "ResolverMatch(func=%s, args=%s, kwargs=%s, url_name=%s, app_names=%s, namespaces=%s, route=%s)" % (
+-            self._func_path, self.args, self.kwargs, self.url_name,
++            func_repr, self.args, self.kwargs, self.url_name,
+             self.app_names, self.namespaces, self.route,
+         )
+ 
+diff --git a/test_partial_comprehensive.py b/test_partial_comprehensive.py
+new file mode 100644
+index 0000000000..4d1d0eed6c
+--- /dev/null
++++ b/test_partial_comprehensive.py
+@@ -0,0 +1,61 @@
++import functools
++from django.urls.resolvers import ResolverMatch
++
++def test_view_func(request, arg1, arg2=None, arg3=None):
++    """Test view function."""
++    return f"Test view with {arg1}, {arg2}, and {arg3}"
++
++class TestViewClass:
++    """Test view class."""
++    def __call__(self, request, arg1, arg2=None):
++        return f"Class view with {arg1} and {arg2}"
++
++# Test cases
++
++# 1. Regular function (no partial) - baseline
++rm1 = ResolverMatch(test_view_func, [], {"arg1": "value1"}, url_name="test-view")
++print("1. Regular function:")
++print(repr(rm1))
++print()
++
++# 2. Partial with positional args
++partial_positional = functools.partial(test_view_func, "pos_arg")
++rm2 = ResolverMatch(partial_positional, [], {"arg2": "value2"}, url_name="partial-pos")
++print("2. Partial with positional args:")
++print(repr(rm2))
++print()
++
++# 3. Partial with keyword args
++partial_keyword = functools.partial(test_view_func, arg1="kw_arg")
++rm3 = ResolverMatch(partial_keyword, [], {"arg2": "value2"}, url_name="partial-kw")
++print("3. Partial with keyword args:")
++print(repr(rm3))
++print()
++
++# 4. Partial with multiple keyword args
++partial_multi_keyword = functools.partial(test_view_func, arg1="kw1", arg2="kw2")
++rm4 = ResolverMatch(partial_multi_keyword, [], {"arg3": "value3"}, url_name="partial-multi-kw")
++print("4. Partial with multiple keyword args:")
++print(repr(rm4))
++print()
++
++# 5. Partial with mixed positional and keyword args
++partial_mixed = functools.partial(test_view_func, "pos_arg", arg2="kw_arg")
++rm5 = ResolverMatch(partial_mixed, [], {"arg3": "value3"}, url_name="partial-mixed")
++print("5. Partial with mixed positional and keyword args:")
++print(repr(rm5))
++print()
++
++# 6. Class-based view
++view_instance = TestViewClass()
++rm6 = ResolverMatch(view_instance, [], {"arg1": "value1"}, url_name="class-view")
++print("6. Class-based view:")
++print(repr(rm6))
++print()
++
++# 7. Partial of a class-based view
++partial_class = functools.partial(view_instance, arg1="kw_arg")
++rm7 = ResolverMatch(partial_class, [], {"arg2": "value2"}, url_name="partial-class")
++print("7. Partial of a class-based view:")
++print(repr(rm7))
++print()
+\ No newline at end of file
+diff --git a/test_partial_resolve.py b/test_partial_resolve.py
+new file mode 100644
+index 0000000000..84a3be2bd6
+--- /dev/null
++++ b/test_partial_resolve.py
+@@ -0,0 +1,21 @@
++import functools
++from django.urls.resolvers import ResolverMatch
++
++def test_view(request, arg1, arg2):
++    return f"Test view with {arg1} and {arg2}"
++
++# Create a partial function with arg1 bound to "bound_value"
++partial_view = functools.partial(test_view, arg1="bound_value")
++
++# Create a ResolverMatch with the partial function
++resolver_match = ResolverMatch(
++    func=partial_view,
++    args=[],
++    kwargs={"arg2": "unbound_value"},
++    url_name="test-view",
++)
++
++# Print the representation to see the issue
++print(repr(resolver_match))
++print("\nAfter fix, we should see:")
++print("Something like: ResolverMatch(func=test_partial_resolve.test_view [arg1='bound_value'], args=[], kwargs={'arg2': 'unbound_value'}, ...)")
+\ No newline at end of file

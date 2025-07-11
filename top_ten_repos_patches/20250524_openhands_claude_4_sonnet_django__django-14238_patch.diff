@@ -1,0 +1,210 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 0f53d9c30b..3724694ea6 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -2524,7 +2524,13 @@ class AutoFieldMeta(type):
+         return isinstance(instance, self._subclasses) or super().__instancecheck__(instance)
+ 
+     def __subclasscheck__(self, subclass):
+-        return subclass in self._subclasses or super().__subclasscheck__(subclass)
++        return (
++            any(
++                issubclass(subclass, cls) 
++                for cls in self._subclasses 
++                if isinstance(cls, type)
++            ) or super().__subclasscheck__(subclass)
++        )
+ 
+ 
+ class AutoField(AutoFieldMixin, IntegerField, metaclass=AutoFieldMeta):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fdb844e19a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the DEFAULT_AUTO_FIELD subclass check issue.
++
++This script reproduces the issue where Django fails to recognize subclasses
++of BigAutoField and SmallAutoField as valid AutoField subclasses.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define custom AutoField subclasses
++class MyBigAutoField(models.BigAutoField):
++    """Custom subclass of BigAutoField"""
++    pass
++
++class MySmallAutoField(models.SmallAutoField):
++    """Custom subclass of SmallAutoField"""
++    pass
++
++def test_bigautofield_subclass():
++    """Test that subclasses of BigAutoField are recognized as AutoField subclasses"""
++    print("Testing BigAutoField subclass...")
++    
++    # This should work but currently fails
++    try:
++        # Temporarily override DEFAULT_AUTO_FIELD
++        original_setting = getattr(settings, 'DEFAULT_AUTO_FIELD', None)
++        settings.DEFAULT_AUTO_FIELD = '__main__.MyBigAutoField'
++        
++        class TestModel(models.Model):
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = '__main__'
++        
++        print("✓ BigAutoField subclass test PASSED")
++        return True
++        
++    except ValueError as e:
++        print(f"✗ BigAutoField subclass test FAILED: {e}")
++        return False
++    finally:
++        # Restore original setting
++        if original_setting is not None:
++            settings.DEFAULT_AUTO_FIELD = original_setting
++        else:
++            delattr(settings, 'DEFAULT_AUTO_FIELD')
++
++def test_smallautofield_subclass():
++    """Test that subclasses of SmallAutoField are recognized as AutoField subclasses"""
++    print("Testing SmallAutoField subclass...")
++    
++    # This should work but currently fails
++    try:
++        # Temporarily override DEFAULT_AUTO_FIELD
++        original_setting = getattr(settings, 'DEFAULT_AUTO_FIELD', None)
++        settings.DEFAULT_AUTO_FIELD = '__main__.MySmallAutoField'
++        
++        class TestModel2(models.Model):
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = '__main__'
++        
++        print("✓ SmallAutoField subclass test PASSED")
++        return True
++        
++    except ValueError as e:
++        print(f"✗ SmallAutoField subclass test FAILED: {e}")
++        return False
++    finally:
++        # Restore original setting
++        if original_setting is not None:
++            settings.DEFAULT_AUTO_FIELD = original_setting
++        else:
++            delattr(settings, 'DEFAULT_AUTO_FIELD')
++
++def test_direct_subclass_check():
++    """Test the subclass check directly"""
++    print("Testing direct subclass checks...")
++    
++    # Test that the metaclass recognizes subclasses properly
++    from django.db.models.fields import AutoField
++    
++    print(f"issubclass(MyBigAutoField, AutoField): {issubclass(MyBigAutoField, AutoField)}")
++    print(f"issubclass(MySmallAutoField, AutoField): {issubclass(MySmallAutoField, AutoField)}")
++    print(f"issubclass(models.BigAutoField, AutoField): {issubclass(models.BigAutoField, AutoField)}")
++    print(f"issubclass(models.SmallAutoField, AutoField): {issubclass(models.SmallAutoField, AutoField)}")
++    
++    # Test edge cases
++    print(f"issubclass(models.AutoField, AutoField): {issubclass(models.AutoField, AutoField)}")
++    print(f"issubclass(models.IntegerField, AutoField): {issubclass(models.IntegerField, AutoField)}")
++    
++    # Test multiple inheritance levels
++    class MyBigAutoFieldSubclass(MyBigAutoField):
++        pass
++    
++    print(f"issubclass(MyBigAutoFieldSubclass, AutoField): {issubclass(MyBigAutoFieldSubclass, AutoField)}")
++
++if __name__ == '__main__':
++    print("Reproducing DEFAULT_AUTO_FIELD subclass check issue...")
++    print("=" * 60)
++    
++    test_direct_subclass_check()
++    print()
++    
++    success1 = test_bigautofield_subclass()
++    print()
++    success2 = test_smallautofield_subclass()
++    print()
++    
++    if success1 and success2:
++        print("All tests PASSED! The issue has been fixed.")
++        sys.exit(0)
++    else:
++        print("Some tests FAILED. The issue still exists.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/tests/model_options/test_default_pk.py b/tests/model_options/test_default_pk.py
+index b678848916..d6b72f77bd 100644
+--- a/tests/model_options/test_default_pk.py
++++ b/tests/model_options/test_default_pk.py
+@@ -4,6 +4,15 @@ from django.test import SimpleTestCase, override_settings
+ from django.test.utils import isolate_apps
+ 
+ 
++# Custom AutoField subclasses for testing
++class MyBigAutoField(models.BigAutoField):
++    pass
++
++
++class MySmallAutoField(models.SmallAutoField):
++    pass
++
++
+ @isolate_apps('model_options')
+ class TestDefaultPK(SimpleTestCase):
+     @override_settings(DEFAULT_AUTO_FIELD='django.db.models.NonexistentAutoField')
+@@ -99,3 +108,23 @@ class TestDefaultPK(SimpleTestCase):
+ 
+         m2m_pk = M2MModel._meta.get_field('m2m').remote_field.through._meta.pk
+         self.assertIsInstance(m2m_pk, models.SmallAutoField)
++
++    @isolate_apps('model_options')
++    @override_settings(DEFAULT_AUTO_FIELD='model_options.test_default_pk.MyBigAutoField')
++    def test_default_auto_field_subclass_of_bigautofield(self):
++        """Test that subclasses of BigAutoField are accepted as DEFAULT_AUTO_FIELD."""
++        class Model(models.Model):
++            class Meta:
++                app_label = 'model_options'
++
++        self.assertIsInstance(Model._meta.pk, MyBigAutoField)
++
++    @isolate_apps('model_options')
++    @override_settings(DEFAULT_AUTO_FIELD='model_options.test_default_pk.MySmallAutoField')
++    def test_default_auto_field_subclass_of_smallautofield(self):
++        """Test that subclasses of SmallAutoField are accepted as DEFAULT_AUTO_FIELD."""
++        class Model(models.Model):
++            class Meta:
++                app_label = 'model_options'
++
++        self.assertIsInstance(Model._meta.pk, MySmallAutoField)

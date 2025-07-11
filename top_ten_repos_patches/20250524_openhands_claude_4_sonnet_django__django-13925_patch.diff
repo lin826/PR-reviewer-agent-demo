@@ -1,0 +1,873 @@
+diff --git a/debug_inheritance.py b/debug_inheritance.py
+new file mode 100644
+index 0000000000..b89c63c0da
+--- /dev/null
++++ b/debug_inheritance.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python
++"""
++Debug script to understand inheritance structure.
++"""
++
++import os
++import sys
++import django
++from unittest import mock
++from django.conf import settings
++from django.core import checks
++from django.db import models
++from django.test.utils import isolate_apps, override_settings, override_system_checks
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'check_framework',
++        ],
++        DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Mock function to simulate the test environment where W042 warnings are triggered
++def mocked_is_overridden(self, setting):
++    return (
++        setting != 'DEFAULT_AUTO_FIELD' or
++        self.DEFAULT_AUTO_FIELD != 'django.db.models.AutoField'
++    )
++
++@mock.patch('django.conf.UserSettingsHolder.is_overridden', mocked_is_overridden)
++@override_settings(DEFAULT_AUTO_FIELD='django.db.models.AutoField')
++@isolate_apps('check_framework.apps.CheckDefaultPKConfig', attr_name='apps')
++@override_system_checks([checks.model_checks.check_all_models])
++def debug_inheritance():
++    print("=== Debugging inheritance structure ===")
++    
++    # Case 1: Base model with explicit primary key
++    class BaseModel(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++
++    # Case 2: Child model inheriting from base
++    class ChildModel(BaseModel):
++        description = models.TextField()
++
++    print(f"BaseModel._meta.pk: {BaseModel._meta.pk}")
++    print(f"BaseModel._meta.pk.auto_created: {BaseModel._meta.pk.auto_created}")
++    print(f"BaseModel._meta.parents: {BaseModel._meta.parents}")
++    print(f"BaseModel._meta.concrete_model: {BaseModel._meta.concrete_model}")
++    print()
++    
++    print(f"ChildModel._meta.pk: {ChildModel._meta.pk}")
++    print(f"ChildModel._meta.pk.auto_created: {ChildModel._meta.pk.auto_created}")
++    print(f"ChildModel._meta.parents: {ChildModel._meta.parents}")
++    print(f"ChildModel._meta.concrete_model: {ChildModel._meta.concrete_model}")
++    print(f"ChildModel._meta.pk.name: {ChildModel._meta.pk.name}")
++    print(f"ChildModel._meta.pk.related_model: {getattr(ChildModel._meta.pk, 'related_model', 'N/A')}")
++    print()
++    
++    # Check if we can trace back to the original primary key
++    if hasattr(ChildModel._meta.pk, 'target_field'):
++        print(f"ChildModel._meta.pk.target_field: {ChildModel._meta.pk.target_field}")
++        print(f"ChildModel._meta.pk.target_field.auto_created: {ChildModel._meta.pk.target_field.auto_created}")
++    
++    if hasattr(ChildModel._meta.pk, 'remote_field'):
++        print(f"ChildModel._meta.pk.remote_field: {ChildModel._meta.pk.remote_field}")
++        if ChildModel._meta.pk.remote_field:
++            print(f"ChildModel._meta.pk.remote_field.model: {ChildModel._meta.pk.remote_field.model}")
++            target_model = ChildModel._meta.pk.remote_field.model
++            print(f"Target model PK: {target_model._meta.pk}")
++            print(f"Target model PK auto_created: {target_model._meta.pk.auto_created}")
++    
++    print()
++    
++    # Case 3: Model with auto-created primary key
++    class AutoModel(models.Model):
++        name = models.CharField(max_length=100)
++
++    class AutoChildModel(AutoModel):
++        description = models.TextField()
++
++    print(f"AutoModel._meta.pk: {AutoModel._meta.pk}")
++    print(f"AutoModel._meta.pk.auto_created: {AutoModel._meta.pk.auto_created}")
++    print()
++    
++    print(f"AutoChildModel._meta.pk: {AutoChildModel._meta.pk}")
++    print(f"AutoChildModel._meta.pk.auto_created: {AutoChildModel._meta.pk.auto_created}")
++    
++    if hasattr(AutoChildModel._meta.pk, 'remote_field') and AutoChildModel._meta.pk.remote_field:
++        target_model = AutoChildModel._meta.pk.remote_field.model
++        print(f"AutoChild target model PK: {target_model._meta.pk}")
++        print(f"AutoChild target model PK auto_created: {target_model._meta.pk.auto_created}")
++
++if __name__ == '__main__':
++    debug_inheritance()
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 4038859cfa..b8dd4bf6df 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1297,14 +1297,39 @@ class Model(metaclass=ModelBase):
+ 
+     @classmethod
+     def _check_default_pk(cls):
++        # Debug for test
++        if 'ChildModel' in cls.__name__:
++            print(f"DEBUG FIX: Checking {cls.__name__}")
++            print(f"DEBUG FIX: pk name: {cls._meta.pk.name}")
++            print(f"DEBUG FIX: pk ends with _ptr: {cls._meta.pk.name.endswith('_ptr')}")
++            print(f"DEBUG FIX: has remote_field: {hasattr(cls._meta.pk, 'remote_field')}")
++            print(f"DEBUG FIX: remote_field: {getattr(cls._meta.pk, 'remote_field', None)}")
++            print(f"DEBUG FIX: has parents: {bool(cls._meta.parents)}")
++            print(f"DEBUG FIX: parents: {cls._meta.parents}")
++        
++        # Check if the primary key is auto-created, but consider inheritance
++        pk_is_auto_created = cls._meta.pk.auto_created
++        
++        # If the primary key is a parent link (inheritance), check the parent model's PK
++        if (cls._meta.pk.name.endswith('_ptr') and 
++            hasattr(cls._meta.pk, 'remote_field') and 
++            cls._meta.pk.remote_field and
++            cls._meta.parents):
++            # This is a parent link - get the parent model from the parents dict
++            parent_model = next(iter(cls._meta.parents.keys()))
++            pk_is_auto_created = parent_model._meta.pk.auto_created
++            # Debug for test
++            if 'ChildModel' in cls.__name__:
++                print(f"DEBUG FIX: {cls.__name__} inherits from {parent_model.__name__}, parent PK auto_created: {pk_is_auto_created}")
++        
+         if (
+-            cls._meta.pk.auto_created and
++            pk_is_auto_created and
+             not settings.is_overridden('DEFAULT_AUTO_FIELD') and
+             not cls._meta.app_config._is_default_auto_field_overridden
+         ):
+             return [
+                 checks.Warning(
+-                    f"Auto-created primary key used when not defining a "
++                    f"MODIFIED: Auto-created primary key used when not defining a "
+                     f"primary key type, by default "
+                     f"'{settings.DEFAULT_AUTO_FIELD}'.",
+                     hint=(
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..38f3aa580c
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,153 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script to verify the fix for models.W042 inheritance issue.
++"""
++
++import django
++from unittest import mock
++from django.conf import settings
++from django.core import checks
++from django.db import models
++from django.test.utils import isolate_apps, override_settings
++
++# Configure Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Mock function to simulate the test environment where W042 warnings are triggered
++def mocked_is_overridden(self, setting):
++    return (
++        setting != 'DEFAULT_AUTO_FIELD' or
++        self.DEFAULT_AUTO_FIELD != 'django.db.models.AutoField'
++    )
++
++@mock.patch('django.conf.UserSettingsHolder.is_overridden', mocked_is_overridden)
++def test_comprehensive():
++    print("=== Comprehensive test for W042 inheritance fix ===")
++    
++    # Test case 1: Model with explicit primary key (should NOT get W042)
++    class BaseModelExplicit(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = BaseModelExplicit.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"1. BaseModelExplicit W042 warnings: {len(w042_errors)} (expected: 0)")
++    assert len(w042_errors) == 0, "Base model with explicit PK should not get W042"
++    
++    # Test case 2: Child model inheriting from model with explicit PK (should NOT get W042)
++    class ChildModelExplicit(BaseModelExplicit):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = ChildModelExplicit.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"2. ChildModelExplicit W042 warnings: {len(w042_errors)} (expected: 0)")
++    assert len(w042_errors) == 0, "Child model with explicit parent PK should not get W042"
++    
++    # Test case 3: Model with auto-created primary key (should get W042)
++    class BaseModelAuto(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = BaseModelAuto.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"3. BaseModelAuto W042 warnings: {len(w042_errors)} (expected: 1)")
++    assert len(w042_errors) == 1, "Base model with auto PK should get W042"
++    
++    # Test case 4: Child model inheriting from model with auto PK (should get W042)
++    class ChildModelAuto(BaseModelAuto):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = ChildModelAuto.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"4. ChildModelAuto W042 warnings: {len(w042_errors)} (expected: 1)")
++    assert len(w042_errors) == 1, "Child model with auto parent PK should get W042"
++    
++    # Test case 5: Multi-level inheritance with explicit PK (should NOT get W042)
++    class GrandChildModelExplicit(ChildModelExplicit):
++        extra_field = models.CharField(max_length=50)
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = GrandChildModelExplicit.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"5. GrandChildModelExplicit W042 warnings: {len(w042_errors)} (expected: 0)")
++    assert len(w042_errors) == 0, "Grandchild model with explicit ancestor PK should not get W042"
++    
++    # Test case 6: Abstract base model with explicit PK
++    class AbstractBaseExplicit(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            abstract = True
++            app_label = 'test'
++
++    class ConcreteFromAbstract(AbstractBaseExplicit):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = ConcreteFromAbstract.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"6. ConcreteFromAbstract W042 warnings: {len(w042_errors)} (expected: 0)")
++    assert len(w042_errors) == 0, "Concrete model from abstract with explicit PK should not get W042"
++    
++    # Test case 7: Model with custom primary key field name
++    class BaseModelCustomPK(models.Model):
++        custom_id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++
++    class ChildModelCustomPK(BaseModelCustomPK):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = ChildModelCustomPK.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"7. ChildModelCustomPK W042 warnings: {len(w042_errors)} (expected: 0)")
++    assert len(w042_errors) == 0, "Child model with custom-named parent PK should not get W042"
++    
++    print("\n✅ All tests passed! The fix is working correctly.")
++    return True
++
++if __name__ == '__main__':
++    try:
++        success = test_comprehensive()
++        print(f"\nComprehensive test result: {'PASSED' if success else 'FAILED'}")
++    except Exception as e:
++        print(f"\n❌ Test failed with error: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..8fa27f803c
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python
++"""
++Test script to verify the fix for models.W042 inheritance issue.
++"""
++
++import django
++from unittest import mock
++from django.conf import settings
++from django.core import checks
++from django.db import models
++from django.test.utils import isolate_apps, override_settings
++
++# Configure Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++    USE_TZ=True,
++)
++
++django.setup()
++
++# Mock function to simulate the test environment where W042 warnings are triggered
++def mocked_is_overridden(self, setting):
++    return (
++        setting != 'DEFAULT_AUTO_FIELD' or
++        self.DEFAULT_AUTO_FIELD != 'django.db.models.AutoField'
++    )
++
++@mock.patch('django.conf.UserSettingsHolder.is_overridden', mocked_is_overridden)
++def test_fix():
++    print("=== Testing the fix ===")
++    
++    # Test case 1: Model with explicit primary key (should NOT get W042)
++    class BaseModel(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = BaseModel.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"BaseModel W042 warnings: {len(w042_errors)}")
++    
++    # Test case 2: Child model inheriting from model with explicit PK (should NOT get W042)
++    class ChildModel(BaseModel):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = 'test'
++
++    errors = ChildModel.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"ChildModel W042 warnings: {len(w042_errors)}")
++    
++    if w042_errors:
++        print("❌ ISSUE STILL EXISTS: Child model incorrectly gets W042")
++        for error in w042_errors:
++            print(f"   {error}")
++        return False
++    else:
++        print("✅ FIXED: Child model doesn't get W042")
++        return True
++
++if __name__ == '__main__':
++    success = test_fix()
++    print(f"\nFix successful: {'YES' if success else 'NO'}")
+\ No newline at end of file
+diff --git a/test_issue_demo.py b/test_issue_demo.py
+new file mode 100644
+index 0000000000..4ed419aaa8
+--- /dev/null
++++ b/test_issue_demo.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python
++"""
++Demonstration script showing the fix for the issue described in the GitHub issue.
++
++This script demonstrates that models inheriting from other models with manually 
++specified primary keys no longer incorrectly raise models.W042 warnings.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core import checks
++from django.db import models
++
++# Configure Django settings similar to a real Django project
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        # This is the key setting that triggers the W042 check
++        DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++        SECRET_KEY='test-secret-key-for-demo',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_issue_scenario():
++    """
++    Test the exact scenario described in the GitHub issue:
++    Models which inherit from other models with manually specified primary keys
++    should NOT raise models.W042 warnings.
++    """
++    
++    print("=== Testing the GitHub issue scenario ===")
++    print("Issue: models.W042 is raised on inherited manually specified primary key")
++    print()
++    
++    # Simulate the Entity base class mentioned in the issue
++    class Entity(models.Model):
++        # Manually specified primary key (not auto-created)
++        id = models.BigAutoField(primary_key=True)
++        created_at = models.DateTimeField(auto_now_add=True)
++        updated_at = models.DateTimeField(auto_now=True)
++        
++        class Meta:
++            app_label = 'accounts'
++            abstract = False  # This is a concrete model
++
++    # Simulate the User model that inherits from Entity
++    class User(Entity):
++        username = models.CharField(max_length=150, unique=True)
++        email = models.EmailField()
++        
++        class Meta:
++            app_label = 'accounts'
++
++    # Simulate other models mentioned in the issue
++    class ReservedUsername(Entity):
++        username = models.CharField(max_length=150, unique=True)
++        
++        class Meta:
++            app_label = 'accounts'
++
++    class Block(Entity):
++        blocker = models.ForeignKey(User, on_delete=models.CASCADE, related_name='blocks_made')
++        blocked = models.ForeignKey(User, on_delete=models.CASCADE, related_name='blocks_received')
++        
++        class Meta:
++            app_label = 'blocks'
++
++    # Test each model
++    models_to_test = [
++        ('Entity (base)', Entity),
++        ('User (inherits from Entity)', User),
++        ('ReservedUsername (inherits from Entity)', ReservedUsername),
++        ('Block (inherits from Entity)', Block),
++    ]
++    
++    all_passed = True
++    
++    for model_name, model_class in models_to_test:
++        print(f"Testing {model_name}...")
++        
++        # Run Django's system checks on the model
++        errors = model_class.check()
++        w042_errors = [e for e in errors if e.id == 'models.W042']
++        
++        print(f"  Primary key: {model_class._meta.pk}")
++        print(f"  Primary key auto_created: {model_class._meta.pk.auto_created}")
++        print(f"  W042 warnings: {len(w042_errors)}")
++        
++        if w042_errors:
++            print(f"  ❌ ISSUE: Model incorrectly gets W042 warning")
++            for error in w042_errors:
++                print(f"     {error}")
++            all_passed = False
++        else:
++            print(f"  ✅ GOOD: No W042 warnings")
++        
++        print()
++    
++    return all_passed
++
++if __name__ == '__main__':
++    print("Django version:", django.VERSION)
++    print("DEFAULT_AUTO_FIELD:", settings.DEFAULT_AUTO_FIELD)
++    print()
++    
++    success = test_issue_scenario()
++    
++    if success:
++        print("🎉 SUCCESS: The issue has been fixed!")
++        print("Models inheriting from models with manually specified primary keys")
++        print("no longer incorrectly raise models.W042 warnings.")
++    else:
++        print("❌ FAILURE: The issue still exists.")
++        print("Some models are still incorrectly raising models.W042 warnings.")
++    
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..183a7ad993
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,179 @@
++#!/usr/bin/env python
++"""
++Reproduction script for models.W042 issue with inherited primary keys.
++
++This script reproduces the issue where Django 3.2+ incorrectly raises W042 warnings
++for models that inherit their primary key from a parent model.
++"""
++
++import os
++import sys
++import django
++from unittest import mock
++from django.conf import settings
++from django.core import checks
++from django.db import models
++from django.test.utils import isolate_apps
++from django.apps import AppConfig
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This script as an app
++        ],
++        DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple app config that doesn't override default_auto_field
++class TestAppConfig(AppConfig):
++    name = '__main__'
++
++# Mock function to simulate the test environment where W042 warnings are triggered
++def mocked_is_overridden(self, setting):
++    # Force treating DEFAULT_AUTO_FIELD = 'django.db.models.AutoField' as a not
++    # overridden setting.
++    return (
++        setting != 'DEFAULT_AUTO_FIELD' or
++        self.DEFAULT_AUTO_FIELD != 'django.db.models.AutoField'
++    )
++
++# Test case 1: Base model with explicit primary key, child should not get W042
++print("=== Test Case 1: Base model with explicit primary key ===")
++
++@mock.patch('django.conf.UserSettingsHolder.is_overridden', mocked_is_overridden)
++@isolate_apps('__main__')
++def test_explicit_pk_inheritance():
++    class BaseModel(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = '__main__'
++
++    class ChildModel(BaseModel):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = '__main__'
++
++    # Run checks on the child model
++    errors = ChildModel.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    
++    print(f"ChildModel primary key: {ChildModel._meta.pk}")
++    print(f"ChildModel primary key auto_created: {ChildModel._meta.pk.auto_created}")
++    print(f"W042 warnings found: {len(w042_errors)}")
++    
++    if w042_errors:
++        print("❌ ISSUE REPRODUCED: Child model with explicit parent PK incorrectly gets W042")
++        for error in w042_errors:
++            print(f"   {error}")
++    else:
++        print("✅ GOOD: No W042 warnings (as expected)")
++    
++    return w042_errors
++
++# Test case 2: Base model with auto-created primary key, child should get W042
++print("\n=== Test Case 2: Base model with auto-created primary key ===")
++
++@mock.patch('django.conf.UserSettingsHolder.is_overridden', mocked_is_overridden)
++@isolate_apps('__main__')
++def test_auto_pk_inheritance():
++    class AutoBaseModel(models.Model):
++        # No explicit primary key - Django will auto-create one
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = '__main__'
++
++    class AutoChildModel(AutoBaseModel):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = '__main__'
++
++    # Run checks on the child model
++    errors = AutoChildModel.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    
++    print(f"AutoChildModel primary key: {AutoChildModel._meta.pk}")
++    print(f"AutoChildModel primary key auto_created: {AutoChildModel._meta.pk.auto_created}")
++    print(f"W042 warnings found: {len(w042_errors)}")
++    
++    if w042_errors:
++        print("✅ EXPECTED: Child model with auto-created parent PK gets W042")
++        for error in w042_errors:
++            print(f"   {error}")
++    else:
++        print("❌ UNEXPECTED: Child model should get W042 warning")
++    
++    return w042_errors
++
++# Test case 3: Abstract base model with explicit primary key
++print("\n=== Test Case 3: Abstract base model with explicit primary key ===")
++
++@mock.patch('django.conf.UserSettingsHolder.is_overridden', mocked_is_overridden)
++@isolate_apps('__main__')
++def test_abstract_explicit_pk_inheritance():
++    class AbstractBaseModel(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            abstract = True
++            app_label = '__main__'
++
++    class ConcreteChildModel(AbstractBaseModel):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = '__main__'
++
++    # Run checks on the child model
++    errors = ConcreteChildModel.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    
++    print(f"ConcreteChildModel primary key: {ConcreteChildModel._meta.pk}")
++    print(f"ConcreteChildModel primary key auto_created: {ConcreteChildModel._meta.pk.auto_created}")
++    print(f"W042 warnings found: {len(w042_errors)}")
++    
++    if w042_errors:
++        print("❌ ISSUE REPRODUCED: Child of abstract model with explicit PK incorrectly gets W042")
++        for error in w042_errors:
++            print(f"   {error}")
++    else:
++        print("✅ GOOD: No W042 warnings (as expected)")
++    
++    return w042_errors
++
++if __name__ == '__main__':
++    print("Testing models.W042 issue with inherited primary keys...\n")
++    
++    # Run all test cases
++    test1_errors = test_explicit_pk_inheritance()
++    test2_errors = test_auto_pk_inheritance()
++    test3_errors = test_abstract_explicit_pk_inheritance()
++    
++    print("\n=== SUMMARY ===")
++    print(f"Test 1 (explicit PK inheritance): {'FAILED' if test1_errors else 'PASSED'}")
++    print(f"Test 2 (auto PK inheritance): {'PASSED' if test2_errors else 'FAILED'}")
++    print(f"Test 3 (abstract explicit PK): {'FAILED' if test3_errors else 'PASSED'}")
++    
++    # The issue exists if test1 or test3 have errors (they shouldn't)
++    issue_exists = bool(test1_errors or test3_errors)
++    print(f"\nIssue reproduced: {'YES' if issue_exists else 'NO'}")
++    
++    sys.exit(1 if issue_exists else 0)
+\ No newline at end of file
+diff --git a/test_reproduction_simple.py b/test_reproduction_simple.py
+new file mode 100644
+index 0000000000..2b30d3505a
+--- /dev/null
++++ b/test_reproduction_simple.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python
++"""
++Simple reproduction script for models.W042 issue with inherited primary keys.
++"""
++
++import os
++import sys
++import django
++from unittest import mock
++from django.conf import settings
++from django.core import checks
++from django.db import models
++from django.test.utils import isolate_apps, override_settings, override_system_checks
++from django.apps import AppConfig
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple app config that doesn't override default_auto_field
++class TestAppConfig(AppConfig):
++    name = 'test_app'
++
++# Mock function to simulate the test environment where W042 warnings are triggered
++def mocked_is_overridden(self, setting):
++    # Force treating DEFAULT_AUTO_FIELD = 'django.db.models.AutoField' as a not
++    # overridden setting.
++    return (
++        setting != 'DEFAULT_AUTO_FIELD' or
++        self.DEFAULT_AUTO_FIELD != 'django.db.models.AutoField'
++    )
++
++@mock.patch('django.conf.UserSettingsHolder.is_overridden', mocked_is_overridden)
++@override_settings(DEFAULT_AUTO_FIELD='django.db.models.AutoField')
++@isolate_apps('test_app', attr_name='apps')
++@override_system_checks([checks.model_checks.check_all_models])
++def test_inheritance_issue():
++    print("=== Testing inheritance issue ===")
++    
++    # Test case 1: Model with no explicit primary key (should get W042)
++    class ModelWithAutoPK(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    errors = ModelWithAutoPK.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"ModelWithAutoPK W042 warnings: {len(w042_errors)}")
++    if w042_errors:
++        print("✅ Expected: Model with auto PK gets W042")
++    else:
++        print("❌ Unexpected: Model with auto PK should get W042")
++    
++    # Test case 2: Model with explicit primary key (should NOT get W042)
++    class ModelWithExplicitPK(models.Model):
++        id = models.BigAutoField(primary_key=True)
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++
++    errors = ModelWithExplicitPK.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"ModelWithExplicitPK W042 warnings: {len(w042_errors)}")
++    if w042_errors:
++        print("❌ Unexpected: Model with explicit PK should NOT get W042")
++    else:
++        print("✅ Expected: Model with explicit PK doesn't get W042")
++    
++    # Test case 3: Child model inheriting from model with explicit PK (should NOT get W042)
++    class ChildOfExplicitPK(ModelWithExplicitPK):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = 'test_app'
++
++    errors = ChildOfExplicitPK.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"ChildOfExplicitPK primary key: {ChildOfExplicitPK._meta.pk}")
++    print(f"ChildOfExplicitPK primary key auto_created: {ChildOfExplicitPK._meta.pk.auto_created}")
++    print(f"ChildOfExplicitPK W042 warnings: {len(w042_errors)}")
++    if w042_errors:
++        print("❌ ISSUE REPRODUCED: Child of model with explicit PK incorrectly gets W042")
++        for error in w042_errors:
++            print(f"   {error}")
++        return True
++    else:
++        print("✅ Good: Child of model with explicit PK doesn't get W042")
++        return False
++    
++    # Test case 4: Child model inheriting from model with auto PK (should get W042)
++    class ChildOfAutoPK(ModelWithAutoPK):
++        description = models.TextField()
++        
++        class Meta:
++            app_label = 'test_app'
++
++    errors = ChildOfAutoPK.check()
++    w042_errors = [e for e in errors if e.id == 'models.W042']
++    print(f"ChildOfAutoPK primary key: {ChildOfAutoPK._meta.pk}")
++    print(f"ChildOfAutoPK primary key auto_created: {ChildOfAutoPK._meta.pk.auto_created}")
++    print(f"ChildOfAutoPK W042 warnings: {len(w042_errors)}")
++    if w042_errors:
++        print("✅ Expected: Child of model with auto PK gets W042")
++    else:
++        print("❌ Unexpected: Child of model with auto PK should get W042")
++
++if __name__ == '__main__':
++    issue_reproduced = test_inheritance_issue()
++    print(f"\nIssue reproduced: {'YES' if issue_reproduced else 'NO'}")
++    sys.exit(1 if issue_reproduced else 0)
+\ No newline at end of file
+diff --git a/tests/check_framework/test_model_checks.py b/tests/check_framework/test_model_checks.py
+index d4342ada07..e0eb7c7a72 100644
+--- a/tests/check_framework/test_model_checks.py
++++ b/tests/check_framework/test_model_checks.py
+@@ -415,3 +415,5 @@ class ModelDefaultAutoFieldTests(SimpleTestCase):
+                 app_label = 'check_framework.apps.CheckPKConfig'
+ 
+         self.assertEqual(checks.run_checks(app_configs=apps.get_app_configs()), [])
++
++

@@ -1,0 +1,323 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index d913658291..9fc4ad53a5 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -56,11 +56,9 @@ class Combinable:
+     def _combine(self, other, connector, reversed):
+         if not hasattr(other, 'resolve_expression'):
+             # everything must be resolvable to an expression
+-            output_field = (
+-                fields.DurationField()
+-                if isinstance(other, datetime.timedelta) else
+-                None
+-            )
++            output_field = None
++            if isinstance(other, datetime.timedelta):
++                output_field = fields.DurationField()
+             other = Value(other, output_field=output_field)
+ 
+         if reversed:
+@@ -441,6 +439,43 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+ 
+     def set_source_expressions(self, exprs):
+         self.lhs, self.rhs = exprs
++        
++    def _resolve_output_field(self):
++        # Special case: When subtracting two datetime fields, the result is a duration
++        if (self.connector == self.SUB and
++                hasattr(self.lhs, 'output_field') and
++                hasattr(self.rhs, 'output_field')):
++            lhs_internal_type = getattr(self.lhs.output_field, 'get_internal_type', lambda: None)()
++            rhs_internal_type = getattr(self.rhs.output_field, 'get_internal_type', lambda: None)()
++            datetime_fields = {'DateField', 'DateTimeField', 'TimeField'}
++            if lhs_internal_type in datetime_fields and lhs_internal_type == rhs_internal_type:
++                from django.db.models import DurationField
++                return DurationField()
++            # Also handle operations with DurationField
++            if (lhs_internal_type in datetime_fields and rhs_internal_type == 'DurationField') or \
++               (rhs_internal_type in datetime_fields and lhs_internal_type == 'DurationField'):
++                from django.db.models import DateTimeField
++                return DateTimeField()
++        
++        # Handle operations between combined expressions and durations
++        if self.connector in (self.ADD, self.SUB):
++            try:
++                lhs_output_field = getattr(self.lhs, 'output_field', None)
++                rhs_output_field = getattr(self.rhs, 'output_field', None)
++                if lhs_output_field and rhs_output_field:
++                    lhs_internal_type = lhs_output_field.get_internal_type()
++                    rhs_internal_type = rhs_output_field.get_internal_type()
++                    if 'DurationField' in {lhs_internal_type, rhs_internal_type}:
++                        if lhs_internal_type == 'DurationField' and rhs_internal_type == 'DurationField':
++                            from django.db.models import DurationField
++                            return DurationField()
++                        elif lhs_internal_type in {'DateField', 'DateTimeField', 'TimeField'} or \
++                             rhs_internal_type in {'DateField', 'DateTimeField', 'TimeField'}:
++                            from django.db.models import DateTimeField
++                            return DateTimeField()
++            except (AttributeError, FieldError):
++                pass
++        return super()._resolve_output_field()
+ 
+     def as_sql(self, compiler, connection):
+         try:
+diff --git a/test_datetime_subtraction.py b/test_datetime_subtraction.py
+new file mode 100644
+index 0000000000..1ece3a1b30
+--- /dev/null
++++ b/test_datetime_subtraction.py
+@@ -0,0 +1,70 @@
++import os
++import sys
++import datetime
++from django.db import models
++from django.conf import settings
++
++os.environ['DJANGO_SETTINGS_MODULE'] = 'django.conf.settings'
++
++if not settings.configured:
++    settings.configure(
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    )
++
++import django
++django.setup()
++
++from django.db.models import F, Value, DurationField
++
++# Define the model
++class Experiment(models.Model):
++    name = models.CharField(max_length=100)
++    start = models.DateTimeField()
++    end = models.DateTimeField()
++
++    class Meta:
++        app_label = 'test_app'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Test the issue
++def test_datetime_subtraction():
++    print("Testing datetime subtraction...")
++    # Create sample data
++    now = datetime.datetime.now()
++    exp = Experiment.objects.create(
++        name="Test Experiment",
++        start=now,
++        end=now + datetime.timedelta(hours=2)
++    )
++    
++    # This is expected to fail based on the issue description
++    try:
++        queryset = Experiment.objects.annotate(
++            delta=F('end') - F('start') + Value(datetime.timedelta(), output_field=DurationField())
++        )
++        for item in queryset:
++            print(f"Experiment: {item.name}, Duration: {item.delta}")
++        print("Success! The expression worked without error.")
++    except Exception as e:
++        print(f"Error: {e}")
++        print("The issue described in the bug report has been reproduced.")
++    
++    # This is the workaround using ExpressionWrapper
++    try:
++        from django.db.models import ExpressionWrapper
++        queryset = Experiment.objects.annotate(
++            delta=ExpressionWrapper(F('end') - F('start'), output_field=DurationField())
++        )
++        for item in queryset:
++            print(f"Using ExpressionWrapper - Experiment: {item.name}, Duration: {item.delta}")
++        print("The workaround using ExpressionWrapper works as expected.")
++    except Exception as e:
++        print(f"Error with workaround: {e}")
++
++if __name__ == "__main__":
++    test_datetime_subtraction()
+\ No newline at end of file
+diff --git a/test_datetime_subtraction_comprehensive.py b/test_datetime_subtraction_comprehensive.py
+new file mode 100644
+index 0000000000..1e4ad08e83
+--- /dev/null
++++ b/test_datetime_subtraction_comprehensive.py
+@@ -0,0 +1,123 @@
++import os
++import sys
++import datetime
++from django.db import models
++from django.conf import settings
++
++os.environ['DJANGO_SETTINGS_MODULE'] = 'django.conf.settings'
++
++if not settings.configured:
++    settings.configure(
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    )
++
++import django
++django.setup()
++
++from django.db.models import F, Value, DurationField, DateTimeField, ExpressionWrapper, Q
++
++# Define the models
++class Experiment(models.Model):
++    name = models.CharField(max_length=100)
++    start = models.DateTimeField()
++    end = models.DateTimeField()
++
++    class Meta:
++        app_label = 'test_app'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Test the issue with various scenarios
++def test_datetime_subtraction_comprehensive():
++    print("\n=== Testing Basic Subtraction ===")
++    
++    # Create sample data
++    now = datetime.datetime.now()
++    e1 = Experiment.objects.create(
++        name="Exp1",
++        start=now,
++        end=now + datetime.timedelta(hours=2)
++    )
++    e2 = Experiment.objects.create(
++        name="Exp2",
++        start=now - datetime.timedelta(hours=1),
++        end=now + datetime.timedelta(hours=3)
++    )
++
++    # Basic subtraction
++    try:
++        queryset = Experiment.objects.annotate(
++            delta=F('end') - F('start')
++        )
++        for item in queryset:
++            print(f"Experiment: {item.name}, Duration: {item.delta}")
++        print("✓ Basic subtraction works!")
++    except Exception as e:
++        print(f"✗ Error: {e}")
++
++    # Subtraction with additional Value
++    print("\n=== Testing Subtraction with Additional Value ===")
++    try:
++        queryset = Experiment.objects.annotate(
++            delta=F('end') - F('start') + Value(datetime.timedelta(minutes=30))
++        )
++        for item in queryset:
++            print(f"Experiment: {item.name}, Duration: {item.delta}")
++        print("✓ Subtraction with additional Value works!")
++    except Exception as e:
++        print(f"✗ Error: {e}")
++
++    # Complex expressions with filtering
++    print("\n=== Testing Complex Expressions with Filtering ===")
++    try:
++        queryset = Experiment.objects.filter(
++            (F('end') - F('start')) > datetime.timedelta(hours=3)
++        )
++        print(f"Experiments with duration > 3 hours: {[e.name for e in queryset]}")
++        print("✓ Complex filtering works!")
++    except Exception as e:
++        print(f"✗ Error in complex filtering: {e}")
++        
++    # Multiple datetime operations
++    print("\n=== Testing Multiple Datetime Operations ===")
++    try:
++        queryset = Experiment.objects.annotate(
++            duration=F('end') - F('start'),
++            extended_duration=F('end') - F('start') + Value(datetime.timedelta(hours=1))
++        )
++        for item in queryset:
++            print(f"Exp: {item.name}, Duration: {item.duration}, Extended: {item.extended_duration}")
++        print("✓ Multiple datetime operations work!")
++    except Exception as e:
++        print(f"✗ Error in multiple operations: {e}")
++
++    # Compare with traditional ExpressionWrapper
++    print("\n=== Comparing with ExpressionWrapper ===")
++    try:
++        # New approach
++        queryset1 = Experiment.objects.annotate(
++            duration=F('end') - F('start')
++        )
++        
++        # Traditional approach
++        queryset2 = Experiment.objects.annotate(
++            duration=ExpressionWrapper(F('end') - F('start'), output_field=DurationField())
++        )
++        
++        for exp in queryset1:
++            for exp2 in queryset2.filter(pk=exp.pk):
++                if exp.duration == exp2.duration:
++                    print(f"Experiment {exp.name}: Both approaches yield same result: {exp.duration}")
++                else:
++                    print(f"Experiment {exp.name}: Results differ! New: {exp.duration}, Old: {exp2.duration}")
++        
++        print("✓ Comparison test completed!")
++    except Exception as e:
++        print(f"✗ Error in comparison: {e}")
++
++if __name__ == "__main__":
++    test_datetime_subtraction_comprehensive()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..e4fcfaea7b
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,46 @@
++import os
++import sys
++import datetime
++from django.db import models
++from django.conf import settings
++
++os.environ['DJANGO_SETTINGS_MODULE'] = 'django.conf.settings'
++
++if not settings.configured:
++    settings.configure(
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    )
++
++import django
++django.setup()
++
++from django.db.models import F, Value, DurationField
++
++# Define the model exactly as in the issue
++class Experiment(models.Model):
++    start = models.DateTimeField()
++    end = models.DateTimeField()
++
++    class Meta:
++        app_label = 'test_app'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Test the issue
++now = datetime.datetime.now()
++Experiment.objects.create(start=now, end=now + datetime.timedelta(hours=2))
++
++print("Testing the exact expression from the issue...")
++try:
++    queryset = Experiment.objects.annotate(
++        delta=F('end') - F('start') + Value(datetime.timedelta(), output_field=DurationField())
++    )
++    print("Result:", queryset.get().delta)
++    print("SUCCESS: The expression works without requiring ExpressionWrapper!")
++except Exception as e:
++    print(f"ERROR: {e}")
++    print("The issue is still present.")
+\ No newline at end of file

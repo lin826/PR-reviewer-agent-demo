@@ -1,0 +1,424 @@
+diff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py
+index d517d7269b..c2aea9c730 100644
+--- a/django/db/models/fields/related.py
++++ b/django/db/models/fields/related.py
+@@ -914,7 +914,7 @@ class ForeignKey(ForeignObject):
+             return
+ 
+         using = router.db_for_read(self.remote_field.model, instance=model_instance)
+-        qs = self.remote_field.model._default_manager.using(using).filter(
++        qs = self.remote_field.model._base_manager.using(using).filter(
+             **{self.remote_field.field_name: value}
+         )
+         qs = qs.complex_filter(self.get_limit_choices_to())
+diff --git a/test_exact_issue_scenario.py b/test_exact_issue_scenario.py
+new file mode 100644
+index 0000000000..245a05f2a2
+--- /dev/null
++++ b/test_exact_issue_scenario.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python
++"""
++Test script that reproduces the exact scenario from the issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.exceptions import ValidationError
++from django.db import models
++from django import forms
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Exact models from the issue description
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    # Don't include archived articles by default.
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = '__main__'
++
++class FavoriteArticle(models.Model):  # Fixed typo from issue description
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class FavoriteArticleForm(forms.ModelForm):  # Fixed typo from issue description
++    class Meta:
++        model = FavoriteArticle
++        fields = '__all__'
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Use the base manager instead of the default manager to allow archived articles.
++        self.fields['article'].queryset = Article._base_manager.all()
++
++def test_exact_issue_scenario():
++    """Test the exact scenario from the issue description."""
++    
++    # Create database tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticle)
++    
++    print("=== Testing exact scenario from issue description ===")
++    
++    # Create some articles
++    regular_article = Article._base_manager.create(title="Regular Article", archived=False)
++    archived_article = Article._base_manager.create(title="Archived Article", archived=True)
++    
++    print(f"Created articles:")
++    print(f"  Regular: {regular_article.title} (archived={regular_article.archived})")
++    print(f"  Archived: {archived_article.title} (archived={archived_article.archived})")
++    
++    # Test the form scenario from the issue
++    print(f"\n--- Testing form with archived article (issue scenario) ---")
++    
++    # Create form data with archived article
++    form_data = {'article': archived_article.pk}
++    form = FavoriteArticleForm(data=form_data)
++    
++    print(f"Form queryset includes archived articles: {archived_article in form.fields['article'].queryset}")
++    
++    if form.is_valid():
++        print("✓ Form validation passed - issue is FIXED!")
++        favorite = form.save()
++        print(f"  Successfully created FavoriteArticle with archived article: {favorite.article.title}")
++    else:
++        print(f"✗ Form validation failed - issue still exists: {form.errors}")
++    
++    # Test direct model validation
++    print(f"\n--- Testing direct model validation ---")
++    favorite_direct = FavoriteArticle(article=archived_article)
++    try:
++        favorite_direct.full_clean()
++        print("✓ Direct model validation passed - issue is FIXED!")
++    except ValidationError as e:
++        print(f"✗ Direct model validation failed - issue still exists: {e}")
++
++if __name__ == '__main__':
++    test_exact_issue_scenario()
+\ No newline at end of file
+diff --git a/test_foreignkey_validation_issue.py b/test_foreignkey_validation_issue.py
+new file mode 100644
+index 0000000000..3560d032b9
+--- /dev/null
++++ b/test_foreignkey_validation_issue.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the ForeignKey validation issue.
++
++This script demonstrates the problem where ForeignKey.validate() uses
++_default_manager instead of _base_manager, causing validation to fail
++when the default manager filters out valid objects.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.exceptions import ValidationError
++from django.db import models
++from django.forms import ModelForm
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models similar to the issue description
++class ArticleManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.filter(archived=False)
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    archived = models.BooleanField(default=False)
++    
++    # Don't include archived articles by default
++    objects = ArticleManager()
++    
++    class Meta:
++        app_label = '__main__'
++
++class FavoriteArticle(models.Model):
++    article = models.ForeignKey(Article, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class FavoriteArticleForm(ModelForm):
++    class Meta:
++        model = FavoriteArticle
++        fields = '__all__'
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Use the base manager instead of the default manager to allow archived articles
++        self.fields['article'].queryset = Article._base_manager.all()
++
++def test_foreignkey_validation_issue():
++    """Test that demonstrates the ForeignKey validation issue."""
++    
++    # Create database tables
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Article)
++        schema_editor.create_model(FavoriteArticle)
++    
++    print("=== Testing ForeignKey validation with custom managers ===")
++    
++    # Create a regular article (not archived)
++    regular_article = Article._base_manager.create(title="Regular Article", archived=False)
++    print(f"Created regular article: {regular_article.title} (archived={regular_article.archived})")
++    
++    # Create an archived article
++    archived_article = Article._base_manager.create(title="Archived Article", archived=True)
++    print(f"Created archived article: {archived_article.title} (archived={archived_article.archived})")
++    
++    print(f"\nArticles via default manager (objects): {list(Article.objects.all())}")
++    print(f"Articles via base manager (_base_manager): {list(Article._base_manager.all())}")
++    
++    # Test 1: Validate FavoriteArticle with regular article (should work)
++    print("\n--- Test 1: Regular article validation ---")
++    favorite1 = FavoriteArticle(article=regular_article)
++    try:
++        favorite1.full_clean()
++        print("✓ Regular article validation passed")
++    except ValidationError as e:
++        print(f"✗ Regular article validation failed: {e}")
++    
++    # Test 2: Validate FavoriteArticle with archived article (should fail with current code)
++    print("\n--- Test 2: Archived article validation ---")
++    favorite2 = FavoriteArticle(article=archived_article)
++    try:
++        favorite2.full_clean()
++        print("✓ Archived article validation passed")
++    except ValidationError as e:
++        print(f"✗ Archived article validation failed: {e}")
++        print("This demonstrates the issue - the archived article exists but validation fails")
++    
++    # Test 3: Test form validation with archived article
++    print("\n--- Test 3: Form validation with archived article ---")
++    form_data = {'article': archived_article.pk}
++    form = FavoriteArticleForm(data=form_data)
++    
++    if form.is_valid():
++        print("✓ Form validation passed")
++    else:
++        print(f"✗ Form validation failed: {form.errors}")
++        print("This shows the form can't validate even though it uses _base_manager for queryset")
++    
++    # Test 4: Direct field validation
++    print("\n--- Test 4: Direct field validation ---")
++    field = FavoriteArticle._meta.get_field('article')
++    try:
++        field.validate(archived_article.pk, favorite2)
++        print("✓ Direct field validation passed")
++    except ValidationError as e:
++        print(f"✗ Direct field validation failed: {e}")
++        print("This is the core issue - ForeignKey.validate() uses _default_manager")
++    
++    # Test 5: Edge case - non-existent ID should still fail
++    print("\n--- Test 5: Non-existent ID validation (should fail) ---")
++    non_existent_id = 9999
++    favorite3 = FavoriteArticle(article_id=non_existent_id)
++    try:
++        favorite3.full_clean()
++        print("✗ Non-existent ID validation should have failed but passed")
++    except ValidationError as e:
++        print("✓ Non-existent ID validation correctly failed")
++    
++    # Test 6: Edge case - None value should pass (if field allows null)
++    print("\n--- Test 6: None value validation ---")
++    try:
++        field.validate(None, favorite2)
++        print("✓ None value validation passed")
++    except ValidationError as e:
++        print(f"✗ None value validation failed: {e}")
++    
++    # Test 7: Test with limit_choices_to (should still respect those limits)
++    print("\n--- Test 7: Testing limit_choices_to behavior ---")
++    # This test would require a more complex setup, but the fix should still respect limit_choices_to
++
++if __name__ == '__main__':
++    test_foreignkey_validation_issue()
+\ No newline at end of file
+diff --git a/test_limit_choices_to.py b/test_limit_choices_to.py
+new file mode 100644
+index 0000000000..2bcf0a2c5d
+--- /dev/null
++++ b/test_limit_choices_to.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python
++"""
++Test script to verify that the ForeignKey validation fix still respects limit_choices_to.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.exceptions import ValidationError
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models to test limit_choices_to behavior
++class CategoryManager(models.Manager):
++    def get_queryset(self):
++        # Filter out inactive categories by default
++        return super().get_queryset().filter(active=True)
++
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    active = models.BooleanField(default=True)
++    priority = models.IntegerField(default=1)
++    
++    objects = CategoryManager()
++    
++    class Meta:
++        app_label = '__main__'
++
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    # Only allow categories with priority >= 5
++    category = models.ForeignKey(
++        Category, 
++        on_delete=models.CASCADE,
++        limit_choices_to={'priority__gte': 5}
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_limit_choices_to_with_base_manager():
++    """Test that limit_choices_to still works with _base_manager."""
++    
++    # Create database tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Category)
++        schema_editor.create_model(Product)
++    
++    print("=== Testing limit_choices_to with _base_manager ===")
++    
++    # Create categories with different priorities and active states
++    cat1 = Category._base_manager.create(name="Low Priority Active", active=True, priority=1)
++    cat2 = Category._base_manager.create(name="High Priority Active", active=True, priority=10)
++    cat3 = Category._base_manager.create(name="High Priority Inactive", active=False, priority=10)
++    cat4 = Category._base_manager.create(name="Low Priority Inactive", active=False, priority=1)
++    
++    print(f"Created categories:")
++    print(f"  {cat1.name}: active={cat1.active}, priority={cat1.priority}")
++    print(f"  {cat2.name}: active={cat2.active}, priority={cat2.priority}")
++    print(f"  {cat3.name}: active={cat3.active}, priority={cat3.priority}")
++    print(f"  {cat4.name}: active={cat4.active}, priority={cat4.priority}")
++    
++    print(f"\nCategories via default manager: {list(Category.objects.all())}")
++    print(f"Categories via base manager: {list(Category._base_manager.all())}")
++    
++    # Test 1: High priority active category (should pass)
++    print("\n--- Test 1: High priority active category ---")
++    product1 = Product(name="Product 1", category=cat2)
++    try:
++        product1.full_clean()
++        print("✓ High priority active category validation passed")
++    except ValidationError as e:
++        print(f"✗ High priority active category validation failed: {e}")
++    
++    # Test 2: High priority inactive category (should pass - exists in base manager and meets limit_choices_to)
++    print("\n--- Test 2: High priority inactive category ---")
++    product2 = Product(name="Product 2", category=cat3)
++    try:
++        product2.full_clean()
++        print("✓ High priority inactive category validation passed")
++    except ValidationError as e:
++        print(f"✗ High priority inactive category validation failed: {e}")
++    
++    # Test 3: Low priority active category (should fail - doesn't meet limit_choices_to)
++    print("\n--- Test 3: Low priority active category ---")
++    product3 = Product(name="Product 3", category=cat1)
++    try:
++        product3.full_clean()
++        print("✗ Low priority active category validation should have failed but passed")
++    except ValidationError as e:
++        print("✓ Low priority active category validation correctly failed (limit_choices_to)")
++    
++    # Test 4: Low priority inactive category (should fail - doesn't meet limit_choices_to)
++    print("\n--- Test 4: Low priority inactive category ---")
++    product4 = Product(name="Product 4", category=cat4)
++    try:
++        product4.full_clean()
++        print("✗ Low priority inactive category validation should have failed but passed")
++    except ValidationError as e:
++        print("✓ Low priority inactive category validation correctly failed (limit_choices_to)")
++
++if __name__ == '__main__':
++    test_limit_choices_to_with_base_manager()
+\ No newline at end of file

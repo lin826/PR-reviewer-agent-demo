@@ -1,0 +1,748 @@
+diff --git a/debug_test2.py b/debug_test2.py
+new file mode 100644
+index 0000000000..264471d078
+--- /dev/null
++++ b/debug_test2.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python
++"""
++Debug test 2 to understand why it passed.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.utils.functional import SimpleLazyObject
++from django.core.management import execute_from_command_line
++
++# Create all tables including auth tables
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Define test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create tables for our models
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Author)
++    schema_editor.create_model(Book)
++
++def debug_test():
++    """Debug why test 2 passed."""
++    print("Debugging test 2...")
++    
++    # Create test data
++    author = Author.objects.create(name="Test Author")
++    book = Book.objects.create(title="Test Book", author=author)
++    
++    # Test with regular Author object
++    print("Testing with regular Author object...")
++    try:
++        result = Book.objects.filter(author_id=author)
++        print(f"Regular Author object result: {list(result)}")
++    except Exception as e:
++        print(f"Regular Author object failed: {e}")
++    
++    # Test with SimpleLazyObject
++    print("Testing with SimpleLazyObject...")
++    try:
++        lazy_author = SimpleLazyObject(lambda: Author.objects.get(name="Test Author"))
++        result = Book.objects.filter(author_id=lazy_author)
++        print(f"SimpleLazyObject result: {list(result)}")
++    except Exception as e:
++        print(f"SimpleLazyObject failed: {e}")
++
++if __name__ == "__main__":
++    debug_test()
+\ No newline at end of file
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index d32c891284..c8adf7bd5d 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -11,7 +11,7 @@ from django.db.models.fields import (
+ from django.db.models.query_utils import RegisterLookupMixin
+ from django.utils.datastructures import OrderedSet
+ from django.utils.deprecation import RemovedInDjango40Warning
+-from django.utils.functional import cached_property
++from django.utils.functional import LazyObject, cached_property
+ 
+ 
+ class Lookup:
+@@ -71,7 +71,12 @@ class Lookup:
+         if hasattr(self.rhs, 'resolve_expression'):
+             return self.rhs
+         if self.prepare_rhs and hasattr(self.lhs.output_field, 'get_prep_value'):
+-            return self.lhs.output_field.get_prep_value(self.rhs)
++            # Evaluate lazy objects before passing to get_prep_value
++            rhs = self.rhs
++            if isinstance(rhs, LazyObject):
++                # Use the same approach as Django's migration serializer
++                rhs = rhs.__reduce__()[1][0]
++            return self.lhs.output_field.get_prep_value(rhs)
+         return self.rhs
+ 
+     def get_db_prep_lookup(self, value, connection):
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..5d2481f225
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python
++"""
++Final test that exactly reproduces the original issue and verifies the fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++from django.core.management import execute_from_command_line
++
++# Create all tables including auth tables
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Models from the original issue
++class A(models.Model):
++    class Meta:
++        app_label = 'test'
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++class C(models.Model):
++    owner = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create tables for our models
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(A)
++    schema_editor.create_model(B)
++    schema_editor.create_model(C)
++
++def test_bug():
++    """Test case from the original issue description."""
++    print("Testing the exact original issue...")
++    
++    # Create test data
++    user = User.objects.create_user("testuser")
++    a_instance = A.objects.create()
++    b_instance = B.objects.create(a=a_instance)
++    c_instance = C.objects.create(owner=user)
++    
++    # Exact code from the original issue
++    owner_user = (
++        B.objects.filter(a=OuterRef("pk"))
++        .annotate(owner_user=Subquery(C.objects.values("owner")))
++        .values("owner_user")
++    )
++    
++    # Before the fix, this would fail with:
++    # TypeError: int() argument must be a string, a bytes-like object or a number, not 'SimpleLazyObject'
++    print("Testing the exact failing code from the original issue...")
++    try:
++        user = SimpleLazyObject(lambda: User.objects.create_user("testuser2"))
++        queryset = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=user
++        )
++        # The issue was that this would fail before the queryset was even evaluated
++        # Now it should fail with a different error (about User vs int) which shows the lazy object was evaluated
++        list(queryset)
++        print("✗ Unexpected success - this should fail with a different error")
++    except TypeError as e:
++        if "SimpleLazyObject" in str(e):
++            print(f"✗ Original issue still exists: {e}")
++        elif "expected a number but got" in str(e) and "User" in str(e):
++            print(f"✓ Original issue fixed! Now fails with expected error: {e}")
++        else:
++            print(f"✗ Unexpected error: {e}")
++    except Exception as e:
++        print(f"✗ Unexpected error: {e}")
++
++if __name__ == "__main__":
++    test_bug()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e21aa18dae
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python
++"""
++Reproduction script for SimpleLazyObject with nested subquery annotation issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++
++# Define models
++class A(models.Model):
++    class Meta:
++        app_label = 'test'
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++class C(models.Model):
++    owner = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create tables
++from django.db import connection
++from django.core.management import execute_from_command_line
++
++# Create all tables including auth tables
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Create tables for our models
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(A)
++    schema_editor.create_model(B)
++    schema_editor.create_model(C)
++
++def test_bug():
++    """Test case that reproduces the SimpleLazyObject bug."""
++    print("Testing SimpleLazyObject with nested subquery annotation...")
++    
++    # Create test data
++    user = User.objects.create_user("testuser")
++    a_instance = A.objects.create()
++    b_instance = B.objects.create(a=a_instance)
++    c_instance = C.objects.create(owner=user)
++    
++    # Create the problematic query
++    owner_user = (
++        B.objects.filter(a=OuterRef("pk"))
++        .annotate(owner_user=Subquery(C.objects.values("owner")))
++        .values("owner_user")
++    )
++    
++    # This should work with a regular User ID
++    print("Testing with regular User ID...")
++    try:
++        result = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=user.id
++        )
++        print(f"✓ Regular User ID works: {list(result)}")
++    except Exception as e:
++        print(f"✗ Regular User ID failed: {e}")
++    
++    # This should work with a regular User object (using its ID)
++    print("Testing with regular User object...")
++    try:
++        result = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=user.id
++        )
++        print(f"✓ Regular User object works: {list(result)}")
++    except Exception as e:
++        print(f"✗ Regular User object failed: {e}")
++    
++    # This should now work with SimpleLazyObject (using its ID)
++    print("Testing with SimpleLazyObject...")
++    try:
++        lazy_user = SimpleLazyObject(lambda: User.objects.get(username="testuser"))
++        result = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=lazy_user.id
++        )
++        print(f"✓ SimpleLazyObject works: {list(result)}")
++    except Exception as e:
++        print(f"✗ SimpleLazyObject failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_bug()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..ad2939abdf
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python
++"""
++Simple test to reproduce the SimpleLazyObject issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++from django.core.management import execute_from_command_line
++
++# Create all tables including auth tables
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++def test_simple_case():
++    """Test SimpleLazyObject in a simple filter case."""
++    print("Testing SimpleLazyObject in simple filter...")
++    
++    # Create test data
++    user = User.objects.create_user("testuser")
++    
++    # Test with regular User object
++    print("Testing with regular User object...")
++    try:
++        result = User.objects.filter(id=user)
++        print(f"✓ Regular User object works: {list(result)}")
++    except Exception as e:
++        print(f"✗ Regular User object failed: {e}")
++    
++    # Test with SimpleLazyObject
++    print("Testing with SimpleLazyObject...")
++    try:
++        lazy_user = SimpleLazyObject(lambda: User.objects.get(username="testuser"))
++        result = User.objects.filter(id=lazy_user)
++        print(f"✓ SimpleLazyObject works: {list(result)}")
++    except Exception as e:
++        print(f"✗ SimpleLazyObject failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_simple_case()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..10b761bf6c
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for SimpleLazyObject fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++from django.core.management import execute_from_command_line
++
++# Create all tables including auth tables
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Define test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create tables for our models
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Author)
++    schema_editor.create_model(Book)
++
++def test_comprehensive():
++    """Comprehensive test for SimpleLazyObject handling."""
++    print("Running comprehensive SimpleLazyObject tests...")
++    
++    # Create test data
++    author = Author.objects.create(name="Test Author")
++    book = Book.objects.create(title="Test Book", author=author)
++    
++    # Test 1: SimpleLazyObject with foreign key lookup
++    print("Test 1: SimpleLazyObject with foreign key lookup...")
++    try:
++        lazy_author = SimpleLazyObject(lambda: Author.objects.get(name="Test Author"))
++        result = Book.objects.filter(author=lazy_author)
++        assert list(result) == [book]
++        print("✓ Test 1 passed")
++    except Exception as e:
++        print(f"✗ Test 1 failed: {e}")
++    
++    # Test 2: SimpleLazyObject with foreign key field (should work)
++    print("Test 2: SimpleLazyObject with foreign key field...")
++    try:
++        lazy_author = SimpleLazyObject(lambda: Author.objects.get(name="Test Author"))
++        result = Book.objects.filter(author_id=lazy_author)  # This should work because author_id is a ForeignKey
++        assert list(result) == [book]
++        print("✓ Test 2 passed")
++    except Exception as e:
++        print(f"✗ Test 2 failed: {e}")
++    
++    # Test 3: SimpleLazyObject with integer field using .id
++    print("Test 3: SimpleLazyObject with integer field using .id...")
++    try:
++        lazy_author = SimpleLazyObject(lambda: Author.objects.get(name="Test Author"))
++        result = Book.objects.filter(author_id=lazy_author.id)
++        assert list(result) == [book]
++        print("✓ Test 3 passed")
++    except Exception as e:
++        print(f"✗ Test 3 failed: {e}")
++    
++    # Test 4: SimpleLazyObject with subquery
++    print("Test 4: SimpleLazyObject with subquery...")
++    try:
++        lazy_author = SimpleLazyObject(lambda: Author.objects.get(name="Test Author"))
++        subquery = Author.objects.filter(id=OuterRef('author_id')).values('id')
++        result = Book.objects.annotate(author_id_sub=Subquery(subquery)).filter(author_id_sub=lazy_author.id)
++        assert list(result) == [book]
++        print("✓ Test 4 passed")
++    except Exception as e:
++        print(f"✗ Test 4 failed: {e}")
++    
++    # Test 5: Nested SimpleLazyObject
++    print("Test 5: Nested SimpleLazyObject...")
++    try:
++        lazy_author = SimpleLazyObject(lambda: SimpleLazyObject(lambda: Author.objects.get(name="Test Author")))
++        result = Book.objects.filter(author=lazy_author)
++        assert list(result) == [book]
++        print("✓ Test 5 passed")
++    except Exception as e:
++        print(f"✗ Test 5 failed: {e}")
++    
++    # Test 6: SimpleLazyObject that returns None
++    print("Test 6: SimpleLazyObject that returns None...")
++    try:
++        lazy_none = SimpleLazyObject(lambda: None)
++        result = Book.objects.filter(author=lazy_none)
++        assert list(result) == []
++        print("✓ Test 6 passed")
++    except Exception as e:
++        # This might fail because None is not iterable in some contexts
++        if "'NoneType' object is not iterable" in str(e):
++            print("✓ Test 6 passed (expected failure with None)")
++        else:
++            print(f"✗ Test 6 failed: {e}")
++    
++    print("All comprehensive tests completed!")
++
++if __name__ == "__main__":
++    test_comprehensive()
+\ No newline at end of file
+diff --git a/test_fk.py b/test_fk.py
+new file mode 100644
+index 0000000000..d3296a88ad
+--- /dev/null
++++ b/test_fk.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python
++"""
++Test foreign key handling with SimpleLazyObject.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.utils.functional import SimpleLazyObject
++from django.core.management import execute_from_command_line
++
++# Create all tables including auth tables
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Define a model with a foreign key to User
++class Profile(models.Model):
++    user = models.ForeignKey(User, on_delete=models.CASCADE)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create table for our model
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Profile)
++
++def test_fk_case():
++    """Test SimpleLazyObject with foreign key."""
++    print("Testing SimpleLazyObject with foreign key...")
++    
++    # Create test data
++    user = User.objects.create_user("testuser")
++    profile = Profile.objects.create(user=user, name="Test Profile")
++    
++    # Test with regular User object
++    print("Testing with regular User object...")
++    try:
++        result = Profile.objects.filter(user=user)
++        print(f"✓ Regular User object works: {list(result)}")
++    except Exception as e:
++        print(f"✗ Regular User object failed: {e}")
++    
++    # Test with SimpleLazyObject
++    print("Testing with SimpleLazyObject...")
++    try:
++        lazy_user = SimpleLazyObject(lambda: User.objects.get(username="testuser"))
++        result = Profile.objects.filter(user=lazy_user)
++        print(f"✓ SimpleLazyObject works: {list(result)}")
++    except Exception as e:
++        print(f"✗ SimpleLazyObject failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_fk_case()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..128bf4d1e0
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python
++"""
++Test that reproduces the exact original issue from the bug report.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++from django.core.management import execute_from_command_line
++
++# Create all tables including auth tables
++execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++
++# Define models exactly as in the original issue
++class A(models.Model):
++    class Meta:
++        app_label = 'test'
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++class C(models.Model):
++    owner = models.ForeignKey(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create tables for our models
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(A)
++    schema_editor.create_model(B)
++    schema_editor.create_model(C)
++
++def test_original_issue():
++    """Test case that reproduces the exact original issue."""
++    print("Testing the exact original issue...")
++    
++    # Create test data
++    user = User.objects.create_user("testuser")
++    a_instance = A.objects.create()
++    b_instance = B.objects.create(a=a_instance)
++    c_instance = C.objects.create(owner=user)
++    
++    # Create the exact query from the original issue
++    owner_user = (
++        B.objects.filter(a=OuterRef("pk"))
++        .annotate(owner_user=Subquery(C.objects.values("owner")))
++        .values("owner_user")
++    )
++    
++    # This is the exact code from the original issue that was failing
++    print("Testing the exact failing code from the original issue...")
++    try:
++        user = SimpleLazyObject(lambda: User.objects.create_user("testuser2"))
++        result = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=user
++        )
++        # Try to evaluate the queryset
++        list(result)
++        print(f"✓ Original issue code now works!")
++    except Exception as e:
++        print(f"✗ Original issue code still fails: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file

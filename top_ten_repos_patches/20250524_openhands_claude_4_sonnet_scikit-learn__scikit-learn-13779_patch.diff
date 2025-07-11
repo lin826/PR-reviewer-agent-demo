@@ -1,0 +1,424 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..ceccdc0da
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with VotingClassifier failing when 
++weights are passed and an estimator is None.
++"""
++
++import numpy as np
++from sklearn.datasets import load_iris
++from sklearn.ensemble import VotingClassifier
++from sklearn.linear_model import LogisticRegression
++from sklearn.ensemble import RandomForestClassifier
++
++def test_voting_classifier_with_none_estimator():
++    """Test the issue described in the bug report."""
++    print("Testing VotingClassifier with None estimator and sample_weight...")
++    
++    # Load data
++    X, y = load_iris(return_X_y=True)
++    
++    # Create VotingClassifier
++    voter = VotingClassifier(
++        estimators=[('lr', LogisticRegression()),
++                    ('rf', RandomForestClassifier())]
++    )
++    
++    # First fit should work
++    print("1. First fit with sample_weight - should work...")
++    try:
++        voter.fit(X, y, sample_weight=np.ones(y.shape))
++        print("   ✓ First fit successful")
++    except Exception as e:
++        print(f"   ✗ First fit failed: {e}")
++        return False
++    
++    # Set one estimator to None
++    print("2. Setting lr estimator to None...")
++    voter.set_params(lr=None)
++    print("   ✓ Set lr=None")
++    
++    # Second fit should fail with the current implementation
++    print("3. Second fit with sample_weight after setting lr=None...")
++    try:
++        voter.fit(X, y, sample_weight=np.ones(y.shape))
++        print("   ✓ Second fit successful (issue is fixed!)")
++        return True
++    except AttributeError as e:
++        if "'NoneType' object has no attribute" in str(e):
++            print(f"   ✗ Second fit failed as expected: {e}")
++            return False
++        else:
++            print(f"   ✗ Second fit failed with unexpected error: {e}")
++            return False
++    except Exception as e:
++        print(f"   ✗ Second fit failed with unexpected error: {e}")
++        return False
++
++def test_voting_classifier_without_sample_weight():
++    """Test that the issue doesn't occur without sample_weight."""
++    print("\nTesting VotingClassifier with None estimator but NO sample_weight...")
++    
++    # Load data
++    X, y = load_iris(return_X_y=True)
++    
++    # Create VotingClassifier
++    voter = VotingClassifier(
++        estimators=[('lr', LogisticRegression()),
++                    ('rf', RandomForestClassifier())]
++    )
++    
++    # First fit should work
++    print("1. First fit without sample_weight - should work...")
++    try:
++        voter.fit(X, y)
++        print("   ✓ First fit successful")
++    except Exception as e:
++        print(f"   ✗ First fit failed: {e}")
++        return False
++    
++    # Set one estimator to None
++    print("2. Setting lr estimator to None...")
++    voter.set_params(lr=None)
++    print("   ✓ Set lr=None")
++    
++    # Second fit should work even with None estimator when no sample_weight
++    print("3. Second fit without sample_weight after setting lr=None...")
++    try:
++        voter.fit(X, y)
++        print("   ✓ Second fit successful")
++        return True
++    except Exception as e:
++        print(f"   ✗ Second fit failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("REPRODUCING VOTING CLASSIFIER ISSUE")
++    print("=" * 60)
++    
++    # Test the main issue
++    issue_reproduced = not test_voting_classifier_with_none_estimator()
++    
++    # Test that it works without sample_weight
++    works_without_sample_weight = test_voting_classifier_without_sample_weight()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"Issue reproduced (with sample_weight): {issue_reproduced}")
++    print(f"Works without sample_weight: {works_without_sample_weight}")
++    
++    if issue_reproduced and works_without_sample_weight:
++        print("✓ Successfully reproduced the issue!")
++    else:
++        print("✗ Could not reproduce the issue as expected")
++    print("=" * 60)
+\ No newline at end of file
+diff --git a/sklearn/ensemble/voting.py b/sklearn/ensemble/voting.py
+index 7afa7180c..13accdcec 100644
+--- a/sklearn/ensemble/voting.py
++++ b/sklearn/ensemble/voting.py
+@@ -78,7 +78,7 @@ class _BaseVoting(_BaseComposition, TransformerMixin):
+ 
+         if sample_weight is not None:
+             for name, step in self.estimators:
+-                if not has_fit_parameter(step, 'sample_weight'):
++                if step is not None and not has_fit_parameter(step, 'sample_weight'):
+                     raise ValueError('Underlying estimator \'%s\' does not'
+                                      ' support sample weights.' % name)
+ 
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 000000000..ccf12e79c
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the VotingClassifier fix.
++"""
++
++import numpy as np
++from sklearn.datasets import load_iris
++from sklearn.ensemble import VotingClassifier, VotingRegressor
++from sklearn.linear_model import LogisticRegression, LinearRegression
++from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.datasets import load_boston
++
++def test_voting_classifier_edge_cases():
++    """Test various edge cases for VotingClassifier with None estimators."""
++    print("Testing VotingClassifier edge cases...")
++    
++    X, y = load_iris(return_X_y=True)
++    sample_weight = np.ones(y.shape)
++    
++    # Test 1: All estimators None should still fail
++    print("1. Testing all estimators None...")
++    voter = VotingClassifier(estimators=[('lr', None), ('rf', None)])
++    try:
++        voter.fit(X, y, sample_weight=sample_weight)
++        print("   ✗ Should have failed with all None estimators")
++        return False
++    except ValueError as e:
++        if "All estimators are None" in str(e):
++            print("   ✓ Correctly failed with all None estimators")
++        else:
++            print(f"   ✗ Failed with unexpected error: {e}")
++            return False
++    
++    # Test 2: Mix of None and valid estimators
++    print("2. Testing mix of None and valid estimators...")
++    voter = VotingClassifier(estimators=[
++        ('lr', LogisticRegression(solver='lbfgs', multi_class='auto')), 
++        ('rf', None),
++        ('lr2', LogisticRegression(solver='lbfgs', multi_class='auto'))
++    ])
++    try:
++        voter.fit(X, y, sample_weight=sample_weight)
++        print("   ✓ Successfully fit with mix of None and valid estimators")
++    except Exception as e:
++        print(f"   ✗ Failed: {e}")
++        return False
++    
++    # Test 3: Setting estimator to None after initial fit
++    print("3. Testing setting estimator to None after initial fit...")
++    voter = VotingClassifier(estimators=[
++        ('lr', LogisticRegression(solver='lbfgs', multi_class='auto')), 
++        ('rf', RandomForestClassifier(n_estimators=10))
++    ])
++    voter.fit(X, y, sample_weight=sample_weight)
++    voter.set_params(lr=None)
++    try:
++        voter.fit(X, y, sample_weight=sample_weight)
++        print("   ✓ Successfully refit after setting estimator to None")
++    except Exception as e:
++        print(f"   ✗ Failed: {e}")
++        return False
++    
++    # Test 4: Estimator that doesn't support sample_weight should still fail
++    print("4. Testing estimator that doesn't support sample_weight...")
++    voter = VotingClassifier(estimators=[
++        ('lr', LogisticRegression(solver='lbfgs', multi_class='auto')), 
++        ('knn', KNeighborsClassifier()),
++        ('rf', None)  # This should be ignored
++    ])
++    try:
++        voter.fit(X, y, sample_weight=sample_weight)
++        print("   ✗ Should have failed with KNN not supporting sample_weight")
++        return False
++    except ValueError as e:
++        if "does not support sample weights" in str(e):
++            print("   ✓ Correctly failed with unsupported sample_weight")
++        else:
++            print(f"   ✗ Failed with unexpected error: {e}")
++            return False
++    
++    return True
++
++def test_voting_regressor_edge_cases():
++    """Test VotingRegressor with None estimators."""
++    print("\nTesting VotingRegressor edge cases...")
++    
++    X, y = load_boston(return_X_y=True)
++    sample_weight = np.ones(y.shape)
++    
++    # Test 1: Mix of None and valid estimators
++    print("1. Testing VotingRegressor with mix of None and valid estimators...")
++    voter = VotingRegressor(estimators=[
++        ('lr', LinearRegression()), 
++        ('rf', None),
++        ('lr2', LinearRegression())
++    ])
++    try:
++        voter.fit(X, y, sample_weight=sample_weight)
++        print("   ✓ Successfully fit VotingRegressor with mix of None and valid estimators")
++    except Exception as e:
++        print(f"   ✗ Failed: {e}")
++        return False
++    
++    # Test 2: Setting estimator to None after initial fit
++    print("2. Testing VotingRegressor setting estimator to None after initial fit...")
++    voter = VotingRegressor(estimators=[
++        ('lr', LinearRegression()), 
++        ('rf', RandomForestRegressor(n_estimators=10))
++    ])
++    voter.fit(X, y, sample_weight=sample_weight)
++    voter.set_params(lr=None)
++    try:
++        voter.fit(X, y, sample_weight=sample_weight)
++        print("   ✓ Successfully refit VotingRegressor after setting estimator to None")
++    except Exception as e:
++        print(f"   ✗ Failed: {e}")
++        return False
++    
++    return True
++
++def test_original_issue():
++    """Test the exact scenario from the original issue."""
++    print("\nTesting original issue scenario...")
++    
++    X, y = load_iris(return_X_y=True)
++    voter = VotingClassifier(
++        estimators=[('lr', LogisticRegression(solver='lbfgs', multi_class='auto')),
++                    ('rf', RandomForestClassifier(n_estimators=10))]
++    )
++    voter.fit(X, y, sample_weight=np.ones(y.shape))
++    voter.set_params(lr=None)
++    try:
++        voter.fit(X, y, sample_weight=np.ones(y.shape))
++        print("   ✓ Original issue scenario works correctly")
++        return True
++    except Exception as e:
++        print(f"   ✗ Original issue scenario failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("COMPREHENSIVE TESTING OF VOTING CLASSIFIER FIX")
++    print("=" * 60)
++    
++    success = True
++    success &= test_voting_classifier_edge_cases()
++    success &= test_voting_regressor_edge_cases()
++    success &= test_original_issue()
++    
++    print("\n" + "=" * 60)
++    if success:
++        print("✓ ALL TESTS PASSED - Fix is working correctly!")
++    else:
++        print("✗ SOME TESTS FAILED - Fix needs more work")
++    print("=" * 60)
+\ No newline at end of file
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 000000000..775683c51
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/env python3
++"""
++Test the exact code from the issue description.
++"""
++
++import numpy as np
++from sklearn.datasets import load_iris
++from sklearn.ensemble import VotingClassifier
++from sklearn.linear_model import LogisticRegression
++from sklearn.ensemble import RandomForestClassifier
++
++# Exact code from the issue description
++X, y = load_iris(return_X_y=True)
++voter = VotingClassifier(
++    estimators=[('lr', LogisticRegression()),
++                ('rf', RandomForestClassifier())]
++)
++voter.fit(X, y, sample_weight=np.ones(y.shape))
++voter.set_params(lr=None)
++voter.fit(X, y, sample_weight=np.ones(y.shape))
++
++print("✓ Issue code executed successfully - no AttributeError!")
+\ No newline at end of file
+diff --git a/test_regression_case.py b/test_regression_case.py
+new file mode 100644
+index 000000000..566fc1150
+--- /dev/null
++++ b/test_regression_case.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Test case that could be added to the test suite to prevent regression.
++This test specifically covers the issue that was fixed.
++"""
++
++import numpy as np
++import pytest
++from sklearn.datasets import load_iris
++from sklearn.ensemble import VotingClassifier, VotingRegressor
++from sklearn.linear_model import LogisticRegression, LinearRegression
++from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
++from sklearn.datasets import load_boston
++
++def test_voting_classifier_with_none_estimator_and_sample_weight():
++    """Test that VotingClassifier works when an estimator is None and sample_weight is provided.
++    
++    This is a regression test for the issue where VotingClassifier would fail
++    with AttributeError when sample_weight was provided and an estimator was set to None.
++    """
++    X, y = load_iris(return_X_y=True)
++    sample_weight = np.ones(y.shape)
++    
++    # Create VotingClassifier with valid estimators
++    voter = VotingClassifier(
++        estimators=[('lr', LogisticRegression(solver='lbfgs', multi_class='auto')),
++                    ('rf', RandomForestClassifier(n_estimators=10))]
++    )
++    
++    # First fit should work
++    voter.fit(X, y, sample_weight=sample_weight)
++    
++    # Set one estimator to None
++    voter.set_params(lr=None)
++    
++    # This should not raise an AttributeError
++    voter.fit(X, y, sample_weight=sample_weight)
++    
++    # Verify that the remaining estimator was actually used
++    assert len(voter.estimators_) == 1
++    assert hasattr(voter.estimators_[0], 'predict')
++
++def test_voting_regressor_with_none_estimator_and_sample_weight():
++    """Test that VotingRegressor works when an estimator is None and sample_weight is provided."""
++    X, y = load_boston(return_X_y=True)
++    sample_weight = np.ones(y.shape)
++    
++    # Create VotingRegressor with valid estimators
++    voter = VotingRegressor(
++        estimators=[('lr', LinearRegression()),
++                    ('rf', RandomForestRegressor(n_estimators=10))]
++    )
++    
++    # First fit should work
++    voter.fit(X, y, sample_weight=sample_weight)
++    
++    # Set one estimator to None
++    voter.set_params(lr=None)
++    
++    # This should not raise an AttributeError
++    voter.fit(X, y, sample_weight=sample_weight)
++    
++    # Verify that the remaining estimator was actually used
++    assert len(voter.estimators_) == 1
++    assert hasattr(voter.estimators_[0], 'predict')
++
++def test_voting_classifier_mixed_none_estimators_with_sample_weight():
++    """Test VotingClassifier with a mix of None and valid estimators from the start."""
++    X, y = load_iris(return_X_y=True)
++    sample_weight = np.ones(y.shape)
++    
++    # Create VotingClassifier with some None estimators
++    voter = VotingClassifier(
++        estimators=[('lr', LogisticRegression(solver='lbfgs', multi_class='auto')),
++                    ('rf', None),
++                    ('lr2', LogisticRegression(solver='lbfgs', multi_class='auto'))]
++    )
++    
++    # This should work without issues
++    voter.fit(X, y, sample_weight=sample_weight)
++    
++    # Verify that only non-None estimators were fitted
++    assert len(voter.estimators_) == 2
++    for estimator in voter.estimators_:
++        assert hasattr(estimator, 'predict')
++
++if __name__ == "__main__":
++    test_voting_classifier_with_none_estimator_and_sample_weight()
++    test_voting_regressor_with_none_estimator_and_sample_weight()
++    test_voting_classifier_mixed_none_estimators_with_sample_weight()
++    print("All regression tests passed!")
+\ No newline at end of file

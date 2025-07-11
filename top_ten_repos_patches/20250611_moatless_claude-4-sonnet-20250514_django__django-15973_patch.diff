@@ -1,0 +1,106 @@
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -141,6 +141,22 @@
+     sql_delete_pk = sql_delete_constraint
+ 
+     sql_delete_procedure = "DROP PROCEDURE %(procedure)s"
++
++    def _resolve_through_model(self, field, model):
++        """
++        Resolve a ManyToManyField's through model from string to model class if needed.
++        """
++        through = field.remote_field.through
++        if isinstance(through, str):
++            # Resolve the through model from the apps registry
++            if "." in through:
++                app_label, model_name = through.split(".", 1)
++            else:
++                # If no app_label is specified, use the current model's app_label
++                app_label = model._meta.app_label
++                model_name = through
++            through = model._meta.apps.get_model(app_label, model_name)
++        return through
+ 
+     def __init__(self, connection, collect_sql=False, atomic=True):
+         self.connection = connection
+@@ -450,15 +466,17 @@
+ 
+         # Make M2M tables
+         for field in model._meta.local_many_to_many:
+-            if field.remote_field.through._meta.auto_created:
+-                self.create_model(field.remote_field.through)
++            through = self._resolve_through_model(field, model)
++            if through._meta.auto_created:
++                self.create_model(through)
+ 
+     def delete_model(self, model):
+         """Delete a model from the database."""
+         # Handle auto-created intermediary models
+         for field in model._meta.local_many_to_many:
+-            if field.remote_field.through._meta.auto_created:
+-                self.delete_model(field.remote_field.through)
++            through = self._resolve_through_model(field, model)
++            if through._meta.auto_created:
++                self.delete_model(through)
+ 
+         # Delete the table
+         self.execute(
+@@ -630,8 +648,10 @@
+         involve adding a table instead (for M2M fields).
+         """
+         # Special-case implicit M2M tables
+-        if field.many_to_many and field.remote_field.through._meta.auto_created:
+-            return self.create_model(field.remote_field.through)
++        if field.many_to_many:
++            through = self._resolve_through_model(field, model)
++            if through._meta.auto_created:
++                return self.create_model(through)
+         # Get the column's definition
+         definition, params = self.column_sql(model, field, include_default=True)
+         # It might not actually have a column behind it
+@@ -704,8 +724,10 @@
+         but for M2Ms may involve deleting a table.
+         """
+         # Special-case implicit M2M tables
+-        if field.many_to_many and field.remote_field.through._meta.auto_created:
+-            return self.delete_model(field.remote_field.through)
++        if field.many_to_many:
++            through = self._resolve_through_model(field, model)
++            if through._meta.auto_created:
++                return self.delete_model(through)
+         # It might not actually have a column behind it
+         if field.db_parameters(connection=self.connection)["type"] is None:
+             return
+@@ -759,23 +781,15 @@
+             and (
+                 old_field.remote_field.through
+                 and new_field.remote_field.through
+-                and old_field.remote_field.through._meta.auto_created
+-                and new_field.remote_field.through._meta.auto_created
+-            )
+-        ):
+-            return self._alter_many_to_many(model, old_field, new_field, strict)
+-        elif (
+-            old_type is None
+-            and new_type is None
+-            and (
+-                old_field.remote_field.through
+-                and new_field.remote_field.through
+-                and not old_field.remote_field.through._meta.auto_created
+-                and not new_field.remote_field.through._meta.auto_created
+-            )
+-        ):
+-            # Both sides have through models; this is a no-op.
+-            return
++            )
++        ):
++            old_through = self._resolve_through_model(old_field, model)
++            new_through = self._resolve_through_model(new_field, model)
++            if old_through._meta.auto_created and new_through._meta.auto_created:
++                return self._alter_many_to_many(model, old_field, new_field, strict)
++            elif not old_through._meta.auto_created and not new_through._meta.auto_created:
++                # Both sides have through models; this is a no-op.
++                return
+         elif old_type is None or new_type is None:
+             raise ValueError(
+                 "Cannot alter field %s into %s - they are not compatible types "

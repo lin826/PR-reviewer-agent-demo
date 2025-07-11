@@ -1,0 +1,108 @@
+diff --git a/edge_case_test.py b/edge_case_test.py
+new file mode 100644
+index 000000000..c2dcac055
+--- /dev/null
++++ b/edge_case_test.py
+@@ -0,0 +1,46 @@
++import numpy as np
++from sklearn.metrics.cluster import fowlkes_mallows_score
++
++def test_large_arrays():
++    """Test fowlkes_mallows_score with large arrays that would previously cause overflow."""
++    # Test with a very large array (100,000 elements)
++    large_n = 100000
++    labels_a = np.zeros(large_n, dtype=np.int)
++    labels_b = np.zeros(large_n, dtype=np.int)
++    
++    # Split into two clusters with complete agreement
++    midpoint = large_n // 2
++    labels_a[midpoint:] = 1
++    labels_b[midpoint:] = 1
++    
++    score = fowlkes_mallows_score(labels_a, labels_b)
++    print(f"Perfect match score (expected 1.0): {score}")
++    assert abs(score - 1.0) < 1e-10, f"Expected 1.0, got {score}"
++    
++    # Test with zero clusters
++    all_zeros_a = np.zeros(large_n, dtype=np.int)
++    all_zeros_b = np.zeros(large_n, dtype=np.int)
++    score_zeros = fowlkes_mallows_score(all_zeros_a, all_zeros_b)
++    print(f"All zeros score (expected 1.0): {score_zeros}")
++    assert abs(score_zeros - 1.0) < 1e-10, f"Expected 1.0, got {score_zeros}"
++    
++    # Test with very different clustering
++    # For Fowlkes-Mallows, we need at least two clusters in both partitions to get a score of 0
++    diff_labels_a = np.zeros(large_n, dtype=np.int)
++    diff_labels_a[:large_n//2] = 0
++    diff_labels_a[large_n//2:] = 1
++    
++    diff_labels_b = np.zeros(large_n, dtype=np.int)
++    diff_labels_b[:large_n//4] = 0
++    diff_labels_b[large_n//4:large_n//2] = 1
++    diff_labels_b[large_n//2:3*large_n//4] = 0
++    diff_labels_b[3*large_n//4:] = 1
++    
++    score_diff = fowlkes_mallows_score(diff_labels_a, diff_labels_b)
++    print(f"Different clustering score: {score_diff}")
++    assert score_diff < 1.0, f"Expected score < 1.0, got {score_diff}"
++
++if __name__ == "__main__":
++    print("Running edge case tests...")
++    test_large_arrays()
++    print("All tests passed!")
+\ No newline at end of file
+diff --git a/reproduce_overflow.py b/reproduce_overflow.py
+new file mode 100644
+index 000000000..021272d90
+--- /dev/null
++++ b/reproduce_overflow.py
+@@ -0,0 +1,35 @@
++import numpy as np
++import warnings
++from sklearn.metrics.cluster import fowlkes_mallows_score
++
++# Filter warnings to see the RuntimeWarning
++warnings.filterwarnings('error')
++
++def reproduce_overflow_issue():
++    """
++    Reproduces the overflow issue in fowlkes_mallows_score.
++    
++    The problem occurs when pk * qk gets too large (exceeds 2^32) 
++    causing overflow in int scalars.
++    """
++    # Create large values that will cause integer overflow when multiplied
++    large_num_samples = 100000
++    labels_a = np.zeros(large_num_samples, dtype=int)
++    labels_b = np.zeros(large_num_samples, dtype=int)
++    
++    # Set some values to 1 to create a non-trivial case
++    labels_a[50000:] = 1
++    labels_b[50000:] = 1
++    
++    try:
++        score = fowlkes_mallows_score(labels_a, labels_b)
++        print(f"Score calculated without overflow: {score}")
++    except RuntimeWarning as e:
++        print(f"Runtime Warning caught: {e}")
++        print("The overflow issue is confirmed!")
++    except Exception as e:
++        print(f"Unexpected error: {e}")
++        
++if __name__ == "__main__":
++    print("Reproducing the overflow issue in fowlkes_mallows_score...")
++    reproduce_overflow_issue()
+\ No newline at end of file
+diff --git a/sklearn/metrics/cluster/supervised.py b/sklearn/metrics/cluster/supervised.py
+index a987778ae..9bcca75a2 100644
+--- a/sklearn/metrics/cluster/supervised.py
++++ b/sklearn/metrics/cluster/supervised.py
+@@ -856,7 +856,7 @@ def fowlkes_mallows_score(labels_true, labels_pred, sparse=False):
+     tk = np.dot(c.data, c.data) - n_samples
+     pk = np.sum(np.asarray(c.sum(axis=0)).ravel() ** 2) - n_samples
+     qk = np.sum(np.asarray(c.sum(axis=1)).ravel() ** 2) - n_samples
+-    return tk / np.sqrt(pk * qk) if tk != 0. else 0.
++    return np.sqrt(tk / pk) * np.sqrt(tk / qk) if tk != 0. else 0.
+ 
+ 
+ def entropy(labels):

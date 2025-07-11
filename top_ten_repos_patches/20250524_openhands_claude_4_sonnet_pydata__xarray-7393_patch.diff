@@ -1,0 +1,373 @@
+diff --git a/debug_indexvariable.py b/debug_indexvariable.py
+new file mode 100644
+index 00000000..710b8662
+--- /dev/null
++++ b/debug_indexvariable.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand what happens in IndexVariable constructor.
++"""
++
++import xarray as xr
++import numpy as np
++from xarray.core.indexing import PandasMultiIndexingAdapter, PandasIndexingAdapter
++from xarray.core.variable import IndexVariable
++import pandas as pd
++
++def test_indexvariable_creation():
++    """Test IndexVariable creation with PandasMultiIndexingAdapter."""
++    print("=== Testing IndexVariable creation ===")
++    
++    # Create a simple MultiIndex
++    index = pd.MultiIndex.from_arrays([[0]], names=['a'])
++    
++    # Create PandasMultiIndexingAdapter with int32 dtype
++    adapter = PandasMultiIndexingAdapter(index, dtype=np.int32, level='a')
++    print(f"Adapter type: {type(adapter)}")
++    print(f"Adapter dtype: {adapter.dtype}")
++    print(f"Is PandasIndexingAdapter? {isinstance(adapter, PandasIndexingAdapter)}")
++    
++    # Test the __array__ method
++    arr = adapter.__array__()
++    print(f"Adapter __array__() dtype: {arr.dtype}")
++    
++    # Create IndexVariable
++    print(f"\n--- Creating IndexVariable ---")
++    var = IndexVariable('dim', adapter, fastpath=True)
++    print(f"Variable data type: {type(var._data)}")
++    print(f"Variable data dtype: {var._data.dtype if hasattr(var._data, 'dtype') else 'N/A'}")
++    print(f"Variable values dtype: {var.values.dtype}")
++
++def test_stack_step_by_step():
++    """Test the stack operation step by step."""
++    print("\n=== Testing stack step by step ===")
++    
++    ds = xr.Dataset(coords={'a': np.array([0], dtype='i4')})
++    print(f"Original dtype: {ds['a'].values.dtype}")
++    
++    # Get the index that would be created
++    from xarray.core.indexes import PandasMultiIndex
++    variables = {'a': ds._variables['a']}
++    
++    print(f"\n--- Creating PandasMultiIndex ---")
++    multi_index = PandasMultiIndex.stack(variables, 'b')
++    print(f"MultiIndex level_coords_dtype: {multi_index.level_coords_dtype}")
++    
++    print(f"\n--- Creating variables from MultiIndex ---")
++    idx_vars = multi_index.create_variables()
++    for name, var in idx_vars.items():
++        print(f"Variable {name}:")
++        print(f"  Data type: {type(var._data)}")
++        print(f"  Data dtype: {var._data.dtype if hasattr(var._data, 'dtype') else 'N/A'}")
++        print(f"  Values dtype: {var.values.dtype}")
++
++if __name__ == "__main__":
++    test_indexvariable_creation()
++    test_stack_step_by_step()
+\ No newline at end of file
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 00000000..282f71a4
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""
++Final verification that the stack dtype preservation issue is fixed.
++"""
++
++import xarray as xr
++import numpy as np
++
++def test_original_issue():
++    """Test the exact issue from the GitHub issue."""
++    print("=== Original Issue Test ===")
++    
++    # Exact code from the issue
++    ds = xr.Dataset(coords={'a': np.array([0], dtype='i4')})
++    result = ds['a'].values.dtype == ds.stack(b=('a',))['a'].values.dtype
++    
++    print(f"ds['a'].values.dtype == ds.stack(b=('a',))['a'].values.dtype: {result}")
++    print(f"Expected: True")
++    print(f"✓ Issue is fixed!" if result else "✗ Issue still exists!")
++    
++    return result
++
++def test_comprehensive_dtypes():
++    """Test that all numeric dtypes are preserved."""
++    print("\n=== Comprehensive Dtype Test ===")
++    
++    dtypes = ['i1', 'i2', 'i4', 'i8', 'u1', 'u2', 'u4', 'u8', 'f4', 'f8']
++    all_passed = True
++    
++    for dtype in dtypes:
++        ds = xr.Dataset(coords={'a': np.array([0], dtype=dtype)})
++        stacked = ds.stack(b=('a',))
++        preserved = ds['a'].values.dtype == stacked['a'].values.dtype
++        
++        status = "✓" if preserved else "✗"
++        print(f"  {status} {dtype:2} -> {stacked['a'].values.dtype} (preserved: {preserved})")
++        
++        if not preserved:
++            all_passed = False
++    
++    print(f"\n{'✓ All dtypes preserved!' if all_passed else '✗ Some dtypes not preserved!'}")
++    return all_passed
++
++def test_multiindex_functionality():
++    """Test that MultiIndex functionality still works correctly."""
++    print("\n=== MultiIndex Functionality Test ===")
++    
++    # Create a more complex example
++    ds = xr.Dataset(
++        data_vars={'data': (('x', 'y'), [[1, 2], [3, 4]])},
++        coords={
++            'x': np.array([10, 20], dtype='i4'),
++            'y': np.array([0.1, 0.2], dtype='f4')
++        }
++    )
++    
++    print(f"Original dtypes: x={ds['x'].values.dtype}, y={ds['y'].values.dtype}")
++    
++    # Stack both dimensions
++    stacked = ds.stack(z=('x', 'y'))
++    
++    print(f"Stacked dtypes: x={stacked['x'].values.dtype}, y={stacked['y'].values.dtype}")
++    
++    # Check that stacking worked
++    assert stacked.dims == {'z': 4}
++    assert 'z' in stacked.indexes
++    
++    # Check dtype preservation
++    x_preserved = ds['x'].values.dtype == stacked['x'].values.dtype
++    y_preserved = ds['y'].values.dtype == stacked['y'].values.dtype
++    
++    print(f"Dtype preservation: x={x_preserved}, y={y_preserved}")
++    
++    # Test unstacking
++    unstacked = stacked.unstack('z')
++    x_roundtrip = ds['x'].values.dtype == unstacked['x'].values.dtype
++    y_roundtrip = ds['y'].values.dtype == unstacked['y'].values.dtype
++    
++    print(f"Roundtrip preservation: x={x_roundtrip}, y={y_roundtrip}")
++    
++    all_good = x_preserved and y_preserved and x_roundtrip and y_roundtrip
++    print(f"{'✓ MultiIndex functionality works correctly!' if all_good else '✗ MultiIndex functionality broken!'}")
++    
++    return all_good
++
++if __name__ == "__main__":
++    print("Final verification of stack dtype preservation fix")
++    print("=" * 60)
++    
++    test1 = test_original_issue()
++    test2 = test_comprehensive_dtypes()
++    test3 = test_multiindex_functionality()
++    
++    print("\n" + "=" * 60)
++    if test1 and test2 and test3:
++        print("🎉 ALL TESTS PASSED! The issue has been successfully fixed.")
++    else:
++        print("❌ Some tests failed. The issue may not be fully resolved.")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..91eeec1c
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the stack dtype preservation fix.
++"""
++
++import xarray as xr
++import numpy as np
++
++def test_multiple_coordinates():
++    """Test stacking with multiple coordinates."""
++    print("=== Testing multiple coordinates ===")
++    
++    ds = xr.Dataset(coords={
++        'a': np.array([0, 1], dtype='i4'),
++        'b': np.array([2, 3], dtype='f4')
++    })
++    
++    print(f"Original dtypes: a={ds['a'].values.dtype}, b={ds['b'].values.dtype}")
++    
++    stacked = ds.stack(c=('a', 'b'))
++    print(f"Stacked dtypes: a={stacked['a'].values.dtype}, b={stacked['b'].values.dtype}")
++    
++    a_preserved = ds['a'].values.dtype == stacked['a'].values.dtype
++    b_preserved = ds['b'].values.dtype == stacked['b'].values.dtype
++    print(f"Preserved: a={a_preserved}, b={b_preserved}")
++
++def test_explicit_dtype_parameter():
++    """Test that explicit dtype parameter still works."""
++    print("\n=== Testing explicit dtype parameter ===")
++    
++    ds = xr.Dataset(coords={'a': np.array([0], dtype='i4')})
++    stacked = ds.stack(b=('a',))
++    
++    # Get the adapter directly
++    var = stacked._variables['a']
++    if hasattr(var.data, '__array__'):
++        # Test with explicit dtype
++        arr_default = var.data.__array__()
++        arr_float64 = var.data.__array__(np.float64)
++        arr_int8 = var.data.__array__(np.int8)
++        
++        print(f"Default dtype: {arr_default.dtype}")
++        print(f"Explicit float64: {arr_float64.dtype}")
++        print(f"Explicit int8: {arr_int8.dtype}")
++
++def test_unstack_roundtrip():
++    """Test that stack/unstack preserves dtypes."""
++    print("\n=== Testing stack/unstack roundtrip ===")
++    
++    ds = xr.Dataset(coords={'a': np.array([0, 1], dtype='i4')})
++    print(f"Original dtype: {ds['a'].values.dtype}")
++    
++    stacked = ds.stack(b=('a',))
++    print(f"Stacked dtype: {stacked['a'].values.dtype}")
++    
++    unstacked = stacked.unstack('b')
++    print(f"Unstacked dtype: {unstacked['a'].values.dtype}")
++    
++    roundtrip_preserved = ds['a'].values.dtype == unstacked['a'].values.dtype
++    print(f"Roundtrip preserved: {roundtrip_preserved}")
++
++def test_different_dtypes():
++    """Test various numeric dtypes."""
++    print("\n=== Testing various dtypes ===")
++    
++    dtypes = ['i1', 'i2', 'i4', 'i8', 'u1', 'u2', 'u4', 'u8', 'f4', 'f8']
++    
++    for dtype in dtypes:
++        try:
++            ds = xr.Dataset(coords={'a': np.array([0], dtype=dtype)})
++            stacked = ds.stack(b=('a',))
++            preserved = ds['a'].values.dtype == stacked['a'].values.dtype
++            print(f"  {dtype:2} -> {stacked['a'].values.dtype} (preserved: {preserved})")
++        except Exception as e:
++            print(f"  {dtype:2} -> ERROR: {e}")
++
++if __name__ == "__main__":
++    test_multiple_coordinates()
++    test_explicit_dtype_parameter()
++    test_unstack_roundtrip()
++    test_different_dtypes()
+\ No newline at end of file
+diff --git a/test_stack_dtype_issue.py b/test_stack_dtype_issue.py
+new file mode 100644
+index 00000000..ed6c48e5
+--- /dev/null
++++ b/test_stack_dtype_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the stack dtype casting issue.
++"""
++
++import xarray as xr
++import numpy as np
++
++def test_stack_dtype_preservation():
++    """Test that stack preserves coordinate dtypes."""
++    print("=== Testing stack dtype preservation ===")
++    
++    # Test with int32
++    print("\n1. Testing int32 (i4):")
++    ds = xr.Dataset(coords={'a': np.array([0], dtype='i4')})
++    print(f"   Original dtype: {ds['a'].values.dtype}")
++    stacked = ds.stack(b=('a',))
++    print(f"   Stacked dtype:  {stacked['a'].values.dtype}")
++    print(f"   Are equal?      {ds['a'].values.dtype == stacked['a'].values.dtype}")
++    
++    # Test with other dtypes
++    dtypes_to_test = ['i1', 'i2', 'i4', 'i8', 'f4', 'f8']
++    print(f"\n2. Testing various dtypes:")
++    for dtype in dtypes_to_test:
++        ds = xr.Dataset(coords={'a': np.array([0], dtype=dtype)})
++        stacked = ds.stack(b=('a',))
++        preserved = ds['a'].values.dtype == stacked['a'].values.dtype
++        print(f"   {dtype:2} -> {stacked['a'].values.dtype} (preserved: {preserved})")
++
++def test_multiindex_internals():
++    """Test the internal MultiIndex creation to understand the issue."""
++    print("\n=== Testing MultiIndex internals ===")
++    
++    ds = xr.Dataset(coords={'a': np.array([0], dtype='i4')})
++    print(f"Original coordinate dtype: {ds['a'].values.dtype}")
++    
++    # Let's examine what happens during stacking
++    stacked = ds.stack(b=('a',))
++    
++    # Check the MultiIndex
++    print(f"MultiIndex type: {type(stacked.indexes['b'])}")
++    print(f"XArray indexes: {stacked.xindexes}")
++    
++    # Check if it's an xarray index
++    xr_index = stacked.xindexes['b']
++    print(f"XArray index type: {type(xr_index)}")
++    if hasattr(xr_index, 'level_coords_dtype'):
++        print(f"Level coords dtype: {xr_index.level_coords_dtype}")
++    
++    # Test the create_variables method directly
++    print(f"\n--- Testing create_variables method ---")
++    idx_vars = xr_index.create_variables()
++    for name, var in idx_vars.items():
++        print(f"Variable {name}: type={type(var.data)}, dtype={var.data.dtype if hasattr(var.data, 'dtype') else 'N/A'}")
++        if hasattr(var.data, '_dtype'):
++            print(f"  _dtype: {var.data._dtype}")
++        # Check if it's a PandasMultiIndexingAdapter
++        from xarray.core.indexing import PandasMultiIndexingAdapter
++        if isinstance(var.data, PandasMultiIndexingAdapter):
++            print(f"  Is PandasMultiIndexingAdapter: True")
++            print(f"  Adapter dtype: {var.data.dtype}")
++            print(f"  Adapter level: {var.data.level}")
++            # Test the __array__ method
++            arr = var.data.__array__()
++            print(f"  __array__() result dtype: {arr.dtype}")
++        else:
++            print(f"  Is PandasMultiIndexingAdapter: False")
++    
++    # Check the coordinate variable
++    coord_var = stacked['a']
++    print(f"\n--- Coordinate variable analysis ---")
++    print(f"Coordinate variable type: {type(coord_var.data)}")
++    print(f"Coordinate variable dtype: {coord_var.values.dtype}")
++    
++    # Check the underlying data
++    if hasattr(coord_var.data, 'dtype'):
++        print(f"Underlying data dtype: {coord_var.data.dtype}")
++    if hasattr(coord_var.data, '_dtype'):
++        print(f"Underlying _dtype: {coord_var.data._dtype}")
++    
++    # Let's check the variable directly from the dataset
++    print(f"Variable from dataset: {type(stacked._variables['a'])}")
++    print(f"Variable data: {type(stacked._variables['a'].data)}")
++    if hasattr(stacked._variables['a'].data, '_dtype'):
++        print(f"Variable data _dtype: {stacked._variables['a'].data._dtype}")
++    if hasattr(stacked._variables['a'].data, 'dtype'):
++        print(f"Variable data dtype: {stacked._variables['a'].data.dtype}")
++
++if __name__ == "__main__":
++    test_stack_dtype_preservation()
++    test_multiindex_internals()
+\ No newline at end of file
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index ba937183..50bedf7b 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -1532,7 +1532,9 @@ class PandasMultiIndexingAdapter(PandasIndexingAdapter):
+ 
+     def __array__(self, dtype: DTypeLike = None) -> np.ndarray:
+         if self.level is not None:
+-            return self.array.get_level_values(self.level).values
++            if dtype is None:
++                dtype = self.dtype
++            return np.asarray(self.array.get_level_values(self.level).values, dtype=dtype)
+         else:
+             return super().__array__(dtype)

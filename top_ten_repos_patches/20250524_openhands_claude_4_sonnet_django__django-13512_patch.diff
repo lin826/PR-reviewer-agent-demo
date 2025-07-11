@@ -1,0 +1,823 @@
+diff --git a/django/core/serializers/xml_serializer.py b/django/core/serializers/xml_serializer.py
+index 88bfa59032..5a45f57d25 100644
+--- a/django/core/serializers/xml_serializer.py
++++ b/django/core/serializers/xml_serializer.py
+@@ -79,7 +79,7 @@ class Serializer(base.Serializer):
+             if field.get_internal_type() == 'JSONField':
+                 # Dump value since JSONField.value_to_string() doesn't output
+                 # strings.
+-                value = json.dumps(value, cls=field.encoder)
++                value = json.dumps(value, cls=field.encoder, ensure_ascii=False)
+             try:
+                 self.xml.characters(value)
+             except UnserializableContentError:
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index a249f4cdbf..2beedafabf 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -81,7 +81,7 @@ class JSONField(CheckFieldDefaultMixin, Field):
+     def get_prep_value(self, value):
+         if value is None:
+             return value
+-        return json.dumps(value, cls=self.encoder)
++        return json.dumps(value, cls=self.encoder, ensure_ascii=False)
+ 
+     def get_transform(self, name):
+         transform = super().get_transform(name)
+@@ -92,7 +92,7 @@ class JSONField(CheckFieldDefaultMixin, Field):
+     def validate(self, value, model_instance):
+         super().validate(value, model_instance)
+         try:
+-            json.dumps(value, cls=self.encoder)
++            json.dumps(value, cls=self.encoder, ensure_ascii=False)
+         except TypeError:
+             raise exceptions.ValidationError(
+                 self.error_messages['invalid'],
+diff --git a/django/forms/fields.py b/django/forms/fields.py
+index 9de2c60b35..8ba0013871 100644
+--- a/django/forms/fields.py
++++ b/django/forms/fields.py
+@@ -1258,7 +1258,7 @@ class JSONField(CharField):
+     def prepare_value(self, value):
+         if isinstance(value, InvalidJSONInput):
+             return value
+-        return json.dumps(value, cls=self.encoder)
++        return json.dumps(value, cls=self.encoder, ensure_ascii=False)
+ 
+     def has_changed(self, initial, data):
+         if super().has_changed(initial, data):
+@@ -1266,6 +1266,6 @@ class JSONField(CharField):
+         # For purposes of seeing whether something has changed, True isn't the
+         # same as 1 and the order of keys doesn't matter.
+         return (
+-            json.dumps(initial, sort_keys=True, cls=self.encoder) !=
+-            json.dumps(self.to_python(data), sort_keys=True, cls=self.encoder)
++            json.dumps(initial, sort_keys=True, cls=self.encoder, ensure_ascii=False) !=
++            json.dumps(self.to_python(data), sort_keys=True, cls=self.encoder, ensure_ascii=False)
+         )
+diff --git a/test_admin_unicode.py b/test_admin_unicode.py
+new file mode 100644
+index 0000000000..0d4c8c5ac3
+--- /dev/null
++++ b/test_admin_unicode.py
+@@ -0,0 +1,136 @@
++#!/usr/bin/env python
++"""
++Test script to verify Unicode fix works in admin context.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.contrib.admin.utils import display_for_field
++from django.forms import ModelForm
++import json
++
++# Create a test model with JSONField
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    data = models.JSONField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++def test_admin_display():
++    """Test that admin displays Unicode correctly."""
++    print("=== Testing Admin Display ===")
++    
++    # Test data with Unicode characters
++    test_data = {
++        'name': '中国用户',
++        'preferences': {
++            'language': '中文',
++            'city': '北京',
++            'hobbies': ['阅读', '旅游', '音乐']
++        },
++        'messages': [
++            {'from': '张三', 'text': '你好！'},
++            {'from': '李四', 'text': '欢迎使用我们的系统'}
++        ]
++    }
++    
++    # Create and save a test instance
++    instance = TestModel(name='Test User', data=test_data)
++    instance.save()
++    
++    # Test display_for_field function (used by admin)
++    field = TestModel._meta.get_field('data')
++    display_result = display_for_field(test_data, field, empty_value_display='-')
++    
++    print(f"Original data: {test_data}")
++    print(f"Admin display: {display_result}")
++    
++    # Check that Unicode characters are preserved
++    unicode_escape = '\\u'
++    has_escapes = unicode_escape in display_result
++    print(f"Contains Unicode escapes: {has_escapes}")
++    
++    # Verify the JSON is still valid
++    try:
++        parsed = json.loads(display_result)
++        print(f"JSON is valid: True")
++        print(f"Round-trip successful: {parsed == test_data}")
++    except json.JSONDecodeError as e:
++        print(f"JSON is valid: False - {e}")
++    
++    # Test specific Unicode characters
++    chinese_chars = ['中', '国', '用', '户', '文', '京', '读', '游', '乐', '三', '四', '好', '迎', '们', '统']
++    preserved_chars = [char for char in chinese_chars if char in display_result]
++    print(f"Unicode characters preserved: {len(preserved_chars)}/{len(chinese_chars)}")
++    
++    return not has_escapes and len(preserved_chars) == len(chinese_chars)
++
++def test_form_field():
++    """Test that form field handles Unicode correctly."""
++    print("\n=== Testing Form Field ===")
++    
++    from django.forms.fields import JSONField
++    
++    field = JSONField()
++    test_data = {'message': '你好，世界！', 'emoji': '🌍🚀🎉'}
++    
++    # Test prepare_value (used when displaying form)
++    prepared = field.prepare_value(test_data)
++    print(f"Original data: {test_data}")
++    print(f"Prepared value: {prepared}")
++    
++    unicode_escape = '\\u'
++    has_escapes = unicode_escape in prepared
++    print(f"Contains Unicode escapes: {has_escapes}")
++    
++    # Test round-trip
++    try:
++        parsed = json.loads(prepared)
++        print(f"Round-trip successful: {parsed == test_data}")
++        return not has_escapes and parsed == test_data
++    except json.JSONDecodeError as e:
++        print(f"JSON parsing failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    admin_test_passed = test_admin_display()
++    form_test_passed = test_form_field()
++    
++    print(f"\n=== Test Results ===")
++    print(f"Admin display test: {'PASSED' if admin_test_passed else 'FAILED'}")
++    print(f"Form field test: {'PASSED' if form_test_passed else 'FAILED'}")
++    print(f"Overall: {'PASSED' if admin_test_passed and form_test_passed else 'FAILED'}")
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..0ade35f1a8
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,242 @@
++#!/usr/bin/env python
++"""
++Final comprehensive test to verify the Unicode fix is complete.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin.utils import display_for_field
++from django.forms.fields import JSONField as FormJSONField
++from django.core import serializers
++import json
++
++def test_all_unicode_scenarios():
++    """Test all scenarios where Unicode should be preserved."""
++    print("=== Final Comprehensive Unicode Test ===")
++    
++    # Test data with various Unicode characters
++    test_cases = [
++        # Chinese
++        {'language': 'Chinese', 'data': {'greeting': '你好', 'country': '中国'}},
++        # Japanese
++        {'language': 'Japanese', 'data': {'greeting': 'こんにちは', 'country': '日本'}},
++        # Korean
++        {'language': 'Korean', 'data': {'greeting': '안녕하세요', 'country': '한국'}},
++        # Arabic
++        {'language': 'Arabic', 'data': {'greeting': 'مرحبا', 'country': 'العربية'}},
++        # Russian
++        {'language': 'Russian', 'data': {'greeting': 'Привет', 'country': 'Россия'}},
++        # Emoji
++        {'language': 'Emoji', 'data': {'greeting': '👋', 'symbols': '🌍🚀🎉💖'}},
++        # Mixed
++        {'language': 'Mixed', 'data': {'text': 'Hello 世界 🌍', 'numbers': [1, 2, 3]}},
++    ]
++    
++    results = []
++    
++    for i, test_case in enumerate(test_cases, 1):
++        print(f"\n{i}. Testing {test_case['language']}:")
++        test_data = test_case['data']
++        print(f"   Data: {test_data}")
++        
++        # Test 1: Model JSONField get_prep_value
++        field = models.JSONField()
++        model_result = field.get_prep_value(test_data)
++        model_unicode_ok = '\\u' not in model_result
++        print(f"   Model field Unicode OK: {model_unicode_ok}")
++        
++        # Test 2: Form JSONField prepare_value
++        form_field = FormJSONField()
++        form_result = form_field.prepare_value(test_data)
++        form_unicode_ok = '\\u' not in form_result
++        print(f"   Form field Unicode OK: {form_unicode_ok}")
++        
++        # Test 3: Admin display_for_field
++        admin_result = display_for_field(test_data, field, empty_value_display='-')
++        admin_unicode_ok = '\\u' not in admin_result
++        print(f"   Admin display Unicode OK: {admin_unicode_ok}")
++        
++        # Test 4: Form has_changed method
++        form_changed = form_field.has_changed(test_data, form_result)
++        has_changed_ok = not form_changed  # Should be False since data is the same
++        print(f"   Form has_changed OK: {has_changed_ok}")
++        
++        # Test 5: JSON validity and round-trip
++        try:
++            parsed_model = json.loads(model_result)
++            parsed_form = json.loads(form_result)
++            parsed_admin = json.loads(admin_result)
++            
++            roundtrip_ok = (
++                parsed_model == test_data and
++                parsed_form == test_data and
++                parsed_admin == test_data
++            )
++            print(f"   Round-trip OK: {roundtrip_ok}")
++        except json.JSONDecodeError:
++            roundtrip_ok = False
++            print(f"   Round-trip OK: False (JSON decode error)")
++        
++        # Overall result for this test case
++        case_ok = all([model_unicode_ok, form_unicode_ok, admin_unicode_ok, has_changed_ok, roundtrip_ok])
++        results.append(case_ok)
++        print(f"   Overall: {'PASS' if case_ok else 'FAIL'}")
++    
++    return all(results)
++
++def test_edge_cases():
++    """Test edge cases and special scenarios."""
++    print("\n\n=== Edge Cases Test ===")
++    
++    field = models.JSONField()
++    form_field = FormJSONField()
++    
++    edge_cases = [
++        # None
++        None,
++        # Empty structures
++        {},
++        [],
++        # Nested Unicode
++        {
++            'users': [
++                {'name': '张三', 'email': 'zhang@example.com'},
++                {'name': 'José', 'email': 'jose@example.com'},
++            ],
++            'metadata': {
++                'title': 'Список пользователей',
++                'description': 'ユーザーリスト with 🌟'
++            }
++        },
++        # Special characters
++        {'quotes': '"Hello"', 'apostrophe': "It's working", 'unicode': '中文测试'},
++    ]
++    
++    results = []
++    
++    for i, test_data in enumerate(edge_cases, 1):
++        print(f"\n{i}. Testing edge case: {test_data}")
++        
++        try:
++            if test_data is None:
++                # Special handling for None
++                model_result = field.get_prep_value(test_data)
++                edge_case_ok = model_result is None
++                print(f"   Result: {'PASS' if edge_case_ok else 'FAIL'}")
++            else:
++                # Test all methods
++                model_result = field.get_prep_value(test_data)
++                form_result = form_field.prepare_value(test_data)
++                admin_result = display_for_field(test_data, field, empty_value_display='-')
++                
++                # Check for Unicode escapes
++                unicode_ok = all('\\u' not in str(result) for result in [model_result, form_result, admin_result])
++                
++                # Check JSON validity
++                try:
++                    parsed = json.loads(model_result)
++                    roundtrip_ok = parsed == test_data
++                except json.JSONDecodeError:
++                    roundtrip_ok = False
++                
++                edge_case_ok = unicode_ok and roundtrip_ok
++                print(f"   Unicode OK: {unicode_ok}, Round-trip OK: {roundtrip_ok}")
++                print(f"   Result: {'PASS' if edge_case_ok else 'FAIL'}")
++            
++            results.append(edge_case_ok)
++            
++        except Exception as e:
++            print(f"   Error: {e}")
++            results.append(False)
++    
++    return all(results)
++
++def test_backward_compatibility():
++    """Test that our changes don't break existing functionality."""
++    print("\n\n=== Backward Compatibility Test ===")
++    
++    field = models.JSONField()
++    form_field = FormJSONField()
++    
++    # Test with ASCII-only data (should work exactly as before)
++    ascii_data = {
++        'name': 'John Doe',
++        'age': 30,
++        'active': True,
++        'scores': [85, 92, 78],
++        'metadata': None
++    }
++    
++    print(f"Testing ASCII data: {ascii_data}")
++    
++    # Test all methods
++    model_result = field.get_prep_value(ascii_data)
++    form_result = form_field.prepare_value(ascii_data)
++    admin_result = display_for_field(ascii_data, field, empty_value_display='-')
++    
++    # Verify JSON validity
++    try:
++        parsed_model = json.loads(model_result)
++        parsed_form = json.loads(form_result)
++        parsed_admin = json.loads(admin_result)
++        
++        compatibility_ok = (
++            parsed_model == ascii_data and
++            parsed_form == ascii_data and
++            parsed_admin == ascii_data
++        )
++        print(f"Backward compatibility: {'PASS' if compatibility_ok else 'FAIL'}")
++        return compatibility_ok
++        
++    except json.JSONDecodeError as e:
++        print(f"Backward compatibility: FAIL ({e})")
++        return False
++
++if __name__ == '__main__':
++    print("Running final verification of Unicode fix for JSONField...")
++    
++    unicode_test = test_all_unicode_scenarios()
++    edge_test = test_edge_cases()
++    compat_test = test_backward_compatibility()
++    
++    print(f"\n\n=== FINAL RESULTS ===")
++    print(f"Unicode scenarios: {'PASS' if unicode_test else 'FAIL'}")
++    print(f"Edge cases: {'PASS' if edge_test else 'FAIL'}")
++    print(f"Backward compatibility: {'PASS' if compat_test else 'FAIL'}")
++    
++    overall_success = unicode_test and edge_test and compat_test
++    print(f"Overall: {'SUCCESS' if overall_success else 'FAILURE'}")
++    
++    if overall_success:
++        print("\n✅ All tests passed! The Unicode fix is working correctly.")
++    else:
++        print("\n❌ Some tests failed. Please review the implementation.")
++    
++    sys.exit(0 if overall_success else 1)
+\ No newline at end of file
+diff --git a/test_unicode_comprehensive.py b/test_unicode_comprehensive.py
+new file mode 100644
+index 0000000000..bc77e6c69f
+--- /dev/null
++++ b/test_unicode_comprehensive.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script to verify the Unicode fix in JSONField.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin.utils import display_for_field
++from django.forms.fields import JSONField as FormJSONField
++import json
++
++def test_unicode_characters():
++    """Test various Unicode characters from different languages."""
++    print("=== Testing Unicode Characters ===")
++    
++    field = models.JSONField()
++    form_field = FormJSONField()
++    
++    test_cases = [
++        # Chinese
++        {'name': '中国', 'description': '这是一个测试'},
++        # Japanese
++        {'name': '日本', 'description': 'これはテストです'},
++        # Korean
++        {'name': '한국', 'description': '이것은 테스트입니다'},
++        # Arabic
++        {'name': 'العربية', 'description': 'هذا اختبار'},
++        # Russian
++        {'name': 'Россия', 'description': 'Это тест'},
++        # Emoji
++        {'name': '🌍', 'description': '🚀 Test with emojis 🎉'},
++        # Mixed content
++        {'mixed': ['中国', 'Japan', '🌸', 123, True, None]},
++    ]
++    
++    for i, test_data in enumerate(test_cases, 1):
++        print(f"\n{i}. Testing: {test_data}")
++        
++        # Test model field
++        model_result = field.get_prep_value(test_data)
++        print(f"   Model result: {model_result}")
++        
++        # Test form field
++        form_result = form_field.prepare_value(test_data)
++        print(f"   Form result: {form_result}")
++        
++        # Test admin display
++        admin_result = display_for_field(test_data, field, empty_value_display='-')
++        print(f"   Admin result: {admin_result}")
++        
++        # Verify no Unicode escapes
++        unicode_escape = '\\u'
++        has_escapes = any(unicode_escape in str(result) for result in [model_result, form_result, admin_result])
++        print(f"   Contains Unicode escapes: {has_escapes}")
++        
++        # Verify JSON is still valid
++        try:
++            parsed = json.loads(model_result)
++            print(f"   JSON is valid: True")
++            print(f"   Round-trip successful: {parsed == test_data}")
++        except json.JSONDecodeError as e:
++            print(f"   JSON is valid: False - {e}")
++
++def test_edge_cases():
++    """Test edge cases and special scenarios."""
++    print("\n\n=== Testing Edge Cases ===")
++    
++    field = models.JSONField()
++    form_field = FormJSONField()
++    
++    edge_cases = [
++        # None value
++        None,
++        # Empty structures
++        {},
++        [],
++        # Nested structures with Unicode
++        {
++            'users': [
++                {'name': '张三', 'city': '北京'},
++                {'name': '李四', 'city': '上海'},
++            ],
++            'metadata': {
++                'title': '用户列表',
++                'description': '这是一个包含中文的用户列表'
++            }
++        },
++        # String with quotes and special characters
++        {'message': '他说："你好，世界！"'},
++        # Numbers and booleans mixed with Unicode
++        {'count': 42, 'active': True, 'name': '测试用户'},
++    ]
++    
++    for i, test_data in enumerate(edge_cases, 1):
++        print(f"\n{i}. Testing edge case: {test_data}")
++        
++        try:
++            # Test model field
++            model_result = field.get_prep_value(test_data)
++            print(f"   Model result: {model_result}")
++            
++            if test_data is not None:
++                # Test form field
++                form_result = form_field.prepare_value(test_data)
++                print(f"   Form result: {form_result}")
++                
++                # Test admin display
++                admin_result = display_for_field(test_data, field, empty_value_display='-')
++                print(f"   Admin result: {admin_result}")
++                
++                # Verify JSON validity
++                if model_result is not None:
++                    parsed = json.loads(model_result)
++                    print(f"   Round-trip successful: {parsed == test_data}")
++            
++        except Exception as e:
++            print(f"   Error: {e}")
++
++def test_has_changed_method():
++    """Test the has_changed method with Unicode data."""
++    print("\n\n=== Testing has_changed Method ===")
++    
++    form_field = FormJSONField()
++    
++    test_cases = [
++        # Same Unicode data
++        ({'name': '中国'}, '{"name": "中国"}', False),
++        # Different Unicode data
++        ({'name': '中国'}, '{"name": "日本"}', True),
++        # Same data, different order
++        ({'a': '中国', 'b': '日本'}, '{"b": "日本", "a": "中国"}', False),
++        # Unicode vs escaped (should be considered same)
++        ({'name': '中国'}, '{"name": "\\u4e2d\\u56fd"}', False),
++    ]
++    
++    for i, (initial, data, expected_changed) in enumerate(test_cases, 1):
++        print(f"\n{i}. Testing has_changed:")
++        print(f"   Initial: {initial}")
++        print(f"   Data: {data}")
++        
++        result = form_field.has_changed(initial, data)
++        print(f"   Expected changed: {expected_changed}")
++        print(f"   Actual changed: {result}")
++        print(f"   Test passed: {result == expected_changed}")
++
++if __name__ == '__main__':
++    test_unicode_characters()
++    test_edge_cases()
++    test_has_changed_method()
+\ No newline at end of file
+diff --git a/test_unicode_issue.py b/test_unicode_issue.py
+new file mode 100644
+index 0000000000..494c9b39cc
+--- /dev/null
++++ b/test_unicode_issue.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the Unicode issue in JSONField admin display.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin.utils import display_for_field
++from django.forms.fields import JSONField as FormJSONField
++import json
++
++# Test the current behavior
++def test_current_behavior():
++    print("=== Testing Current Behavior ===")
++    
++    # Test 1: Model JSONField get_prep_value
++    print("\n1. Model JSONField.get_prep_value():")
++    field = models.JSONField()
++    chinese_data = {'name': '中国', 'city': '北京'}
++    result = field.get_prep_value(chinese_data)
++    print(f"Input: {chinese_data}")
++    print(f"Output: {result}")
++    unicode_escape = '\\u'
++    print(f"Contains Unicode escapes: {unicode_escape in result}")
++    
++    # Test 2: Forms JSONField prepare_value
++    print("\n2. Forms JSONField.prepare_value():")
++    form_field = FormJSONField()
++    result = form_field.prepare_value(chinese_data)
++    print(f"Input: {chinese_data}")
++    print(f"Output: {result}")
++    print(f"Contains Unicode escapes: {unicode_escape in result}")
++    
++    # Test 3: Admin display_for_field
++    print("\n3. Admin display_for_field():")
++    result = display_for_field(chinese_data, field, empty_value_display='-')
++    print(f"Input: {chinese_data}")
++    print(f"Output: {result}")
++    print(f"Contains Unicode escapes: {unicode_escape in result}")
++    
++    # Test 4: Standard json.dumps behavior
++    print("\n4. Standard json.dumps() behavior:")
++    result_default = json.dumps(chinese_data)
++    result_unicode = json.dumps(chinese_data, ensure_ascii=False)
++    print(f"Input: {chinese_data}")
++    print(f"json.dumps() default: {result_default}")
++    print(f"json.dumps(ensure_ascii=False): {result_unicode}")
++    print(f"Default contains Unicode escapes: {unicode_escape in result_default}")
++    print(f"ensure_ascii=False contains Unicode escapes: {unicode_escape in result_unicode}")
++
++if __name__ == '__main__':
++    test_current_behavior()
+\ No newline at end of file
+diff --git a/test_xml_serializer.py b/test_xml_serializer.py
+new file mode 100644
+index 0000000000..067b294f21
+--- /dev/null
++++ b/test_xml_serializer.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++"""
++Test script to verify Unicode fix works in XML serialization.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++import json
++
++# Create a test model with JSONField
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    data = models.JSONField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++def test_xml_serialization():
++    """Test that XML serialization preserves Unicode in JSONField."""
++    print("=== Testing XML Serialization ===")
++    
++    # Test data with Unicode characters
++    test_data = {
++        'name': '中国用户',
++        'city': '北京',
++        'message': '你好，世界！'
++    }
++    
++    # Create and save a test instance
++    instance = TestModel(name='Test User', data=test_data)
++    instance.save()
++    
++    # Serialize to XML
++    xml_output = serializers.serialize('xml', [instance])
++    print(f"Original data: {test_data}")
++    print(f"XML output: {xml_output}")
++    
++    # Check that Unicode characters are preserved in the XML
++    unicode_escape = '\\u'
++    has_escapes = unicode_escape in xml_output
++    print(f"Contains Unicode escapes: {has_escapes}")
++    
++    # Check that actual Unicode characters are present
++    chinese_chars = ['中', '国', '用', '户', '京', '你', '好', '世', '界']
++    preserved_chars = [char for char in chinese_chars if char in xml_output]
++    print(f"Unicode characters preserved: {len(preserved_chars)}/{len(chinese_chars)}")
++    
++    # Test deserialization
++    try:
++        deserialized = list(serializers.deserialize('xml', xml_output))
++        if deserialized:
++            obj = deserialized[0].object
++            print(f"Deserialization successful: {obj.data == test_data}")
++            return not has_escapes and obj.data == test_data
++        else:
++            print("Deserialization failed: No objects returned")
++            return False
++    except Exception as e:
++        print(f"Deserialization failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    test_passed = test_xml_serialization()
++    print(f"\n=== Test Results ===")
++    print(f"XML serialization test: {'PASSED' if test_passed else 'FAILED'}")
+\ No newline at end of file

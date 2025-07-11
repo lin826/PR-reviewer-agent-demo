@@ -1,0 +1,657 @@
+diff --git a/edge_case_test.py b/edge_case_test.py
+new file mode 100644
+index 00000000..9a1f8ba8
+--- /dev/null
++++ b/edge_case_test.py
+@@ -0,0 +1,106 @@
++import xarray as xr
++import numpy as np
++import os
++import shutil
++import time
++
++# Add a custom wrapper to track when data is loaded
++class TracingArray:
++    def __init__(self, orig_array, var_name):
++        self._orig_array = orig_array
++        self._var_name = var_name
++        self._accessed = False
++    
++    def __array__(self, *args, **kwargs):
++        print(f"TRACING: Data for variable {self._var_name} is being loaded into memory!")
++        self._accessed = True
++        return self._orig_array.__array__(*args, **kwargs)
++    
++    def __getattr__(self, name):
++        return getattr(self._orig_array, name)
++
++def test_no_encoding():
++    """Test with Dataset that has no encoding information"""
++    print("\n=== TEST: Dataset with no encoding ===")
++    
++    # Create a Dataset without explicit chunks
++    ds = xr.Dataset({
++        "foo": (["x", "y"], np.random.rand(10, 20)),
++    })
++    
++    # Add tracing
++    for var_name, var in ds.variables.items():
++        if hasattr(var._data, '__array__'):
++            var._data = TracingArray(var._data, var_name)
++    
++    print("Accessing ds.chunks on a dataset with no encoding:")
++    chunks = ds.chunks
++    print(f"Chunks: {chunks}")
++    
++    return "PASSED"
++
++def test_mixed_encoding():
++    """Test with Dataset that has mixed encoding information"""
++    print("\n=== TEST: Dataset with mixed encoding ===")
++    
++    # Create a zarr dataset where some variables have preferred_chunks and others don't
++    if os.path.exists("mixed.zarr"):
++        shutil.rmtree("mixed.zarr")
++    
++    # First create and save a dataset with chunks
++    ds1 = xr.Dataset({
++        "with_chunks": (["x", "y"], np.random.rand(10, 20)),
++    })
++    ds1.to_zarr("mixed.zarr", encoding={
++        'with_chunks': {'chunks': (5, 10)}
++    })
++    
++    # Now add another variable with SAME chunks to avoid inconsistency
++    ds2 = xr.open_dataset("mixed.zarr", engine="zarr")
++    ds2["another_var"] = xr.Variable(["x", "y"], np.random.rand(10, 20))
++    ds2.to_zarr("mixed.zarr", mode="a", encoding={
++        'another_var': {'chunks': (5, 10)}  # Same chunks as with_chunks
++    })
++    
++    # Open the dataset and test
++    ds = xr.open_dataset("mixed.zarr", engine="zarr")
++    
++    # Add tracing
++    for var_name, var in ds.variables.items():
++        if hasattr(var._data, '__array__'):
++            var._data = TracingArray(var._data, var_name)
++    
++    print("Variable encodings:")
++    for var_name, var in ds.variables.items():
++        print(f"{var_name} preferred_chunks: {var.encoding.get('preferred_chunks')}")
++    
++    print("\nAccessing ds.chunks on a dataset with mixed but consistent encoding:")
++    chunks = ds.chunks
++    print(f"Chunks: {chunks}")
++    
++    # Let's also try with inconsistent chunks (should raise an error, which is correct behavior)
++    print("\nTrying with inconsistent chunks (expect error):")
++    try:
++        # Add a variable with different chunks
++        ds3 = ds.copy()
++        ds3["inconsistent_chunks"] = xr.Variable(["x", "y"], np.random.rand(10, 20))
++        ds3["inconsistent_chunks"].encoding["preferred_chunks"] = {'x': 2, 'y': 4}
++        
++        # Accessing chunks should raise a ValueError
++        chunks = ds3.chunks
++        print(f"WARNING: No error raised, chunks = {chunks}")
++    except ValueError as e:
++        print(f"Got expected ValueError: {e}")
++    
++    return "PASSED"
++
++if __name__ == "__main__":
++    print("Running edge case tests...")
++    
++    results = {}
++    results["no_encoding"] = test_no_encoding()
++    results["mixed_encoding"] = test_mixed_encoding()
++    
++    print("\n=== TEST RESULTS ===")
++    for test_name, result in results.items():
++        print(f"{test_name}: {result}")
+\ No newline at end of file
+diff --git a/mixed.zarr/.zattrs b/mixed.zarr/.zattrs
+new file mode 100644
+index 00000000..9e26dfee
+--- /dev/null
++++ b/mixed.zarr/.zattrs
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff --git a/mixed.zarr/.zgroup b/mixed.zarr/.zgroup
+new file mode 100644
+index 00000000..3b7daf22
+--- /dev/null
++++ b/mixed.zarr/.zgroup
+@@ -0,0 +1,3 @@
++{
++    "zarr_format": 2
++}
+\ No newline at end of file
+diff --git a/mixed.zarr/.zmetadata b/mixed.zarr/.zmetadata
+new file mode 100644
+index 00000000..1221a5e3
+--- /dev/null
++++ b/mixed.zarr/.zmetadata
+@@ -0,0 +1,65 @@
++{
++    "metadata": {
++        ".zattrs": {},
++        ".zgroup": {
++            "zarr_format": 2
++        },
++        "another_var/.zarray": {
++            "chunks": [
++                5,
++                10
++            ],
++            "compressor": {
++                "blocksize": 0,
++                "clevel": 5,
++                "cname": "lz4",
++                "id": "blosc",
++                "shuffle": 1
++            },
++            "dtype": "<f8",
++            "fill_value": "NaN",
++            "filters": null,
++            "order": "C",
++            "shape": [
++                10,
++                20
++            ],
++            "zarr_format": 2
++        },
++        "another_var/.zattrs": {
++            "_ARRAY_DIMENSIONS": [
++                "x",
++                "y"
++            ]
++        },
++        "with_chunks/.zarray": {
++            "chunks": [
++                5,
++                10
++            ],
++            "compressor": {
++                "blocksize": 0,
++                "clevel": 5,
++                "cname": "lz4",
++                "id": "blosc",
++                "shuffle": 1
++            },
++            "dtype": "<f8",
++            "fill_value": "NaN",
++            "filters": null,
++            "order": "C",
++            "shape": [
++                10,
++                20
++            ],
++            "zarr_format": 2
++        },
++        "with_chunks/.zattrs": {
++            "_ARRAY_DIMENSIONS": [
++                "x",
++                "y"
++            ]
++        }
++    },
++    "zarr_consolidated_format": 1
++}
+\ No newline at end of file
+diff --git a/mixed.zarr/another_var/.zarray b/mixed.zarr/another_var/.zarray
+new file mode 100644
+index 00000000..2ddfe04a
+--- /dev/null
++++ b/mixed.zarr/another_var/.zarray
+@@ -0,0 +1,22 @@
++{
++    "chunks": [
++        5,
++        10
++    ],
++    "compressor": {
++        "blocksize": 0,
++        "clevel": 5,
++        "cname": "lz4",
++        "id": "blosc",
++        "shuffle": 1
++    },
++    "dtype": "<f8",
++    "fill_value": "NaN",
++    "filters": null,
++    "order": "C",
++    "shape": [
++        10,
++        20
++    ],
++    "zarr_format": 2
++}
+\ No newline at end of file
+diff --git a/mixed.zarr/another_var/.zattrs b/mixed.zarr/another_var/.zattrs
+new file mode 100644
+index 00000000..74ac71d9
+--- /dev/null
++++ b/mixed.zarr/another_var/.zattrs
+@@ -0,0 +1,6 @@
++{
++    "_ARRAY_DIMENSIONS": [
++        "x",
++        "y"
++    ]
++}
+\ No newline at end of file
+diff --git a/mixed.zarr/with_chunks/.zarray b/mixed.zarr/with_chunks/.zarray
+new file mode 100644
+index 00000000..2ddfe04a
+--- /dev/null
++++ b/mixed.zarr/with_chunks/.zarray
+@@ -0,0 +1,22 @@
++{
++    "chunks": [
++        5,
++        10
++    ],
++    "compressor": {
++        "blocksize": 0,
++        "clevel": 5,
++        "cname": "lz4",
++        "id": "blosc",
++        "shuffle": 1
++    },
++    "dtype": "<f8",
++    "fill_value": "NaN",
++    "filters": null,
++    "order": "C",
++    "shape": [
++        10,
++        20
++    ],
++    "zarr_format": 2
++}
+\ No newline at end of file
+diff --git a/mixed.zarr/with_chunks/.zattrs b/mixed.zarr/with_chunks/.zattrs
+new file mode 100644
+index 00000000..74ac71d9
+--- /dev/null
++++ b/mixed.zarr/with_chunks/.zattrs
+@@ -0,0 +1,6 @@
++{
++    "_ARRAY_DIMENSIONS": [
++        "x",
++        "y"
++    ]
++}
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..b3fda216
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,88 @@
++import xarray as xr
++import sys
++import os
++import time
++
++# Add a custom wrapper to track when data is loaded
++class TracingArray:
++    def __init__(self, orig_array, var_name):
++        self._orig_array = orig_array
++        self._var_name = var_name
++        self._accessed = False
++    
++    def __array__(self, *args, **kwargs):
++        print(f"TRACING: Data for variable {self._var_name} is being loaded into memory!")
++        self._accessed = True
++        return self._orig_array.__array__(*args, **kwargs)
++    
++    def __getattr__(self, name):
++        return getattr(self._orig_array, name)
++
++def main():
++    # The URL in the issue description
++    url = "https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/swot_adac/FESOM/surf/fma.zarr"
++    
++    # Use a smaller local zarr file for testing
++    # Create a simple dataset and save it to zarr with chunks
++    print("Creating a test dataset with explicit chunks...")
++    import numpy as np
++    
++    # Create a larger dataset to better demonstrate chunking
++    nx, ny = 100, 200
++    ds = xr.Dataset(
++        {
++            "foo": (["x", "y"], np.random.rand(nx, ny)),
++            "bar": (["x", "y"], np.random.rand(nx, ny)),
++        }
++    )
++    
++    # Use explicit chunking when saving
++    if os.path.exists("test.zarr"):
++        import shutil
++        shutil.rmtree("test.zarr")
++        
++    ds.to_zarr("test.zarr", encoding={
++        'foo': {'chunks': (10, 20)},
++        'bar': {'chunks': (10, 20)}
++    })
++    
++    # Open the zarr file
++    print("\nOpening the zarr file...")
++    ds = xr.open_dataset("test.zarr", engine="zarr")
++    
++    # Print some information about the dataset
++    print("Dataset info:")
++    print(f"Variables: {list(ds.variables)}")
++    print(f"Dimensions: {dict(ds.dims)}")
++    
++    # Wrap the data array to trace access
++    for var_name, var in ds.variables.items():
++        if hasattr(var._data, '__array__'):
++            var._data = TracingArray(var._data, var_name)
++    
++    # Check if we can get chunking info directly from the encoding
++    print("\nChecking variable encoding for chunks info:")
++    for var_name, var in ds.variables.items():
++        print(f"{var_name} encoding chunks: {var.encoding.get('chunks')}")
++        print(f"{var_name} encoding preferred_chunks: {var.encoding.get('preferred_chunks')}")
++    
++    # Access the chunks attribute which should trigger the issue
++    print("\nAccessing ds.chunks (this should trigger the issue)...")
++    time.sleep(0.5)  # Give time for output to be displayed properly
++    try:
++        chunks = ds.chunks
++        print(f"Chunks: {chunks}")
++        print("Note: If you saw 'Data is being loaded' messages above, then the issue is confirmed.")
++    except Exception as e:
++        print(f"Exception while accessing ds.chunks: {type(e).__name__}: {e}")
++    
++    # Print all variable data to confirm loading can happen normally
++    print("\nNow explicitly loading the data (this should show the tracing message)...")
++    time.sleep(0.5)  # Give time for output to be displayed properly
++    for var_name in ds.variables:
++        # Access the values to trigger loading
++        data = ds[var_name].values
++        print(f"Loaded shape of {var_name}: {data.shape}")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test.zarr/.zattrs b/test.zarr/.zattrs
+new file mode 100644
+index 00000000..9e26dfee
+--- /dev/null
++++ b/test.zarr/.zattrs
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff --git a/test.zarr/.zgroup b/test.zarr/.zgroup
+new file mode 100644
+index 00000000..3b7daf22
+--- /dev/null
++++ b/test.zarr/.zgroup
+@@ -0,0 +1,3 @@
++{
++    "zarr_format": 2
++}
+\ No newline at end of file
+diff --git a/test.zarr/.zmetadata b/test.zarr/.zmetadata
+new file mode 100644
+index 00000000..d9bc1c3e
+--- /dev/null
++++ b/test.zarr/.zmetadata
+@@ -0,0 +1,65 @@
++{
++    "metadata": {
++        ".zattrs": {},
++        ".zgroup": {
++            "zarr_format": 2
++        },
++        "bar/.zarray": {
++            "chunks": [
++                10,
++                20
++            ],
++            "compressor": {
++                "blocksize": 0,
++                "clevel": 5,
++                "cname": "lz4",
++                "id": "blosc",
++                "shuffle": 1
++            },
++            "dtype": "<f8",
++            "fill_value": "NaN",
++            "filters": null,
++            "order": "C",
++            "shape": [
++                100,
++                200
++            ],
++            "zarr_format": 2
++        },
++        "bar/.zattrs": {
++            "_ARRAY_DIMENSIONS": [
++                "x",
++                "y"
++            ]
++        },
++        "foo/.zarray": {
++            "chunks": [
++                10,
++                20
++            ],
++            "compressor": {
++                "blocksize": 0,
++                "clevel": 5,
++                "cname": "lz4",
++                "id": "blosc",
++                "shuffle": 1
++            },
++            "dtype": "<f8",
++            "fill_value": "NaN",
++            "filters": null,
++            "order": "C",
++            "shape": [
++                100,
++                200
++            ],
++            "zarr_format": 2
++        },
++        "foo/.zattrs": {
++            "_ARRAY_DIMENSIONS": [
++                "x",
++                "y"
++            ]
++        }
++    },
++    "zarr_consolidated_format": 1
++}
+\ No newline at end of file
+diff --git a/test.zarr/bar/.zarray b/test.zarr/bar/.zarray
+new file mode 100644
+index 00000000..a828559a
+--- /dev/null
++++ b/test.zarr/bar/.zarray
+@@ -0,0 +1,22 @@
++{
++    "chunks": [
++        10,
++        20
++    ],
++    "compressor": {
++        "blocksize": 0,
++        "clevel": 5,
++        "cname": "lz4",
++        "id": "blosc",
++        "shuffle": 1
++    },
++    "dtype": "<f8",
++    "fill_value": "NaN",
++    "filters": null,
++    "order": "C",
++    "shape": [
++        100,
++        200
++    ],
++    "zarr_format": 2
++}
+\ No newline at end of file
+diff --git a/test.zarr/bar/.zattrs b/test.zarr/bar/.zattrs
+new file mode 100644
+index 00000000..74ac71d9
+--- /dev/null
++++ b/test.zarr/bar/.zattrs
+@@ -0,0 +1,6 @@
++{
++    "_ARRAY_DIMENSIONS": [
++        "x",
++        "y"
++    ]
++}
+\ No newline at end of file
+diff --git a/test.zarr/foo/.zarray b/test.zarr/foo/.zarray
+new file mode 100644
+index 00000000..a828559a
+--- /dev/null
++++ b/test.zarr/foo/.zarray
+@@ -0,0 +1,22 @@
++{
++    "chunks": [
++        10,
++        20
++    ],
++    "compressor": {
++        "blocksize": 0,
++        "clevel": 5,
++        "cname": "lz4",
++        "id": "blosc",
++        "shuffle": 1
++    },
++    "dtype": "<f8",
++    "fill_value": "NaN",
++    "filters": null,
++    "order": "C",
++    "shape": [
++        100,
++        200
++    ],
++    "zarr_format": 2
++}
+\ No newline at end of file
+diff --git a/test.zarr/foo/.zattrs b/test.zarr/foo/.zattrs
+new file mode 100644
+index 00000000..74ac71d9
+--- /dev/null
++++ b/test.zarr/foo/.zattrs
+@@ -0,0 +1,6 @@
++{
++    "_ARRAY_DIMENSIONS": [
++        "x",
++        "y"
++    ]
++}
+\ No newline at end of file
+diff --git a/test_real_zarr.py b/test_real_zarr.py
+new file mode 100644
+index 00000000..2c79ef1a
+--- /dev/null
++++ b/test_real_zarr.py
+@@ -0,0 +1,70 @@
++import xarray as xr
++import sys
++import os
++import time
++
++class TracingArray:
++    def __init__(self, orig_array, var_name):
++        self._orig_array = orig_array
++        self._var_name = var_name
++        self._accessed = False
++    
++    def __array__(self, *args, **kwargs):
++        print(f"TRACING: Data for variable {self._var_name} is being loaded into memory!")
++        self._accessed = True
++        return self._orig_array.__array__(*args, **kwargs)
++    
++    def __getattr__(self, name):
++        return getattr(self._orig_array, name)
++
++def main():
++    # Try with a local zarr dataset we created earlier
++    print("\n==== Testing with a local zarr store ====")
++    
++    # Use the test.zarr file we created earlier
++    url = "test.zarr"
++    
++    try:
++        print(f"Attempting to open: {url}")
++        ds = xr.open_dataset(url, engine="zarr")
++        print(f"Dataset opened successfully: {list(ds.data_vars)}")
++        
++        # Wrap the data arrays to trace access
++        print("Adding tracing to data arrays...")
++        for var_name, var in ds.variables.items():
++            if hasattr(var._data, '__array__'):
++                var._data = TracingArray(var._data, var_name)
++        
++        print("\nChecking encoding information:")
++        for var_name, var in ds.variables.items():
++            chunks_info = var.encoding.get('chunks')
++            preferred_info = var.encoding.get('preferred_chunks')
++            print(f"{var_name}: chunks={chunks_info}, preferred_chunks={preferred_info}")
++        
++        print("\nAccessing ds.chunks (should not trigger loading):")
++        chunks = ds.chunks
++        print(f"ds.chunks = {chunks}")
++        
++        print("\nAccessing a small slice of data (should trigger loading):")
++        if len(ds.data_vars) > 0:
++            var_name = list(ds.data_vars)[0]
++            # Remove the TracingArray wrapper before slicing to avoid issues
++            for var_name, var in ds.variables.items():
++                if hasattr(var, "_data") and isinstance(var._data, TracingArray):
++                    var._data = var._data._orig_array
++            
++            small_slice = ds[var_name].isel({dim: slice(0, 2) for dim in ds[var_name].dims})
++            print(f"Loaded small slice from {var_name}: shape={small_slice.shape}")
++            
++        return True
++    except Exception as e:
++        print(f"Error working with zarr store: {e}")
++        return False
++
++if __name__ == "__main__":
++    success = main()
++    if success:
++        print("\nTest completed successfully!")
++    else:
++        print("\nTest encountered errors.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/xarray/core/common.py b/xarray/core/common.py
+index 3c328f42..d7b92490 100644
+--- a/xarray/core/common.py
++++ b/xarray/core/common.py
+@@ -2023,7 +2023,18 @@ def get_chunksizes(
+ 
+     chunks: dict[Any, tuple[int, ...]] = {}
+     for v in variables:
+-        if hasattr(v.data, "chunks"):
++        # First check if we can get chunk info from the encoding
++        # This avoids loading the data for backends like zarr
++        if "preferred_chunks" in v.encoding:
++            for dim, c in v.encoding["preferred_chunks"].items():
++                if dim in chunks and c != chunks[dim]:
++                    raise ValueError(
++                        f"Object has inconsistent chunks along dimension {dim}. "
++                        "This can be fixed by calling unify_chunks()."
++                    )
++                chunks[dim] = c
++        # Fall back to checking data.chunks if encoding doesn't have the info
++        elif hasattr(v.data, "chunks"):
+             for dim, c in v.chunksizes.items():
+                 if dim in chunks and c != chunks[dim]:
+                     raise ValueError(

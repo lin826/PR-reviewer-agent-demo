@@ -1,0 +1,308 @@
+diff --git a/django/utils/functional.py b/django/utils/functional.py
+index 6d38f932f9..5623de7e4e 100644
+--- a/django/utils/functional.py
++++ b/django/utils/functional.py
+@@ -323,6 +323,11 @@ class LazyObject:
+     __bytes__ = new_method_proxy(bytes)
+     __str__ = new_method_proxy(str)
+     __bool__ = new_method_proxy(bool)
++    
++    # Numeric type conversion methods
++    __int__ = new_method_proxy(int)
++    __float__ = new_method_proxy(float)
++    __complex__ = new_method_proxy(complex)
+ 
+     # Introspection support
+     __dir__ = new_method_proxy(dir)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..515fe5de32
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,71 @@
++from django.contrib.auth.models import User
++from django.db.models import OuterRef, Subquery
++from django.test import TestCase
++from django.utils.functional import SimpleLazyObject
++
++# Import the models from the issue description
++# Since we don't have the actual models, creating them here
++from django.db import models
++
++class A(models.Model):
++    pass
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++
++class C(models.Model):
++    owner = models.ForeignKey(User, on_delete=models.CASCADE)
++
++class BugTestCase(TestCase):
++    def test_bug(self):
++        # Setting up the query as described in the issue
++        owner_user = (
++            B.objects.filter(a=OuterRef("pk"))
++            .annotate(owner_user=Subquery(C.objects.values("owner")))
++            .values("owner_user")
++        )
++        
++        # Create a user wrapped in a SimpleLazyObject
++        user = SimpleLazyObject(lambda: User.objects.create_user("testuser"))
++        
++        # This is expected to fail with:
++        # TypeError: int() argument must be a string, a bytes-like object or a number, not 'SimpleLazyObject'
++        queryset = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=user
++        )
++        
++        # Force evaluation of the queryset to trigger the error
++        list(queryset)
++
++if __name__ == "__main__":
++    # This is a simplified approach to run the test case
++    import django
++    from django.conf import settings
++    
++    # Configure minimal settings
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++    django.setup()
++    
++    # Run the test
++    test_case = BugTestCase()
++    test_case.setUp()
++    try:
++        test_case.test_bug()
++        print("Test passed - which means the issue is fixed or not reproducible")
++    except TypeError as e:
++        print(f"Test failed with error: {e}")
++        print("This reproduces the issue described in the ticket")
++    except Exception as e:
++        print(f"Test failed with unexpected error: {e}")
+\ No newline at end of file
+diff --git a/test_db_query.py b/test_db_query.py
+new file mode 100644
+index 0000000000..e4934dd299
+--- /dev/null
++++ b/test_db_query.py
+@@ -0,0 +1,73 @@
++import os
++import sys
++import django
++from django.conf import settings
++from django.utils.functional import SimpleLazyObject
++
++# Configure settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++    ],
++)
++
++django.setup()
++
++from django.contrib.auth.models import User
++from django.db import models
++from django.db.models import OuterRef, Subquery
++
++# Create models for testing
++class A(models.Model):
++    class Meta:
++        app_label = 'test_app'
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++    class Meta:
++        app_label = 'test_app'
++
++class C(models.Model):
++    owner = models.ForeignKey(User, on_delete=models.CASCADE)
++    class Meta:
++        app_label = 'test_app'
++
++# Set up the database
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(A)
++    schema_editor.create_model(B)
++    schema_editor.create_model(C)
++
++# Create a user
++user = SimpleLazyObject(lambda: User.objects.create(username="testuser"))
++
++# Create a test instance
++a = SimpleLazyObject(lambda: A.objects.create())
++
++# Now try the query that caused the issue
++try:
++    owner_user = (
++        B.objects.filter(a=OuterRef("pk"))
++        .annotate(owner_user=Subquery(C.objects.values("owner")))
++        .values("owner_user")
++    )
++    
++    queryset = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++        owner_user=user
++    )
++    
++    # Force evaluation
++    list(queryset)
++    print("Success! The query executed without errors.")
++    
++except Exception as e:
++    print(f"Failed! The query raised an exception: {e}")
+\ No newline at end of file
+diff --git a/test_field_conversion.py b/test_field_conversion.py
+new file mode 100644
+index 0000000000..d20263d2ca
+--- /dev/null
++++ b/test_field_conversion.py
+@@ -0,0 +1,45 @@
++import django
++from django.conf import settings
++from django.utils.functional import SimpleLazyObject
++
++# Configure settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++)
++
++django.setup()
++
++from django.db.models.fields import IntegerField
++
++# Create a lazy object that would return an integer
++lazy_int = SimpleLazyObject(lambda: 42)
++
++# Test IntegerField's get_prep_value with the lazy object
++integer_field = IntegerField()
++try:
++    value = integer_field.get_prep_value(lazy_int)
++    print(f"Success! IntegerField.get_prep_value() returned {value}")
++except Exception as e:
++    print(f"Failed! IntegerField.get_prep_value() raised: {e}")
++
++# Try with a lazy object that would return a string (should be convertible to int)
++lazy_str_int = SimpleLazyObject(lambda: "42")
++try:
++    value = integer_field.get_prep_value(lazy_str_int)
++    print(f"Success! IntegerField.get_prep_value() with string returned {value}")
++except Exception as e:
++    print(f"Failed! IntegerField.get_prep_value() with string raised: {e}")
++
++# Try with a lazy object that is not convertible to int
++lazy_non_int = SimpleLazyObject(lambda: "not an int")
++try:
++    value = integer_field.get_prep_value(lazy_non_int)
++    print(f"Success! IntegerField.get_prep_value() with non-int returned {value}")
++except Exception as e:
++    print(f"Expected failure with non-int: {e}")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..9b709d73e4
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,25 @@
++from django.utils.functional import SimpleLazyObject
++
++# Create a simple lazy object
++lazy_int = SimpleLazyObject(lambda: 42)
++
++# Test the lazy int conversion
++try:
++    value = int(lazy_int)
++    print(f"Success! int(lazy_int) returned {value}")
++except Exception as e:
++    print(f"Failed! int(lazy_int) raised: {e}")
++
++# Test the lazy float conversion 
++try:
++    value = float(lazy_int)
++    print(f"Success! float(lazy_int) returned {value}")
++except Exception as e:
++    print(f"Failed! float(lazy_int) raised: {e}")
++
++# Test the lazy complex conversion
++try:
++    value = complex(lazy_int)
++    print(f"Success! complex(lazy_int) returned {value}")
++except Exception as e:
++    print(f"Failed! complex(lazy_int) raised: {e}")
+\ No newline at end of file
+diff --git a/tests/lazy_test/__init__.py b/tests/lazy_test/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/lazy_test/models.py b/tests/lazy_test/models.py
+new file mode 100644
+index 0000000000..1a964f5ae5
+--- /dev/null
++++ b/tests/lazy_test/models.py
+@@ -0,0 +1,11 @@
++from django.contrib.auth.models import User
++from django.db import models
++
++class A(models.Model):
++    pass
++
++class B(models.Model):
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++
++class C(models.Model):
++    owner = models.ForeignKey(User, on_delete=models.CASCADE)
+\ No newline at end of file
+diff --git a/tests/lazy_test/tests.py b/tests/lazy_test/tests.py
+new file mode 100644
+index 0000000000..d17f860814
+--- /dev/null
++++ b/tests/lazy_test/tests.py
+@@ -0,0 +1,22 @@
++from django.contrib.auth.models import User
++from django.db.models import OuterRef, Subquery
++from django.test import TestCase
++from django.utils.functional import SimpleLazyObject
++
++from .models import A, B, C
++
++
++class BugTestCase(TestCase):
++    def test_bug(self):
++        owner_user = (
++            B.objects.filter(a=OuterRef("pk"))
++            .annotate(owner_user=Subquery(C.objects.values("owner")))
++            .values("owner_user")
++        )
++        user = SimpleLazyObject(lambda: User.objects.create_user("testuser"))
++        # This should work, but currently fails with:
++        # TypeError: int() argument must be a string, a bytes-like object or a number, not 'SimpleLazyObject'
++        queryset = A.objects.annotate(owner_user=Subquery(owner_user)).filter(
++            owner_user=user
++        )
++        list(queryset)  # Force evaluation of the queryset
+\ No newline at end of file

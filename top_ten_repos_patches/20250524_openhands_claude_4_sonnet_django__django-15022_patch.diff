@@ -1,0 +1,528 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 66f3396a6b..7af44b397a 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -1031,6 +1031,7 @@ class ModelAdmin(BaseModelAdmin):
+         if search_fields and search_term:
+             orm_lookups = [construct_search(str(search_field))
+                            for search_field in search_fields]
++            word_queries = []
+             for bit in smart_split(search_term):
+                 if bit.startswith(('"', "'")) and bit[0] == bit[-1]:
+                     bit = unescape_string_literal(bit)
+@@ -1038,7 +1039,13 @@ class ModelAdmin(BaseModelAdmin):
+                     *((orm_lookup, bit) for orm_lookup in orm_lookups),
+                     _connector=models.Q.OR,
+                 )
+-                queryset = queryset.filter(or_queries)
++                word_queries.append(or_queries)
++            if word_queries:
++                # Combine all word queries with AND logic to avoid multiple JOINs
++                combined_query = word_queries[0]
++                for query in word_queries[1:]:
++                    combined_query &= query
++                queryset = queryset.filter(combined_query)
+             may_have_duplicates |= any(
+                 lookup_spawns_duplicates(self.opts, search_spec)
+                 for search_spec in orm_lookups
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..342926b43a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the unnecessary joins issue in Django admin changelist query.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'tests.admin_changelist',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin import ModelAdmin
++from django.db import models, connection
++from django.test import RequestFactory
++from tests.admin_changelist.models import Group, Musician, Concert
++from django.contrib.admin.views.main import SEARCH_VAR
++from django.contrib.auth.models import User
++
++
++# Create models similar to the issue description
++class Client(models.Model):
++    name = models.CharField(max_length=256)
++    name2 = models.CharField(max_length=256, blank=True, null=True)
++    contact_person = models.CharField(max_length=256, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'admin_changelist'
++
++
++class ClientOffice(models.Model):
++    name = models.CharField(max_length=256)
++    name2 = models.CharField(max_length=256, blank=True, null=True)
++    client = models.ForeignKey(Client, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'admin_changelist'
++
++
++class ClientAdmin(ModelAdmin):
++    search_fields = ('name', 'name2', 'contact_person', 'clientoffice__name', 'clientoffice__name2')
++
++
++def count_joins_in_query(query_str):
++    """Count the number of JOIN clauses in a SQL query string."""
++    return query_str.upper().count('JOIN')
++
++
++def test_multiple_word_search():
++    """Test searching with multiple words to demonstrate the JOIN issue."""
++    
++    # Create tables for our test models
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Client)
++        schema_editor.create_model(ClientOffice)
++        schema_editor.create_model(User)
++    
++    # Create a superuser
++    superuser = User.objects.create_superuser('admin', 'admin@test.com', 'password')
++    
++    # Create some test data
++    client1 = Client.objects.create(name="Test Client", name2="Alternative Name", contact_person="John Doe")
++    client2 = Client.objects.create(name="Another Client", name2="Other Name", contact_person="Jane Smith")
++    
++    office1 = ClientOffice.objects.create(name="Main Office", name2="HQ", client=client1)
++    office2 = ClientOffice.objects.create(name="Branch Office", name2="Secondary", client=client1)
++    office3 = ClientOffice.objects.create(name="Remote Office", name2="Satellite", client=client2)
++    
++    # Set up admin
++    admin_site = AdminSite()
++    client_admin = ClientAdmin(Client, admin_site)
++    
++    # Create request factory
++    factory = RequestFactory()
++    
++    print("Testing Django admin search with multiple words...")
++    print("=" * 60)
++    
++    # Test different search scenarios
++    test_cases = [
++        ("single word", "Test"),
++        ("two words", "Test Client"),
++        ("three words", "Test Client Main"),
++        ("four words", "Test Client Main Office"),
++        ("five words", "Test Client Main Office HQ"),
++    ]
++    
++    for description, search_term in test_cases:
++        print(f"\nTesting {description}: '{search_term}'")
++        
++        # Create request with search term
++        request = factory.get('/admin/client/', data={SEARCH_VAR: search_term})
++        request.user = superuser
++        
++        # Get changelist instance
++        changelist = client_admin.get_changelist_instance(request)
++        
++        # Get the queryset and capture the SQL
++        queryset = changelist.queryset
++        
++        # Force evaluation to get the actual SQL
++        with connection.cursor() as cursor:
++            # Clear previous queries
++            connection.queries_log.clear()
++            
++            # Execute the query
++            list(queryset)
++            
++            # Get the last query
++            if connection.queries_log:
++                sql_query = connection.queries_log[-1]['sql']
++                join_count = count_joins_in_query(sql_query)
++                
++                print(f"  Number of JOINs: {join_count}")
++                print(f"  SQL: {sql_query}")
++            else:
++                print("  No SQL query captured")
++    
++    print("\n" + "=" * 60)
++    print("Issue: Each additional word creates an additional JOIN to the same table!")
++    print("Expected: All words should be combined into a single JOIN.")
++
++
++if __name__ == "__main__":
++    test_multiple_word_search()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..97136e296a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,172 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the search fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'tests.admin_changelist',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin import ModelAdmin
++from django.db import models, connection
++from django.test import RequestFactory
++from django.contrib.admin.views.main import SEARCH_VAR
++from django.contrib.auth.models import User
++
++
++# Create models similar to the issue description
++class Client(models.Model):
++    name = models.CharField(max_length=256)
++    name2 = models.CharField(max_length=256, blank=True, null=True)
++    contact_person = models.CharField(max_length=256, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'admin_changelist'
++
++
++class ClientOffice(models.Model):
++    name = models.CharField(max_length=256)
++    name2 = models.CharField(max_length=256, blank=True, null=True)
++    client = models.ForeignKey(Client, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'admin_changelist'
++
++
++class ClientAdmin(ModelAdmin):
++    search_fields = ('name', 'name2', 'contact_person', 'clientoffice__name', 'clientoffice__name2')
++
++
++def count_joins_in_query(query_str):
++    """Count the number of JOIN clauses in a SQL query string."""
++    return query_str.upper().count('JOIN')
++
++
++def test_edge_cases():
++    """Test edge cases for the search fix."""
++    
++    # Create tables for our test models
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Client)
++        schema_editor.create_model(ClientOffice)
++        schema_editor.create_model(User)
++    
++    # Create a superuser
++    superuser = User.objects.create_superuser('admin', 'admin@test.com', 'password')
++    
++    # Create test data
++    client1 = Client.objects.create(name="Test Client", name2="Alternative Name", contact_person="John Doe")
++    office1 = ClientOffice.objects.create(name="Main Office", name2="HQ", client=client1)
++    
++    # Set up admin
++    admin_site = AdminSite()
++    client_admin = ClientAdmin(Client, admin_site)
++    
++    # Create request factory
++    factory = RequestFactory()
++    
++    print("Testing edge cases for the search fix...")
++    print("=" * 60)
++    
++    # Test cases: (description, search_term, expected_join_count)
++    test_cases = [
++        # Edge cases
++        ("Empty search", "", 0),
++        ("Single space", " ", 0),
++        ("Multiple spaces", "   ", 0),
++        ("Quoted empty string", '""', 1),  # Empty string search matches all
++        ("Single quoted empty string", "''", 1),  # Empty string search matches all
++        
++        # Normal cases
++        ("Single word", "Test", 1),
++        ("Two words", "Test Client", 1),
++        ("Three words", "Test Client Main", 1),
++        ("Ten words", "a b c d e f g h i j", 1),
++        
++        # Quoted strings (should be treated as single terms)
++        ("Quoted two words", '"Test Client"', 1),
++        ("Quoted three words", '"Test Client Main"', 1),
++        
++        # Mixed quoted and unquoted
++        ("Mixed quoted unquoted", '"Test Client" Main', 1),
++        ("Multiple quoted", '"Test Client" "Main Office"', 1),
++    ]
++    
++    for description, search_term, expected_joins in test_cases:
++        print(f"\nTesting {description}: '{search_term}'")
++        
++        # Create request with search term
++        request = factory.get('/admin/client/', data={SEARCH_VAR: search_term})
++        request.user = superuser
++        
++        # Get changelist instance
++        changelist = client_admin.get_changelist_instance(request)
++        
++        # Get the queryset and capture the SQL
++        queryset = changelist.queryset
++        
++        # Force evaluation to get the actual SQL
++        with connection.cursor() as cursor:
++            # Clear previous queries
++            connection.queries_log.clear()
++            
++            # Execute the query
++            list(queryset)
++            
++            # Get the last query
++            if connection.queries_log:
++                sql_query = connection.queries_log[-1]['sql']
++                join_count = count_joins_in_query(sql_query)
++                
++                print(f"  Expected JOINs: {expected_joins}")
++                print(f"  Actual JOINs:   {join_count}")
++                
++                if join_count == expected_joins:
++                    print("  ✅ PASS")
++                else:
++                    print("  ❌ FAIL")
++                    print(f"  SQL: {sql_query}")
++                    return False
++            else:
++                if expected_joins == 0:
++                    print("  ✅ PASS (No query executed)")
++                else:
++                    print("  ❌ FAIL (Expected query but none executed)")
++                    return False
++    
++    print("\n" + "=" * 60)
++    print("✅ All edge case tests passed!")
++    return True
++
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_search_functionality.py b/test_search_functionality.py
+new file mode 100644
+index 0000000000..88aef4abb7
+--- /dev/null
++++ b/test_search_functionality.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python
++"""
++Test that the search functionality still works correctly after the fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'tests.admin_changelist',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin.sites import AdminSite
++from django.contrib.admin import ModelAdmin
++from django.db import models, connection
++from django.test import RequestFactory
++from django.contrib.admin.views.main import SEARCH_VAR
++from django.contrib.auth.models import User
++
++
++# Create models similar to the issue description
++class Client(models.Model):
++    name = models.CharField(max_length=256)
++    name2 = models.CharField(max_length=256, blank=True, null=True)
++    contact_person = models.CharField(max_length=256, blank=True, null=True)
++    
++    class Meta:
++        app_label = 'admin_changelist'
++
++
++class ClientOffice(models.Model):
++    name = models.CharField(max_length=256)
++    name2 = models.CharField(max_length=256, blank=True, null=True)
++    client = models.ForeignKey(Client, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'admin_changelist'
++
++
++class ClientAdmin(ModelAdmin):
++    search_fields = ('name', 'name2', 'contact_person', 'clientoffice__name', 'clientoffice__name2')
++
++
++def test_search_functionality():
++    """Test that search functionality works correctly after the fix."""
++    
++    # Create tables for our test models
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Client)
++        schema_editor.create_model(ClientOffice)
++        schema_editor.create_model(User)
++    
++    # Create a superuser
++    superuser = User.objects.create_superuser('admin', 'admin@test.com', 'password')
++    
++    # Create test data
++    client1 = Client.objects.create(name="Acme Corp", name2="Acme Corporation", contact_person="John Smith")
++    client2 = Client.objects.create(name="Beta Inc", name2="Beta Industries", contact_person="Jane Doe")
++    client3 = Client.objects.create(name="Gamma LLC", name2="Gamma Limited", contact_person="Bob Wilson")
++    
++    office1 = ClientOffice.objects.create(name="Main Office", name2="Headquarters", client=client1)
++    office2 = ClientOffice.objects.create(name="Branch Office", name2="Secondary Location", client=client1)
++    office3 = ClientOffice.objects.create(name="Remote Office", name2="Satellite", client=client2)
++    office4 = ClientOffice.objects.create(name="Downtown Office", name2="City Center", client=client3)
++    
++    # Set up admin
++    admin_site = AdminSite()
++    client_admin = ClientAdmin(Client, admin_site)
++    
++    # Create request factory
++    factory = RequestFactory()
++    
++    print("Testing search functionality after the fix...")
++    print("=" * 60)
++    
++    # Test cases: (search_term, expected_client_names)
++    test_cases = [
++        # Single word searches
++        ("Acme", ["Acme Corp"]),
++        ("Beta", ["Beta Inc"]),
++        ("John", ["Acme Corp"]),
++        ("Main", ["Acme Corp"]),
++        
++        # Multi-word searches (AND logic)
++        ("Acme Corp", ["Acme Corp"]),  # Both words in client name
++        ("Acme Main", ["Acme Corp"]),  # Client name + office name
++        ("John Main", ["Acme Corp"]),  # Contact person + office name
++        ("Beta Remote", ["Beta Inc"]),  # Client name + office name
++        
++        # Searches that should return no results
++        ("Acme Beta", []),  # Two different client names
++        ("John Jane", []),  # Two different contact persons
++        ("Nonexistent", []),  # Word not in any field
++        
++        # Quoted searches (should be treated as single term)
++        ('"Acme Corp"', ["Acme Corp"]),
++        ('"Main Office"', ["Acme Corp"]),
++    ]
++    
++    for search_term, expected_names in test_cases:
++        print(f"\nTesting search: '{search_term}'")
++        
++        # Create request with search term
++        request = factory.get('/admin/client/', data={SEARCH_VAR: search_term})
++        request.user = superuser
++        
++        # Get changelist instance
++        changelist = client_admin.get_changelist_instance(request)
++        
++        # Get the results
++        results = list(changelist.queryset)
++        result_names = [client.name for client in results]
++        result_names.sort()
++        expected_names.sort()
++        
++        print(f"  Expected: {expected_names}")
++        print(f"  Got:      {result_names}")
++        
++        if result_names == expected_names:
++            print("  ✅ PASS")
++        else:
++            print("  ❌ FAIL")
++            return False
++    
++    print("\n" + "=" * 60)
++    print("✅ All search functionality tests passed!")
++    print("The fix maintains correct search behavior while reducing JOINs.")
++    return True
++
++
++if __name__ == "__main__":
++    test_search_functionality()
+\ No newline at end of file

@@ -1,0 +1,237 @@
+diff --git a/astropy/utils/introspection.py b/astropy/utils/introspection.py
+index 3e784f9fc3..2149e4f25a 100644
+--- a/astropy/utils/introspection.py
++++ b/astropy/utils/introspection.py
+@@ -6,7 +6,6 @@
+ import inspect
+ import types
+ import importlib
+-from distutils.version import LooseVersion
+ 
+ 
+ __all__ = ['resolve_name', 'minversion', 'find_current_module',
+@@ -139,10 +138,15 @@ def minversion(module, version, inclusive=True, version_path='__version__'):
+     else:
+         have_version = resolve_name(module.__name__, version_path)
+ 
++    try:
++        from pkg_resources import parse_version
++    except ImportError:
++        from distutils.version import LooseVersion as parse_version
++
+     if inclusive:
+-        return LooseVersion(have_version) >= LooseVersion(version)
++        return parse_version(have_version) >= parse_version(version)
+     else:
+-        return LooseVersion(have_version) > LooseVersion(version)
++        return parse_version(have_version) > parse_version(version)
+ 
+ 
+ def find_current_module(depth=1, finddiff=False):
+diff --git a/astropy/utils/tests/test_introspection.py b/astropy/utils/tests/test_introspection.py
+index d8262d4581..05ce3d1702 100644
+--- a/astropy/utils/tests/test_introspection.py
++++ b/astropy/utils/tests/test_introspection.py
+@@ -73,3 +73,33 @@ def test_minversion():
+         assert minversion(test_module, version)
+     for version in bad_versions:
+         assert not minversion(test_module, version)
++
++
++def test_minversion_dev_version_comparison():
++    """
++    Test that minversion works correctly with development versions that
++    would trigger the LooseVersion bug (issue with comparing int and str).
++    
++    This test ensures that the fix for the LooseVersion bug works correctly
++    by using pkg_resources.parse_version when available.
++    """
++    from types import ModuleType
++    
++    # Test cases that would fail with LooseVersion but should work with pkg_resources
++    test_cases = [
++        ('1.14.3', '1.14dev', True),   # 1.14.3 >= 1.14dev should be True
++        ('1.14.3', '1.14.0dev', True), # 1.14.3 >= 1.14.0dev should be True  
++        ('2.0.1', '2.0dev', True),     # 2.0.1 >= 2.0dev should be True
++        ('1.15.0', '1.14dev', True),   # 1.15.0 >= 1.14dev should be True
++        ('1.13.9', '1.14dev', False),  # 1.13.9 >= 1.14dev should be False
++    ]
++    
++    for have_version, min_version, expected in test_cases:
++        test_module = ModuleType(str("test_module"))
++        test_module.__version__ = have_version
++        
++        result = minversion(test_module, min_version)
++        assert result == expected, (
++            f"minversion({have_version}, {min_version}) returned {result}, "
++            f"expected {expected}"
++        )
+diff --git a/test_fallback.py b/test_fallback.py
+new file mode 100644
+index 0000000000..dad556fe40
+--- /dev/null
++++ b/test_fallback.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python
++"""
++Test script to verify the fallback behavior when pkg_resources is not available.
++"""
++
++import sys
++import types
++
++def test_fallback_behavior():
++    """Test that the fallback to LooseVersion works when pkg_resources is unavailable."""
++    
++    # Temporarily hide pkg_resources
++    original_modules = sys.modules.copy()
++    if 'pkg_resources' in sys.modules:
++        del sys.modules['pkg_resources']
++    
++    # Also add it to a blacklist to prevent import
++    class ImportBlocker:
++        def find_spec(self, name, path, target=None):
++            if name == 'pkg_resources':
++                raise ImportError("pkg_resources blocked for testing")
++            return None
++        
++        def find_module(self, name, path=None):
++            if name == 'pkg_resources':
++                raise ImportError("pkg_resources blocked for testing")
++            return None
++    
++    blocker = ImportBlocker()
++    sys.meta_path.insert(0, blocker)
++    
++    try:
++        # Clear the module cache for introspection to force re-import
++        if 'astropy.utils.introspection' in sys.modules:
++            del sys.modules['astropy.utils.introspection']
++        
++        # Now test minversion - it should use LooseVersion fallback
++        from astropy.utils.introspection import minversion
++        
++        # Test with versions that don't trigger the LooseVersion bug
++        test_module = types.ModuleType("test_module")
++        test_module.__version__ = '1.14'
++        
++        result1 = minversion(test_module, '1.13')
++        print(f"Fallback test 1 (1.14 >= 1.13): {result1}")
++        
++        result2 = minversion(test_module, '1.15')
++        print(f"Fallback test 2 (1.14 >= 1.15): {result2}")
++        
++        # Test a case that would trigger the bug - this should fail with LooseVersion
++        test_module.__version__ = '1.14.3'
++        try:
++            result3 = minversion(test_module, '1.14dev')
++            print(f"Fallback test 3 (1.14.3 >= 1.14dev): {result3}")
++        except TypeError as e:
++            print(f"Fallback test 3 failed as expected with LooseVersion: {e}")
++        
++    finally:
++        # Restore the original state
++        sys.meta_path.remove(blocker)
++        sys.modules.clear()
++        sys.modules.update(original_modules)
++
++if __name__ == "__main__":
++    print("Testing fallback behavior when pkg_resources is not available...")
++    test_fallback_behavior()
+\ No newline at end of file
+diff --git a/test_minversion_issue.py b/test_minversion_issue.py
+new file mode 100644
+index 0000000000..233261a189
+--- /dev/null
++++ b/test_minversion_issue.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the minversion issue with LooseVersion.
++"""
++
++def test_looseversion_bug():
++    """Test that demonstrates the LooseVersion bug."""
++    from distutils.version import LooseVersion
++    
++    print("Testing LooseVersion bug...")
++    try:
++        result = LooseVersion('1.14.3') >= LooseVersion('1.14dev')
++        print(f"LooseVersion comparison result: {result}")
++    except Exception as e:
++        print(f"LooseVersion comparison failed: {type(e).__name__}: {e}")
++        return False
++    return True
++
++def test_pkg_resources_works():
++    """Test that pkg_resources.parse_version works correctly."""
++    try:
++        from pkg_resources import parse_version
++        print("Testing pkg_resources.parse_version...")
++        result = parse_version('1.14.3') >= parse_version('1.14dev')
++        print(f"pkg_resources comparison result: {result}")
++        return True
++    except ImportError:
++        print("pkg_resources not available")
++        return False
++
++def test_minversion_current():
++    """Test the current minversion function."""
++    from astropy.utils import minversion
++    import types
++    
++    print("Testing current minversion function...")
++    
++    # Create a mock module with version 1.14.3
++    test_module = types.ModuleType("test_module")
++    test_module.__version__ = '1.14.3'
++    
++    try:
++        # This should trigger the bug if LooseVersion is used
++        result = minversion(test_module, '1.14dev')
++        print(f"minversion result: {result}")
++        return True
++    except Exception as e:
++        print(f"minversion failed: {type(e).__name__}: {e}")
++        return False
++
++def test_minversion_edge_cases():
++    """Test various edge cases that might trigger the bug."""
++    from astropy.utils import minversion
++    import types
++    
++    print("Testing minversion edge cases...")
++    
++    test_cases = [
++        ('1.14.3', '1.14dev'),
++        ('1.14.3', '1.14.0dev'),
++        ('2.0.1', '2.0dev'),
++        ('1.15.0', '1.14dev'),
++    ]
++    
++    for have_version, min_version in test_cases:
++        test_module = types.ModuleType("test_module")
++        test_module.__version__ = have_version
++        
++        try:
++            result = minversion(test_module, min_version)
++            print(f"  {have_version} >= {min_version}: {result}")
++        except Exception as e:
++            print(f"  {have_version} >= {min_version}: FAILED - {type(e).__name__}: {e}")
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("Testing minversion issue reproduction")
++    print("=" * 60)
++    
++    test_looseversion_bug()
++    print()
++    test_pkg_resources_works()
++    print()
++    test_minversion_current()
++    print()
++    test_minversion_edge_cases()
+\ No newline at end of file

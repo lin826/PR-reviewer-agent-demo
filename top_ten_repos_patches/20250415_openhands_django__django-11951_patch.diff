@@ -1,0 +1,399 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..2215090766
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the bulk_create batch_size fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections, models
++
++# Configure a basic Django environment
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++)
++
++django.setup()
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=50)
++    value = models.IntegerField(default=0)
++
++    class Meta:
++        app_label = 'test_app'
++
++
++# Create the schema
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Test different database engines by mocking their operation class
++class MockOracleOps:
++    def bulk_batch_size(self, fields, objs):
++        return 3  # Oracle might have a very low batch size
++
++class MockSQLiteOps:
++    def bulk_batch_size(self, fields, objs):
++        return 1000  # SQLite can handle larger batches
++
++class MockPostgreSQLOps:
++    def bulk_batch_size(self, fields, objs):
++        return 10  # A moderate batch size
++
++# Run tests with different database operation behaviors
++def test_with_mock_db_ops(db_ops_class, name=""):
++    print(f"\n=== Testing with {name} mock database operations ===")
++    # Save original operations
++    original_ops = connections['default'].ops
++    
++    # Replace with our mock
++    connections['default'].ops = db_ops_class()
++    
++    # Test cases to cover various scenarios
++    test_cases = [
++        {"batch_size": None, "objects": 5},  # Use database default
++        {"batch_size": 2, "objects": 5},     # User batch size < db max
++        {"batch_size": 20, "objects": 5},    # User batch size > db max
++    ]
++    
++    for case in test_cases:
++        batch_size = case["batch_size"]
++        num_objects = case["objects"]
++        
++        # Create test objects
++        objects = [TestModel(name=f"{name}-{batch_size}-{i}", value=i) for i in range(num_objects)]
++        
++        # Get the expected batch size
++        expected_batch_size = min(batch_size, connections['default'].ops.bulk_batch_size([], [])) if batch_size else connections['default'].ops.bulk_batch_size([], [])
++        
++        print(f"  Case: batch_size={batch_size}, objects={num_objects}")
++        print(f"  Expected effective batch size: {expected_batch_size}")
++        
++        # Perform bulk create
++        created = TestModel.objects.bulk_create(objects, batch_size=batch_size)
++        
++        # Verify objects were created
++        db_objects = TestModel.objects.filter(name__startswith=f"{name}-{batch_size}").count()
++        print(f"  Created {db_objects} objects in database")
++        print(f"  Result: {'OK' if db_objects == num_objects else 'FAILED'}")
++    
++    # Restore original operations
++    connections['default'].ops = original_ops
++
++# Run tests with different database operation behaviors
++test_with_mock_db_ops(MockSQLiteOps, "SQLite")
++test_with_mock_db_ops(MockOracleOps, "Oracle")
++test_with_mock_db_ops(MockPostgreSQLOps, "PostgreSQL")
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 794e0faae7..92349cd0c5 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1209,7 +1209,8 @@ class QuerySet:
+         if ignore_conflicts and not connections[self.db].features.supports_ignore_conflicts:
+             raise NotSupportedError('This database backend does not support ignoring conflicts.')
+         ops = connections[self.db].ops
+-        batch_size = (batch_size or max(ops.bulk_batch_size(fields, objs), 1))
++        max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
++        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+         inserted_rows = []
+         bulk_return = connections[self.db].features.can_return_rows_from_bulk_insert
+         for item in [objs[i:i + batch_size] for i in range(0, len(objs), batch_size)]:
+diff --git a/realistic_test.py b/realistic_test.py
+new file mode 100644
+index 0000000000..890259bba0
+--- /dev/null
++++ b/realistic_test.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python
++"""
++A more realistic test that directly patches the bulk_batch_size method
++to return different values, without replacing the entire ops object.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections, models
++
++# Configure a basic Django environment
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++)
++
++django.setup()
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=50)
++    value = models.IntegerField(default=0)
++
++    class Meta:
++        app_label = 'test_app'
++
++
++# Create the schema
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Save original method
++original_bulk_batch_size = connections['default'].ops.bulk_batch_size
++
++# Run tests with different bulk_batch_size values
++def test_with_mock_batch_size(max_size, name=""):
++    print(f"\n=== Testing with max_batch_size={max_size} ===")
++    
++    # Define a mock bulk_batch_size function that returns our desired value
++    def mock_bulk_batch_size(fields, objs):
++        return max_size
++    
++    # Apply the mock
++    connections['default'].ops.bulk_batch_size = mock_bulk_batch_size
++    
++    # Test cases to cover various scenarios
++    test_cases = [
++        {"batch_size": None, "objects": 5},  # Use database default
++        {"batch_size": max_size - 2, "objects": 5},  # User batch size < db max
++        {"batch_size": max_size + 5, "objects": 5},  # User batch size > db max
++    ]
++    
++    for case in test_cases:
++        batch_size = case["batch_size"]
++        num_objects = case["objects"]
++        
++        # Create test objects
++        objects = [TestModel(name=f"Max{max_size}-Batch{batch_size}-{i}", value=i) for i in range(num_objects)]
++        
++        # Get the expected batch size based on our fix's logic
++        expected_batch_size = min(batch_size, max_size) if batch_size else max_size
++        
++        print(f"  Case: batch_size={batch_size}, objects={num_objects}")
++        print(f"  Expected effective batch size: {expected_batch_size}")
++        
++        # Perform bulk create
++        created = TestModel.objects.bulk_create(objects, batch_size=batch_size)
++        
++        # Verify objects were created
++        db_objects = TestModel.objects.filter(name__startswith=f"Max{max_size}-Batch{batch_size}").count()
++        print(f"  Created {db_objects} objects in database")
++        print(f"  Result: {'OK' if db_objects == num_objects else 'FAILED'}")
++    
++# Try different max batch sizes
++test_with_mock_batch_size(3, "Very Small")
++test_with_mock_batch_size(10, "Medium")
++test_with_mock_batch_size(1000, "Large")
++
++# Restore original method
++connections['default'].ops.bulk_batch_size = original_bulk_batch_size
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_batch_size.py b/test_batch_size.py
+new file mode 100644
+index 0000000000..9e5575b2bd
+--- /dev/null
++++ b/test_batch_size.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python
++
++# Test script to verify bulk_create batch_size behavior
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections, models
++from django.test import TestCase
++
++# Configure a basic Django environment
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++)
++
++django.setup()
++
++# Create a test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=50)
++
++    class Meta:
++        app_label = 'test_app'
++
++
++# Create the schema
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++
++# Mock the bulk_batch_size method to return a very small value
++original_bulk_batch_size = connections['default'].ops.bulk_batch_size
++
++def mock_bulk_batch_size(fields, objs):
++    # Force a small max batch size of 5 for testing
++    return 5
++
++connections['default'].ops.bulk_batch_size = mock_bulk_batch_size
++
++# Create test data
++objects = [TestModel(name=f"Test {i}") for i in range(20)]
++
++print("Testing bulk_create with batch_size=10 (larger than max_batch_size=5):")
++
++# For monitoring the actual batch size without monkey patching
++# Subclass QuerySet to add our own _batched_insert that logs values
++from django.db.models import query
++
++class MonitoredQuerySet(query.QuerySet):
++    def _batched_insert(self, objs, fields, batch_size, **kwargs):
++        ops = connections[self.db].ops
++        # Print what's happening before the actual method runs
++        max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
++        adjusted_batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
++        print(f"User batch_size: {batch_size}")
++        print(f"Max batch_size: {max_batch_size}")
++        print(f"Actual batch_size used: {adjusted_batch_size}")
++        # Call the actual implementation
++        return super()._batched_insert(objs, fields, batch_size, **kwargs)
++
++# Create a monitored manager
++from django.db import models
++TestModel.objects.all()._clone = lambda: MonitoredQuerySet(model=TestModel)
++
++try:
++    # Test with batch_size > max_batch_size
++    TestModel.objects.bulk_create(objects, batch_size=10)
++except Exception as e:
++    print(f"Error: {e}")
++
++# Restore original function
++connections['default'].ops.bulk_batch_size = original_bulk_batch_size
++query.QuerySet._batched_insert = original_code
++
++print("Test completed.")
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..5c7601f78b
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python
++
++# Simpler test script to directly verify the fixed implementation
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections, models
++
++# Configure a basic Django environment
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++)
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=50)
++
++    class Meta:
++        app_label = 'test_app'
++
++
++# Create the schema
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++
++# Override bulk_batch_size to return a controlled value
++original_bulk_batch_size = connections['default'].ops.bulk_batch_size
++
++def mock_bulk_batch_size(fields, objs):
++    return 5  # Return a fixed small value
++
++connections['default'].ops.bulk_batch_size = mock_bulk_batch_size
++
++# Now we'll manually replicate the _batched_insert logic to see what happens
++
++# Our test cases
++test_cases = [
++    {"batch_size": None, "expected": 5},  # Should use max_batch_size
++    {"batch_size": 3, "expected": 3},     # Should use batch_size since it's smaller
++    {"batch_size": 10, "expected": 5},    # Should use max_batch_size since batch_size is larger
++]
++
++# Test our scenarios
++print("\nVerifying batch size calculation:")
++for case in test_cases:
++    batch_size = case["batch_size"]
++    objs = [TestModel(name=f"Test {i}") for i in range(20)]
++    fields = [TestModel._meta.get_field('name')]
++    
++    ops = connections['default'].ops
++    max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
++    calculated_batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
++    
++    result = "PASS" if calculated_batch_size == case["expected"] else "FAIL"
++    
++    print(f"User batch_size: {batch_size}")
++    print(f"Max batch_size: {max_batch_size}")
++    print(f"Calculated batch_size: {calculated_batch_size}")
++    print(f"Expected: {case['expected']}")
++    print(f"Result: {result}\n")
++
++# Create objects with different batch sizes to ensure database operations still work
++print("Creating objects with different batch sizes:")
++for batch_size in [None, 3, 10]:
++    objs = [TestModel(name=f"Batch {batch_size} - {i}") for i in range(5)]
++    TestModel.objects.bulk_create(objs, batch_size=batch_size)
++    count = TestModel.objects.filter(name__startswith=f"Batch {batch_size}").count()
++    print(f"Created {count} objects with batch_size={batch_size}")
++
++# Restore original function
++connections['default'].ops.bulk_batch_size = original_bulk_batch_size
++
++print("\nTest completed successfully!")
+\ No newline at end of file

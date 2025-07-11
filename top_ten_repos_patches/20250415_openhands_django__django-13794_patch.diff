@@ -1,0 +1,108 @@
+diff --git a/django/template/defaultfilters.py b/django/template/defaultfilters.py
+index 1c844580c6..5d455d5e0a 100644
+--- a/django/template/defaultfilters.py
++++ b/django/template/defaultfilters.py
+@@ -678,6 +678,11 @@ def add(value, arg):
+         return int(value) + int(arg)
+     except (ValueError, TypeError):
+         try:
++            # Handle lazy strings by forcing evaluation
++            if hasattr(value, '__class__') and value.__class__.__name__ == '__proxy__':
++                value = str(value)
++            if hasattr(arg, '__class__') and arg.__class__.__name__ == '__proxy__':
++                arg = str(arg)
+             return value + arg
+         except Exception:
+             return ''
+diff --git a/reproduce_add_filter_issue.py b/reproduce_add_filter_issue.py
+new file mode 100644
+index 0000000000..a4cbf80422
+--- /dev/null
++++ b/reproduce_add_filter_issue.py
+@@ -0,0 +1,27 @@
++import os
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.settings')
++
++from django.conf import settings
++settings.configure(USE_I18N=True)
++
++from django.utils.translation import gettext_lazy as _
++from django.template.defaultfilters import add as add_filter
++
++# Create a regular string and a lazy string
++regular_string = "hello"
++lazy_string = _("world")
++
++# Try using the filter function directly
++direct_filter_result = add_filter(regular_string, lazy_string)
++print(f"Direct filter result: '{direct_filter_result}'")
++
++# Show that the bug occurs when adding a regular string and a lazy string
++print(f"Type of lazy_string: {type(lazy_string)}")
++
++# For comparison, direct concatenation works fine
++direct_concat = regular_string + str(lazy_string)
++print(f"Direct concatenation: '{direct_concat}'")
++
++# Show what happens if we force the lazy string to a regular string first
++str_result = add_filter(regular_string, str(lazy_string))
++print(f"Filter with str() conversion: '{str_result}'")
+\ No newline at end of file
+diff --git a/reproduce_issue_simple.py b/reproduce_issue_simple.py
+new file mode 100644
+index 0000000000..d1c39b7fe6
+--- /dev/null
++++ b/reproduce_issue_simple.py
+@@ -0,0 +1,37 @@
++from django.template.defaultfilters import add
++from django.utils.functional import lazy
++
++# Create a regular string
++regular_string = "hello"
++
++# Create a lazy string (a simplified version that doesn't depend on gettext)
++def lazy_function():
++    return "world"
++
++lazy_string = lazy(lazy_function, str)()
++
++# Try adding them with the add filter
++result = add(regular_string, lazy_string)
++
++print(f"Type of lazy_string: {type(lazy_string)}")
++print(f"Result of add filter: '{result}'")
++print(f"Direct concat: '{regular_string + str(lazy_string)}'")
++
++# Test the fix we'll implement
++def add_fixed(value, arg):
++    """Add the arg to the value."""
++    try:
++        return int(value) + int(arg)
++    except (ValueError, TypeError):
++        try:
++            # Convert potential lazy strings to strings first
++            if hasattr(value, '__str__'):
++                value = str(value)
++            if hasattr(arg, '__str__'):
++                arg = str(arg)
++            return value + arg
++        except Exception:
++            return ''
++
++fixed_result = add_fixed(regular_string, lazy_string)
++print(f"Fixed result: '{fixed_result}'")
+\ No newline at end of file
+diff --git a/tests/template_tests/filter_tests/test_add.py b/tests/template_tests/filter_tests/test_add.py
+index 0fcc661f4a..4e9ff99f19 100644
+--- a/tests/template_tests/filter_tests/test_add.py
++++ b/tests/template_tests/filter_tests/test_add.py
+@@ -51,3 +51,9 @@ class FunctionTests(SimpleTestCase):
+ 
+     def test_add(self):
+         self.assertEqual(add('1', '2'), 3)
++
++    def test_add_with_lazy_string(self):
++        from django.utils.functional import lazy
++        lazy_str = lazy(lambda: "world", str)()
++        self.assertEqual(add("hello", lazy_str), "helloworld")
++        self.assertEqual(add(lazy_str, "hello"), "worldhello")

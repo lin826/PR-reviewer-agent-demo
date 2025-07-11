@@ -1,0 +1,68 @@
+diff --git a/django/db/models/fields/related_lookups.py b/django/db/models/fields/related_lookups.py
+index d745ecd5f9..eb6eba53db 100644
+--- a/django/db/models/fields/related_lookups.py
++++ b/django/db/models/fields/related_lookups.py
+@@ -86,8 +86,23 @@ class RelatedIn(In):
+                     AND)
+             return root_constraint.as_sql(compiler, connection)
+         else:
+-            if (not getattr(self.rhs, 'has_select_fields', True) and
+-                    not getattr(self.lhs.field.target_field, 'primary_key', False)):
++            # Check if this lookup is being processed as part of an OR query
++            is_or_query = False
++            if hasattr(compiler, 'query') and hasattr(compiler.query, 'where'):
++                # OR could be at the top level or in nested conditions
++                where_node = compiler.query.where
++                is_or_query = where_node.connector == 'OR'
++                
++                # If not at the top level, check children for OR nodes
++                if not is_or_query and where_node.children:
++                    for child in where_node.children:
++                        # Check if any child is a Node with OR connector
++                        if hasattr(child, 'connector') and child.connector == 'OR':
++                            is_or_query = True
++                            break
++            
++            # Always optimize the query if it's part of an OR or if select fields aren't explicitly set
++            if (is_or_query or not getattr(self.rhs, 'has_select_fields', True)):
+                 self.rhs.clear_select_clause()
+                 if (getattr(self.lhs.output_field, 'primary_key', False) and
+                         self.lhs.output_field.model == self.rhs.model):
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 5089737034..3457e656ae 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -401,9 +401,31 @@ class In(FieldGetDbPrepValueIterableMixin, BuiltinLookup):
+             placeholder = '(' + ', '.join(sqls) + ')'
+             return (placeholder, sqls_params)
+         else:
+-            if not getattr(self.rhs, 'has_select_fields', True):
++            # We need to ensure that QuerySets used in OR expressions only select the primary key
++            # to prevent unnecessary data from being retrieved and to optimize the query
++            
++            # Check if this lookup is being processed as part of an OR query
++            is_or_query = False
++            
++            # Check if there's an OR connector in the query's where clause
++            if hasattr(compiler, 'query') and hasattr(compiler.query, 'where'):
++                # OR could be at the top level or in nested conditions
++                where_node = compiler.query.where
++                is_or_query = where_node.connector == 'OR'
++                
++                # If not at the top level, check children for OR nodes
++                if not is_or_query and where_node.children:
++                    for child in where_node.children:
++                        # Check if any child is a Node with OR connector
++                        if hasattr(child, 'connector') and child.connector == 'OR':
++                            is_or_query = True
++                            break
++            
++            # Always optimize the query if it's part of an OR or if select fields aren't explicitly set
++            if is_or_query or not getattr(self.rhs, 'has_select_fields', True):
+                 self.rhs.clear_select_clause()
+                 self.rhs.add_fields(['pk'])
++            
+             return super().process_rhs(compiler, connection)
+ 
+     def get_rhs_op(self, connection, rhs):
+

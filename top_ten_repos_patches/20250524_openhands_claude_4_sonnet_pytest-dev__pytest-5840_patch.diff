@@ -1,0 +1,1280 @@
+diff --git a/src/_pytest/pathlib.py b/src/_pytest/pathlib.py
+index 0403b6947..5efe0fbef 100644
+--- a/src/_pytest/pathlib.py
++++ b/src/_pytest/pathlib.py
+@@ -11,7 +11,6 @@ from functools import partial
+ from os.path import expanduser
+ from os.path import expandvars
+ from os.path import isabs
+-from os.path import normcase
+ from os.path import sep
+ from posixpath import sep as posix_sep
+ 
+@@ -343,4 +342,4 @@ def unique_path(path):
+ 
+     This is needed only for ``py.path.local``; ``pathlib.Path`` handles this
+     natively with ``resolve()``."""
+-    return type(path)(normcase(str(path.realpath())))
++    return type(path)(str(path.realpath()))
+diff --git a/test_conftest_import_case.py b/test_conftest_import_case.py
+new file mode 100644
+index 000000000..991b1bde0
+--- /dev/null
++++ b/test_conftest_import_case.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python3
++"""
++Test to reproduce the conftest import issue with case conversion.
++
++This test simulates the Windows case issue by mocking os.path.normcase
++to behave like it does on Windows (converting to lowercase).
++"""
++
++import os
++import sys
++import tempfile
++import unittest.mock
++from pathlib import Path
++
++# Add the src directory to Python path
++sys.path.insert(0, '/workspace/pytest-dev__pytest__5.1/src')
++
++from _pytest.pathlib import unique_path
++from _pytest.config import PytestPluginManager
++import py
++
++
++def windows_normcase(path):
++    """Simulate Windows normcase behavior (converts to lowercase)."""
++    return path.lower()
++
++
++def test_conftest_loading_with_case_conversion():
++    """Test that demonstrates the conftest loading issue with case conversion."""
++    
++    print("=== Testing conftest loading with case conversion ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create a directory structure with mixed case
++        base_path = Path(tmpdir)
++        test_structure = base_path / "Azure" / "KMS" / "ComponentTest" / "Python" / "PIsys"
++        test_structure.mkdir(parents=True)
++        
++        # Create a conftest.py file
++        conftest_file = test_structure / "conftest.py"
++        conftest_file.write_text("""
++# Test conftest file
++def pytest_configure():
++    pass
++""")
++        
++        print(f"Created test structure: {test_structure}")
++        print(f"Conftest file: {conftest_file}")
++        
++        # Convert to py.path.local
++        py_conftest_path = py.path.local(str(conftest_file))
++        py_dir_path = py.path.local(str(test_structure))
++        
++        print(f"Original conftest path: {py_conftest_path}")
++        print(f"Original directory path: {py_dir_path}")
++        
++        # Test with normal behavior (Unix)
++        print("\n--- Normal behavior (Unix) ---")
++        normal_unique_conftest = unique_path(py_conftest_path)
++        normal_unique_dir = unique_path(py_dir_path)
++        
++        print(f"Normal unique conftest: {normal_unique_conftest}")
++        print(f"Normal unique directory: {normal_unique_dir}")
++        
++        # Test with Windows-like behavior (case conversion)
++        print("\n--- Windows-like behavior (case conversion) ---")
++        
++        # Mock os.path.normcase to behave like Windows
++        with unittest.mock.patch('_pytest.pathlib.normcase', side_effect=windows_normcase):
++            windows_unique_conftest = unique_path(py_conftest_path)
++            windows_unique_dir = unique_path(py_dir_path)
++            
++            print(f"Windows unique conftest: {windows_unique_conftest}")
++            print(f"Windows unique directory: {windows_unique_dir}")
++            
++            # Show the difference
++            print(f"\nCase conversion differences:")
++            print(f"  Original: {py_conftest_path}")
++            print(f"  Windows:  {windows_unique_conftest}")
++            
++            # This would break module imports because:
++            # - Original path has "Python" (capitalized)
++            # - Windows path has "python" (lowercase)
++            # - Python module system is case-sensitive
++            
++            original_parts = str(py_conftest_path).split(os.sep)
++            windows_parts = str(windows_unique_conftest).split(os.sep)
++            
++            for i, (orig, win) in enumerate(zip(original_parts, windows_parts)):
++                if orig != win:
++                    print(f"  Part {i}: '{orig}' -> '{win}'")
++                    if orig.lower() == 'python':
++                        print(f"    ^^^ This would cause ModuleNotFoundError!")
++
++
++def test_plugin_manager_with_case_conversion():
++    """Test PytestPluginManager with case conversion to show the actual error."""
++    
++    print("\n=== Testing PytestPluginManager with case conversion ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create test structure
++        base_path = Path(tmpdir)
++        test_structure = base_path / "ComponentTest" / "Python" / "PIsys"
++        test_structure.mkdir(parents=True)
++        
++        # Create a conftest.py that tries to import something
++        conftest_file = test_structure / "conftest.py"
++        conftest_file.write_text("""
++# This conftest tries to import from the parent 'Python' directory
++import sys
++import os
++
++# Add the Python directory to sys.path
++python_dir = os.path.dirname(__file__)
++if python_dir not in sys.path:
++    sys.path.insert(0, python_dir)
++
++def pytest_configure():
++    print("Conftest loaded successfully")
++""")
++        
++        # Create a module in the Python directory
++        python_module = test_structure.parent / "test_module.py"
++        python_module.write_text("""
++# Test module in Python directory
++def hello():
++    return "Hello from Python directory"
++""")
++        
++        print(f"Created conftest: {conftest_file}")
++        print(f"Created module: {python_module}")
++        
++        # Test with Windows-like case conversion
++        with unittest.mock.patch('_pytest.pathlib.normcase', side_effect=windows_normcase):
++            try:
++                # Create plugin manager
++                pm = PytestPluginManager()
++                
++                # Try to load conftest - this would fail on Windows due to case conversion
++                py_conftest_path = py.path.local(str(conftest_file))
++                
++                print(f"Original conftest path: {py_conftest_path}")
++                
++                # This is what unique_path would return with case conversion
++                unique_conftest = unique_path(py_conftest_path)
++                print(f"Case-converted path: {unique_conftest}")
++                
++                # The issue is that the path gets converted to lowercase,
++                # but Python's import system is case-sensitive
++                
++                print("\nThis demonstrates the Windows issue:")
++                print(f"  Original directory: 'Python' (capitalized)")
++                print(f"  Converted path: '{str(unique_conftest).split(os.sep)[-2]}' (lowercase)")
++                print(f"  Result: ModuleNotFoundError when trying to import from 'python'")
++                
++            except Exception as e:
++                print(f"Error during conftest loading: {e}")
++                import traceback
++                traceback.print_exc()
++
++
++if __name__ == "__main__":
++    test_conftest_loading_with_case_conversion()
++    test_plugin_manager_with_case_conversion()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..3dd4d2734
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,192 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the unique_path fix.
++"""
++
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++# Add the src directory to Python path
++sys.path.insert(0, '/workspace/pytest-dev__pytest__5.1/src')
++
++from _pytest.pathlib import unique_path
++import py
++
++
++def test_empty_path():
++    """Test unique_path with empty/minimal paths."""
++    
++    print("=== Testing edge cases ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Test with just a filename
++        simple_file = Path(tmpdir) / "test.py"
++        simple_file.write_text("# test")
++        
++        py_path = py.path.local(str(simple_file))
++        unique_result = unique_path(py_path)
++        
++        print(f"Simple file: {py_path} -> {unique_result}")
++        assert str(py_path) == str(unique_result)
++        
++        # Test with directory
++        test_dir = Path(tmpdir) / "TestDir"
++        test_dir.mkdir()
++        
++        py_dir = py.path.local(str(test_dir))
++        unique_dir = unique_path(py_dir)
++        
++        print(f"Simple dir: {py_dir} -> {unique_dir}")
++        assert str(py_dir) == str(unique_dir)
++
++
++def test_special_characters():
++    """Test unique_path with special characters in path names."""
++    
++    print("\n=== Testing special characters ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Test with special characters that might be affected by case conversion
++        special_names = [
++            "Test-Dir",
++            "Test_Dir", 
++            "Test.Dir",
++            "Test Dir",  # space
++            "TestDir123",
++            "UPPERCASE",
++            "lowercase",
++            "MiXeD_CaSe-123.test"
++        ]
++        
++        for name in special_names:
++            try:
++                test_path = Path(tmpdir) / name
++                test_path.mkdir(exist_ok=True)
++                
++                py_path = py.path.local(str(test_path))
++                unique_result = unique_path(py_path)
++                
++                print(f"Special name '{name}': {py_path} -> {unique_result}")
++                
++                # Case should be preserved
++                assert str(py_path) == str(unique_result)
++                
++                # The name should be exactly preserved
++                assert name in str(unique_result)
++                
++            except OSError as e:
++                print(f"Skipping '{name}' due to filesystem limitation: {e}")
++
++
++def test_long_paths():
++    """Test unique_path with long nested paths."""
++    
++    print("\n=== Testing long paths ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create a deeply nested structure
++        nested_path = Path(tmpdir)
++        path_components = ["Level1", "Level2", "Level3", "Level4", "Level5"]
++        
++        for component in path_components:
++            nested_path = nested_path / component
++            nested_path.mkdir()
++        
++        final_file = nested_path / "test.py"
++        final_file.write_text("# deep test")
++        
++        py_path = py.path.local(str(final_file))
++        unique_result = unique_path(py_path)
++        
++        print(f"Long path: {py_path}")
++        print(f"Unique:    {unique_result}")
++        
++        # Should be identical
++        assert str(py_path) == str(unique_result)
++        
++        # All components should be preserved
++        for component in path_components:
++            assert component in str(unique_result)
++
++
++def test_relative_vs_absolute():
++    """Test unique_path with relative vs absolute paths."""
++    
++    print("\n=== Testing relative vs absolute paths ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create test file
++        test_file = Path(tmpdir) / "TestFile.py"
++        test_file.write_text("# test")
++        
++        # Test with absolute path
++        abs_py_path = py.path.local(str(test_file))
++        abs_unique = unique_path(abs_py_path)
++        
++        print(f"Absolute: {abs_py_path} -> {abs_unique}")
++        
++        # Change to the directory and test relative path
++        original_cwd = os.getcwd()
++        try:
++            os.chdir(tmpdir)
++            rel_py_path = py.path.local("TestFile.py")
++            rel_unique = unique_path(rel_py_path)
++            
++            print(f"Relative: {rel_py_path} -> {rel_unique}")
++            
++            # Both should resolve to the same absolute path
++            assert str(abs_unique) == str(rel_unique)
++            
++        finally:
++            os.chdir(original_cwd)
++
++
++def test_nonexistent_paths():
++    """Test unique_path with non-existent paths."""
++    
++    print("\n=== Testing non-existent paths ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Test with non-existent file
++        nonexistent = Path(tmpdir) / "DoesNotExist.py"
++        
++        try:
++            py_path = py.path.local(str(nonexistent))
++            unique_result = unique_path(py_path)
++            
++            print(f"Non-existent: {py_path} -> {unique_result}")
++            
++            # Should still preserve the path structure
++            assert "DoesNotExist.py" in str(unique_result)
++            
++        except Exception as e:
++            print(f"Non-existent path handling: {e}")
++
++
++def main():
++    """Run all edge case tests."""
++    
++    print("🧪 Testing edge cases for unique_path fix...")
++    
++    try:
++        test_empty_path()
++        test_special_characters()
++        test_long_paths()
++        test_relative_vs_absolute()
++        test_nonexistent_paths()
++        
++        print("\n✅ All edge case tests passed!")
++        return True
++        
++    except Exception as e:
++        print(f"\n❌ Edge case test failed: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_exact_issue_reproduction.py b/test_exact_issue_reproduction.py
+new file mode 100644
+index 000000000..243cf1930
+--- /dev/null
++++ b/test_exact_issue_reproduction.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python3
++"""
++Exact reproduction of the Windows case issue reported in the GitHub issue.
++
++This test creates the exact scenario described in the issue:
++- Directory structure: C:\Azure\KMS\ComponentTest\Python\PIsys
++- Command: pytest --collect-only .\PIsys -m smoke
++- Error: ModuleNotFoundError: No module named 'python'
++"""
++
++import os
++import sys
++import tempfile
++import unittest.mock
++from pathlib import Path
++
++# Add the src directory to Python path
++sys.path.insert(0, '/workspace/pytest-dev__pytest__5.1/src')
++
++from _pytest.pathlib import unique_path
++from _pytest.config import PytestPluginManager, _prepareconfig
++from _pytest.config import ConftestImportFailure
++import py
++
++
++def windows_normcase(path):
++    """Simulate Windows normcase behavior (converts to lowercase)."""
++    return path.lower()
++
++
++def test_exact_issue_reproduction():
++    """Reproduce the exact issue from the GitHub report."""
++    
++    print("=== Reproducing exact issue from GitHub ===")
++    print("Original error: ImportError while loading conftest 'c:\\azure\\kms\\componenttest\\python\\pisys\\conftest.py'")
++    print("ModuleNotFoundError: No module named 'python'")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create the exact directory structure from the issue
++        base_path = Path(tmpdir)
++        azure_path = base_path / "Azure" / "KMS" / "ComponentTest" / "Python"
++        pisys_path = azure_path / "PIsys"
++        pisys_path.mkdir(parents=True)
++        
++        # Create conftest.py in PIsys directory
++        conftest_file = pisys_path / "conftest.py"
++        conftest_file.write_text("""
++# Conftest file that would cause import issues
++import sys
++import os
++
++# This is a common pattern - adding parent directories to sys.path
++current_dir = os.path.dirname(__file__)
++python_dir = os.path.dirname(current_dir)  # This should be 'Python' directory
++
++# Add the Python directory to sys.path for imports
++if python_dir not in sys.path:
++    sys.path.insert(0, python_dir)
++
++# Try to import something from the Python directory
++# This would fail if the path case is wrong
++try:
++    # This import would work with correct case but fail with lowercase
++    pass
++except ImportError as e:
++    print(f"Import error in conftest: {e}")
++
++def pytest_configure():
++    print("Conftest configured successfully")
++""")
++        
++        # Create a test file to make it look like a real test directory
++        test_file = pisys_path / "test_smoke.py"
++        test_file.write_text("""
++import pytest
++
++@pytest.mark.smoke
++def test_example():
++    assert True
++""")
++        
++        print(f"Created directory structure:")
++        print(f"  Base: {base_path}")
++        print(f"  Azure: {azure_path}")
++        print(f"  PIsys: {pisys_path}")
++        print(f"  Conftest: {conftest_file}")
++        
++        # Show what happens with normal (Unix) behavior
++        print(f"\n--- Normal behavior (Unix) ---")
++        py_conftest = py.path.local(str(conftest_file))
++        normal_unique = unique_path(py_conftest)
++        print(f"Original path: {py_conftest}")
++        print(f"Unique path:   {normal_unique}")
++        
++        # Show what happens with Windows case conversion
++        print(f"\n--- Windows behavior (case conversion) ---")
++        with unittest.mock.patch('_pytest.pathlib.normcase', side_effect=windows_normcase):
++            windows_unique = unique_path(py_conftest)
++            print(f"Original path: {py_conftest}")
++            print(f"Windows path:  {windows_unique}")
++            
++            # Extract the problematic part
++            original_parts = str(py_conftest).split(os.sep)
++            windows_parts = str(windows_unique).split(os.sep)
++            
++            print(f"\nPath component changes:")
++            for i, (orig, win) in enumerate(zip(original_parts, windows_parts)):
++                if orig != win:
++                    print(f"  {orig} -> {win}")
++                    if orig == 'Python':
++                        print(f"    ^^^ This causes the 'python' module not found error!")
++            
++            # This is the exact error scenario:
++            # 1. Original path has 'Python' directory
++            # 2. Windows normcase converts it to 'python'
++            # 3. When Python tries to import from 'python' directory, it fails
++            # 4. Because the actual directory is 'Python' (capitalized)
++            
++            print(f"\nThis reproduces the exact error:")
++            print(f"  Expected directory: 'Python'")
++            print(f"  Converted path uses: 'python'")
++            print(f"  Result: ModuleNotFoundError: No module named 'python'")
++
++
++def test_plugin_manager_conftest_loading():
++    """Test the actual conftest loading mechanism that fails."""
++    
++    print(f"\n=== Testing actual conftest loading mechanism ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create the problematic structure
++        base_path = Path(tmpdir)
++        python_dir = base_path / "ComponentTest" / "Python"
++        pisys_dir = python_dir / "PIsys"
++        pisys_dir.mkdir(parents=True)
++        
++        # Create a conftest that would trigger the import error
++        conftest_file = pisys_dir / "conftest.py"
++        conftest_file.write_text("""
++# This conftest file simulates the import issue
++import sys
++import os
++
++# Get the parent directory (should be 'Python')
++parent_dir = os.path.dirname(os.path.dirname(__file__))
++print(f"Parent directory path: {parent_dir}")
++
++# Check if we can find the 'Python' directory
++python_dir_name = os.path.basename(os.path.dirname(__file__))
++print(f"Python directory name: {python_dir_name}")
++
++# This would fail if the case is wrong
++if python_dir_name.lower() == 'python' and python_dir_name != 'Python':
++    raise ModuleNotFoundError("No module named 'python'")
++
++def pytest_configure():
++    pass
++""")
++        
++        print(f"Created conftest: {conftest_file}")
++        
++        # Test with Windows case conversion
++        with unittest.mock.patch('_pytest.pathlib.normcase', side_effect=windows_normcase):
++            try:
++                # Create plugin manager
++                pm = PytestPluginManager()
++                
++                # Convert to py.path.local
++                py_conftest = py.path.local(str(conftest_file))
++                
++                print(f"Original conftest path: {py_conftest}")
++                
++                # This is what would happen in _importconftest
++                unique_conftest = unique_path(py_conftest)
++                print(f"Unique conftest path: {unique_conftest}")
++                
++                # Show the case difference
++                orig_python_dir = str(py_conftest).split(os.sep)[-2]
++                unique_python_dir = str(unique_conftest).split(os.sep)[-2]
++                
++                print(f"Original Python dir: '{orig_python_dir}'")
++                print(f"Unique Python dir: '{unique_python_dir}'")
++                
++                if orig_python_dir != unique_python_dir:
++                    print(f"Case mismatch detected! This would cause import errors.")
++                    print(f"The conftest would try to import from '{unique_python_dir}' directory")
++                    print(f"But the actual directory is '{orig_python_dir}'")
++                
++            except Exception as e:
++                print(f"Error: {e}")
++
++
++if __name__ == "__main__":
++    test_exact_issue_reproduction()
++    test_plugin_manager_conftest_loading()
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 000000000..02c37a6e4
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,247 @@
++#!/usr/bin/env python3
++"""
++Test to verify that the fix for the Windows case issue works correctly.
++
++This test verifies that unique_path() now preserves case and doesn't
++break Python imports on Windows.
++"""
++
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++# Add the src directory to Python path
++sys.path.insert(0, '/workspace/pytest-dev__pytest__5.1/src')
++
++from _pytest.pathlib import unique_path
++import py
++
++
++def test_unique_path_preserves_case():
++    """Test that unique_path now preserves case."""
++    
++    print("=== Testing that unique_path preserves case ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create a directory structure with mixed case
++        base_path = Path(tmpdir)
++        mixed_case_path = base_path / "Azure" / "KMS" / "ComponentTest" / "Python" / "PIsys"
++        mixed_case_path.mkdir(parents=True)
++        
++        # Create a conftest.py file
++        conftest_file = mixed_case_path / "conftest.py"
++        conftest_file.write_text("# Test conftest file\n")
++        
++        # Convert to py.path.local
++        py_path = py.path.local(str(conftest_file))
++        
++        print(f"Original path: {py_path}")
++        
++        # Test unique_path function
++        unique_py_path = unique_path(py_path)
++        
++        print(f"Unique path: {unique_py_path}")
++        
++        # Verify that case is preserved
++        original_str = str(py_path)
++        unique_str = str(unique_py_path)
++        
++        print(f"Original string: {original_str}")
++        print(f"Unique string:   {unique_str}")
++        
++        # The paths should be identical (case preserved)
++        if original_str == unique_str:
++            print("✅ SUCCESS: Case is preserved!")
++            return True
++        else:
++            print("❌ FAILURE: Case was not preserved!")
++            
++            # Show differences
++            orig_parts = original_str.split(os.sep)
++            unique_parts = unique_str.split(os.sep)
++            
++            for i, (orig, unique) in enumerate(zip(orig_parts, unique_parts)):
++                if orig != unique:
++                    print(f"  Difference at part {i}: '{orig}' -> '{unique}'")
++            
++            return False
++
++
++def test_symlink_resolution():
++    """Test that unique_path still resolves symlinks correctly."""
++    
++    print(f"\n=== Testing symlink resolution ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        base_path = Path(tmpdir)
++        
++        # Create a real directory with mixed case
++        real_dir = base_path / "RealDir" / "Python" / "Tests"
++        real_dir.mkdir(parents=True)
++        
++        # Create a conftest.py in the real directory
++        real_conftest = real_dir / "conftest.py"
++        real_conftest.write_text("# Real conftest file\n")
++        
++        # Create a symlink to the conftest file
++        symlink_dir = base_path / "SymlinkDir"
++        symlink_dir.mkdir()
++        symlink_conftest = symlink_dir / "conftest.py"
++        
++        try:
++            # Create symlink (may not work on all systems)
++            symlink_conftest.symlink_to(real_conftest)
++            
++            # Convert to py.path.local
++            py_real = py.path.local(str(real_conftest))
++            py_symlink = py.path.local(str(symlink_conftest))
++            
++            print(f"Real path:    {py_real}")
++            print(f"Symlink path: {py_symlink}")
++            
++            # Test unique_path on both
++            unique_real = unique_path(py_real)
++            unique_symlink = unique_path(py_symlink)
++            
++            print(f"Unique real:    {unique_real}")
++            print(f"Unique symlink: {unique_symlink}")
++            
++            # Both should resolve to the same real path
++            if str(unique_real) == str(unique_symlink):
++                print("✅ SUCCESS: Symlinks resolve to the same path!")
++                
++                # And case should be preserved
++                if "Python" in str(unique_real):
++                    print("✅ SUCCESS: Case preserved in symlink resolution!")
++                    return True
++                else:
++                    print("❌ FAILURE: Case not preserved in symlink resolution!")
++                    return False
++            else:
++                print("❌ FAILURE: Symlinks don't resolve to the same path!")
++                return False
++                
++        except OSError:
++            print("⚠️  SKIP: Symlinks not supported on this system")
++            return True
++
++
++def test_windows_scenario_simulation():
++    """Test the exact Windows scenario that was failing."""
++    
++    print(f"\n=== Testing Windows scenario simulation ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create the exact structure from the issue
++        base_path = Path(tmpdir)
++        azure_path = base_path / "Azure" / "KMS" / "ComponentTest" / "Python" / "PIsys"
++        azure_path.mkdir(parents=True)
++        
++        # Create conftest.py
++        conftest_file = azure_path / "conftest.py"
++        conftest_file.write_text("""
++# Conftest that would fail with case conversion
++import os
++import sys
++
++# Get the parent directory name
++parent_dir = os.path.dirname(__file__)
++python_dir_name = os.path.basename(os.path.dirname(parent_dir))
++
++print(f"Python directory name from conftest: {python_dir_name}")
++
++# This should be 'Python' (capitalized), not 'python' (lowercase)
++if python_dir_name == 'Python':
++    print("✅ Correct case: Found 'Python' directory")
++elif python_dir_name == 'python':
++    print("❌ Wrong case: Found 'python' directory - this would cause import errors!")
++    raise ModuleNotFoundError("No module named 'python'")
++else:
++    print(f"Unexpected directory name: {python_dir_name}")
++
++def pytest_configure():
++    pass
++""")
++        
++        print(f"Created Windows-like structure: {azure_path}")
++        print(f"Conftest file: {conftest_file}")
++        
++        # Convert to py.path.local
++        py_conftest = py.path.local(str(conftest_file))
++        
++        print(f"Original conftest path: {py_conftest}")
++        
++        # Apply unique_path (this is what pytest does internally)
++        unique_conftest = unique_path(py_conftest)
++        
++        print(f"Unique conftest path: {unique_conftest}")
++        
++        # Check if the Python directory name is preserved
++        original_parts = str(py_conftest).split(os.sep)
++        unique_parts = str(unique_conftest).split(os.sep)
++        
++        # Find the 'Python' directory in both paths
++        orig_python_idx = None
++        unique_python_idx = None
++        
++        for i, part in enumerate(original_parts):
++            if part == 'Python':
++                orig_python_idx = i
++                break
++                
++        for i, part in enumerate(unique_parts):
++            if part == 'Python':
++                unique_python_idx = i
++                break
++        
++        if orig_python_idx is not None and unique_python_idx is not None:
++            print("✅ SUCCESS: 'Python' directory name preserved!")
++            return True
++        elif orig_python_idx is not None and unique_python_idx is None:
++            # Check if it was converted to lowercase
++            for i, part in enumerate(unique_parts):
++                if part == 'python':
++                    print("❌ FAILURE: 'Python' was converted to 'python'!")
++                    return False
++            print("❌ FAILURE: 'Python' directory not found in unique path!")
++            return False
++        else:
++            print("❌ FAILURE: Unexpected path structure!")
++            return False
++
++
++def main():
++    """Run all verification tests."""
++    
++    print("🔧 Verifying the fix for Windows case issue...")
++    
++    results = []
++    
++    # Test 1: Basic case preservation
++    results.append(test_unique_path_preserves_case())
++    
++    # Test 2: Symlink resolution
++    results.append(test_symlink_resolution())
++    
++    # Test 3: Windows scenario
++    results.append(test_windows_scenario_simulation())
++    
++    # Summary
++    print(f"\n=== SUMMARY ===")
++    passed = sum(results)
++    total = len(results)
++    
++    print(f"Tests passed: {passed}/{total}")
++    
++    if passed == total:
++        print("🎉 ALL TESTS PASSED! The fix works correctly.")
++        return True
++    else:
++        print("❌ Some tests failed. The fix needs more work.")
++        return False
++
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_realistic_scenario.py b/test_realistic_scenario.py
+new file mode 100644
+index 000000000..25c4944d7
+--- /dev/null
++++ b/test_realistic_scenario.py
+@@ -0,0 +1,267 @@
++#!/usr/bin/env python3
++"""
++Realistic test scenario that simulates the exact Windows issue.
++
++This test creates a realistic project structure and verifies that
++conftest loading works correctly with mixed-case directory names.
++"""
++
++import os
++import sys
++import tempfile
++import subprocess
++from pathlib import Path
++
++# Add the src directory to Python path
++sys.path.insert(0, '/workspace/pytest-dev__pytest__5.1/src')
++
++from _pytest.config import PytestPluginManager
++from _pytest.pathlib import unique_path
++import py
++
++
++def test_realistic_windows_project():
++    """Test a realistic Windows project structure."""
++    
++    print("=== Testing realistic Windows project structure ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create a realistic project structure like the one in the issue
++        project_root = Path(tmpdir) / "Azure" / "KMS" / "ComponentTest"
++        python_dir = project_root / "Python"
++        pisys_dir = python_dir / "PIsys"
++        
++        # Create directories
++        pisys_dir.mkdir(parents=True)
++        
++        # Create a Python module in the Python directory
++        python_module = python_dir / "shared_utils.py"
++        python_module.write_text("""
++# Shared utilities for the project
++def get_project_info():
++    return "Azure KMS Component Test - Python Module"
++
++def validate_config():
++    return True
++""")
++        
++        # Create __init__.py files to make it a proper Python package
++        (python_dir / "__init__.py").write_text("")
++        (pisys_dir / "__init__.py").write_text("")
++        
++        # Create a conftest.py that imports from the parent Python directory
++        conftest_content = '''
++"""
++Conftest file for PIsys tests.
++This file imports from the parent Python directory, which would fail
++if the path case is converted incorrectly on Windows.
++"""
++import sys
++import os
++
++# Add the Python directory to sys.path for imports
++python_dir = os.path.dirname(os.path.dirname(__file__))
++if python_dir not in sys.path:
++    sys.path.insert(0, python_dir)
++
++# This import would fail if the path case is wrong
++try:
++    import shared_utils
++    print(f"✅ Successfully imported shared_utils: {shared_utils.get_project_info()}")
++    IMPORT_SUCCESS = True
++except ImportError as e:
++    print(f"❌ Failed to import shared_utils: {e}")
++    IMPORT_SUCCESS = False
++
++def pytest_configure():
++    """Pytest configuration hook."""
++    if not IMPORT_SUCCESS:
++        raise ImportError("Failed to import shared_utils from Python directory")
++    print("Conftest configured successfully")
++
++def pytest_collection_modifyitems(items):
++    """Modify collected test items."""
++    print(f"Collected {len(items)} test items")
++'''
++        
++        conftest_file = pisys_dir / "conftest.py"
++        conftest_file.write_text(conftest_content)
++        
++        # Create a test file
++        test_file = pisys_dir / "test_smoke.py"
++        test_file.write_text('''
++"""
++Smoke tests for PIsys.
++"""
++import pytest
++import shared_utils
++
++@pytest.mark.smoke
++def test_shared_utils_available():
++    """Test that shared utilities are available."""
++    assert shared_utils.validate_config() is True
++
++@pytest.mark.smoke  
++def test_project_info():
++    """Test project info retrieval."""
++    info = shared_utils.get_project_info()
++    assert "Azure KMS" in info
++    assert "Python" in info
++
++def test_basic_functionality():
++    """Basic functionality test."""
++    assert True
++''')
++        
++        print(f"Created project structure:")
++        print(f"  Project root: {project_root}")
++        print(f"  Python dir: {python_dir}")
++        print(f"  PIsys dir: {pisys_dir}")
++        print(f"  Conftest: {conftest_file}")
++        print(f"  Test file: {test_file}")
++        
++        # Test the unique_path function with this structure
++        print(f"\n--- Testing unique_path with project structure ---")
++        
++        py_conftest = py.path.local(str(conftest_file))
++        py_python_dir = py.path.local(str(python_dir))
++        py_pisys_dir = py.path.local(str(pisys_dir))
++        
++        unique_conftest = unique_path(py_conftest)
++        unique_python_dir = unique_path(py_python_dir)
++        unique_pisys_dir = unique_path(py_pisys_dir)
++        
++        print(f"Original conftest: {py_conftest}")
++        print(f"Unique conftest:   {unique_conftest}")
++        print(f"Original Python:   {py_python_dir}")
++        print(f"Unique Python:     {unique_python_dir}")
++        print(f"Original PIsys:    {py_pisys_dir}")
++        print(f"Unique PIsys:      {unique_pisys_dir}")
++        
++        # Verify case preservation
++        assert "Python" in str(unique_python_dir), "Python directory case not preserved"
++        assert "PIsys" in str(unique_pisys_dir), "PIsys directory case not preserved"
++        assert "ComponentTest" in str(unique_conftest), "ComponentTest case not preserved"
++        
++        print("✅ Case preservation verified!")
++        
++        # Test conftest loading with PytestPluginManager
++        print(f"\n--- Testing conftest loading ---")
++        
++        try:
++            pm = PytestPluginManager()
++            
++            # This is what pytest does internally - it calls unique_path on conftest files
++            unique_conftest_path = unique_path(py_conftest)
++            
++            print(f"Loading conftest from: {unique_conftest_path}")
++            
++            # Verify the path still has correct case
++            path_parts = str(unique_conftest_path).split(os.sep)
++            python_part = None
++            pisys_part = None
++            
++            for part in path_parts:
++                if part == "Python":
++                    python_part = part
++                elif part == "PIsys":
++                    pisys_part = part
++            
++            assert python_part == "Python", f"Python directory case changed: {python_part}"
++            assert pisys_part == "PIsys", f"PIsys directory case changed: {pisys_part}"
++            
++            print("✅ Conftest path case verification passed!")
++            
++            # The actual import test would happen when pytest loads the conftest
++            # but we can't easily test that here without running a full pytest session
++            
++        except Exception as e:
++            print(f"❌ Error during conftest loading test: {e}")
++            raise
++        
++        return True
++
++
++def test_pytest_collection_simulation():
++    """Simulate pytest collection with the fixed unique_path."""
++    
++    print(f"\n=== Simulating pytest collection ===")
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create a simpler test structure
++        base_path = Path(tmpdir)
++        test_dir = base_path / "TestProject" / "Python" / "Tests"
++        test_dir.mkdir(parents=True)
++        
++        # Create conftest
++        conftest = test_dir / "conftest.py"
++        conftest.write_text("""
++def pytest_configure():
++    print("Test conftest loaded")
++""")
++        
++        # Create test file
++        test_file = test_dir / "test_example.py"
++        test_file.write_text("""
++def test_example():
++    assert True
++""")
++        
++        print(f"Created test structure: {test_dir}")
++        
++        # Simulate what pytest does during collection
++        py_test_dir = py.path.local(str(test_dir))
++        py_conftest = py.path.local(str(conftest))
++        
++        # Apply unique_path (this is what pytest does)
++        unique_test_dir = unique_path(py_test_dir)
++        unique_conftest = unique_path(py_conftest)
++        
++        print(f"Original test dir: {py_test_dir}")
++        print(f"Unique test dir:   {unique_test_dir}")
++        print(f"Original conftest: {py_conftest}")
++        print(f"Unique conftest:   {unique_conftest}")
++        
++        # Verify case preservation in all components
++        original_parts = str(py_test_dir).split(os.sep)
++        unique_parts = str(unique_test_dir).split(os.sep)
++        
++        for orig, unique in zip(original_parts, unique_parts):
++            if orig != unique:
++                print(f"❌ Case change detected: '{orig}' -> '{unique}'")
++                return False
++        
++        print("✅ All path components preserved correctly!")
++        return True
++
++
++def main():
++    """Run all realistic scenario tests."""
++    
++    print("🏗️  Testing realistic Windows project scenario...")
++    
++    try:
++        # Test 1: Realistic Windows project
++        success1 = test_realistic_windows_project()
++        
++        # Test 2: Pytest collection simulation
++        success2 = test_pytest_collection_simulation()
++        
++        if success1 and success2:
++            print("\n🎉 All realistic scenario tests passed!")
++            print("The fix successfully resolves the Windows case issue!")
++            return True
++        else:
++            print("\n❌ Some realistic scenario tests failed!")
++            return False
++            
++    except Exception as e:
++        print(f"\n💥 Realistic scenario test failed with error: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_windows_case_issue.py b/test_windows_case_issue.py
+new file mode 100644
+index 000000000..42a61b5fc
+--- /dev/null
++++ b/test_windows_case_issue.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the Windows case issue with pytest 5.1.2.
++
++The issue is that unique_path() uses os.path.normcase() which converts
++paths to lowercase on Windows, breaking module imports.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from pathlib import Path
++
++# Add the src directory to Python path so we can import pytest modules
++sys.path.insert(0, '/workspace/pytest-dev__pytest__5.1/src')
++
++from _pytest.pathlib import unique_path
++import py
++
++
++def test_unique_path_preserves_case():
++    """Test that unique_path preserves case on case-sensitive systems."""
++    
++    # Create a temporary directory structure with mixed case
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir_path = Path(tmpdir)
++        
++        # Create a mixed-case directory structure
++        mixed_case_dir = tmpdir_path / "Azure" / "KMS" / "ComponentTest" / "Python" / "PIsys"
++        mixed_case_dir.mkdir(parents=True)
++        
++        # Create a conftest.py file
++        conftest_file = mixed_case_dir / "conftest.py"
++        conftest_file.write_text("# Test conftest file\n")
++        
++        # Convert to py.path.local (which pytest uses)
++        py_path = py.path.local(str(conftest_file))
++        
++        print(f"Original path: {py_path}")
++        print(f"Original path str: {str(py_path)}")
++        
++        # Test unique_path function
++        unique_py_path = unique_path(py_path)
++        
++        print(f"Unique path: {unique_py_path}")
++        print(f"Unique path str: {str(unique_py_path)}")
++        
++        # On Windows, this would convert to lowercase and break imports
++        # Let's simulate what happens on Windows
++        import os.path
++        
++        # Show what normcase does on different platforms
++        original_str = str(py_path)
++        normcase_result = os.path.normcase(original_str)
++        
++        print(f"os.path.normcase result: {normcase_result}")
++        print(f"Platform: {sys.platform}")
++        
++        # The issue is that on Windows, normcase converts to lowercase
++        # which breaks Python module imports because they are case-sensitive
++        
++        if sys.platform.startswith('win'):
++            # On Windows, this would be lowercase
++            assert normcase_result != original_str, "On Windows, normcase should change case"
++            print("ERROR: On Windows, this would break module imports!")
++        else:
++            # On Unix, normcase preserves case
++            print("On Unix, normcase preserves case (no issue here)")
++            
++        # The problem is in the unique_path implementation
++        # It should preserve case for module import compatibility
++        
++        return original_str, str(unique_py_path), normcase_result
++
++
++def simulate_windows_issue():
++    """Simulate what happens on Windows with the current unique_path implementation."""
++    
++    # Simulate a Windows path
++    windows_path = r"C:\Azure\KMS\ComponentTest\Python\PIsys\conftest.py"
++    
++    print(f"Original Windows path: {windows_path}")
++    
++    # Simulate what os.path.normcase does on Windows (converts to lowercase)
++    simulated_normcase = windows_path.lower()
++    print(f"Windows normcase result: {simulated_normcase}")
++    
++    # This is what would break module imports:
++    # The path "c:\azure\kms\componenttest\python\pisys\conftest.py"
++    # would try to import from module "python" (lowercase)
++    # but the actual directory is "Python" (capitalized)
++    
++    print("This would cause: ModuleNotFoundError: No module named 'python'")
++    print("Because Python looks for 'python' but directory is 'Python'")
++
++
++def test_current_implementation():
++    """Test the current unique_path implementation to see the issue."""
++    
++    print("\n=== Testing current unique_path implementation ===")
++    
++    # Test with a temporary path that has mixed case
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create mixed case structure
++        base_path = Path(tmpdir)
++        mixed_case_path = base_path / "TestDir" / "Python" / "conftest.py"
++        mixed_case_path.parent.mkdir(parents=True)
++        mixed_case_path.write_text("# test")
++        
++        # Convert to py.path.local
++        py_path = py.path.local(str(mixed_case_path))
++        
++        print(f"Original py.path: {py_path}")
++        
++        # Apply unique_path
++        result = unique_path(py_path)
++        
++        print(f"unique_path result: {result}")
++        print(f"Types: original={type(py_path)}, result={type(result)}")
++        
++        # Check if case is preserved
++        original_parts = str(py_path).split(os.sep)
++        result_parts = str(result).split(os.sep)
++        
++        print(f"Original parts: {original_parts}")
++        print(f"Result parts: {result_parts}")
++        
++        # Look for case differences
++        for i, (orig, res) in enumerate(zip(original_parts, result_parts)):
++            if orig != res:
++                print(f"Case difference at part {i}: '{orig}' -> '{res}'")
++
++
++if __name__ == "__main__":
++    print("=== Windows Case Issue Reproduction Test ===")
++    
++    print("\n1. Testing current unique_path behavior:")
++    test_current_implementation()
++    
++    print("\n2. Simulating Windows issue:")
++    simulate_windows_issue()
++    
++    print("\n3. Testing unique_path case preservation:")
++    try:
++        original, unique, normcase_result = test_unique_path_preserves_case()
++        print(f"\nSummary:")
++        print(f"  Original: {original}")
++        print(f"  Unique:   {unique}")
++        print(f"  Normcase: {normcase_result}")
++    except Exception as e:
++        print(f"Error in test: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file

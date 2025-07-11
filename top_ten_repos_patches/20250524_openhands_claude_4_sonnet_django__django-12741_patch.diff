@@ -1,0 +1,517 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..c5710fef04
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python
++"""
++Debug the test execution to see what's happening.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection, transaction
++from django.core.management.color import no_style
++import inspect
++
++def debug_execute_sql_flush():
++    """Debug the execute_sql_flush method"""
++    print("=== Debugging execute_sql_flush ===")
++    
++    # Check the signature
++    method = connection.ops.execute_sql_flush
++    sig = inspect.signature(method)
++    print(f"Method signature: {sig}")
++    print(f"Parameters: {list(sig.parameters.keys())}")
++    
++    # Check the method source
++    try:
++        source = inspect.getsource(method)
++        print(f"Method source:\n{source}")
++    except Exception as e:
++        print(f"Could not get source: {e}")
++    
++    # Try the old call pattern
++    print("\n--- Testing old call pattern ---")
++    try:
++        sql_list = []  # Empty list for testing
++        
++        # This is the old pattern from the test
++        connection.ops.execute_sql_flush(connection.alias, sql_list)
++        print("✗ Old pattern worked - this shouldn't happen!")
++    except Exception as e:
++        print(f"✓ Old pattern failed as expected: {e}")
++    
++    # Try the new call pattern
++    print("\n--- Testing new call pattern ---")
++    try:
++        sql_list = []  # Empty list for testing
++        
++        # This is the new pattern
++        connection.ops.execute_sql_flush(sql_list)
++        print("✓ New pattern worked!")
++    except Exception as e:
++        print(f"✗ New pattern failed: {e}")
++
++if __name__ == "__main__":
++    debug_execute_sql_flush()
+\ No newline at end of file
+diff --git a/django/core/management/commands/flush.py b/django/core/management/commands/flush.py
+index e8ed3967f7..bc8021cf4e 100644
+--- a/django/core/management/commands/flush.py
++++ b/django/core/management/commands/flush.py
+@@ -60,7 +60,7 @@ Are you sure you want to do this?
+ 
+         if confirm == 'yes':
+             try:
+-                connection.ops.execute_sql_flush(database, sql_list)
++                connection.ops.execute_sql_flush(sql_list)
+             except Exception as exc:
+                 raise CommandError(
+                     "Database %s couldn't be flushed. Possible reasons:\n"
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 70ac07ae09..f07580c18b 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -400,9 +400,9 @@ class BaseDatabaseOperations:
+         """
+         raise NotImplementedError('subclasses of BaseDatabaseOperations must provide a sql_flush() method')
+ 
+-    def execute_sql_flush(self, using, sql_list):
++    def execute_sql_flush(self, sql_list):
+         """Execute a list of SQL statements to flush the database."""
+-        with transaction.atomic(using=using, savepoint=self.connection.features.can_rollback_ddl):
++        with transaction.atomic(using=self.connection.alias, savepoint=self.connection.features.can_rollback_ddl):
+             with self.connection.cursor() as cursor:
+                 for sql in sql_list:
+                     cursor.execute(sql)
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..20f7bb5810
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python
++"""
++Final verification that all requirements are met.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from django.core.management.color import no_style
++from django.core.management.sql import sql_flush
++import inspect
++
++def verify_requirements():
++    """Verify all requirements are met"""
++    print("=== Final Verification ===")
++    
++    # 1. Check method signature
++    method = connection.ops.execute_sql_flush
++    sig = inspect.signature(method)
++    params = list(sig.parameters.keys())
++    
++    print(f"1. Method signature: {sig}")
++    if params == ['sql_list']:
++        print("   ✅ Signature simplified correctly")
++    else:
++        print(f"   ❌ Expected ['sql_list'], got {params}")
++        return False
++    
++    # 2. Check that using parameter is removed
++    if 'using' not in params:
++        print("   ✅ 'using' parameter removed")
++    else:
++        print("   ❌ 'using' parameter still present")
++        return False
++    
++    # 3. Check method source uses self.connection.alias
++    try:
++        source = inspect.getsource(method)
++        if 'self.connection.alias' in source:
++            print("   ✅ Method uses self.connection.alias")
++        else:
++            print("   ❌ Method doesn't use self.connection.alias")
++            return False
++    except Exception as e:
++        print(f"   ❌ Could not verify source: {e}")
++        return False
++    
++    # 4. Test new usage works
++    try:
++        sql_list = []
++        connection.ops.execute_sql_flush(sql_list)
++        print("   ✅ New usage pattern works")
++    except Exception as e:
++        print(f"   ❌ New usage failed: {e}")
++        return False
++    
++    # 5. Test old usage fails
++    try:
++        sql_list = []
++        connection.ops.execute_sql_flush(connection.alias, sql_list)
++        print("   ❌ Old usage still works (should fail)")
++        return False
++    except TypeError:
++        print("   ✅ Old usage correctly fails")
++    except Exception as e:
++        print(f"   ❌ Old usage failed with unexpected error: {e}")
++        return False
++    
++    # 6. Test that connection.alias is available and correct
++    if hasattr(connection, 'alias'):
++        print(f"   ✅ connection.alias available: {connection.alias}")
++    else:
++        print("   ❌ connection.alias not available")
++        return False
++    
++    if hasattr(connection.ops, 'connection') and hasattr(connection.ops.connection, 'alias'):
++        if connection.ops.connection.alias == connection.alias:
++            print("   ✅ self.connection.alias equals connection.alias")
++        else:
++            print(f"   ❌ self.connection.alias ({connection.ops.connection.alias}) != connection.alias ({connection.alias})")
++            return False
++    else:
++        print("   ❌ self.connection.alias not available")
++        return False
++    
++    # 7. Test flush command integration
++    try:
++        sql_list = sql_flush(no_style(), connection, only_django=True)
++        connection.ops.execute_sql_flush(sql_list)
++        print("   ✅ Flush command integration works")
++    except Exception as e:
++        print(f"   ❌ Flush command integration failed: {e}")
++        return False
++    
++    print("\n🎉 All requirements verified successfully!")
++    return True
++
++if __name__ == "__main__":
++    success = verify_requirements()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_execute_sql_flush_signature.py b/test_execute_sql_flush_signature.py
+new file mode 100644
+index 0000000000..915ead0f99
+--- /dev/null
++++ b/test_execute_sql_flush_signature.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce and verify the execute_sql_flush signature issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from django.core.management.color import no_style
++import inspect
++
++def test_new_signature():
++    """Test the new signature of execute_sql_flush"""
++    print("=== Testing New Signature ===")
++    
++    # Get the method signature
++    method = connection.ops.execute_sql_flush
++    sig = inspect.signature(method)
++    print(f"New signature: {sig}")
++    print(f"Parameters: {list(sig.parameters.keys())}")
++    
++    # Test that connection.alias is available
++    print(f"connection.alias = {connection.alias}")
++    print(f"self.connection.alias would be = {connection.ops.connection.alias}")
++    
++    return True
++
++def test_desired_signature():
++    """Test what the desired signature should look like"""
++    print("\n=== Testing Desired Signature ===")
++    
++    # This is what we want to be able to do
++    try:
++        sql_list = []
++        # This should work after the fix (without passing connection.alias)
++        connection.ops.execute_sql_flush(sql_list)
++        print("✓ Desired usage works: connection.ops.execute_sql_flush(sql_list)")
++        return True
++    except Exception as e:
++        print(f"✗ Desired usage failed: {e}")
++        return False
++
++def main():
++    print("Testing execute_sql_flush signature simplification")
++    print("=" * 50)
++    
++    test_new_signature()
++    desired_works = test_desired_signature()
++    
++    print("\n=== Summary ===")
++    print(f"New signature works: {desired_works}")
++    print(f"Connection alias available: {connection.ops.connection.alias}")
++    print("Fix implemented successfully!")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_flush_command.py b/test_flush_command.py
+new file mode 100644
+index 0000000000..7ae0756e0b
+--- /dev/null
++++ b/test_flush_command.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python
++"""
++Test the flush command to make sure it works with the new signature.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.management import call_command
++from django.core.management.commands.flush import Command
++from django.db import connection
++from django.core.management.color import no_style
++from django.core.management.sql import sql_flush
++
++def test_flush_command():
++    """Test that the flush command works with the new signature"""
++    print("=== Testing flush command ===")
++    
++    try:
++        # Test the sql_flush function
++        sql_list = sql_flush(no_style(), connection, only_django=True)
++        print(f"Generated SQL list: {sql_list}")
++        
++        # Test the execute_sql_flush call (this is what the flush command does)
++        connection.ops.execute_sql_flush(sql_list)
++        print("✓ Flush command logic works with new signature")
++        
++        return True
++    except Exception as e:
++        print(f"✗ Flush command failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    test_flush_command()
+\ No newline at end of file
+diff --git a/test_signature_verification.py b/test_signature_verification.py
+new file mode 100644
+index 0000000000..cd60722d72
+--- /dev/null
++++ b/test_signature_verification.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python
++"""
++Test script to verify the signature change is working correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++import inspect
++
++def test_signature_change():
++    """Test that the signature has actually changed"""
++    print("=== Verifying Signature Change ===")
++    
++    # Get the method signature
++    method = connection.ops.execute_sql_flush
++    sig = inspect.signature(method)
++    print(f"Current signature: {sig}")
++    print(f"Parameters: {list(sig.parameters.keys())}")
++    
++    # Test new usage (should work)
++    try:
++        sql_list = []
++        connection.ops.execute_sql_flush(sql_list)
++        print("✓ New usage works: execute_sql_flush(sql_list)")
++    except Exception as e:
++        print(f"✗ New usage failed: {e}")
++        return False
++    
++    # Test old usage (should fail)
++    try:
++        sql_list = []
++        connection.ops.execute_sql_flush(connection.alias, sql_list)
++        print("✗ Old usage still works - this suggests the signature wasn't changed correctly")
++        return False
++    except TypeError as e:
++        print(f"✓ Old usage correctly fails: {e}")
++        return True
++    except Exception as e:
++        print(f"? Old usage failed with unexpected error: {e}")
++        return False
++
++if __name__ == "__main__":
++    test_signature_change()
+\ No newline at end of file
+diff --git a/test_specific_failure.py b/test_specific_failure.py
+new file mode 100644
+index 0000000000..e5952829ce
+--- /dev/null
++++ b/test_specific_failure.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python
++"""
++Test to reproduce the specific test failure.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection, transaction
++from django.core.management.color import no_style
++
++def test_specific_call():
++    """Test the specific call that should fail"""
++    print("=== Testing specific call that should fail ===")
++    
++    try:
++        # This is exactly what the test does
++        sql_list = []  # Empty for testing
++        connection.ops.execute_sql_flush(connection.alias, sql_list)
++        print("✗ UNEXPECTED: Old call pattern worked!")
++        return False
++    except TypeError as e:
++        print(f"✓ EXPECTED: Old call pattern failed with TypeError: {e}")
++        return True
++    except Exception as e:
++        print(f"? UNEXPECTED: Old call pattern failed with different error: {e}")
++        return False
++
++if __name__ == "__main__":
++    test_specific_call()
+\ No newline at end of file

@@ -1,0 +1,688 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index dddf7c679c..98c92c0f0b 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -137,11 +137,16 @@ class CreateModel(ModelOperation):
+                 ),
+             ]
+         elif isinstance(operation, AlterModelOptions) and self.name_lower == operation.name_lower:
++            # Merge options and remove any ALTER_OPTION_KEYS not in operation.options
++            merged_options = {**self.options, **operation.options}
++            for key in operation.ALTER_OPTION_KEYS:
++                if key not in operation.options:
++                    merged_options.pop(key, None)
+             return [
+                 CreateModel(
+                     self.name,
+                     fields=self.fields,
+-                    options={**self.options, **operation.options},
++                    options=merged_options,
+                     bases=self.bases,
+                     managers=self.managers,
+                 ),
+diff --git a/test_comprehensive_squash.py b/test_comprehensive_squash.py
+new file mode 100644
+index 0000000000..987e9cb43e
+--- /dev/null
++++ b/test_comprehensive_squash.py
+@@ -0,0 +1,238 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script for the squashmigrations fix.
++
++This script tests various edge cases to ensure the fix works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import migrations, models
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_complete_option_removal():
++    """Test that all ALTER_OPTION_KEYS are removed when operation.options is empty."""
++    
++    print("Test 1: Complete option removal...")
++    
++    create_operation = CreateModel(
++        name="TestModel",
++        fields=[("id", models.AutoField(primary_key=True))],
++        options={
++            "verbose_name": "Test Model",
++            "ordering": ["name"],
++            "permissions": [("can_test", "Can test")],
++            "managed": True,
++            "indexes": [],  # This should NOT be removed (not in ALTER_OPTION_KEYS)
++            "constraints": [],  # This should NOT be removed (not in ALTER_OPTION_KEYS)
++        }
++    )
++    
++    alter_operation = AlterModelOptions(name="TestModel", options={})
++    
++    reduced_operations = create_operation.reduce(alter_operation, "test_app")
++    reduced_create = reduced_operations[0]
++    
++    expected_remaining = {"indexes", "constraints"}
++    actual_remaining = set(reduced_create.options.keys())
++    
++    if actual_remaining == expected_remaining:
++        print("✅ Complete option removal works correctly")
++        return True
++    else:
++        print(f"❌ Expected: {expected_remaining}, Got: {actual_remaining}")
++        return False
++
++def test_partial_option_update():
++    """Test that only specified options are updated, others are removed."""
++    
++    print("Test 2: Partial option update...")
++    
++    create_operation = CreateModel(
++        name="TestModel",
++        fields=[("id", models.AutoField(primary_key=True))],
++        options={
++            "verbose_name": "Old Name",
++            "ordering": ["old_field"],
++            "permissions": [("old_perm", "Old Permission")],
++            "managed": True,
++            "indexes": [],
++            "constraints": [],
++        }
++    )
++    
++    alter_operation = AlterModelOptions(
++        name="TestModel", 
++        options={
++            "verbose_name": "New Name",  # Update this
++            "managed": False,  # Update this
++            # ordering and permissions should be removed
++        }
++    )
++    
++    reduced_operations = create_operation.reduce(alter_operation, "test_app")
++    reduced_create = reduced_operations[0]
++    
++    expected_options = {
++        "verbose_name": "New Name",
++        "managed": False,
++        "indexes": [],
++        "constraints": [],
++    }
++    
++    if reduced_create.options == expected_options:
++        print("✅ Partial option update works correctly")
++        return True
++    else:
++        print(f"❌ Expected: {expected_options}")
++        print(f"   Got: {reduced_create.options}")
++        return False
++
++def test_non_alter_option_keys_preserved():
++    """Test that options not in ALTER_OPTION_KEYS are always preserved."""
++    
++    print("Test 3: Non-ALTER_OPTION_KEYS preservation...")
++    
++    create_operation = CreateModel(
++        name="TestModel",
++        fields=[("id", models.AutoField(primary_key=True))],
++        options={
++            "verbose_name": "Test Model",
++            "ordering": ["name"],
++            "indexes": [{"fields": ["name"]}],
++            "constraints": [{"name": "test_constraint"}],
++            "db_table": "custom_table",  # This is not in ALTER_OPTION_KEYS
++        }
++    )
++    
++    alter_operation = AlterModelOptions(name="TestModel", options={})
++    
++    reduced_operations = create_operation.reduce(alter_operation, "test_app")
++    reduced_create = reduced_operations[0]
++    
++    # Should preserve indexes, constraints, and db_table
++    expected_preserved = {"indexes", "constraints", "db_table"}
++    actual_remaining = set(reduced_create.options.keys())
++    
++    if expected_preserved.issubset(actual_remaining):
++        print("✅ Non-ALTER_OPTION_KEYS are preserved correctly")
++        return True
++    else:
++        print(f"❌ Expected to preserve: {expected_preserved}")
++        print(f"   Actually remaining: {actual_remaining}")
++        return False
++
++def test_empty_original_options():
++    """Test that the fix works when original CreateModel has no options."""
++    
++    print("Test 4: Empty original options...")
++    
++    create_operation = CreateModel(
++        name="TestModel",
++        fields=[("id", models.AutoField(primary_key=True))],
++        options={}
++    )
++    
++    alter_operation = AlterModelOptions(
++        name="TestModel", 
++        options={"verbose_name": "New Name"}
++    )
++    
++    reduced_operations = create_operation.reduce(alter_operation, "test_app")
++    reduced_create = reduced_operations[0]
++    
++    expected_options = {"verbose_name": "New Name"}
++    
++    if reduced_create.options == expected_options:
++        print("✅ Empty original options works correctly")
++        return True
++    else:
++        print(f"❌ Expected: {expected_options}, Got: {reduced_create.options}")
++        return False
++
++def test_no_matching_model():
++    """Test that reduce returns None when model names don't match."""
++    
++    print("Test 5: Non-matching model names...")
++    
++    create_operation = CreateModel(
++        name="TestModel",
++        fields=[("id", models.AutoField(primary_key=True))],
++        options={"verbose_name": "Test Model"}
++    )
++    
++    alter_operation = AlterModelOptions(
++        name="DifferentModel", 
++        options={}
++    )
++    
++    reduced_operations = create_operation.reduce(alter_operation, "test_app")
++    
++    # When models don't match, reduce should return True (no reduction possible)
++    if reduced_operations is True:
++        print("✅ Non-matching model names handled correctly")
++        return True
++    else:
++        print(f"❌ Expected True, Got: {reduced_operations}")
++        return False
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("COMPREHENSIVE SQUASHMIGRATIONS FIX TESTING")
++    print("=" * 60)
++    
++    tests = [
++        test_complete_option_removal,
++        test_partial_option_update,
++        test_non_alter_option_keys_preserved,
++        test_empty_original_options,
++        test_no_matching_model,
++    ]
++    
++    results = []
++    for test in tests:
++        try:
++            result = test()
++            results.append(result)
++        except Exception as e:
++            print(f"❌ Test failed with exception: {e}")
++            results.append(False)
++        print()
++    
++    print("=" * 60)
++    print("SUMMARY:")
++    print("=" * 60)
++    
++    passed = sum(results)
++    total = len(results)
++    
++    print(f"Tests passed: {passed}/{total}")
++    
++    if passed == total:
++        print("🎉 All tests passed! The fix works correctly.")
++        sys.exit(0)
++    else:
++        print("❌ Some tests failed. Please review the implementation.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_reduce_fix.py b/test_reduce_fix.py
+new file mode 100644
+index 0000000000..3f73f1141e
+--- /dev/null
++++ b/test_reduce_fix.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python
++"""
++Test case for the CreateModel.reduce() fix that can be added to Django's test suite.
++
++This test ensures that when CreateModel.reduce() is called with an AlterModelOptions
++operation, it properly handles option removal according to ALTER_OPTION_KEYS.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import migrations, models
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++from django.test import TestCase
++
++class CreateModelReduceTests(TestCase):
++    """
++    Tests for CreateModel.reduce() method with AlterModelOptions operations.
++    """
++
++    def test_reduce_alter_model_options_clear_all(self):
++        """
++        CreateModel.reduce() with AlterModelOptions that clears all options
++        should remove all ALTER_OPTION_KEYS but preserve other options.
++        """
++        create_operation = CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            options={
++                "verbose_name": "Test Model",
++                "ordering": ["name"],
++                "permissions": [("can_test", "Can test")],
++                "managed": True,
++                "indexes": [],  # Should be preserved (not in ALTER_OPTION_KEYS)
++                "constraints": [],  # Should be preserved (not in ALTER_OPTION_KEYS)
++            }
++        )
++        
++        alter_operation = AlterModelOptions(name="TestModel", options={})
++        
++        reduced_operations = create_operation.reduce(alter_operation, "test_app")
++        self.assertEqual(len(reduced_operations), 1)
++        
++        reduced_create = reduced_operations[0]
++        self.assertIsInstance(reduced_create, CreateModel)
++        
++        # Should only have non-ALTER_OPTION_KEYS remaining
++        expected_options = {"indexes": [], "constraints": []}
++        self.assertEqual(reduced_create.options, expected_options)
++
++    def test_reduce_alter_model_options_partial_update(self):
++        """
++        CreateModel.reduce() with AlterModelOptions that updates some options
++        should update specified options and remove unspecified ALTER_OPTION_KEYS.
++        """
++        create_operation = CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            options={
++                "verbose_name": "Old Name",
++                "ordering": ["old_field"],
++                "permissions": [("old_perm", "Old Permission")],
++                "managed": True,
++                "indexes": [],
++                "constraints": [],
++            }
++        )
++        
++        alter_operation = AlterModelOptions(
++            name="TestModel", 
++            options={
++                "verbose_name": "New Name",  # Update this
++                "managed": False,  # Update this
++                # ordering and permissions should be removed
++            }
++        )
++        
++        reduced_operations = create_operation.reduce(alter_operation, "test_app")
++        self.assertEqual(len(reduced_operations), 1)
++        
++        reduced_create = reduced_operations[0]
++        expected_options = {
++            "verbose_name": "New Name",
++            "managed": False,
++            "indexes": [],
++            "constraints": [],
++        }
++        self.assertEqual(reduced_create.options, expected_options)
++
++    def test_reduce_alter_model_options_preserve_non_alter_keys(self):
++        """
++        CreateModel.reduce() should preserve options that are not in ALTER_OPTION_KEYS.
++        """
++        create_operation = CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            options={
++                "verbose_name": "Test Model",
++                "ordering": ["name"],
++                "db_table": "custom_table",  # Not in ALTER_OPTION_KEYS
++                "indexes": [{"fields": ["name"]}],  # Not in ALTER_OPTION_KEYS
++                "constraints": [{"name": "test_constraint"}],  # Not in ALTER_OPTION_KEYS
++            }
++        )
++        
++        alter_operation = AlterModelOptions(name="TestModel", options={})
++        
++        reduced_operations = create_operation.reduce(alter_operation, "test_app")
++        reduced_create = reduced_operations[0]
++        
++        # Should preserve db_table, indexes, constraints
++        self.assertIn("db_table", reduced_create.options)
++        self.assertIn("indexes", reduced_create.options)
++        self.assertIn("constraints", reduced_create.options)
++        self.assertEqual(reduced_create.options["db_table"], "custom_table")
++        
++        # Should remove ALTER_OPTION_KEYS
++        self.assertNotIn("verbose_name", reduced_create.options)
++        self.assertNotIn("ordering", reduced_create.options)
++
++    def test_reduce_alter_model_options_different_model(self):
++        """
++        CreateModel.reduce() should return True when model names don't match.
++        """
++        create_operation = CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            options={"verbose_name": "Test Model"}
++        )
++        
++        alter_operation = AlterModelOptions(
++            name="DifferentModel", 
++            options={}
++        )
++        
++        result = create_operation.reduce(alter_operation, "test_app")
++        self.assertTrue(result)  # Should return True (no reduction possible)
++
++if __name__ == "__main__":
++    # Run the tests
++    import unittest
++    unittest.main(verbosity=2)
+\ No newline at end of file
+diff --git a/test_squash_issue.py b/test_squash_issue.py
+new file mode 100644
+index 0000000000..aef75e423e
+--- /dev/null
++++ b/test_squash_issue.py
+@@ -0,0 +1,169 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the squashmigrations issue with model options.
++
++This script demonstrates that when an AlterModelOptions operation with empty options
++is squashed into a CreateModel operation, the model options are not properly cleared.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import migrations, models
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++def test_squash_issue():
++    """Test that demonstrates the squash issue with model options."""
++    
++    print("Testing squashmigrations issue with model options...")
++    
++    # Create a CreateModel operation with some options
++    create_operation = CreateModel(
++        name="TestModel",
++        fields=[
++            ("id", models.AutoField(primary_key=True)),
++            ("name", models.CharField(max_length=100)),
++        ],
++        options={
++            "verbose_name": "Test Model",
++            "ordering": ["name"],
++            "permissions": [("can_test", "Can test")],
++        }
++    )
++    
++    print(f"Original CreateModel options: {create_operation.options}")
++    
++    # Create an AlterModelOptions operation that clears all options
++    alter_operation = AlterModelOptions(
++        name="TestModel",
++        options={}  # This should clear all options
++    )
++    
++    print(f"AlterModelOptions options: {alter_operation.options}")
++    
++    # Test the reduce operation (this is what squashmigrations does)
++    reduced_operations = create_operation.reduce(alter_operation, "test_app")
++    
++    if reduced_operations:
++        reduced_create = reduced_operations[0]
++        print(f"Reduced CreateModel options: {reduced_create.options}")
++        
++        # Check if the options were properly cleared
++        if reduced_create.options:
++            print("❌ BUG REPRODUCED: Options were not cleared!")
++            print(f"   Expected: {{}}")
++            print(f"   Actual: {reduced_create.options}")
++            return False
++        else:
++            print("✅ Options were properly cleared")
++            return True
++    else:
++        print("❌ No reduced operations returned")
++        return False
++
++def test_alter_model_options_state_forwards():
++    """Test that AlterModelOptions.state_forwards() correctly handles option removal."""
++    
++    print("\nTesting AlterModelOptions.state_forwards() behavior...")
++    
++    from django.db.migrations.state import ProjectState, ModelState
++    
++    # Create a project state with a model that has options
++    project_state = ProjectState()
++    model_state = ModelState(
++        app_label="test_app",
++        name="TestModel",
++        fields=[
++            ("id", models.AutoField(primary_key=True)),
++            ("name", models.CharField(max_length=100)),
++        ],
++        options={
++            "verbose_name": "Test Model",
++            "ordering": ["name"],
++            "permissions": [("can_test", "Can test")],
++        }
++    )
++    project_state.add_model(model_state)
++    
++    print(f"Original model options: {model_state.options}")
++    
++    # Create an AlterModelOptions operation that clears all options
++    alter_operation = AlterModelOptions(
++        name="TestModel",
++        options={}
++    )
++    
++    # Apply the operation
++    alter_operation.state_forwards("test_app", project_state)
++    
++    # Check the result
++    updated_model = project_state.models["test_app", "testmodel"]
++    print(f"Updated model options: {updated_model.options}")
++    
++    # Check if options were properly cleared
++    # Only options NOT in ALTER_OPTION_KEYS should remain
++    alter_option_keys = set(alter_operation.ALTER_OPTION_KEYS)
++    actual_remaining_options = set(updated_model.options.keys())
++    
++    # Check if any ALTER_OPTION_KEYS remain (they shouldn't)
++    remaining_alter_options = actual_remaining_options & alter_option_keys
++    
++    if not remaining_alter_options:
++        print("✅ AlterModelOptions.state_forwards() correctly clears options")
++        print(f"   Remaining non-ALTER_OPTION_KEYS: {actual_remaining_options}")
++        return True
++    else:
++        print("❌ AlterModelOptions.state_forwards() did not clear options properly")
++        print(f"   ALTER_OPTION_KEYS that should be cleared: {remaining_alter_options}")
++        print(f"   All remaining options: {actual_remaining_options}")
++        return False
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("TESTING SQUASHMIGRATIONS MODEL OPTIONS ISSUE")
++    print("=" * 60)
++    
++    # Test the current behavior
++    bug_reproduced = not test_squash_issue()
++    alter_works = test_alter_model_options_state_forwards()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print("=" * 60)
++    
++    if bug_reproduced:
++        print("❌ BUG CONFIRMED: CreateModel.reduce() does not clear options properly")
++    else:
++        print("✅ CreateModel.reduce() works correctly")
++        
++    if alter_works:
++        print("✅ AlterModelOptions.state_forwards() works correctly")
++    else:
++        print("❌ AlterModelOptions.state_forwards() has issues")
++    
++    if bug_reproduced and alter_works:
++        print("\n🔧 CONCLUSION: The issue is in CreateModel.reduce() - it should use")
++        print("   the same logic as AlterModelOptions.state_forwards() to handle option removal")
++    
++    sys.exit(1 if bug_reproduced else 0)
+\ No newline at end of file
+diff --git a/tests/migrations/test_operations.py b/tests/migrations/test_operations.py
+index 38ad6a2d18..3a4f6a981e 100644
+--- a/tests/migrations/test_operations.py
++++ b/tests/migrations/test_operations.py
+@@ -3330,6 +3330,70 @@ class OperationTests(OperationTestBase):
+             operation.database_backwards(app_label, editor, new_state, project_state)
+         assertModelsAndTables(after_db=False)
+ 
++    def test_create_model_reduce_alter_model_options(self):
++        """
++        CreateModel.reduce() with AlterModelOptions should properly handle
++        option removal according to ALTER_OPTION_KEYS.
++        """
++        # Test complete option removal
++        create_operation = migrations.CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            options={
++                "verbose_name": "Test Model",
++                "ordering": ["name"],
++                "permissions": [("can_test", "Can test")],
++                "managed": True,
++                "indexes": [],  # Should be preserved (not in ALTER_OPTION_KEYS)
++                "constraints": [],  # Should be preserved (not in ALTER_OPTION_KEYS)
++            }
++        )
++        
++        alter_operation = migrations.AlterModelOptions(name="TestModel", options={})
++        
++        reduced_operations = create_operation.reduce(alter_operation, "test_app")
++        self.assertEqual(len(reduced_operations), 1)
++        
++        reduced_create = reduced_operations[0]
++        self.assertIsInstance(reduced_create, migrations.CreateModel)
++        
++        # Should only have non-ALTER_OPTION_KEYS remaining
++        expected_options = {"indexes": [], "constraints": []}
++        self.assertEqual(reduced_create.options, expected_options)
++
++        # Test partial option update
++        create_operation = migrations.CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            options={
++                "verbose_name": "Old Name",
++                "ordering": ["old_field"],
++                "permissions": [("old_perm", "Old Permission")],
++                "managed": True,
++                "indexes": [],
++                "constraints": [],
++            }
++        )
++        
++        alter_operation = migrations.AlterModelOptions(
++            name="TestModel", 
++            options={
++                "verbose_name": "New Name",  # Update this
++                "managed": False,  # Update this
++                # ordering and permissions should be removed
++            }
++        )
++        
++        reduced_operations = create_operation.reduce(alter_operation, "test_app")
++        reduced_create = reduced_operations[0]
++        expected_options = {
++            "verbose_name": "New Name",
++            "managed": False,
++            "indexes": [],
++            "constraints": [],
++        }
++        self.assertEqual(reduced_create.options, expected_options)
++
+ 
+ class SwappableOperationTests(OperationTestBase):
+     """

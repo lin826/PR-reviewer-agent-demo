@@ -1,0 +1,223 @@
+diff --git a/django/db/models/sql/where.py b/django/db/models/sql/where.py
+index aaab1730b7..17f05008c9 100644
+--- a/django/db/models/sql/where.py
++++ b/django/db/models/sql/where.py
+@@ -129,13 +129,16 @@ class WhereNode(tree.Node):
+             # Convert if the database doesn't support XOR:
+             #   a XOR b XOR c XOR ...
+             # to:
+-            #   (a OR b OR c OR ...) AND (a + b + c + ...) == 1
++            #   (a OR b OR c OR ...) AND (a + b + c + ...) % 2 == 1
++            # This ensures XOR works correctly for any number of terms
++            # (true when an odd number of terms are true)
+             lhs = self.__class__(self.children, OR)
+             rhs_sum = reduce(
+                 operator.add,
+                 (Case(When(c, then=1), default=0) for c in self.children),
+             )
+-            rhs = Exact(1, rhs_sum)
++            from django.db.models.functions import Mod
++            rhs = Exact(1, Mod(rhs_sum, 2))
+             return self.__class__([lhs, rhs], AND, self.negated).as_sql(
+                 compiler, connection
+             )
+diff --git a/test_xor_fix_comprehensive.py b/test_xor_fix_comprehensive.py
+new file mode 100644
+index 0000000000..54f5c5efdf
+--- /dev/null
++++ b/test_xor_fix_comprehensive.py
+@@ -0,0 +1,108 @@
++"""
++Comprehensive test for Django XOR fix
++This test verifies that XOR operations with 3+ terms work correctly
++in both native XOR-supporting databases and databases without XOR support
++"""
++import os
++import sys
++import django
++from django.db import connection, models
++from django.db.models import Q
++from django.conf import settings
++
++# Configure a minimal Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',  # Use an in-memory database for testing
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    USE_TZ=False,
++)
++
++django.setup()
++
++
++# Define test models
++class TestItem(models.Model):
++    value = models.IntegerField()
++    name = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = "test_xor_app"
++    
++    def __str__(self):
++        return f"{self.name} ({self.value})"
++
++
++def setup_test_data():
++    """Create test data for various XOR test cases"""
++    # Create the table manually since we're not using migrations
++    with connection.cursor() as cursor:
++        cursor.execute("CREATE TABLE IF NOT EXISTS test_xor_app_testitem (id INTEGER PRIMARY KEY, value INTEGER, name TEXT)")
++        # Clear any existing data
++        cursor.execute("DELETE FROM test_xor_app_testitem")
++        
++        # Add test records
++        test_data = [
++            (1, 10, "item1"),
++            (2, 20, "item2"),
++            (3, 30, "item3"),
++            (4, 40, "item4"),
++            (5, 50, "item5"),
++        ]
++        cursor.executemany(
++            "INSERT INTO test_xor_app_testitem (id, value, name) VALUES (?, ?, ?)",
++            test_data
++        )
++
++
++def test_multi_term_xor():
++    """Test XOR operations with various numbers of terms"""
++    print("Testing multiple XOR terms...")
++    
++    # Get database info
++    db_engine = connection.settings_dict['ENGINE'].split('.')[-1]
++    supports_xor = connection.features.supports_logical_xor
++    print(f"Database: {db_engine}, Native XOR support: {supports_xor}")
++    
++    # Test different combinations
++    print("\nMulti-term XOR tests with same condition (all true):")
++    print(" 2-term: 10=10 XOR 10=10 = ", TestItem.objects.filter(Q(value=10) ^ Q(value=10)).count())  # 0
++    print(" 3-term: 10=10 XOR 10=10 XOR 10=10 = ", TestItem.objects.filter(Q(value=10) ^ Q(value=10) ^ Q(value=10)).count())  # 1
++    print(" 4-term: 10=10 XOR 10=10 XOR 10=10 XOR 10=10 = ", TestItem.objects.filter(Q(value=10) ^ Q(value=10) ^ Q(value=10) ^ Q(value=10)).count())  # 0
++    print(" 5-term: 10=10 XOR 10=10 XOR 10=10 XOR 10=10 XOR 10=10 = ", TestItem.objects.filter(Q(value=10) ^ Q(value=10) ^ Q(value=10) ^ Q(value=10) ^ Q(value=10)).count())  # 1
++    
++    print("\nMulti-term XOR tests with mixed conditions:")
++    # These correspond to 1, 2, 3, 4, and 5 items matching
++    one_match = Q(id=1)  # Just item1
++    two_match = Q(value__lt=30)  # item1, item2
++    three_match = Q(value__lt=40)  # item1, item2, item3
++    four_match = Q(value__lt=50)  # item1, item2, item3, item4
++    five_match = Q(value__lt=60)  # all items
++    
++    print(" 3-term: (match 1) XOR (match 2) XOR (match 3) = ", 
++          TestItem.objects.filter(one_match ^ two_match ^ three_match).count())
++    print(" 3-term: (match 1) XOR (match 3) XOR (match 5) = ", 
++          TestItem.objects.filter(one_match ^ three_match ^ five_match).count())
++    print(" 4-term: (match 1) XOR (match 2) XOR (match 3) XOR (match 4) = ", 
++          TestItem.objects.filter(one_match ^ two_match ^ three_match ^ four_match).count())
++    print(" 5-term: (match 1) XOR (match 2) XOR (match 3) XOR (match 4) XOR (match 5) = ", 
++          TestItem.objects.filter(one_match ^ two_match ^ three_match ^ four_match ^ five_match).count())
++    
++    # Show examples of SQL generated
++    query = TestItem.objects.filter(one_match ^ two_match ^ three_match)
++    print("\nSQL for 3-term XOR with different conditions:")
++    print(query.query)
++
++
++if __name__ == "__main__":
++    print("Running XOR comprehensive test...")
++    setup_test_data()
++    test_multi_term_xor()
+\ No newline at end of file
+diff --git a/test_xor_issue.py b/test_xor_issue.py
+new file mode 100644
+index 0000000000..931b1ef303
+--- /dev/null
++++ b/test_xor_issue.py
+@@ -0,0 +1,78 @@
++import os
++import sys
++import django
++from django.db import connection, models
++from django.db.models import Q
++from django.core.management.color import no_style
++from django.conf import settings
++
++# Configure a minimal Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',  # Use an in-memory database for testing
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    USE_TZ=False,
++)
++
++django.setup()
++
++
++# Define a simple model for testing
++class TestModel(models.Model):
++    value = models.IntegerField()
++    
++    class Meta:
++        app_label = "test_xor_app"
++        # This ensures the model only exists in memory
++        managed = False
++
++
++def setup_test_environment():
++    """Setup a table for testing"""
++    # Create the table
++    with connection.cursor() as cursor:
++        cursor.execute("CREATE TABLE IF NOT EXISTS test_xor_app_testmodel (id INTEGER PRIMARY KEY, value INTEGER)")
++        # Ensure we have our test data
++        cursor.execute("DELETE FROM test_xor_app_testmodel")
++        cursor.execute("INSERT INTO test_xor_app_testmodel (id, value) VALUES (1, 37)")
++
++
++def run_tests():
++    """Run tests to verify XOR operations"""
++    setup_test_environment()
++    
++    # Check if the database supports XOR natively
++    supports_xor = connection.features.supports_logical_xor
++    print(f"Database supports logical XOR: {supports_xor}")
++    
++    # Test cases
++    test_results = []
++    test_results.append(TestModel.objects.filter(Q(value=37)).count())  # Should be 1
++    test_results.append(TestModel.objects.filter(Q(value=37) ^ Q(value=37)).count())  # Should be 0
++    test_results.append(TestModel.objects.filter(Q(value=37) ^ Q(value=37) ^ Q(value=37)).count())  # Should be 1 (odd number)
++    test_results.append(TestModel.objects.filter(Q(value=37) ^ Q(value=37) ^ Q(value=37) ^ Q(value=37)).count())  # Should be 0 (even number)
++    test_results.append(TestModel.objects.filter(Q(value=37) ^ Q(value=37) ^ Q(value=37) ^ Q(value=37) ^ Q(value=37)).count())  # Should be 1 (odd number)
++    
++    expected_results = [1, 0, 1, 0, 1]
++    
++    print("\nResults:")
++    for i, (result, expected) in enumerate(zip(test_results, expected_results)):
++        match = result == expected
++        print(f"Test {i+1}: Got {result}, Expected {expected} - {'✓' if match else '✗'}")
++    
++    print("\nSQL Query Examples:")
++    # Print SQL for a 3-term XOR query
++    query = TestModel.objects.filter(Q(value=37) ^ Q(value=37) ^ Q(value=37))
++    print(f"3-term XOR query SQL: {query.query}")
++
++
++if __name__ == "__main__":
++    run_tests()
+\ No newline at end of file

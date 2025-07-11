@@ -1,0 +1,201 @@
+diff --git a/benchmark_resolver.py b/benchmark_resolver.py
+new file mode 100644
+index 0000000000..e2390b4917
+--- /dev/null
++++ b/benchmark_resolver.py
+@@ -0,0 +1,67 @@
++import os
++import sys
++import time
++
++# Add Django project to path
++sys.path.insert(0, os.path.abspath('.'))
++
++# Define minimal Django settings
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test_secret_key',
++    ROOT_URLCONF='django.contrib.auth.urls',  # Use a URL pattern with many routes
++    INSTALLED_APPS=[
++        'django.contrib.admin',
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++        'django.contrib.sessions',
++    ],
++)
++
++# Import Django components
++import django
++django.setup()
++
++from django.urls.base import get_urlconf, set_urlconf, clear_url_caches
++from django.urls.resolvers import get_resolver
++
++
++def simulate_multiple_resolver_creations(iterations=100):
++    """Simulate a scenario where resolver is created both before and after set_urlconf."""
++    start_time = time.time()
++
++    for _ in range(iterations):
++        # Simulate code that might run at import time
++        resolver1 = get_resolver(None)
++
++        # Simulate request handling that calls set_urlconf
++        set_urlconf(settings.ROOT_URLCONF)
++
++        # Simulate code that runs during/after a request
++        resolver2 = get_resolver(get_urlconf())
++
++        # Reset for next iteration
++        set_urlconf(None)
++        clear_url_caches()
++
++    duration = time.time() - start_time
++    print(f"Completed {iterations} iterations in {duration:.4f} seconds")
++    print(f"Average time per iteration: {(duration / iterations) * 1000:.4f} ms")
++
++    return duration
++
++
++if __name__ == "__main__":
++    print("Running resolver creation benchmark")
++    print("==================================")
++
++    # Warm up to initialize any lazy loading
++    print("Warming up...")
++    simulate_multiple_resolver_creations(5)
++    clear_url_caches()
++
++    # Run the actual benchmark
++    print("\nRunning benchmark tests...")
++    simulate_multiple_resolver_creations(100)
+\ No newline at end of file
+diff --git a/django/urls/base.py b/django/urls/base.py
+index 0e1c3d909c..eafd8d58e0 100644
+--- a/django/urls/base.py
++++ b/django/urls/base.py
+@@ -92,7 +92,8 @@ reverse_lazy = lazy(reverse, str)
+
+ def clear_url_caches():
+     get_callable.cache_clear()
+-    get_resolver.cache_clear()
++    from django.urls.resolvers import _get_resolver
++    _get_resolver.cache_clear()
+     get_ns_resolver.cache_clear()
+
+
+diff --git a/django/urls/resolvers.py b/django/urls/resolvers.py
+index 247e3680c0..b6fddd5a4f 100644
+--- a/django/urls/resolvers.py
++++ b/django/urls/resolvers.py
+@@ -63,10 +63,13 @@ class ResolverMatch:
+         )
+
+
+-@functools.lru_cache(maxsize=None)
+ def get_resolver(urlconf=None):
+     if urlconf is None:
+         urlconf = settings.ROOT_URLCONF
++    return _get_resolver(urlconf)
++
++@functools.lru_cache(maxsize=None)
++def _get_resolver(urlconf):
+     return URLResolver(RegexPattern(r'^/'), urlconf)
+
+
+diff --git a/test_resolver_optimization.py b/test_resolver_optimization.py
+new file mode 100644
+index 0000000000..6caf81c9a2
+--- /dev/null
++++ b/test_resolver_optimization.py
+@@ -0,0 +1,87 @@
++import os
++import sys
++import time
++from functools import wraps
++
++# Add Django project to path
++sys.path.insert(0, os.path.abspath('.'))
++
++# Define minimal Django settings
++from django.conf import settings
++from django.conf import global_settings
++
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test_secret_key',
++    ROOT_URLCONF='django.contrib.auth.urls',
++    INSTALLED_APPS=[
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++    ],
++)
++
++# Import Django components
++import django
++from django.urls.base import get_urlconf, set_urlconf, clear_url_caches
++from django.urls.resolvers import get_resolver
++
++django.setup()
++
++# Timer decorator to measure function performance
++def timeit(func):
++    @wraps(func)
++    def wrapper(*args, **kwargs):
++        start = time.time()
++        result = func(*args, **kwargs)
++        end = time.time()
++        print(f"{func.__name__} took {end - start:.6f} seconds")
++        return result
++    return wrapper
++
++# Clear the cache to ensure a clean test
++@timeit
++def clear_cache():
++    print("Clearing URL caches...")
++    clear_url_caches()
++    # We can't check the cache info for the inner _get_resolver function directly
++    # So we'll just continue with the test
++
++# Test function to demonstrate the issue
++@timeit
++def test_resolver_creation():
++    print("Testing resolver creation...")
++
++    # First, call get_resolver with None (simulating code that runs at import time)
++    print("\nStep 1: Call get_resolver() with None (pre-request)")
++    resolver1 = get_resolver(None)
++    print(f"  - resolver1: {resolver1}")
++    print(f"  - resolver1._populated: {resolver1._populated}")
++    # We're using _get_resolver under the hood now, so we can't check cache info
++
++    # Now set the urlconf to ROOT_URLCONF (simulating request processing)
++    print("\nStep 2: Call set_urlconf(settings.ROOT_URLCONF) (during request)")
++    set_urlconf(settings.ROOT_URLCONF)
++    print(f"  - Current urlconf: {get_urlconf()}")
++
++    # Get resolver again (simulating code that runs during/after request)
++    print("\nStep 3: Call get_resolver() from code after request handling")
++    resolver2 = get_resolver(get_urlconf())
++    print(f"  - resolver2: {resolver2}")
++    print(f"  - resolver2._populated: {resolver2._populated}")
++    # We're using _get_resolver under the hood now, so we can't check cache info
++
++    # Check if we got the same resolver instance
++    print("\nStep 4: Comparing resolvers")
++    print(f"  - Same instances: {resolver1 is resolver2}")
++
++    # Reset urlconf for next tests
++    set_urlconf(None)
++
++def main():
++    # Initial test shows the problem
++    print("\n=== WITH FIX ===")
++    clear_cache()
++    test_resolver_creation()
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file

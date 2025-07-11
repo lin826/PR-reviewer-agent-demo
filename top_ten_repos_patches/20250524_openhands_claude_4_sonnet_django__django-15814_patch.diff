@@ -1,0 +1,515 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..f5d532f07d
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,172 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script for the proxy model fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models from the issue description
++class CustomModel(models.Model):
++    name = models.CharField(max_length=16)
++    description = models.CharField(max_length=100, default="")
++    
++    class Meta:
++        app_label = '__main__'
++
++class ProxyCustomModel(CustomModel):
++    class Meta:
++        proxy = True
++        app_label = '__main__'
++
++class AnotherModel(models.Model):
++    custom = models.ForeignKey(
++        ProxyCustomModel,
++        on_delete=models.SET_NULL,
++        null=True,
++        blank=True,
++    )
++    title = models.CharField(max_length=50, default="")
++    
++    class Meta:
++        app_label = '__main__'
++
++# Test proxy of proxy
++class ProxyProxyCustomModel(ProxyCustomModel):
++    class Meta:
++        proxy = True
++        app_label = '__main__'
++
++class ThirdModel(models.Model):
++    proxy_proxy_custom = models.ForeignKey(
++        ProxyProxyCustomModel,
++        on_delete=models.SET_NULL,
++        null=True,
++        blank=True,
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++def run_tests():
++    """Run comprehensive tests for the proxy model fix."""
++    from django.db import connection
++    
++    # Create tables for our models
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(CustomModel)
++        schema_editor.create_model(AnotherModel)
++        schema_editor.create_model(ThirdModel)
++    
++    # Create test data
++    custom = ProxyCustomModel.objects.create(name="test_name", description="test_desc")
++    another = AnotherModel.objects.create(custom=custom, title="test_title")
++    
++    proxy_proxy_custom = ProxyProxyCustomModel.objects.create(name="proxy_proxy_name", description="proxy_proxy_desc")
++    third = ThirdModel.objects.create(proxy_proxy_custom=proxy_proxy_custom)
++    
++    print("Created test data successfully")
++    
++    tests = [
++        # Test 1: Original issue case
++        {
++            'name': 'Original issue case',
++            'query': lambda: list(AnotherModel.objects.select_related("custom").only("custom__name").all()),
++            'expected_count': 1
++        },
++        
++        # Test 2: Multiple fields from proxy model
++        {
++            'name': 'Multiple fields from proxy model',
++            'query': lambda: list(AnotherModel.objects.select_related("custom").only("custom__name", "custom__description").all()),
++            'expected_count': 1
++        },
++        
++        # Test 3: Mix of local and proxy fields
++        {
++            'name': 'Mix of local and proxy fields',
++            'query': lambda: list(AnotherModel.objects.select_related("custom").only("title", "custom__name").all()),
++            'expected_count': 1
++        },
++        
++        # Test 4: Proxy of proxy model
++        {
++            'name': 'Proxy of proxy model',
++            'query': lambda: list(ThirdModel.objects.select_related("proxy_proxy_custom").only("proxy_proxy_custom__name").all()),
++            'expected_count': 1
++        },
++        
++        # Test 5: Only local fields (should still work)
++        {
++            'name': 'Only local fields',
++            'query': lambda: list(AnotherModel.objects.only("title").all()),
++            'expected_count': 1
++        },
++        
++        # Test 6: Select related without only (should still work)
++        {
++            'name': 'Select related without only',
++            'query': lambda: list(AnotherModel.objects.select_related("custom").all()),
++            'expected_count': 1
++        },
++    ]
++    
++    all_passed = True
++    
++    for test in tests:
++        try:
++            print(f"\nRunning test: {test['name']}")
++            result = test['query']()
++            if len(result) == test['expected_count']:
++                print(f"✓ Test passed! Found {len(result)} objects")
++                # Try to access the fields to ensure they're properly loaded
++                for obj in result:
++                    if hasattr(obj, 'custom') and obj.custom:
++                        if hasattr(obj.custom, 'name'):
++                            print(f"  - custom.name: {obj.custom.name}")
++                    if hasattr(obj, 'proxy_proxy_custom') and obj.proxy_proxy_custom:
++                        if hasattr(obj.proxy_proxy_custom, 'name'):
++                            print(f"  - proxy_proxy_custom.name: {obj.proxy_proxy_custom.name}")
++            else:
++                print(f"✗ Test failed! Expected {test['expected_count']} objects, got {len(result)}")
++                all_passed = False
++        except Exception as e:
++            print(f"✗ Test failed with error: {type(e).__name__}: {e}")
++            import traceback
++            traceback.print_exc()
++            all_passed = False
++    
++    return all_passed
++
++if __name__ == "__main__":
++    success = run_tests()
++    if success:
++        print("\n🎉 All tests passed!")
++        sys.exit(0)
++    else:
++        print("\n❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 33cc636b22..5036335bec 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -748,7 +748,7 @@ class Query(BaseExpression):
+                     cur_model = source.related_model
+                 else:
+                     cur_model = source.remote_field.model
+-                opts = cur_model._meta
++                opts = cur_model._meta.concrete_model._meta
+                 # Even if we're "just passing through" this model, we must add
+                 # both the current model's pk and the related reference field
+                 # (if it's not a reverse relation) to the things we select.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fb2c927163
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the issue with QuerySet.only() after select_related() crash on proxy models.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models from the issue description
++class CustomModel(models.Model):
++    name = models.CharField(max_length=16)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ProxyCustomModel(CustomModel):
++    class Meta:
++        proxy = True
++        app_label = '__main__'
++
++class AnotherModel(models.Model):
++    custom = models.ForeignKey(
++        ProxyCustomModel,
++        on_delete=models.SET_NULL,
++        null=True,
++        blank=True,
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_issue():
++    """Test the issue described in the bug report."""
++    from django.db import connection
++    
++    # Create tables for our models
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(CustomModel)
++        schema_editor.create_model(AnotherModel)
++    
++    # Create test data
++    custom = ProxyCustomModel.objects.create(name="test_name")
++    another = AnotherModel.objects.create(custom=custom)
++    
++    print("Created test data successfully")
++    
++    # This should crash with ValueError: 'id' is not in list
++    try:
++        print("Attempting the problematic query...")
++        objs = list(AnotherModel.objects.select_related("custom").only("custom__name").all())
++        print(f"Query succeeded! Found {len(objs)} objects")
++        for obj in objs:
++            print(f"Object: {obj}, custom.name: {obj.custom.name}")
++    except Exception as e:
++        print(f"Error occurred: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = test_issue()
++    if success:
++        print("Test passed!")
++        sys.exit(0)
++    else:
++        print("Test failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_proxy_only_fix.py b/test_proxy_only_fix.py
+new file mode 100644
+index 0000000000..83651230e4
+--- /dev/null
++++ b/test_proxy_only_fix.py
+@@ -0,0 +1,162 @@
++"""
++Test case for the proxy model + select_related + only fix.
++This test can be added to the Django test suite.
++"""
++
++from django.test import TestCase
++from django.db import models
++
++
++class ProxyOnlyTestModels:
++    """Models for testing proxy model with select_related and only."""
++    
++    class CustomModel(models.Model):
++        name = models.CharField(max_length=16)
++        description = models.CharField(max_length=100, default="")
++        
++        class Meta:
++            app_label = 'defer'  # Use existing app for testing
++    
++    class ProxyCustomModel(CustomModel):
++        class Meta:
++            proxy = True
++            app_label = 'defer'
++    
++    class AnotherModel(models.Model):
++        custom = models.ForeignKey(
++            ProxyCustomModel,
++            on_delete=models.SET_NULL,
++            null=True,
++            blank=True,
++        )
++        title = models.CharField(max_length=50, default="")
++        
++        class Meta:
++            app_label = 'defer'
++
++
++class ProxyModelSelectRelatedOnlyTest(TestCase):
++    """Test that select_related + only works correctly with proxy models."""
++    
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        # Create the test models dynamically
++        cls.CustomModel = ProxyOnlyTestModels.CustomModel
++        cls.ProxyCustomModel = ProxyOnlyTestModels.ProxyCustomModel
++        cls.AnotherModel = ProxyOnlyTestModels.AnotherModel
++        
++        # Create tables
++        from django.db import connection
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(cls.CustomModel)
++            schema_editor.create_model(cls.AnotherModel)
++    
++    @classmethod
++    def tearDownClass(cls):
++        # Clean up tables
++        from django.db import connection
++        with connection.schema_editor() as schema_editor:
++            schema_editor.delete_model(cls.AnotherModel)
++            schema_editor.delete_model(cls.CustomModel)
++        super().tearDownClass()
++    
++    def test_select_related_only_with_proxy_model(self):
++        """
++        Test that select_related() + only() works with proxy models.
++        This was failing with ValueError: 'id' is not in list before the fix.
++        """
++        # Create test data
++        custom = self.ProxyCustomModel.objects.create(
++            name="test_name", 
++            description="test_desc"
++        )
++        another = self.AnotherModel.objects.create(
++            custom=custom, 
++            title="test_title"
++        )
++        
++        # This should not raise ValueError: 'id' is not in list
++        objs = list(
++            self.AnotherModel.objects
++            .select_related("custom")
++            .only("custom__name")
++            .all()
++        )
++        
++        self.assertEqual(len(objs), 1)
++        self.assertEqual(objs[0].custom.name, "test_name")
++    
++    def test_select_related_only_multiple_fields_proxy_model(self):
++        """Test select_related + only with multiple fields from proxy model."""
++        custom = self.ProxyCustomModel.objects.create(
++            name="test_name", 
++            description="test_desc"
++        )
++        another = self.AnotherModel.objects.create(
++            custom=custom, 
++            title="test_title"
++        )
++        
++        objs = list(
++            self.AnotherModel.objects
++            .select_related("custom")
++            .only("custom__name", "custom__description")
++            .all()
++        )
++        
++        self.assertEqual(len(objs), 1)
++        self.assertEqual(objs[0].custom.name, "test_name")
++        self.assertEqual(objs[0].custom.description, "test_desc")
++    
++    def test_select_related_only_mixed_fields_proxy_model(self):
++        """Test select_related + only with mix of local and proxy fields."""
++        custom = self.ProxyCustomModel.objects.create(
++            name="test_name", 
++            description="test_desc"
++        )
++        another = self.AnotherModel.objects.create(
++            custom=custom, 
++            title="test_title"
++        )
++        
++        objs = list(
++            self.AnotherModel.objects
++            .select_related("custom")
++            .only("title", "custom__name")
++            .all()
++        )
++        
++        self.assertEqual(len(objs), 1)
++        self.assertEqual(objs[0].title, "test_title")
++        self.assertEqual(objs[0].custom.name, "test_name")
++
++
++if __name__ == '__main__':
++    import django
++    from django.conf import settings
++    from django.test.utils import get_runner
++    
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            DATABASES={
++                'default': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                    'NAME': ':memory:',
++                }
++            },
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++                'defer',
++            ],
++            USE_TZ=True,
++        )
++    
++    django.setup()
++    TestRunner = get_runner(settings)
++    test_runner = TestRunner()
++    failures = test_runner.run_tests(["__main__"])
++    if failures:
++        exit(1)
+\ No newline at end of file
+diff --git a/tests/defer/models.py b/tests/defer/models.py
+index 6de2e2af97..609fe77ed6 100644
+--- a/tests/defer/models.py
++++ b/tests/defer/models.py
+@@ -58,3 +58,22 @@ class ShadowParent(models.Model):
+ 
+ class ShadowChild(ShadowParent):
+     name = models.CharField(default="adonis", max_length=6)
++
++
++# Models for testing the proxy model + select_related + only issue
++class CustomModel(models.Model):
++    name = models.CharField(max_length=16)
++
++
++class ProxyCustomModel(CustomModel):
++    class Meta:
++        proxy = True
++
++
++class AnotherModel(models.Model):
++    custom = models.ForeignKey(
++        ProxyCustomModel,
++        on_delete=models.SET_NULL,
++        null=True,
++        blank=True,
++    )
+diff --git a/tests/defer/tests.py b/tests/defer/tests.py
+index d2cff258b4..a8bc1b753f 100644
+--- a/tests/defer/tests.py
++++ b/tests/defer/tests.py
+@@ -255,6 +255,22 @@ class TestDefer2(AssertionMixin, TestCase):
+         self.assertEqual(child.name, "p1")
+         self.assertEqual(child.value, "xx")
+ 
++    def test_defer_proxy_related_field(self):
++        """
++        Ensure select_related together with only on fields from a related
++        proxy model behaves as expected. This was failing with 
++        ValueError: 'id' is not in list before the fix.
++        """
++        from .models import CustomModel, ProxyCustomModel, AnotherModel
++        
++        custom = ProxyCustomModel.objects.create(name="test_name")
++        another = AnotherModel.objects.create(custom=custom)
++        
++        # This should not raise ValueError: 'id' is not in list
++        objs = list(AnotherModel.objects.select_related("custom").only("custom__name").all())
++        self.assertEqual(len(objs), 1)
++        self.assertEqual(objs[0].custom.name, "test_name")
++
+     def test_defer_inheritance_pk_chaining(self):
+         """
+         When an inherited model is fetched from the DB, its PK is also fetched.

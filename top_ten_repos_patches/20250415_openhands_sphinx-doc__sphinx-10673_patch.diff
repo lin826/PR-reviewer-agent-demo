@@ -1,0 +1,268 @@
+diff --git a/sphinx/directives/other.py b/sphinx/directives/other.py
+index 35e16e623..396694c4c 100644
+--- a/sphinx/directives/other.py
++++ b/sphinx/directives/other.py
+@@ -119,15 +119,21 @@ class TocTree(SphinxDirective):
+                 if url_re.match(ref) or ref == 'self':
+                     toctree['entries'].append((title, ref))
+                 elif docname not in self.env.found_docs:
+-                    if excluded(self.env.doc2path(docname, False)):
++                    # Special handling for genindex, modindex, and search which are
++                    # created dynamically by the HTML builder
++                    if docname in ('genindex', 'modindex', 'search'):
++                        # These are valid references, proceed without warning
++                        toctree['entries'].append((title, docname))
++                    elif excluded(self.env.doc2path(docname, False)):
+                         message = __('toctree contains reference to excluded document %r')
+                         subtype = 'excluded'
++                        logger.warning(message, docname, type='toc', subtype=subtype,
++                                     location=toctree)
+                     else:
+                         message = __('toctree contains reference to nonexisting document %r')
+                         subtype = 'not_readable'
+-
+-                    logger.warning(message, docname, type='toc', subtype=subtype,
+-                                   location=toctree)
++                        logger.warning(message, docname, type='toc', subtype=subtype,
++                                     location=toctree)
+                     self.env.note_reread()
+                 else:
+                     if docname in all_docnames:
+diff --git a/sphinx/environment/adapters/toctree.py b/sphinx/environment/adapters/toctree.py
+index 9678e3c7c..308e67a91 100644
+--- a/sphinx/environment/adapters/toctree.py
++++ b/sphinx/environment/adapters/toctree.py
+@@ -165,14 +165,25 @@ class TocTree:
+                                        ref, location=toctreenode)
+                 except KeyError:
+                     # this is raised if the included file does not exist
+-                    if excluded(self.env.doc2path(ref, False)):
++                    # Special handling for genindex, modindex, and search which are
++                    # created dynamically by the HTML builder
++                    if ref in ('genindex', 'modindex', 'search'):
++                        # Create a placeholder toc for these special pages
++                        reference = nodes.reference('', '', internal=True,
++                                                   refuri=ref, anchorname='',
++                                                   *[nodes.Text(ref)])
++                        para = addnodes.compact_paragraph('', '', reference)
++                        item = nodes.list_item('', para)
++                        toc = nodes.bullet_list('', item)
++                    elif excluded(self.env.doc2path(ref, False)):
+                         message = __('toctree contains reference to excluded document %r')
++                        logger.warning(message, ref, location=toctreenode)
+                     elif not included(self.env.doc2path(ref, False)):
+                         message = __('toctree contains reference to non-included document %r')
++                        logger.warning(message, ref, location=toctreenode)
+                     else:
+                         message = __('toctree contains reference to nonexisting document %r')
+-
+-                    logger.warning(message, ref, location=toctreenode)
++                        logger.warning(message, ref, location=toctreenode)
+                 else:
+                     # if titles_only is given, only keep the main title and
+                     # sub-toctrees
+diff --git a/test-toctree-mixed.py b/test-toctree-mixed.py
+new file mode 100644
+index 000000000..d1e3a7870
+--- /dev/null
++++ b/test-toctree-mixed.py
+@@ -0,0 +1,112 @@
++"""
++Test to verify that toctree works with special pages and regular documents mixed
++"""
++
++import os
++import shutil
++import tempfile
++from pathlib import Path
++
++from sphinx.application import Sphinx
++from sphinx.util.console import nocolor  # type: ignore
++
++
++def test_toctree_with_mixed_pages():
++    # Set up the test directory
++    tempdir = tempfile.mkdtemp()
++    try:
++        # Create a basic conf.py
++        with open(os.path.join(tempdir, 'conf.py'), 'w') as f:
++            f.write("""
++project = 'Test Project'
++copyright = '2023, Test'
++author = 'Test'
++master_doc = 'index'
++version = '0.1'
++extensions = []
++""")
++
++        # Create an index.rst file with a mixed toctree
++        with open(os.path.join(tempdir, 'index.rst'), 'w') as f:
++            f.write("""
++Test Title
++===========
++
++.. toctree::
++   :maxdepth: 1
++   :caption: Regular Documents
++
++   page1
++
++.. toctree::
++   :maxdepth: 1
++   :caption: Indices and tables
++
++   genindex
++   modindex
++   search
++
++Regular content here.
++""")
++
++        # Create a regular page
++        with open(os.path.join(tempdir, 'page1.rst'), 'w') as f:
++            f.write("""
++Page 1
++=======
++
++This is a regular page.
++""")
++
++        # Temp output directory for Sphinx
++        outdir = os.path.join(tempdir, '_build')
++
++        # Initialize and run Sphinx
++        nocolor()
++        app = Sphinx(srcdir=tempdir,
++                     confdir=tempdir,
++                     outdir=outdir,
++                     doctreedir=os.path.join(outdir, '.doctrees'),
++                     buildername='html',
++                     warningiserror=True)  # Ensure warnings are treated as errors
++
++        print("Running Sphinx build...")
++        try:
++            app.build()
++            print("Build succeeded without warnings")
++            success = True
++        except Exception as e:
++            print(f"Build failed with error: {e}")
++            success = False
++
++        # Check that both the regular document and special pages are in the output
++        if success:
++            files_to_check = [
++                'index.html',
++                'page1.html',
++                'genindex.html',
++                'search.html'
++            ]
++
++            for filename in files_to_check:
++                path = os.path.join(outdir, filename)
++                if not os.path.exists(path):
++                    print(f"Missing expected output file: {filename}")
++                    success = False
++
++            if success:
++                print("All expected output files were generated")
++
++        return success
++
++    finally:
++        # Clean up
++        shutil.rmtree(tempdir)
++
++
++if __name__ == "__main__":
++    success = test_toctree_with_mixed_pages()
++    if not success:
++        print("Test failed - this reproduces the issue")
++    else:
++        print("Test passed - the issue is fixed")
+\ No newline at end of file
+diff --git a/test-toctree-special.py b/test-toctree-special.py
+new file mode 100644
+index 000000000..3002e1ead
+--- /dev/null
++++ b/test-toctree-special.py
+@@ -0,0 +1,79 @@
++"""
++Test to reproduce the issue with special pages in toctree
++"""
++
++import os
++import shutil
++import tempfile
++from pathlib import Path
++
++from sphinx.application import Sphinx
++from sphinx.util.console import nocolor  # type: ignore
++
++
++def test_toctree_with_special_pages():
++    # Set up the test directory
++    tempdir = tempfile.mkdtemp()
++    try:
++        # Create a basic conf.py
++        with open(os.path.join(tempdir, 'conf.py'), 'w') as f:
++            f.write("""
++project = 'Test Project'
++copyright = '2023, Test'
++author = 'Test'
++master_doc = 'index'
++version = '0.1'
++extensions = []
++""")
++
++        # Create an index.rst file with the problematic toctree
++        with open(os.path.join(tempdir, 'index.rst'), 'w') as f:
++            f.write("""
++Test Title
++===========
++
++.. toctree::
++   :maxdepth: 1
++   :caption: Indices and tables
++
++   genindex
++   modindex
++   search
++
++Regular content here.
++""")
++
++        # Temp output directory for Sphinx
++        outdir = os.path.join(tempdir, '_build')
++
++        # Initialize and run Sphinx
++        nocolor()
++        app = Sphinx(srcdir=tempdir,
++                     confdir=tempdir,
++                     outdir=outdir,
++                     doctreedir=os.path.join(outdir, '.doctrees'),
++                     buildername='html',
++                     warningiserror=True)  # Ensure warnings are treated as errors
++
++        print("Running Sphinx build...")
++        try:
++            app.build()
++            print("Build succeeded without warnings")
++            success = True
++        except Exception as e:
++            print(f"Build failed with error: {e}")
++            success = False
++
++        return success
++
++    finally:
++        # Clean up
++        shutil.rmtree(tempdir)
++
++
++if __name__ == "__main__":
++    success = test_toctree_with_special_pages()
++    if not success:
++        print("Test failed - this reproduces the issue")
++    else:
++        print("Test passed - the issue is fixed")
+\ No newline at end of file

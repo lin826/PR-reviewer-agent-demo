@@ -1,0 +1,627 @@
+diff --git a/django/core/serializers/python.py b/django/core/serializers/python.py
+index 36048601af..c0c457f8a3 100644
+--- a/django/core/serializers/python.py
++++ b/django/core/serializers/python.py
+@@ -5,6 +5,7 @@ other serializers.
+ """
+ 
+ from django.apps import apps
++from django.core.exceptions import FieldError
+ from django.core.serializers import base
+ from django.db import DEFAULT_DB_ALIAS, models
+ from django.utils.encoding import is_protected_type
+@@ -79,13 +80,24 @@ class Serializer(base.Serializer):
+                     return self._value_from_field(value, value._meta.pk)
+ 
+                 def queryset_iterator(obj, field):
+-                    return getattr(obj, field.name).only("pk").iterator()
++                    try:
++                        return getattr(obj, field.name).only("pk").iterator()
++                    except FieldError:
++                        # Fall back to non-optimized version if there's a conflict
++                        # between only() and select_related() from custom managers
++                        return getattr(obj, field.name).iterator()
+ 
+             m2m_iter = getattr(obj, "_prefetched_objects_cache", {}).get(
+                 field.name,
+                 queryset_iterator(obj, field),
+             )
+-            self._current[field.name] = [m2m_value(related) for related in m2m_iter]
++            try:
++                self._current[field.name] = [m2m_value(related) for related in m2m_iter]
++            except FieldError:
++                # Fall back to non-optimized version if there's a conflict
++                # between only() and select_related() from custom managers
++                m2m_iter = getattr(obj, field.name).iterator()
++                self._current[field.name] = [m2m_value(related) for related in m2m_iter]
+ 
+     def getvalue(self):
+         return self.objects
+diff --git a/django/core/serializers/xml_serializer.py b/django/core/serializers/xml_serializer.py
+index 1d3269c41a..90f89c84e0 100644
+--- a/django/core/serializers/xml_serializer.py
++++ b/django/core/serializers/xml_serializer.py
+@@ -8,7 +8,7 @@ from xml.sax.expatreader import ExpatParser as _ExpatParser
+ 
+ from django.apps import apps
+ from django.conf import settings
+-from django.core.exceptions import ObjectDoesNotExist
++from django.core.exceptions import FieldError, ObjectDoesNotExist
+ from django.core.serializers import base
+ from django.db import DEFAULT_DB_ALIAS, models
+ from django.utils.xmlutils import SimplerXMLGenerator, UnserializableContentError
+@@ -155,14 +155,26 @@ class Serializer(base.Serializer):
+                     self.xml.addQuickElement("object", attrs={"pk": str(value.pk)})
+ 
+                 def queryset_iterator(obj, field):
+-                    return getattr(obj, field.name).only("pk").iterator()
++                    try:
++                        return getattr(obj, field.name).only("pk").iterator()
++                    except FieldError:
++                        # Fall back to non-optimized version if there's a conflict
++                        # between only() and select_related() from custom managers
++                        return getattr(obj, field.name).iterator()
+ 
+             m2m_iter = getattr(obj, "_prefetched_objects_cache", {}).get(
+                 field.name,
+                 queryset_iterator(obj, field),
+             )
+-            for relobj in m2m_iter:
+-                handle_m2m(relobj)
++            try:
++                for relobj in m2m_iter:
++                    handle_m2m(relobj)
++            except FieldError:
++                # Fall back to non-optimized version if there's a conflict
++                # between only() and select_related() from custom managers
++                m2m_iter = getattr(obj, field.name).iterator()
++                for relobj in m2m_iter:
++                    handle_m2m(relobj)
+ 
+             self.xml.endElement("field")
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..29ddf5bca3
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the serialization issue with m2m relations 
++that have custom managers using select_related.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++
++
++class TestTagManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")  # follow master when retrieving object by default
++        return qs
++
++
++class TestTagMaster(models.Model):
++    name = models.CharField(max_length=120)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TestTag(models.Model):
++    # default = models.Manager()  # solution is to define custom default manager, which is used by RelatedManager
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Test(models.Model):
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def main():
++    # Create tables manually
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestTagMaster)
++        schema_editor.create_model(TestTag)
++        schema_editor.create_model(Test)
++    
++    print("Tables created successfully")
++    
++    # Create test data
++    tag_master = TestTagMaster.objects.create(name="master")
++    tag = TestTag.objects.create(name="tag", master=tag_master)
++    test = Test.objects.create(name="test")
++    test.tags.add(tag)
++    test.save()
++    
++    print("Test data created successfully")
++    
++    # Try to serialize - this should work now
++    try:
++        result = serializers.serialize("json", [test])
++        print("JSON Serialization succeeded:")
++        print(result)
++    except Exception as e:
++        print(f"JSON Serialization failed with error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    # Also test XML serialization
++    try:
++        result = serializers.serialize("xml", [test])
++        print("XML Serialization succeeded:")
++        print(result)
++    except Exception as e:
++        print(f"XML Serialization failed with error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    return True
++
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..00ae248b62
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,169 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the serialization fix with various scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++
++
++# Test case 1: Custom manager with select_related (the original issue)
++class TestTagManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")
++        return qs
++
++
++class TestTagMaster(models.Model):
++    name = models.CharField(max_length=120)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TestTag(models.Model):
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Test(models.Model):
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++# Test case 2: Normal manager (should still use optimization)
++class NormalTag(models.Model):
++    name = models.CharField(max_length=120)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class NormalTest(models.Model):
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(NormalTag, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++# Test case 3: Model with natural key
++class NaturalKeyTag(models.Model):
++    name = models.CharField(max_length=120, unique=True)
++    
++    def natural_key(self):
++        return (self.name,)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class NaturalKeyTest(models.Model):
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(NaturalKeyTag, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def main():
++    # Create tables manually
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestTagMaster)
++        schema_editor.create_model(TestTag)
++        schema_editor.create_model(Test)
++        schema_editor.create_model(NormalTag)
++        schema_editor.create_model(NormalTest)
++        schema_editor.create_model(NaturalKeyTag)
++        schema_editor.create_model(NaturalKeyTest)
++    
++    print("Tables created successfully")
++    
++    # Test case 1: Custom manager with select_related
++    print("\n=== Test Case 1: Custom manager with select_related ===")
++    tag_master = TestTagMaster.objects.create(name="master")
++    tag = TestTag.objects.create(name="tag", master=tag_master)
++    test = Test.objects.create(name="test")
++    test.tags.add(tag)
++    
++    try:
++        result = serializers.serialize("json", [test])
++        print("✓ JSON serialization succeeded")
++        result = serializers.serialize("xml", [test])
++        print("✓ XML serialization succeeded")
++    except Exception as e:
++        print(f"✗ Serialization failed: {e}")
++        return False
++    
++    # Test case 2: Normal manager (should still work and use optimization)
++    print("\n=== Test Case 2: Normal manager (optimization should work) ===")
++    normal_tag = NormalTag.objects.create(name="normal_tag")
++    normal_test = NormalTest.objects.create(name="normal_test")
++    normal_test.tags.add(normal_tag)
++    
++    try:
++        result = serializers.serialize("json", [normal_test])
++        print("✓ JSON serialization succeeded")
++        result = serializers.serialize("xml", [normal_test])
++        print("✓ XML serialization succeeded")
++    except Exception as e:
++        print(f"✗ Serialization failed: {e}")
++        return False
++    
++    # Test case 3: Natural key (should not use only() optimization)
++    print("\n=== Test Case 3: Natural key (no only() optimization) ===")
++    natural_tag = NaturalKeyTag.objects.create(name="natural_tag")
++    natural_test = NaturalKeyTest.objects.create(name="natural_test")
++    natural_test.tags.add(natural_tag)
++    
++    try:
++        result = serializers.serialize("json", [natural_test], use_natural_foreign_keys=True)
++        print("✓ JSON serialization with natural keys succeeded")
++        result = serializers.serialize("xml", [natural_test], use_natural_foreign_keys=True)
++        print("✓ XML serialization with natural keys succeeded")
++    except Exception as e:
++        print(f"✗ Serialization failed: {e}")
++        return False
++    
++    print("\n=== All tests passed! ===")
++    return True
++
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_original_error.py b/test_original_error.py
+new file mode 100644
+index 0000000000..b4aabd5429
+--- /dev/null
++++ b/test_original_error.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python
++"""
++Test to verify that the original error still occurs without our fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++from django.core.exceptions import FieldError
++
++
++class TestTagManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        qs = qs.select_related("master")
++        return qs
++
++
++class TestTagMaster(models.Model):
++    name = models.CharField(max_length=120)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TestTag(models.Model):
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Test(models.Model):
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def test_direct_conflict():
++    """Test that the FieldError is still raised for direct conflicts."""
++    # Create tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestTagMaster)
++        schema_editor.create_model(TestTag)
++        schema_editor.create_model(Test)
++    
++    print("Tables created successfully")
++    
++    # Create test data
++    tag_master = TestTagMaster.objects.create(name="master")
++    tag = TestTag.objects.create(name="tag", master=tag_master)
++    
++    # Test that direct conflicts still raise FieldError
++    print("\n=== Testing direct defer + select_related conflict ===")
++    try:
++        # This should still raise FieldError
++        list(TestTag.objects.defer("master").select_related("master"))
++        print("✗ Expected FieldError was not raised!")
++        return False
++    except FieldError as e:
++        print(f"✓ Expected FieldError raised: {e}")
++    
++    print("\n=== Testing only + select_related conflict ===")
++    try:
++        # This should still raise FieldError
++        list(TestTag.objects.only("name").select_related("master"))
++        print("✗ Expected FieldError was not raised!")
++        return False
++    except FieldError as e:
++        print(f"✓ Expected FieldError raised: {e}")
++    
++    # Test that serialization now works (with our fix)
++    print("\n=== Testing serialization (should work with our fix) ===")
++    test = Test.objects.create(name="test")
++    test.tags.add(tag)
++    
++    try:
++        result = serializers.serialize("json", [test])
++        print("✓ Serialization succeeded with our fix")
++        return True
++    except FieldError as e:
++        print(f"✗ Serialization failed: {e}")
++        return False
++
++
++if __name__ == "__main__":
++    success = test_direct_conflict()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_serialization_fix.py b/test_serialization_fix.py
+new file mode 100644
+index 0000000000..dc4bf6508f
+--- /dev/null
++++ b/test_serialization_fix.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python
++"""
++Test case for the serialization fix with custom managers using select_related.
++This test should be added to the Django test suite.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core import serializers
++
++
++class CustomManagerWithSelectRelatedManager(models.Manager):
++    """Custom manager that uses select_related in get_queryset."""
++    def get_queryset(self):
++        return super().get_queryset().select_related("related_model")
++
++
++class RelatedModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class ModelWithCustomManager(models.Model):
++    objects = CustomManagerWithSelectRelatedManager()
++    name = models.CharField(max_length=100)
++    related_model = models.ForeignKey(RelatedModel, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class MainModel(models.Model):
++    name = models.CharField(max_length=100)
++    many_to_many = models.ManyToManyField(ModelWithCustomManager)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def run_tests():
++    """Run the test case."""
++    # Create tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(RelatedModel)
++        schema_editor.create_model(ModelWithCustomManager)
++        schema_editor.create_model(MainModel)
++    
++    print("Tables created successfully")
++    
++    # Test 1: Custom manager with select_related
++    print("\n=== Test 1: Custom manager with select_related ===")
++    related = RelatedModel.objects.create(name="related")
++    custom_model = ModelWithCustomManager.objects.create(
++        name="custom", related_model=related
++    )
++    main_model = MainModel.objects.create(name="main")
++    main_model.many_to_many.add(custom_model)
++    
++    try:
++        # Test JSON serialization
++        json_result = serializers.serialize("json", [main_model])
++        assert '"many_to_many": [1]' in json_result
++        print("✓ JSON serialization succeeded")
++        
++        # Test XML serialization
++        xml_result = serializers.serialize("xml", [main_model])
++        assert '<object pk="1"></object>' in xml_result
++        print("✓ XML serialization succeeded")
++        
++        # Test with natural keys
++        json_result_natural = serializers.serialize(
++            "json", [main_model], use_natural_foreign_keys=True
++        )
++        assert '"many_to_many": [1]' in json_result_natural
++        print("✓ Natural keys serialization succeeded")
++        
++    except Exception as e:
++        print(f"✗ Test failed: {e}")
++        return False
++    
++    print("\n=== All tests passed! ===")
++    return True
++
++
++if __name__ == "__main__":
++    success = run_tests()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

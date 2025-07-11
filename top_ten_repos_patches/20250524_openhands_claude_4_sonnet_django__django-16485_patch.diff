@@ -1,0 +1,316 @@
+diff --git a/django/template/defaultfilters.py b/django/template/defaultfilters.py
+index 23c3a08c67..abd42196fd 100644
+--- a/django/template/defaultfilters.py
++++ b/django/template/defaultfilters.py
+@@ -184,6 +184,8 @@ def floatformat(text, arg=-1):
+     units = len(tupl[1])
+     units += -tupl[2] if m else tupl[2]
+     prec = abs(p) + units + 1
++    # Ensure prec is at least 1 to avoid "valid range for prec is [1, MAX_PREC]" error
++    prec = max(1, prec)
+ 
+     # Avoid conversion to scientific notation by accessing `sign`, `digits`,
+     # and `exponent` from Decimal.as_tuple() directly.
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..ef0bf34052
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python
++"""
++Final verification that the floatformat fix works correctly
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(USE_I18N=False, USE_L10N=False)
++django.setup()
++
++from decimal import Decimal
++from django.template.defaultfilters import floatformat
++
++def test_original_issue():
++    """Test the exact issue from the bug report"""
++    print("=== Testing Original Issue ===")
++    
++    # These were the exact failing cases from the issue
++    try:
++        result1 = floatformat('0.00', 0)
++        print(f"✅ floatformat('0.00', 0) = {result1!r}")
++        assert result1 == '0', f"Expected '0', got {result1!r}"
++    except Exception as e:
++        print(f"❌ floatformat('0.00', 0) failed: {e}")
++        return False
++    
++    try:
++        result2 = floatformat(Decimal('0.00'), 0)
++        print(f"✅ floatformat(Decimal('0.00'), 0) = {result2!r}")
++        assert result2 == '0', f"Expected '0', got {result2!r}"
++    except Exception as e:
++        print(f"❌ floatformat(Decimal('0.00'), 0) failed: {e}")
++        return False
++    
++    return True
++
++def test_regression():
++    """Test that existing functionality still works"""
++    print("\n=== Testing Regression ===")
++    
++    # Test cases from the existing test suite
++    test_cases = [
++        (7.7, None, "7.7"),
++        (7.0, None, "7"),
++        (0.7, None, "0.7"),
++        (0.0, None, "0"),
++        (7.7, 0, "8"),
++        (7.7, 3, "7.700"),
++        (6.000000, 3, "6.000"),
++        (6.200000, -3, "6.200"),
++        (13.1031, -3, "13.103"),
++        (11.1197, -2, "11.12"),
++        (11.0000, -2, "11"),
++        (Decimal("555.555"), 2, "555.56"),
++        (Decimal("09.000"), None, "9"),
++    ]
++    
++    failed = 0
++    for value, precision, expected in test_cases:
++        try:
++            if precision is None:
++                result = floatformat(value)
++            else:
++                result = floatformat(value, precision)
++            
++            if result == expected:
++                print(f"✅ floatformat({value!r}, {precision}) = {result!r}")
++            else:
++                print(f"❌ floatformat({value!r}, {precision}) = {result!r}, expected {expected!r}")
++                failed += 1
++        except Exception as e:
++            print(f"❌ floatformat({value!r}, {precision}) failed: {e}")
++            failed += 1
++    
++    return failed == 0
++
++def test_edge_cases():
++    """Test edge cases that might be affected by the precision fix"""
++    print("\n=== Testing Edge Cases ===")
++    
++    edge_cases = [
++        # Various zero representations with precision 0
++        ('0', 0, '0'),
++        ('0.0', 0, '0'),
++        ('0.00', 0, '0'),
++        ('0.000', 0, '0'),
++        (Decimal('0'), 0, '0'),
++        (Decimal('0.0'), 0, '0'),
++        (Decimal('0.00'), 0, '0'),
++        (Decimal('0.000'), 0, '0'),
++        
++        # Small numbers with precision 0
++        ('0.1', 0, '0'),
++        ('0.5', 0, '1'),
++        ('0.9', 0, '1'),
++        (Decimal('0.1'), 0, '0'),
++        (Decimal('0.5'), 0, '1'),
++        (Decimal('0.9'), 0, '1'),
++        
++        # Negative cases
++        ('-0.00', 0, '0'),
++        (Decimal('-0.00'), 0, '0'),
++    ]
++    
++    failed = 0
++    for value, precision, expected in edge_cases:
++        try:
++            result = floatformat(value, precision)
++            if result == expected:
++                print(f"✅ floatformat({value!r}, {precision}) = {result!r}")
++            else:
++                print(f"❌ floatformat({value!r}, {precision}) = {result!r}, expected {expected!r}")
++                failed += 1
++        except Exception as e:
++            print(f"❌ floatformat({value!r}, {precision}) failed: {e}")
++            failed += 1
++    
++    return failed == 0
++
++def main():
++    """Run all tests"""
++    print("Final Verification of floatformat Fix")
++    print("=" * 50)
++    
++    success = True
++    success &= test_original_issue()
++    success &= test_regression()
++    success &= test_edge_cases()
++    
++    print("\n" + "=" * 50)
++    if success:
++        print("🎉 ALL TESTS PASSED! The fix is working correctly.")
++    else:
++        print("❌ Some tests failed. The fix needs more work.")
++    
++    return success
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6859526c31
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python
++"""
++Reproduction script for floatformat() crash on "0.00"
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(USE_I18N=False, USE_L10N=False)
++django.setup()
++
++from decimal import Decimal
++from django.template.defaultfilters import floatformat
++
++def test_floatformat_issue():
++    """Test the floatformat issue with '0.00' and Decimal('0.00')"""
++    
++    print("Testing floatformat issue...")
++    
++    # Test cases that should work
++    working_cases = [
++        (0, 0, "0"),
++        (0.0, 0, "0"),
++        (7.7, 0, "8"),
++        ("0.00", -1, "0"),  # This works because p < 0
++        (Decimal("0.00"), -1, "0"),  # This works because p < 0
++    ]
++    
++    print("\n=== Working cases ===")
++    for value, precision, expected in working_cases:
++        try:
++            result = floatformat(value, precision)
++            status = "✓" if result == expected else f"✗ (got {result})"
++            print(f"floatformat({value!r}, {precision}) = {result!r} {status}")
++        except Exception as e:
++            print(f"floatformat({value!r}, {precision}) = ERROR: {e}")
++    
++    # Test cases that currently fail
++    failing_cases = [
++        ("0.00", 0, "0"),  # Should return "0" but crashes
++        (Decimal("0.00"), 0, "0"),  # Should return "0" but crashes
++        ("0.00", 1, "0.0"),  # Should work but let's test
++        (Decimal("0.00"), 1, "0.0"),  # Should work but let's test
++    ]
++    
++    print("\n=== Failing cases ===")
++    for value, precision, expected in failing_cases:
++        try:
++            result = floatformat(value, precision)
++            status = "✓" if result == expected else f"✗ (got {result})"
++            print(f"floatformat({value!r}, {precision}) = {result!r} {status}")
++        except Exception as e:
++            print(f"floatformat({value!r}, {precision}) = ERROR: {e}")
++
++if __name__ == "__main__":
++    test_floatformat_issue()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1f42741fe7
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the floatformat fix
++"""
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(USE_I18N=False, USE_L10N=False)
++django.setup()
++
++from decimal import Decimal
++from django.template.defaultfilters import floatformat
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix doesn't break existing functionality"""
++    
++    print("Testing edge cases...")
++    
++    # Test cases that might be affected by the fix
++    test_cases = [
++        # Original issue cases
++        ("0.00", 0, "0"),
++        (Decimal("0.00"), 0, "0"),
++        
++        # Other zero-like cases
++        ("0.000", 0, "0"),
++        (Decimal("0.000"), 0, "0"),
++        ("0.0000", 0, "0"),
++        (Decimal("0.0000"), 0, "0"),
++        
++        # Non-zero cases with precision 0
++        ("1.23", 0, "1"),
++        (Decimal("1.23"), 0, "1"),
++        ("7.7", 0, "8"),
++        (Decimal("7.7"), 0, "8"),
++        
++        # Cases with positive precision
++        ("0.00", 1, "0.0"),
++        (Decimal("0.00"), 1, "0.0"),
++        ("0.00", 2, "0.00"),
++        (Decimal("0.00"), 2, "0.00"),
++        
++        # Cases with negative precision
++        ("0.00", -1, "0"),
++        (Decimal("0.00"), -1, "0"),
++        ("0.00", -2, "0"),
++        (Decimal("0.00"), -2, "0"),
++        
++        # Very small numbers
++        ("0.001", 0, "0"),
++        (Decimal("0.001"), 0, "0"),
++        ("0.001", 1, "0.0"),
++        (Decimal("0.001"), 1, "0.0"),
++        
++        # Large precision values
++        ("0.00", 10, "0.0000000000"),
++        (Decimal("0.00"), 10, "0.0000000000"),
++    ]
++    
++    print(f"\n=== Testing {len(test_cases)} edge cases ===")
++    failed_cases = []
++    
++    for i, (value, precision, expected) in enumerate(test_cases, 1):
++        try:
++            result = floatformat(value, precision)
++            status = "✓" if result == expected else f"✗ (got {result!r})"
++            print(f"{i:2d}. floatformat({value!r}, {precision}) = {result!r} {status}")
++            if result != expected:
++                failed_cases.append((value, precision, expected, result))
++        except Exception as e:
++            print(f"{i:2d}. floatformat({value!r}, {precision}) = ERROR: {e}")
++            failed_cases.append((value, precision, expected, f"ERROR: {e}"))
++    
++    if failed_cases:
++        print(f"\n❌ {len(failed_cases)} test(s) failed:")
++        for value, precision, expected, actual in failed_cases:
++            print(f"  floatformat({value!r}, {precision}): expected {expected!r}, got {actual}")
++    else:
++        print(f"\n✅ All {len(test_cases)} tests passed!")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file

@@ -1,0 +1,115 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..cc6b17164
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,38 @@
++import pandas as pd
++import warnings
++from sklearn.ensemble import IsolationForest
++import re
++
++# Filter warnings
++warnings.filterwarnings("ignore", category=DeprecationWarning)  # Ignore pandas deprecation warnings
++warnings.filterwarnings("always", message=".*feature names.*")  # Show feature names warnings
++
++# Create a simple DataFrame
++X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100]})
++
++# Function to check for feature names warning
++def check_for_feature_names_warning(w):
++    for warning in w:
++        if re.search("feature names", str(warning.message)):
++            return True, warning.message
++    return False, None
++
++# Case 1: Default contamination (should not warn about feature names)
++print("Case 1: Default contamination ('auto'):")
++with warnings.catch_warnings(record=True) as w:
++    clf1 = IsolationForest(random_state=0).fit(X)
++    has_warning, message = check_for_feature_names_warning(w)
++    if has_warning:
++        print(f"Feature names warning raised: {message}")
++    else:
++        print("No feature names warning raised.")
++
++# Case 2: Non-default contamination (should warn in current implementation)
++print("\nCase 2: Non-default contamination (0.05):")
++with warnings.catch_warnings(record=True) as w:
++    clf2 = IsolationForest(random_state=0, contamination=0.05).fit(X)
++    has_warning, message = check_for_feature_names_warning(w)
++    if has_warning:
++        print(f"Feature names warning raised: {message}")
++    else:
++        print("No feature names warning raised.")
+\ No newline at end of file
+diff --git a/sklearn/ensemble/_iforest.py b/sklearn/ensemble/_iforest.py
+index 4d6c1c3f0..c4ef86d95 100644
+--- a/sklearn/ensemble/_iforest.py
++++ b/sklearn/ensemble/_iforest.py
+@@ -345,7 +345,10 @@ class IsolationForest(OutlierMixin, BaseBagging):
+             return self
+
+         # else, define offset_ wrt contamination parameter
+-        self.offset_ = np.percentile(self.score_samples(X), 100.0 * self.contamination)
++        # Calculate scores directly instead of calling score_samples
++        # which would trigger a feature names warning
++        scores = -self._compute_chunked_score_samples(X)
++        self.offset_ = np.percentile(scores, 100.0 * self.contamination)
+
+         return self
+
+diff --git a/test_feature_names_fix.py b/test_feature_names_fix.py
+new file mode 100644
+index 000000000..e3a30c734
+--- /dev/null
++++ b/test_feature_names_fix.py
+@@ -0,0 +1,47 @@
++import pandas as pd
++import numpy as np
++import warnings
++from sklearn.ensemble import IsolationForest
++import re
++
++# This test ensures that no feature names warning is raised
++# when fitting IsolationForest with a DataFrame, regardless
++# of the contamination parameter value
++
++def test_no_feature_names_warning():
++    """Test that no feature names warning is raised with different contamination values."""
++    # Filter warnings to only show feature names warnings
++    warnings.filterwarnings("error", message=".*feature names.*")
++
++    # Sample data as DataFrame
++    X = pd.DataFrame({
++        "feature1": np.random.randn(100),
++        "feature2": np.random.randn(100),
++    })
++
++    # Different contamination values to test
++    contamination_values = ["auto", 0.01, 0.05, 0.1, 0.25]
++
++    for contamination in contamination_values:
++        try:
++            # This should not raise any feature names warnings
++            model = IsolationForest(contamination=contamination, random_state=42)
++            model.fit(X)
++
++            # Extra test - make sure predict also doesn't raise warnings
++            model.predict(X)
++
++            print(f"No warning for contamination={contamination} - PASS")
++        except Warning as w:
++            if "feature names" in str(w):
++                print(f"Warning for contamination={contamination}: {w} - FAIL")
++                return False
++
++    return True
++
++if __name__ == "__main__":
++    success = test_no_feature_names_warning()
++    if success:
++        print("\nAll tests passed! The fix works correctly.")
++    else:
++        print("\nTest failed! The fix is not working as expected.")
+\ No newline at end of file

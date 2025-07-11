@@ -1,0 +1,312 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index abbb1e37cb..fc7935de5c 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -724,10 +724,18 @@ class SQLCompiler:
+         pieces = name.split(LOOKUP_SEP)
+         field, targets, alias, joins, path, opts, transform_function = self._setup_joins(pieces, opts, alias)
+ 
++        # Check if the field name is a foreign key ending with '_id'
++        original_name = pieces[-1]
++        if (len(pieces) > 1 and original_name.endswith('_id') and
++                field.is_relation and (original_name == field.attname or
++                                       original_name == field.remote_field.get_related_field().name)):
++            # This is a direct reference to a foreign key ID column (e.g. 'author_id' or just 'id')
++            # so don't apply any default ordering from the related model
++            pass
+         # If we get to this point and the field is a relation to another model,
+         # append the default ordering for that model unless it is the pk
+         # shortcut or the attribute name of the field that is specified.
+-        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != name and name != 'pk':
++        elif field.is_relation and opts.ordering and getattr(field, 'attname', None) != name and name != 'pk':
+             # Firstly, avoid infinite loops.
+             already_seen = already_seen or set()
+             join_tuple = tuple(getattr(self.query.alias_map[j], 'join_cols', None) for j in joins)
+diff --git a/test_self_ref_fk.py b/test_self_ref_fk.py
+new file mode 100644
+index 0000000000..209451649b
+--- /dev/null
++++ b/test_self_ref_fk.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python
++
++"""
++Test script to reproduce issue with self-referencing foreign keys in Django's ORM.
++
++The issue: When ordering by a self-referencing foreign key with _id suffix,
++Django incorrectly applies the default ordering from the model's Meta class
++instead of using the explicitly requested ordering.
++"""
++
++import os
++import sys
++import django
++from django.db import models
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++    django.setup()
++
++# Define models for testing
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)  # Default descending order
++        app_label = 'test_app'
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("self", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    class Meta:
++        app_label = 'test_app'
++    
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(OneModel)
++    schema_editor.create_model(TwoModel)
++
++# Create some test data
++root1 = OneModel.objects.create(oneval=1)
++root2 = OneModel.objects.create(oneval=2)
++root3 = OneModel.objects.create(oneval=3)
++
++child1 = OneModel.objects.create(root=root1, oneval=10)
++child2 = OneModel.objects.create(root=root2, oneval=20)
++child3 = OneModel.objects.create(root=root3, oneval=30)
++
++TwoModel.objects.create(record=child1, twoval=100)
++TwoModel.objects.create(record=child2, twoval=200)
++TwoModel.objects.create(record=child3, twoval=300)
++
++# Test queries
++print("TESTS FOR SELF-REFERENCING FOREIGN KEY ORDERING\n")
++
++# Test 1: Ordering by "record__root_id" (problematic case)
++qs1 = TwoModel.objects.filter(record__oneval__in=[10, 20, 30])
++qs1 = qs1.order_by("record__root_id")
++print("Test 1: order_by('record__root_id')")
++print(qs1.query)
++print("Results:")
++for item in qs1:
++    print(f"  TwoModel id={item.id}, record_id={item.record_id}, root_id={item.record.root_id}")
++
++print("\n" + "-" * 80 + "\n")
++
++# Test 2: Ordering by "record__root__id" (working case)
++qs2 = TwoModel.objects.filter(record__oneval__in=[10, 20, 30])
++qs2 = qs2.order_by("record__root__id")
++print("Test 2: order_by('record__root__id')")
++print(qs2.query)
++print("Results:")
++for item in qs2:
++    print(f"  TwoModel id={item.id}, record_id={item.record_id}, root_id={item.record.root_id}")
++
++print("\n" + "-" * 80 + "\n")
++
++# Test 3: Ordering by F-expression (working case)
++from django.db.models import F
++qs3 = TwoModel.objects.filter(record__oneval__in=[10, 20, 30])
++qs3 = qs3.annotate(root_id=F("record__root_id"))
++qs3 = qs3.order_by("root_id")
++print("Test 3: annotate(root_id=F('record__root_id')).order_by('root_id')")
++print(qs3.query)
++print("Results:")
++for item in qs3:
++    print(f"  TwoModel id={item.id}, record_id={item.record_id}, root_id={item.record.root_id}")
++
++print("\n" + "-" * 80 + "\n")
++
++# Test 4: Ordering by "-record__root_id" (showing the inverted order issue)
++qs4 = TwoModel.objects.filter(record__oneval__in=[10, 20, 30])
++qs4 = qs4.order_by("-record__root_id")
++print("Test 4: order_by('-record__root_id')")
++print(qs4.query)
++print("Results:")
++for item in qs4:
++    print(f"  TwoModel id={item.id}, record_id={item.record_id}, root_id={item.record.root_id}")
+\ No newline at end of file
+diff --git a/test_self_ref_fk_advanced.py b/test_self_ref_fk_advanced.py
+new file mode 100644
+index 0000000000..f577cb9d47
+--- /dev/null
++++ b/test_self_ref_fk_advanced.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python
++
++"""
++Advanced test script to thoroughly verify the fix for the self-referencing
++foreign key ordering issue. This script tests more complex scenarios.
++"""
++
++import os
++import sys
++import django
++from django.db import models
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++    django.setup()
++
++# Define models for multiple relationship scenarios
++class SelfRefModel(models.Model):
++    """Model with a self-referencing foreign key and default ordering."""
++    class Meta:
++        ordering = ("-id",)
++        app_label = 'test_app'
++    
++    id = models.BigAutoField(primary_key=True)
++    parent = models.ForeignKey("self", on_delete=models.CASCADE, null=True, related_name="children")
++    name = models.CharField(max_length=50)
++    
++    def __str__(self):
++        return f"{self.name} (id={self.id}, parent_id={self.parent_id})"
++
++class NormalModel(models.Model):
++    """Regular model without default ordering."""
++    class Meta:
++        app_label = 'test_app'
++    
++    id = models.BigAutoField(primary_key=True)
++    name = models.CharField(max_length=50)
++    
++    def __str__(self):
++        return f"{self.name} (id={self.id})"
++
++class ReferencingModel(models.Model):
++    """Model that references both SelfRefModel and NormalModel."""
++    class Meta:
++        app_label = 'test_app'
++    
++    id = models.BigAutoField(primary_key=True)
++    self_ref = models.ForeignKey(SelfRefModel, on_delete=models.CASCADE, related_name="refs")
++    normal = models.ForeignKey(NormalModel, on_delete=models.CASCADE, related_name="refs")
++    name = models.CharField(max_length=50)
++    
++    def __str__(self):
++        return f"{self.name} (id={self.id}, self_ref_id={self.self_ref_id}, normal_id={self.normal_id})"
++
++# Create the test database schema
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(SelfRefModel)
++    schema_editor.create_model(NormalModel)
++    schema_editor.create_model(ReferencingModel)
++
++# Create test data structure:
++# Tree 1: Root -> Child A -> Child B -> Child C
++# Tree 2: Root -> Child D -> Child E
++root1 = SelfRefModel.objects.create(name="Root 1", parent=None)
++child_a = SelfRefModel.objects.create(name="Child A", parent=root1)
++child_b = SelfRefModel.objects.create(name="Child B", parent=child_a)
++child_c = SelfRefModel.objects.create(name="Child C", parent=child_b)
++
++root2 = SelfRefModel.objects.create(name="Root 2", parent=None)
++child_d = SelfRefModel.objects.create(name="Child D", parent=root2)
++child_e = SelfRefModel.objects.create(name="Child E", parent=child_d)
++
++# Create normal models
++normal1 = NormalModel.objects.create(name="Normal 1")
++normal2 = NormalModel.objects.create(name="Normal 2")
++normal3 = NormalModel.objects.create(name="Normal 3")
++
++# Create referencing models
++ReferencingModel.objects.create(name="Ref 1", self_ref=child_a, normal=normal1)
++ReferencingModel.objects.create(name="Ref 2", self_ref=child_b, normal=normal2)
++ReferencingModel.objects.create(name="Ref 3", self_ref=child_c, normal=normal3)
++ReferencingModel.objects.create(name="Ref 4", self_ref=child_d, normal=normal1)
++ReferencingModel.objects.create(name="Ref 5", self_ref=child_e, normal=normal2)
++
++print("ADVANCED TESTS FOR SELF-REFERENCING FOREIGN KEY ORDERING\n")
++
++# Test 1: Direct parent_id ordering
++qs1 = SelfRefModel.objects.exclude(parent=None).order_by("parent_id")
++print("Test 1: SelfRefModel.objects.exclude(parent=None).order_by('parent_id')")
++print(qs1.query)
++print("Results:")
++for item in qs1:
++    print(f"  {item}")
++
++print("\n" + "-" * 80 + "\n")
++
++# Test 2: Nested ordering by parent's parent id
++qs2 = SelfRefModel.objects.exclude(parent=None).exclude(parent__parent=None).order_by("parent__parent_id")
++print("Test 2: SelfRefModel.objects.exclude(parent=None).exclude(parent__parent=None).order_by('parent__parent_id')")
++print(qs2.query)
++print("Results:")
++for item in qs2:
++    print(f"  {item}")
++
++print("\n" + "-" * 80 + "\n")
++
++# Test 3: Complex filtering with ordering by parent_id
++qs3 = ReferencingModel.objects.filter(
++    self_ref__parent__isnull=False
++).order_by("self_ref__parent_id")
++print("Test 3: ReferencingModel.objects.filter(self_ref__parent__isnull=False).order_by('self_ref__parent_id')")
++print(qs3.query)
++print("Results:")
++for item in qs3:
++    print(f"  {item} -> {item.self_ref}")
++
++print("\n" + "-" * 80 + "\n")
++
++# Test 4: Ordering by non-self-referencing foreign key _id
++qs4 = ReferencingModel.objects.all().order_by("normal_id")
++print("Test 4: ReferencingModel.objects.all().order_by('normal_id')")
++print(qs4.query)
++print("Results:")
++for item in qs4:
++    print(f"  {item}")
++
++print("\n" + "-" * 80 + "\n")
++
++# Test 5: Ordering by id of a field on a self-referencing model
++qs5 = ReferencingModel.objects.all().order_by("self_ref_id")
++print("Test 5: ReferencingModel.objects.all().order_by('self_ref_id')")
++print(qs5.query)
++print("Results:")
++for item in qs5:
++    print(f"  {item}")
++
++print("\n" + "-" * 80 + "\n")
++
++# Test 6: Reverse ordering by parent_id
++qs6 = SelfRefModel.objects.exclude(parent=None).order_by("-parent_id")
++print("Test 6: SelfRefModel.objects.exclude(parent=None).order_by('-parent_id')")
++print(qs6.query)
++print("Results:")
++for item in qs6:
++    print(f"  {item}")
+\ No newline at end of file

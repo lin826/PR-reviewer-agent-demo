@@ -1,0 +1,683 @@
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 000000000..e42bae729
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,110 @@
++import numpy as np
++import sys
++from sklearn.linear_model.logistic import _logistic_regression_path
++from sklearn.linear_model import LogisticRegressionCV
++from sklearn.model_selection import StratifiedKFold
++from sklearn.preprocessing import LabelEncoder
++from sklearn.utils.fixes import _joblib_parallel_args
++
++np.random.seed(29)
++n_samples, n_features = 1000, 3
++X = np.random.normal(size=(n_samples, n_features))
++beta = np.random.normal(size=n_features)
++intercept = np.random.normal()
++y = np.sign(intercept + X @ beta)
++
++# Create a modified version of LogisticRegressionCV.fit with debug prints
++def debug_fit(self, X, y, sample_weight=None):
++    # Get a basic skeleton of the fit method
++    # This is a simplified version just to reach the problematic line
++    
++    # Setup parameters
++    multi_class = self.multi_class
++    if multi_class == 'auto':
++        multi_class = 'ovr'
++    
++    # Encode labels
++    label_encoder = LabelEncoder().fit(y)
++    y = label_encoder.transform(y)
++    self.classes_ = label_encoder.classes_
++    
++    # Setup cross-validation
++    cv = StratifiedKFold(n_splits=5)
++    folds = list(cv.split(X, y))
++    
++    # Setup parameters for path
++    max_iter = getattr(self, 'max_iter', 100)
++    tol = getattr(self, 'tol', 1e-4)
++    solver = getattr(self, 'solver', 'lbfgs')
++    # Set basic l1_ratio
++    l1_ratios_ = [None]
++    penalty = getattr(self, 'penalty', 'l2')
++    
++    # Initialize necessary attributes
++    self.Cs_ = np.array([1.0])  # Simplified for test
++    self.coefs_paths_ = {}
++    self.scores_ = {}
++    self.C_ = []
++    self.l1_ratio_ = []
++    self.coef_ = np.empty((1, X.shape[1]))  # Simplified
++    self.intercept_ = np.zeros(1)
++    
++    # Create a simple coefs_path and scores structure for debugging
++    n_folds = len(folds)
++    n_cs = len(self.Cs_)
++    n_features = X.shape[1]
++    
++    # Create simple test data
++    if multi_class == 'multinomial':
++        n_classes = len(self.classes_)
++        # For multinomial, the shape would be:
++        # coefs_paths: (n_classes, n_folds, n_cs, n_features+1)
++        coefs_paths = np.random.random((n_classes, n_folds, n_cs, n_features+1))
++        scores = np.random.random((n_folds, n_cs))
++    else:
++        # For OVR, the shape would be:
++        # coefs_paths: (n_folds, n_cs, n_features+1)
++        coefs_paths = np.random.random((n_folds, n_cs, n_features+1))
++        scores = np.random.random((n_folds, n_cs))
++    
++    # Print shape info
++    print(f"multi_class: {multi_class}")
++    print(f"coefs_paths shape: {coefs_paths.shape}")
++    print(f"scores shape: {scores.shape}")
++    
++    # This is the problematic section from the original file
++    print("\nTrying to execute the problematic code...\n")
++    
++    # Simulating the problematic part
++    best_indices = np.argmax(scores, axis=1)
++    print(f"best_indices shape: {best_indices.shape}, values: {best_indices}")
++    
++    try:
++        if multi_class == 'ovr':
++            print("OVR path - executing:")
++            w = np.mean([coefs_paths[i, best_indices[i], :]
++                         for i in range(len(folds))], axis=0)
++            print(f"Success! w shape: {w.shape}")
++        else:
++            print("Multinomial path - executing:")
++            w = np.mean([coefs_paths[:, i, best_indices[i], :]
++                         for i in range(len(folds))], axis=0)
++            print(f"Success! w shape: {w.shape}")
++        
++        print("Code executed successfully")
++    except Exception as e:
++        print(f"Error: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++    
++    return self
++
++# Test the OVR case
++print("=== Testing OVR case ===")
++model = LogisticRegressionCV(multi_class='ovr', refit=False)
++debug_fit(model, X, y)
++
++# Test the multinomial case
++print("\n=== Testing Multinomial case ===")
++model = LogisticRegressionCV(multi_class='multinomial', refit=False)
++debug_fit(model, X, y)
+\ No newline at end of file
+diff --git a/debug_monkey_patch.py b/debug_monkey_patch.py
+new file mode 100644
+index 000000000..c2991f4e5
+--- /dev/null
++++ b/debug_monkey_patch.py
+@@ -0,0 +1,42 @@
++import numpy as np
++from sklearn.linear_model import LogisticRegressionCV
++import traceback
++
++# Monkey patch the problematic method with debug prints
++from sklearn.linear_model import logistic
++original_mean = np.mean
++
++def debug_mean(arr, *args, **kwargs):
++    print(f"np.mean called with array shape: {np.shape(arr)}")
++    if isinstance(arr, list):
++        print(f"Array is a list of length {len(arr)}")
++        for i, item in enumerate(arr):
++            print(f"  Item {i} shape: {np.shape(item)}")
++    return original_mean(arr, *args, **kwargs)
++
++# Set the random seed for reproducibility
++np.random.seed(29)
++X = np.random.normal(size=(1000, 3))
++beta = np.random.normal(size=3)
++intercept = np.random.normal(size=None)
++y = np.sign(intercept + X @ beta)
++
++# Replace np.mean with our debug version
++np.mean = debug_mean
++
++print("\nTesting with multinomial and refit=False")
++try:
++    model = LogisticRegressionCV(
++        cv=2,  # Use fewer folds for quicker execution
++        multi_class='multinomial',
++        solver='saga', 
++        tol=1e-2,
++        refit=False)
++    model.fit(X, y)
++    print("Success!")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    traceback.print_exc()
++
++# Restore original np.mean
++np.mean = original_mean
+\ No newline at end of file
+diff --git a/direct_code_test.py b/direct_code_test.py
+new file mode 100644
+index 000000000..fa2ac4649
+--- /dev/null
++++ b/direct_code_test.py
+@@ -0,0 +1,77 @@
++import numpy as np
++import sys
++import traceback
++from sklearn.linear_model import LogisticRegressionCV
++
++# Run the original code from the issue
++np.random.seed(29)
++X = np.random.normal(size=(1000, 3))
++beta = np.random.normal(size=3)
++intercept = np.random.normal(size=None)
++y = np.sign(intercept + X @ beta)
++
++# Create a debugging function to catch and print information before the error
++def debug_indexing():
++    # Create a subclass that will debug the problem
++    class DebuggingLogisticRegressionCV(LogisticRegressionCV):
++        def _debug_internal_state(self, location=None):
++            if location:
++                print(f"Debug at {location}:")
++            # Print internal state values that might be relevant
++            for attr in ['multi_class', 'refit', 'Cs_']:
++                if hasattr(self, attr):
++                    print(f"  {attr} = {getattr(self, attr)}")
++        
++        def fit(self, X, y, sample_weight=None):
++            # This is our modified fit method that will debug the problem
++            try:
++                # Call the original fit method from the parent class
++                result = super().fit(X, y, sample_weight)
++                return result
++            except Exception as e:
++                print(f"\nException caught: {type(e).__name__}: {e}")
++                
++                # Add some detailed debugging before re-raising
++                frame = sys.exc_info()[2].tb_frame
++                line_no = sys.exc_info()[2].tb_lineno
++                
++                # Print local variables from the frame
++                print(f"\nError in file {frame.f_code.co_filename}, line {line_no}")
++                print("Local variables in error frame:")
++                for var_name, var_val in frame.f_locals.items():
++                    # Skip complex objects, focus on simple variables
++                    if var_name in ['self', 'X', 'y', 'sample_weight']:
++                        continue
++                    
++                    if isinstance(var_val, np.ndarray):
++                        print(f"  {var_name}: shape {var_val.shape}, dtype {var_val.dtype}")
++                        if var_name in ['coefs_paths', 'best_indices', 'i']:
++                            print(f"    values: {var_val}")
++                    else:
++                        try:
++                            print(f"  {var_name}: {var_val}")
++                        except:
++                            print(f"  {var_name}: <unprintable>")
++                
++                # Re-raise the exception
++                raise
++    
++    # Test both multinomial and ovr modes
++    for multi_class in ['multinomial', 'ovr']:
++        print(f"\n{'=' * 60}\nTesting with multi_class={multi_class}, refit=False\n{'=' * 60}")
++        model = DebuggingLogisticRegressionCV(
++            cv=2,  # Use fewer folds for quicker execution
++            multi_class=multi_class, 
++            solver='saga',
++            refit=False)
++        
++        try:
++            model._debug_internal_state("before fit")
++            model.fit(X, y)
++            print("\nSuccess! Fit completed without errors.")
++        except Exception as e:
++            print("\nFit failed with error:")
++            traceback.print_exc()
++            print()
++
++debug_indexing()
+\ No newline at end of file
+diff --git a/original_issue_test.py b/original_issue_test.py
+new file mode 100644
+index 000000000..d33bcf6ba
+--- /dev/null
++++ b/original_issue_test.py
+@@ -0,0 +1,31 @@
++import sys
++import sklearn
++from sklearn.linear_model import LogisticRegressionCV
++import numpy as np
++
++np.random.seed(29)
++X = np.random.normal(size=(1000, 3))
++beta = np.random.normal(size=3)
++intercept = np.random.normal(size=None)
++y = np.sign(intercept + X @ beta)
++
++try:
++    print("Testing with saga solver:")
++    LogisticRegressionCV(
++        cv=5,
++        solver='saga',
++        tol=1e-2,
++        refit=False).fit(X, y)
++    print("No error is thrown - FIXED!")
++    
++    print("\nTesting with liblinear solver:")
++    LogisticRegressionCV(
++        cv=5,
++        solver='liblinear',
++        tol=1e-2,
++        refit=False).fit(X, y)
++    print("No error is thrown with liblinear as well - FIXED!")
++except Exception as e:
++    print(f"Error still occurs: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/patch_test.py b/patch_test.py
+new file mode 100644
+index 000000000..b2711b78f
+--- /dev/null
++++ b/patch_test.py
+@@ -0,0 +1,96 @@
++import numpy as np
++from sklearn.linear_model.logistic import LogisticRegressionCV
++
++# Function to monkey-patch LogisticRegressionCV.fit to catch the specific issue
++def modified_fit(self, X, y, sample_weight=None):
++    """Patched version of LogisticRegressionCV.fit to debug the issue"""
++    # First, run through most of the original fit method
++    from sklearn.linear_model.logistic import _check_solver, _check_multi_class
++    from sklearn.utils import check_X_y
++    from sklearn.utils.multiclass import check_classification_targets
++    from sklearn.preprocessing import LabelEncoder
++    from sklearn.model_selection import check_cv
++    
++    solver = _check_solver(self.solver, self.penalty, self.dual)
++    multi_class = _check_multi_class(self.multi_class, solver, 2)  # Assume binary for test
++    
++    # Handle parameters and preprocessing
++    if not self.refit:  # We specifically care about the refit=False case
++        X, y = check_X_y(X, y, accept_sparse='csr', dtype=np.float64, order="C")
++        check_classification_targets(y)
++        label_encoder = LabelEncoder().fit(y)
++        y = label_encoder.transform(y)
++        classes = self.classes_ = label_encoder.classes_
++        cv = check_cv(self.cv, y, classifier=True)
++        folds = list(cv.split(X, y))
++        
++        # Ensure we're in binary classification for simplicity
++        if len(classes) != 2:
++            raise ValueError("Test requires binary classification")
++        
++        # Create mock data structures that would be created in the full fit method
++        n_folds = len(folds)
++        n_cs = 3  # Mock multiple C values
++        n_features = X.shape[1]
++        n_classes = 2  # Binary
++        
++        # Create test structures based on multi_class setting
++        if multi_class == 'multinomial':
++            print(f"Testing with multi_class='multinomial', refit={self.refit}")
++            # Shape for multinomial: (n_classes, n_folds, n_cs, n_features+1)
++            coefs_paths = np.random.random((n_classes, n_folds, n_cs, n_features+1))
++            print(f"coefs_paths shape: {coefs_paths.shape}")
++        else:
++            print(f"Testing with multi_class='ovr', refit={self.refit}")
++            # Shape for ovr: (n_folds, n_cs, n_features+1)
++            coefs_paths = np.random.random((n_folds, n_cs, n_features+1))
++            print(f"coefs_paths shape: {coefs_paths.shape}")
++        
++        # Mock scores
++        scores = np.random.random((n_folds, n_cs))
++        print(f"scores shape: {scores.shape}")
++        
++        # The critical part: simulate best_indices and try to index
++        best_indices = np.argmax(scores, axis=1)
++        print(f"best_indices: {best_indices}")
++        
++        print("\nRunning the problematic code:")
++        print("-" * 50)
++        
++        try:
++            # This is the code from LogisticRegressionCV.fit that's causing problems
++            if multi_class == 'ovr':
++                print("OVR path")
++                w = np.mean([coefs_paths[i, best_indices[i], :]
++                            for i in range(len(folds))], axis=0)
++            else:
++                print("Multinomial path")
++                w = np.mean([coefs_paths[:, i, best_indices[i], :]
++                            for i in range(len(folds))], axis=0)
++            
++            print("Success! Result shape:", w.shape)
++        except Exception as e:
++            print(f"Error: {type(e).__name__}: {e}")
++            import traceback
++            traceback.print_exc()
++    
++    # Return self for method chaining
++    return self
++
++# Save the original method
++original_fit = LogisticRegressionCV.fit
++# Replace with our modified version
++LogisticRegressionCV.fit = modified_fit
++
++# Test with multinomial mode
++print("=" * 60)
++model = LogisticRegressionCV(multi_class='multinomial', refit=False)
++model.fit(np.random.random((100, 5)), np.random.choice([0, 1], size=100))
++
++print("\n" + "=" * 60)
++# Test with ovr mode
++model = LogisticRegressionCV(multi_class='ovr', refit=False)
++model.fit(np.random.random((100, 5)), np.random.choice([0, 1], size=100))
++
++# Restore original method
++LogisticRegressionCV.fit = original_fit
+\ No newline at end of file
+diff --git a/sklearn/linear_model/logistic.py b/sklearn/linear_model/logistic.py
+index 1999f1dae..dc9ba3698 100644
+--- a/sklearn/linear_model/logistic.py
++++ b/sklearn/linear_model/logistic.py
+@@ -2174,14 +2174,27 @@ class LogisticRegressionCV(LogisticRegression, BaseEstimator,
+                     w = np.mean([coefs_paths[i, best_indices[i], :]
+                                  for i in range(len(folds))], axis=0)
+                 else:
+-                    w = np.mean([coefs_paths[:, i, best_indices[i], :]
+-                                 for i in range(len(folds))], axis=0)
++                    if hasattr(coefs_paths, 'shape') and len(coefs_paths.shape) == 4:
++                        # This is the case when coefs_paths has the expected 4D shape
++                        w = np.mean([coefs_paths[:, i, best_indices[i], :]
++                                    for i in range(len(folds))], axis=0)
++                    else:
++                        # Handle the case where coefs_paths doesn't have the expected shape
++                        # This happens when refit=False and should avoid the indexing error
++                        w = np.mean([coefs_paths[i, best_indices[i], :]
++                                    for i in range(len(folds))], axis=0)
+ 
+                 best_indices_C = best_indices % len(self.Cs_)
+                 self.C_.append(np.mean(self.Cs_[best_indices_C]))
+ 
+                 best_indices_l1 = best_indices // len(self.Cs_)
+-                self.l1_ratio_.append(np.mean(l1_ratios_[best_indices_l1]))
++                # Handle the case where l1_ratios_ contains None values
++                if all(l1_ratio is None for l1_ratio in l1_ratios_):
++                    self.l1_ratio_.append(None)
++                else:
++                    # Convert best_indices_l1 to a list of integers for proper indexing
++                    best_indices_l1_list = [int(idx) for idx in best_indices_l1]
++                    self.l1_ratio_.append(np.mean([l1_ratios_[idx] for idx in best_indices_l1_list]))
+ 
+             if multi_class == 'multinomial':
+                 self.C_ = np.tile(self.C_, n_classes)
+diff --git a/specific_indexing_test.py b/specific_indexing_test.py
+new file mode 100644
+index 000000000..fcdc984db
+--- /dev/null
++++ b/specific_indexing_test.py
+@@ -0,0 +1,123 @@
++import numpy as np
++import sys
++import traceback
++from sklearn.linear_model import LogisticRegressionCV
++
++# Monkey-patch LogisticRegressionCV fit method to inspect array shapes just before the indexing issue
++original_fit = LogisticRegressionCV.fit
++
++def patched_fit(self, X, y, sample_weight=None):
++    """Monkey-patched version of fit that will debug the arrays before the error"""
++    # Add our debugging code
++    def debug_arrays_before_indexing(coefs_paths, best_indices, folds, multi_class):
++        """Debug function to print array details before the problematic indexing"""
++        print(f"\nDebugging before potential indexing error:")
++        print(f"multi_class: {multi_class}, refit: {self.refit}")
++        print(f"coefs_paths shape: {np.shape(coefs_paths)}")
++        print(f"coefs_paths type: {type(coefs_paths)}")
++        print(f"best_indices: {best_indices}")
++        print(f"Number of folds: {len(folds)}")
++        
++        # Try manual indexing to see what shape we get
++        print("\nTesting indexing operations:")
++        try:
++            if multi_class == 'ovr':
++                print("OVR indexing test...")
++                for i in range(len(folds)):
++                    item = coefs_paths[i, best_indices[i], :]
++                    print(f"  Index {i}: shape {item.shape}")
++            else:
++                print("Multinomial indexing test...")
++                for i in range(len(folds)):
++                    # This is where the issue should be
++                    if isinstance(coefs_paths, dict):
++                        # Special handling for dict case
++                        print("  coefs_paths is a dict, cannot test indexing directly")
++                        break
++                    try:
++                        item = coefs_paths[:, i, best_indices[i], :]
++                        print(f"  Index {i}: shape {item.shape}")
++                    except Exception as e:
++                        print(f"  Index {i}: ERROR: {type(e).__name__}: {e}")
++                        if isinstance(coefs_paths, np.ndarray) and i < coefs_paths.shape[1]:
++                            print(f"  Examining slice coefs_paths[:, {i}]:")
++                            slice1 = coefs_paths[:, i]
++                            print(f"    Shape: {slice1.shape}")
++                            if slice1.ndim > 1 and best_indices[i] < slice1.shape[1]:
++                                print(f"    Slice can be indexed with best_indices[{i}]={best_indices[i]}")
++                            else:
++                                print(f"    Cannot index slice with best_indices[{i}]={best_indices[i]}")
++                        else:
++                            print(f"  Cannot examine slice coefs_paths[:, {i}]")
++        except Exception as e:
++            print(f"Error during index testing: {type(e).__name__}: {e}")
++    
++    # Run the original method
++    try:
++        # Install our debug hook for debugging right during the problematic part
++        original_mean = np.mean
++        
++        def debug_mean_hook(arr, *args, **kwargs):
++            # This will be called when np.mean is called in the problematic part
++            if isinstance(arr, list) and len(arr) > 0:
++                if hasattr(self, 'multi_class'):
++                    item_shape = np.shape(arr[0])
++                    if ((self.multi_class == 'multinomial' and len(item_shape) > 2) or
++                        (self.multi_class == 'ovr' and len(item_shape) == 1)):
++                        # We're probably in the critical section
++                        frame = sys._getframe(1)  # Get caller frame
++                        if 'coefs_paths' in frame.f_locals and 'best_indices' in frame.f_locals:
++                            if 'folds' in frame.f_locals:
++                                # We're at the critical point - debug the arrays
++                                coefs_paths = frame.f_locals.get('coefs_paths') 
++                                best_indices = frame.f_locals.get('best_indices')
++                                folds = frame.f_locals.get('folds')
++                                multi_class = self.multi_class
++                                debug_arrays_before_indexing(coefs_paths, best_indices, folds, multi_class)
++            
++            # Call the original mean function
++            return original_mean(arr, *args, **kwargs)
++        
++        # Replace np.mean with our debug version
++        np.mean = debug_mean_hook
++        
++        # Call the original fit method
++        result = original_fit(self, X, y, sample_weight)
++        
++        # Restore original np.mean
++        np.mean = original_mean
++        
++        return result
++    except Exception as e:
++        # Restore original np.mean if there's an error
++        np.mean = original_mean
++        print(f"\nException caught: {type(e).__name__}: {e}")
++        traceback.print_exc()
++        print()
++        raise  # Re-raise the exception
++
++# Replace LogisticRegressionCV.fit with our debugging version
++LogisticRegressionCV.fit = patched_fit
++
++# Run the original code from the issue
++np.random.seed(29)
++X = np.random.normal(size=(1000, 3))
++beta = np.random.normal(size=3)
++intercept = np.random.normal(size=None)
++y = np.sign(intercept + X @ beta)
++
++print("\n*** Testing with multiclass=multinomial and refit=False ***")
++try:
++    model = LogisticRegressionCV(
++        cv=3,  # Use fewer folds for quicker execution
++        multi_class='multinomial',
++        solver='saga',
++        tol=1e-2,
++        refit=False)
++    model.fit(X, y)
++    print("\nSuccess! Fit completed without errors.")
++except Exception as e:
++    print(f"\nFit failed with error: {type(e).__name__}: {e}")
++
++# Restore original method
++LogisticRegressionCV.fit = original_fit
+\ No newline at end of file
+diff --git a/test_issue.py b/test_issue.py
+new file mode 100644
+index 000000000..4e49574fc
+--- /dev/null
++++ b/test_issue.py
+@@ -0,0 +1,47 @@
++import numpy as np
++from sklearn.linear_model import LogisticRegressionCV
++import sys
++import traceback
++
++np.random.seed(29)
++X = np.random.normal(size=(1000, 3))
++beta = np.random.normal(size=3)
++intercept = np.random.normal(size=None)
++y = np.sign(intercept + X @ beta)
++
++print("Testing with multiclass=ovr and refit=False:")
++try:
++    LogisticRegressionCV(
++        cv=5,
++        multi_class='ovr',  # explicitly set to 'ovr'
++        solver='saga',
++        tol=1e-2,
++        refit=False).fit(X, y)
++    print("Success!")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    traceback.print_exc()
++
++print("\nTesting with multiclass=multinomial and refit=False:")
++try:
++    LogisticRegressionCV(
++        cv=5,
++        multi_class='multinomial',  # explicitly set to 'multinomial'
++        solver='saga',
++        tol=1e-2,
++        refit=False).fit(X, y)
++    print("Success!")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    traceback.print_exc()
++
++print("\nTesting with refit=True (should work):")
++try:
++    LogisticRegressionCV(
++        cv=5,
++        solver='saga',
++        tol=1e-2,
++        refit=True).fit(X, y)
++    print("Success!")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 000000000..6eaa4a01c
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,66 @@
++import numpy as np
++from sklearn.linear_model import LogisticRegressionCV
++import traceback
++
++# Using the exact same code from the issue description
++
++# Set the random seed for reproducibility
++np.random.seed(29)
++X = np.random.normal(size=(1000, 3))
++beta = np.random.normal(size=3)
++intercept = np.random.normal(size=None)
++y = np.sign(intercept + X @ beta)
++
++print("=== Testing with multiclass=multinomial and refit=False ===")
++try:
++    model = LogisticRegressionCV(
++        cv=5,
++        multi_class='multinomial',
++        solver='saga',
++        tol=1e-2,
++        refit=False)
++    model.fit(X, y)
++    print("Success! Model fitted without errors")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    traceback.print_exc()
++
++print("\n=== Testing with multiclass=ovr and refit=False ===")
++try:
++    model = LogisticRegressionCV(
++        cv=5,
++        multi_class='ovr',
++        solver='saga',
++        tol=1e-2,
++        refit=False)
++    model.fit(X, y)
++    print("Success! Model fitted without errors")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    traceback.print_exc()
++
++print("\n=== Bonus: Testing with refit=True (should continue to work) ===")
++try:
++    model = LogisticRegressionCV(
++        cv=5,
++        solver='saga',
++        tol=1e-2,
++        refit=True)
++    model.fit(X, y)
++    print("Success! Model fitted without errors")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    traceback.print_exc()
++
++print("\n=== Testing the case from the original issue report ===")
++try:
++    # This is exactly what was in the issue
++    LogisticRegressionCV(
++        cv=5,
++        solver='saga',  # same error with 'liblinear'
++        tol=1e-2,
++        refit=False).fit(X, y)
++    print("Success! Original issue case fixed")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    traceback.print_exc()
+\ No newline at end of file

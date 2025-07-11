@@ -1,0 +1,91 @@
+--- a/django/db/models/sql/subqueries.py
++++ b/django/db/models/sql/subqueries.py
+@@ -134,7 +134,12 @@
+             query = UpdateQuery(model)
+             query.values = values
+             if self.related_ids is not None:
+-                query.add_filter("pk__in", self.related_ids)
++                # Use the appropriate parent IDs for this model
++                if isinstance(self.related_ids, dict) and model in self.related_ids:
++                    query.add_filter("pk__in", self.related_ids[model])
++                else:
++                    # Fallback to the original behavior for backward compatibility
++                    query.add_filter("pk__in", self.related_ids)
+             result.append(query)
+         return result
+ 
+
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1850,11 +1850,66 @@
+             # Either we're using the idents in multiple update queries (so
+             # don't want them to change), or the db backend doesn't support
+             # selecting from the updating table (e.g. MySQL).
+-            idents = []
+-            for rows in query.get_compiler(self.using).execute_sql(MULTI):
+-                idents.extend(r[0] for r in rows)
+-            self.query.add_filter("pk__in", idents)
+-            self.query.related_ids = idents
++            if self.query.related_updates:
++                # For multiple inheritance, we need to collect the appropriate
++                # parent IDs for each model that will be updated
++                related_ids = {}
++                meta = self.query.get_meta()
++                
++                # Create a new query to select the appropriate parent link fields
++                parent_query = self.query.chain(klass=Query)
++                parent_query.select_related = False
++                parent_query.clear_ordering(force=True)
++                parent_query.extra = {}
++                parent_query.select = []
++                
++                # Add the parent link fields for each model to be updated
++                for model in self.query.related_updates.keys():
++                    # Find the parent link field for this model
++                    parent_link = meta.get_ancestor_link(model)
++                    if parent_link:
++                        parent_query.add_fields([parent_link.name])
++                
++                # If we couldn't find parent links, fall back to primary key
++                if not parent_query.select:
++                    parent_query.add_fields([meta.pk.name])
++                
++                # Execute the query to get the parent IDs
++                parent_rows = parent_query.get_compiler(self.using).execute_sql(MULTI)
++                
++                # Flatten the results - parent_rows is a list containing chunked results
++                flattened_rows = []
++                for chunk in parent_rows:
++                    flattened_rows.extend(chunk)
++                
++                if len(self.query.related_updates) == 1 and parent_query.select:
++                    # Single parent model - use the parent link values directly
++                    model = list(self.query.related_updates.keys())[0]
++                    related_ids[model] = [row[0] for row in flattened_rows]
++                elif len(parent_query.select) == len(self.query.related_updates):
++                    # Multiple parent models - map each column to its model
++                    models = list(self.query.related_updates.keys())
++                    for i, model in enumerate(models):
++                        related_ids[model] = [row[i] for row in flattened_rows]
++                else:
++                    # Fallback: use primary key for all models (original behavior)
++                    idents = [row[0] for row in flattened_rows]
++                    for model in self.query.related_updates.keys():
++                        related_ids[model] = idents
++                
++                # Set the child table filter using primary keys
++                idents = []
++                for rows in query.get_compiler(self.using).execute_sql(MULTI):
++                    idents.extend(r[0] for r in rows)
++                self.query.add_filter("pk__in", idents)
++                self.query.related_ids = related_ids
++            else:
++                # No related updates, use the original logic
++                idents = []
++                for rows in query.get_compiler(self.using).execute_sql(MULTI):
++                    idents.extend(r[0] for r in rows)
++                self.query.add_filter("pk__in", idents)
++                self.query.related_ids = idents
+         else:
+             # The fast path. Filters and updates in one query.
+             self.query.add_filter("pk__in", query)

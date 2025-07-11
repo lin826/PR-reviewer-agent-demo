@@ -1,0 +1,671 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index c1a76584f0..a8f8b427ca 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -866,6 +866,9 @@ class ExpressionWrapper(Expression):
+     def as_sql(self, compiler, connection):
+         return self.expression.as_sql(compiler, connection)
+ 
++    def get_group_by_cols(self, alias=None):
++        return self.expression.get_group_by_cols(alias)
++
+     def __repr__(self):
+         return "{}({})".format(self.__class__.__name__, self.expression)
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..897ee0cec9
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python
++"""
++Reproduction script for ExpressionWrapper GROUP BY issue.
++
++This script reproduces the issue where ExpressionWrapper incorrectly includes
++constant expressions in the GROUP BY clause, causing PostgreSQL errors.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Sum, Value, IntegerField, ExpressionWrapper
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test model
++class TestModel(models.Model):
++    column_a = models.CharField(max_length=50)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_expression_wrapper_group_by():
++    """Test that demonstrates the ExpressionWrapper GROUP BY issue."""
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create test data
++    TestModel.objects.create(column_a='A', column_b=10)
++    TestModel.objects.create(column_a='A', column_b=20)
++    TestModel.objects.create(column_a='B', column_b=30)
++    
++    print("=== Testing ExpressionWrapper with constant Value ===")
++    
++    # This should work but currently fails due to the bug
++    try:
++        expr = ExpressionWrapper(Value(3), output_field=IntegerField())
++        queryset = TestModel.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        
++        # Get the SQL to see what's generated
++        sql, params = queryset.query.sql_with_params()
++        print(f"Generated SQL: {sql}")
++        print(f"Parameters: {params}")
++        
++        # Try to execute the query
++        results = list(queryset)
++        print(f"Results: {results}")
++        print("✓ ExpressionWrapper with constant works correctly")
++        
++    except Exception as e:
++        print(f"✗ ExpressionWrapper with constant failed: {e}")
++    
++    print("\n=== Testing direct Value (should work) ===")
++    
++    # This should work and does work
++    try:
++        queryset = TestModel.objects.annotate(expr_res=Value(3, output_field=IntegerField())).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        
++        # Get the SQL to see what's generated
++        sql, params = queryset.query.sql_with_params()
++        print(f"Generated SQL: {sql}")
++        print(f"Parameters: {params}")
++        
++        # Try to execute the query
++        results = list(queryset)
++        print(f"Results: {results}")
++        print("✓ Direct Value works correctly")
++        
++    except Exception as e:
++        print(f"✗ Direct Value failed: {e}")
++
++def test_get_group_by_cols():
++    """Test the get_group_by_cols method directly."""
++    print("\n=== Testing get_group_by_cols methods ===")
++    
++    # Test Value.get_group_by_cols()
++    value_expr = Value(3, output_field=IntegerField())
++    value_cols = value_expr.get_group_by_cols()
++    print(f"Value(3).get_group_by_cols(): {value_cols}")
++    
++    # Test ExpressionWrapper.get_group_by_cols()
++    wrapper_expr = ExpressionWrapper(Value(3), output_field=IntegerField())
++    wrapper_cols = wrapper_expr.get_group_by_cols()
++    print(f"ExpressionWrapper(Value(3)).get_group_by_cols(): {wrapper_cols}")
++    
++    # The issue: wrapper_cols should be empty like value_cols, but it's not
++    if len(value_cols) == 0 and len(wrapper_cols) > 0:
++        print("✗ BUG CONFIRMED: ExpressionWrapper includes itself in GROUP BY when it should delegate to wrapped expression")
++    elif len(value_cols) == 0 and len(wrapper_cols) == 0:
++        print("✓ FIXED: ExpressionWrapper correctly delegates to wrapped expression")
++    else:
++        print(f"? Unexpected behavior: value_cols={len(value_cols)}, wrapper_cols={len(wrapper_cols)}")
++
++if __name__ == '__main__':
++    test_get_group_by_cols()
++    test_expression_wrapper_group_by()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..d570854099
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python
++"""
++Simple test to verify the fix works.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db.models import Value, IntegerField, ExpressionWrapper
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_get_group_by_cols():
++    """Test that the fix works correctly."""
++    print("=== Testing get_group_by_cols fix ===")
++    
++    # Test 1: Value.get_group_by_cols() should return []
++    value_expr = Value(3, output_field=IntegerField())
++    value_cols = value_expr.get_group_by_cols()
++    print(f"Value(3).get_group_by_cols(): {value_cols}")
++    assert value_cols == [], f"Expected [], got {value_cols}"
++    
++    # Test 2: ExpressionWrapper.get_group_by_cols() should also return []
++    wrapper_expr = ExpressionWrapper(Value(3), output_field=IntegerField())
++    wrapper_cols = wrapper_expr.get_group_by_cols()
++    print(f"ExpressionWrapper(Value(3)).get_group_by_cols(): {wrapper_cols}")
++    assert wrapper_cols == [], f"Expected [], got {wrapper_cols}"
++    
++    # Test 3: Test with alias parameter
++    wrapper_cols_alias = wrapper_expr.get_group_by_cols(alias='test')
++    print(f"ExpressionWrapper(Value(3)).get_group_by_cols(alias='test'): {wrapper_cols_alias}")
++    assert wrapper_cols_alias == [], f"Expected [], got {wrapper_cols_alias}"
++    
++    print("✅ All tests passed! The fix works correctly.")
++
++if __name__ == '__main__':
++    test_get_group_by_cols()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..54b0ae7c86
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the ExpressionWrapper fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Sum, Value, IntegerField, ExpressionWrapper, F
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test model
++class TestModel(models.Model):
++    column_a = models.CharField(max_length=50)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_edge_cases():
++    """Test various edge cases for ExpressionWrapper.get_group_by_cols()."""
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create test data
++    TestModel.objects.create(column_a='A', column_b=10)
++    
++    print("=== Testing Edge Cases ===")
++    
++    # Test 1: ExpressionWrapper with F expression in a real query context
++    print("\n1. ExpressionWrapper with F expression in query:")
++    try:
++        f_expr = ExpressionWrapper(F('column_b'), output_field=IntegerField())
++        queryset = TestModel.objects.annotate(expr_res=f_expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        sql, params = queryset.query.sql_with_params()
++        print(f"   SQL: {sql}")
++        print(f"   Parameters: {params}")
++        results = list(queryset)
++        print(f"   Results: {results}")
++        print("   ✓ ExpressionWrapper with F expression works")
++    except Exception as e:
++        print(f"   ✗ ExpressionWrapper with F expression failed: {e}")
++    
++    # Test 2: ExpressionWrapper with Value (should not include in GROUP BY)
++    print("\n2. ExpressionWrapper with Value:")
++    value_expr = ExpressionWrapper(Value(42), output_field=IntegerField())
++    value_cols = value_expr.get_group_by_cols()
++    print(f"   ExpressionWrapper(Value(42)).get_group_by_cols(): {value_cols}")
++    print(f"   Length: {len(value_cols)} (should be 0)")
++    
++    # Test 3: ExpressionWrapper with complex expression
++    print("\n3. ExpressionWrapper with complex expression:")
++    complex_expr = ExpressionWrapper(F('column_b') + Value(10), output_field=IntegerField())
++    complex_cols = complex_expr.get_group_by_cols()
++    print(f"   ExpressionWrapper(F('column_b') + Value(10)).get_group_by_cols(): {complex_cols}")
++    print(f"   Length: {len(complex_cols)} (should be > 0)")
++    
++    # Test 4: Test with alias parameter
++    print("\n4. Testing with alias parameter:")
++    value_expr_alias = ExpressionWrapper(Value(99), output_field=IntegerField())
++    value_cols_alias = value_expr_alias.get_group_by_cols(alias='test_alias')
++    print(f"   ExpressionWrapper(Value(99)).get_group_by_cols(alias='test_alias'): {value_cols_alias}")
++    print(f"   Length: {len(value_cols_alias)} (should be 0)")
++    
++    # Test 5: Nested ExpressionWrapper
++    print("\n5. Nested ExpressionWrapper:")
++    nested_expr = ExpressionWrapper(ExpressionWrapper(Value(123), output_field=IntegerField()), output_field=IntegerField())
++    nested_cols = nested_expr.get_group_by_cols()
++    print(f"   Nested ExpressionWrapper(Value(123)).get_group_by_cols(): {nested_cols}")
++    print(f"   Length: {len(nested_cols)} (should be 0)")
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_expression_wrapper_group_by.py b/test_expression_wrapper_group_by.py
+new file mode 100644
+index 0000000000..ee2dafb57e
+--- /dev/null
++++ b/test_expression_wrapper_group_by.py
+@@ -0,0 +1,125 @@
++#!/usr/bin/env python
++"""
++Test case for ExpressionWrapper GROUP BY fix.
++
++This test should be added to the Django test suite to prevent regression.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Sum, Value, IntegerField, ExpressionWrapper, F
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test model
++class TestModel(models.Model):
++    column_a = models.CharField(max_length=50)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++class ExpressionWrapperGroupByTest(TestCase):
++    """Test that ExpressionWrapper correctly delegates get_group_by_cols to wrapped expression."""
++    
++    def setUp(self):
++        # Create test data
++        TestModel.objects.create(column_a='A', column_b=10)
++        TestModel.objects.create(column_a='A', column_b=20)
++        TestModel.objects.create(column_a='B', column_b=30)
++    
++    def test_expression_wrapper_constant_group_by_cols(self):
++        """Test that ExpressionWrapper with constant returns empty group_by_cols."""
++        # Direct Value should return empty list
++        value_expr = Value(3, output_field=IntegerField())
++        value_cols = value_expr.get_group_by_cols()
++        self.assertEqual(value_cols, [])
++        
++        # ExpressionWrapper with Value should also return empty list
++        wrapper_expr = ExpressionWrapper(Value(3), output_field=IntegerField())
++        wrapper_cols = wrapper_expr.get_group_by_cols()
++        self.assertEqual(wrapper_cols, [])
++        
++        # They should be identical
++        self.assertEqual(value_cols, wrapper_cols)
++    
++    def test_expression_wrapper_constant_sql_generation(self):
++        """Test that ExpressionWrapper with constant generates same SQL as direct Value."""
++        # Query with direct Value
++        q1 = TestModel.objects.annotate(
++            expr_res=Value(3, output_field=IntegerField())
++        ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        
++        # Query with ExpressionWrapper
++        q2 = TestModel.objects.annotate(
++            expr_res=ExpressionWrapper(Value(3), output_field=IntegerField())
++        ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        
++        # SQL should be identical
++        sql1, params1 = q1.query.sql_with_params()
++        sql2, params2 = q2.query.sql_with_params()
++        
++        self.assertEqual(sql1, sql2)
++        self.assertEqual(params1, params2)
++        
++        # Results should be identical
++        results1 = list(q1)
++        results2 = list(q2)
++        self.assertEqual(results1, results2)
++    
++    def test_expression_wrapper_constant_no_group_by_constant(self):
++        """Test that constant is not included in GROUP BY clause."""
++        # Query with ExpressionWrapper containing constant
++        queryset = TestModel.objects.annotate(
++            expr_res=ExpressionWrapper(Value(3), output_field=IntegerField())
++        ).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        
++        sql, params = queryset.query.sql_with_params()
++        
++        # The constant should not appear in GROUP BY clause
++        # SQL should only group by column_a, not by the constant
++        self.assertIn('GROUP BY', sql)
++        self.assertIn('"column_a"', sql)
++        
++        # Count parameter placeholders in GROUP BY
++        # There should be only one parameter (for SELECT), not two (SELECT + GROUP BY)
++        self.assertEqual(len(params), 1)
++        self.assertEqual(params[0], 3)
++    
++    def test_expression_wrapper_with_alias_parameter(self):
++        """Test that get_group_by_cols works correctly with alias parameter."""
++        wrapper_expr = ExpressionWrapper(Value(42), output_field=IntegerField())
++        
++        # Test with None alias
++        cols_none = wrapper_expr.get_group_by_cols(alias=None)
++        self.assertEqual(cols_none, [])
++        
++        # Test with string alias
++        cols_alias = wrapper_expr.get_group_by_cols(alias='test_alias')
++        self.assertEqual(cols_alias, [])
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_postgres_issue.py b/test_postgres_issue.py
+new file mode 100644
+index 0000000000..15f507624e
+--- /dev/null
++++ b/test_postgres_issue.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python
++"""
++Test script that would demonstrate the PostgreSQL issue.
++
++This script shows the SQL that would be generated and would fail on PostgreSQL.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Sum, Value, IntegerField, ExpressionWrapper
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test model
++class TestModel(models.Model):
++    column_a = models.CharField(max_length=50)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++def analyze_sql_generation():
++    """Analyze the SQL generation to show the PostgreSQL issue."""
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    print("=== SQL Analysis for PostgreSQL Issue ===")
++    
++    # Test ExpressionWrapper with constant
++    expr = ExpressionWrapper(Value(3), output_field=IntegerField())
++    queryset = TestModel.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    
++    sql, params = queryset.query.sql_with_params()
++    print(f"\nExpressionWrapper SQL: {sql}")
++    print(f"Parameters: {params}")
++    
++    # Simulate what this would look like in PostgreSQL
++    postgres_sql = sql.replace('"%s"', '3').replace('%s', '3')
++    print(f"PostgreSQL equivalent: {postgres_sql}")
++    print("^ This would fail with: 'aggregate functions are not allowed in GROUP BY'")
++    
++    # Test direct Value
++    queryset2 = TestModel.objects.annotate(expr_res=Value(3, output_field=IntegerField())).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    
++    sql2, params2 = queryset2.query.sql_with_params()
++    print(f"\nDirect Value SQL: {sql2}")
++    print(f"Parameters: {params2}")
++    
++    # Simulate what this would look like in PostgreSQL
++    postgres_sql2 = sql2.replace('%s', '3')
++    print(f"PostgreSQL equivalent: {postgres_sql2}")
++    print("^ This works correctly - no constant in GROUP BY")
++
++if __name__ == '__main__':
++    analyze_sql_generation()
+\ No newline at end of file
+diff --git a/test_real_usage.py b/test_real_usage.py
+new file mode 100644
+index 0000000000..736163f2fa
+--- /dev/null
++++ b/test_real_usage.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python
++"""
++Test real usage scenarios for the ExpressionWrapper fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Sum, Value, IntegerField, ExpressionWrapper, F
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test model
++class TestModel(models.Model):
++    column_a = models.CharField(max_length=50)
++    column_b = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_real_usage():
++    """Test real usage scenarios that would occur in Django applications."""
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create test data
++    TestModel.objects.create(column_a='A', column_b=10)
++    TestModel.objects.create(column_a='A', column_b=20)
++    TestModel.objects.create(column_a='B', column_b=30)
++    
++    print("=== Testing Real Usage Scenarios ===")
++    
++    # Test 1: The original issue - ExpressionWrapper with constant
++    print("\n1. Original issue - ExpressionWrapper with constant:")
++    def execQuery(expr):
++        expr = ExpressionWrapper(expr, output_field=IntegerField())
++        return TestModel.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    
++    try:
++        results = list(execQuery(Value(3)))
++        print(f"   Results: {results}")
++        print("   ✓ ExpressionWrapper with constant works correctly")
++    except Exception as e:
++        print(f"   ✗ ExpressionWrapper with constant failed: {e}")
++    
++    # Test 2: ExpressionWrapper with field reference
++    print("\n2. ExpressionWrapper with field reference:")
++    try:
++        expr = ExpressionWrapper(F('column_b'), output_field=IntegerField())
++        queryset = TestModel.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        results = list(queryset)
++        print(f"   Results: {results}")
++        print("   ✓ ExpressionWrapper with field reference works correctly")
++    except Exception as e:
++        print(f"   ✗ ExpressionWrapper with field reference failed: {e}")
++    
++    # Test 3: ExpressionWrapper with arithmetic expression
++    print("\n3. ExpressionWrapper with arithmetic expression:")
++    try:
++        expr = ExpressionWrapper(F('column_b') * 2, output_field=IntegerField())
++        queryset = TestModel.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++        results = list(queryset)
++        print(f"   Results: {results}")
++        print("   ✓ ExpressionWrapper with arithmetic expression works correctly")
++    except Exception as e:
++        print(f"   ✗ ExpressionWrapper with arithmetic expression failed: {e}")
++    
++    # Test 4: Compare SQL generation
++    print("\n4. SQL generation comparison:")
++    
++    # Direct Value
++    q1 = TestModel.objects.annotate(expr_res=Value(3, output_field=IntegerField())).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    sql1, params1 = q1.query.sql_with_params()
++    
++    # ExpressionWrapper with Value
++    q2 = TestModel.objects.annotate(expr_res=ExpressionWrapper(Value(3), output_field=IntegerField())).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    sql2, params2 = q2.query.sql_with_params()
++    
++    print(f"   Direct Value SQL: {sql1}")
++    print(f"   ExpressionWrapper SQL: {sql2}")
++    
++    if sql1 == sql2 and params1 == params2:
++        print("   ✓ SQL generation is identical - fix successful!")
++    else:
++        print("   ✗ SQL generation differs - fix may have issues")
++
++if __name__ == '__main__':
++    test_real_usage()
+\ No newline at end of file
+diff --git a/tests/expressions/tests.py b/tests/expressions/tests.py
+index 72bca4f205..c5aab7bf67 100644
+--- a/tests/expressions/tests.py
++++ b/tests/expressions/tests.py
+@@ -1699,6 +1699,28 @@ class ValueTests(TestCase):
+         with self.assertRaisesMessage(ValueError, msg):
+             ExpressionList()
+ 
++    def test_expression_wrapper_group_by_cols(self):
++        """
++        Test that ExpressionWrapper correctly delegates get_group_by_cols to
++        the wrapped expression, particularly for constants like Value.
++        """
++        # Direct Value should return empty list for get_group_by_cols
++        value_expr = Value(3, output_field=IntegerField())
++        value_cols = value_expr.get_group_by_cols()
++        self.assertEqual(value_cols, [])
++
++        # ExpressionWrapper with Value should also return empty list
++        wrapper_expr = ExpressionWrapper(Value(3), output_field=IntegerField())
++        wrapper_cols = wrapper_expr.get_group_by_cols()
++        self.assertEqual(wrapper_cols, [])
++
++        # Test with alias parameter
++        wrapper_cols_alias = wrapper_expr.get_group_by_cols(alias='test_alias')
++        self.assertEqual(wrapper_cols_alias, [])
++
++        # Both should be identical
++        self.assertEqual(value_cols, wrapper_cols)
++
+ 
+ class FieldTransformTests(TestCase):

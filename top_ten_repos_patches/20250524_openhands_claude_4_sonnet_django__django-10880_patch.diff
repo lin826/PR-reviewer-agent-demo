@@ -1,0 +1,443 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index ac0b62d0bf..ea88c54b0d 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -68,7 +68,7 @@ class Aggregate(Func):
+         return []
+ 
+     def as_sql(self, compiler, connection, **extra_context):
+-        extra_context['distinct'] = 'DISTINCT' if self.distinct else ''
++        extra_context['distinct'] = 'DISTINCT ' if self.distinct else ''
+         if self.filter:
+             if connection.features.supports_aggregate_filter_clause:
+                 filter_sql, filter_params = self.filter.as_sql(compiler, connection)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..686bbc2113
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,194 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the Count + Case + distinct issue.
++This script demonstrates the SQL syntax error when using Count with both
++Case condition and distinct=True.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.aggregation',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from django.db.models import Count, Case, When, IntegerField
++from tests.aggregation.models import Book, Author, Publisher
++
++def create_test_data():
++    """Create some test data"""
++    # Create publishers
++    pub1 = Publisher.objects.create(name="Publisher 1", num_awards=5)
++    pub2 = Publisher.objects.create(name="Publisher 2", num_awards=3)
++    
++    # Create authors
++    author1 = Author.objects.create(name="Author 1", age=30)
++    author2 = Author.objects.create(name="Author 2", age=40)
++    
++    # Create books
++    book1 = Book.objects.create(
++        isbn="123456789",
++        name="Book 1",
++        pages=200,
++        rating=4.5,
++        price=29.99,
++        contact=author1,
++        publisher=pub1,
++        pubdate="2023-01-01"
++    )
++    book2 = Book.objects.create(
++        isbn="987654321", 
++        name="Book 2",
++        pages=300,
++        rating=3.5,
++        price=39.99,
++        contact=author2,
++        publisher=pub2,
++        pubdate="2023-02-01"
++    )
++    book3 = Book.objects.create(
++        isbn="555666777",
++        name="Book 3", 
++        pages=150,
++        rating=4.0,
++        price=19.99,
++        contact=author1,
++        publisher=pub1,
++        pubdate="2023-03-01"
++    )
++    
++    return book1, book2, book3
++
++def test_count_with_case_and_distinct():
++    """Test Count with Case condition and distinct=True"""
++    print("Testing Count with Case condition and distinct=True...")
++    
++    try:
++        # This should trigger the bug: COUNT(DISTINCTCASE WHEN ...)
++        queryset = Book.objects.annotate(
++            high_rating_count=Count(
++                Case(
++                    When(rating__gte=4.0, then=1),
++                    default=None,
++                    output_field=IntegerField()
++                ),
++                distinct=True
++            )
++        )
++        
++        # Try to get the SQL - this should show the malformed query
++        print("Generated SQL:")
++        print(str(queryset.query))
++        print()
++        
++        # Try to execute the query - this should fail with SQL syntax error
++        print("Executing query...")
++        result = list(queryset.values('name', 'high_rating_count'))
++        print("Query executed successfully!")
++        print("Results:", result)
++        
++    except Exception as e:
++        print(f"Error occurred: {type(e).__name__}: {e}")
++        print()
++        
++        # Let's also check the raw SQL that would be generated
++        try:
++            sql, params = queryset.query.sql_with_params()
++            print("Raw SQL that would be generated:")
++            print(sql % params if params else sql)
++        except Exception as sql_e:
++            print(f"Could not get SQL: {sql_e}")
++
++def test_count_with_distinct_only():
++    """Test Count with distinct=True only (should work)"""
++    print("Testing Count with distinct=True only (control test)...")
++    
++    try:
++        queryset = Book.objects.annotate(
++            distinct_rating_count=Count('rating', distinct=True)
++        )
++        
++        print("Generated SQL:")
++        print(str(queryset.query))
++        print()
++        
++        result = list(queryset.values('name', 'distinct_rating_count'))
++        print("Query executed successfully!")
++        print("Results:", result)
++        print()
++        
++    except Exception as e:
++        print(f"Error occurred: {type(e).__name__}: {e}")
++        print()
++
++def test_count_with_case_only():
++    """Test Count with Case condition only (should work)"""
++    print("Testing Count with Case condition only (control test)...")
++    
++    try:
++        queryset = Book.objects.annotate(
++            high_rating_count=Count(
++                Case(
++                    When(rating__gte=4.0, then=1),
++                    default=None,
++                    output_field=IntegerField()
++                )
++            )
++        )
++        
++        print("Generated SQL:")
++        print(str(queryset.query))
++        print()
++        
++        result = list(queryset.values('name', 'high_rating_count'))
++        print("Query executed successfully!")
++        print("Results:", result)
++        print()
++        
++    except Exception as e:
++        print(f"Error occurred: {type(e).__name__}: {e}")
++        print()
++
++if __name__ == '__main__':
++    # Create tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Create test data
++    create_test_data()
++    
++    print("=" * 60)
++    print("REPRODUCTION SCRIPT FOR COUNT + CASE + DISTINCT ISSUE")
++    print("=" * 60)
++    print()
++    
++    # Test the problematic case
++    test_count_with_case_and_distinct()
++    
++    print("-" * 40)
++    
++    # Test control cases
++    test_count_with_distinct_only()
++    test_count_with_case_only()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..d5666dd1d4
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,222 @@
++#!/usr/bin/env python
++"""
++Edge case tests for the Count + Case + distinct fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.aggregation',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from django.db.models import Count, Case, When, IntegerField, Sum, Avg, Max, Min
++from tests.aggregation.models import Book, Author, Publisher
++
++def create_test_data():
++    """Create some test data"""
++    # Create publishers
++    pub1 = Publisher.objects.create(name="Publisher 1", num_awards=5)
++    pub2 = Publisher.objects.create(name="Publisher 2", num_awards=3)
++    
++    # Create authors
++    author1 = Author.objects.create(name="Author 1", age=30)
++    author2 = Author.objects.create(name="Author 2", age=40)
++    
++    # Create books
++    book1 = Book.objects.create(
++        isbn="123456789",
++        name="Book 1",
++        pages=200,
++        rating=4.5,
++        price=29.99,
++        contact=author1,
++        publisher=pub1,
++        pubdate="2023-01-01"
++    )
++    book2 = Book.objects.create(
++        isbn="987654321", 
++        name="Book 2",
++        pages=300,
++        rating=3.5,
++        price=39.99,
++        contact=author2,
++        publisher=pub2,
++        pubdate="2023-02-01"
++    )
++    book3 = Book.objects.create(
++        isbn="555666777",
++        name="Book 3", 
++        pages=150,
++        rating=4.0,
++        price=19.99,
++        contact=author1,
++        publisher=pub1,
++        pubdate="2023-03-01"
++    )
++    
++    return book1, book2, book3
++
++def test_other_aggregates_with_distinct():
++    """Test other aggregates with distinct=True to ensure they still work"""
++    print("Testing other aggregates with distinct=True...")
++    
++    # Test Sum with distinct
++    try:
++        queryset = Book.objects.aggregate(
++            distinct_sum=Sum('pages', distinct=True)
++        )
++        print(f"Sum with distinct: {queryset}")
++    except Exception as e:
++        print(f"Sum with distinct failed: {e}")
++    
++    # Test Avg with distinct (should fail since Avg doesn't allow distinct)
++    try:
++        queryset = Book.objects.aggregate(
++            distinct_avg=Avg('pages', distinct=True)
++        )
++        print(f"Avg with distinct: {queryset}")
++    except Exception as e:
++        print(f"Avg with distinct failed (expected): {e}")
++    
++    # Test Max with distinct (should fail since Max doesn't allow distinct)
++    try:
++        queryset = Book.objects.aggregate(
++            distinct_max=Max('pages', distinct=True)
++        )
++        print(f"Max with distinct: {queryset}")
++    except Exception as e:
++        print(f"Max with distinct failed (expected): {e}")
++    
++    print()
++
++def test_complex_case_expressions():
++    """Test more complex Case expressions with distinct"""
++    print("Testing complex Case expressions with distinct...")
++    
++    try:
++        # Multiple When conditions
++        queryset = Book.objects.annotate(
++            rating_category_count=Count(
++                Case(
++                    When(rating__gte=4.0, then=1),
++                    When(rating__gte=3.0, then=2),
++                    default=3,
++                    output_field=IntegerField()
++                ),
++                distinct=True
++            )
++        )
++        
++        print("Generated SQL for complex Case:")
++        print(str(queryset.query))
++        print()
++        
++        result = list(queryset.values('name', 'rating_category_count'))
++        print("Query executed successfully!")
++        print("Results:", result)
++        print()
++        
++    except Exception as e:
++        print(f"Complex Case with distinct failed: {e}")
++        print()
++
++def test_nested_expressions():
++    """Test nested expressions with distinct"""
++    print("Testing nested expressions with distinct...")
++    
++    try:
++        # Case inside another expression
++        queryset = Book.objects.annotate(
++            complex_count=Count(
++                Case(
++                    When(rating__gte=4.0, then='pages'),
++                    default=None,
++                    output_field=IntegerField()
++                ),
++                distinct=True
++            )
++        )
++        
++        print("Generated SQL for nested expressions:")
++        print(str(queryset.query))
++        print()
++        
++        result = list(queryset.values('name', 'complex_count'))
++        print("Query executed successfully!")
++        print("Results:", result)
++        print()
++        
++    except Exception as e:
++        print(f"Nested expressions with distinct failed: {e}")
++        print()
++
++def test_multiple_distinct_aggregates():
++    """Test multiple distinct aggregates in the same query"""
++    print("Testing multiple distinct aggregates...")
++    
++    try:
++        queryset = Book.objects.annotate(
++            distinct_ratings=Count('rating', distinct=True),
++            high_rating_count=Count(
++                Case(
++                    When(rating__gte=4.0, then=1),
++                    default=None,
++                    output_field=IntegerField()
++                ),
++                distinct=True
++            )
++        )
++        
++        print("Generated SQL for multiple distinct aggregates:")
++        print(str(queryset.query))
++        print()
++        
++        result = list(queryset.values('name', 'distinct_ratings', 'high_rating_count'))
++        print("Query executed successfully!")
++        print("Results:", result)
++        print()
++        
++    except Exception as e:
++        print(f"Multiple distinct aggregates failed: {e}")
++        print()
++
++if __name__ == '__main__':
++    # Create tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Create test data
++    create_test_data()
++    
++    print("=" * 60)
++    print("EDGE CASE TESTS FOR COUNT + CASE + DISTINCT FIX")
++    print("=" * 60)
++    print()
++    
++    test_other_aggregates_with_distinct()
++    test_complex_case_expressions()
++    test_nested_expressions()
++    test_multiple_distinct_aggregates()
+\ No newline at end of file

@@ -1,0 +1,367 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..b0e2869b3c
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,136 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for QuerySet.ordered property fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Count, Sum
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class ModelWithOrdering(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['name']
++
++class ModelWithoutOrdering(models.Model):
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create tables
++from django.db import connection
++
++tables = connection.introspection.table_names()
++
++if 'main_modelwithordering' not in tables:
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ModelWithOrdering)
++        schema_editor.create_model(ModelWithoutOrdering)
++
++def test_comprehensive_ordered_property():
++    print("Comprehensive test for QuerySet.ordered property")
++    print("=" * 60)
++    
++    test_cases = [
++        # (description, queryset_func, expected_ordered, expected_has_order_by)
++        ("Model with ordering - basic query", 
++         lambda: ModelWithOrdering.objects.all(), True, True),
++        
++        ("Model with ordering - explicit order_by", 
++         lambda: ModelWithOrdering.objects.order_by('value'), True, True),
++        
++        ("Model with ordering - cleared order_by", 
++         lambda: ModelWithOrdering.objects.order_by(), False, False),
++        
++        ("Model with ordering - annotated with aggregate (GROUP BY)", 
++         lambda: ModelWithOrdering.objects.annotate(Count('pk')), False, False),
++        
++        ("Model with ordering - annotated with aggregate + explicit order_by", 
++         lambda: ModelWithOrdering.objects.annotate(Count('pk')).order_by('name'), True, True),
++        
++        ("Model without ordering - basic query", 
++         lambda: ModelWithoutOrdering.objects.all(), False, False),
++        
++        ("Model without ordering - explicit order_by", 
++         lambda: ModelWithoutOrdering.objects.order_by('value'), True, True),
++        
++        ("Model without ordering - annotated with aggregate", 
++         lambda: ModelWithoutOrdering.objects.annotate(Count('pk')), False, False),
++        
++        ("Model without ordering - annotated with aggregate + explicit order_by", 
++         lambda: ModelWithoutOrdering.objects.annotate(Count('pk')).order_by('name'), True, True),
++        
++        ("Empty queryset", 
++         lambda: ModelWithOrdering.objects.none(), True, False),
++    ]
++    
++    all_passed = True
++    
++    for description, queryset_func, expected_ordered, expected_has_order_by in test_cases:
++        qs = queryset_func()
++        actual_ordered = qs.ordered
++        
++        # Get actual SQL to check ORDER BY
++        try:
++            sql = qs.query.get_compiler(connection.alias).as_sql()[0]
++            actual_has_order_by = 'ORDER BY' in sql
++        except Exception:
++            # Empty querysets and some other cases might not generate SQL
++            actual_has_order_by = False
++            sql = "N/A"
++        
++        # Check results
++        ordered_correct = actual_ordered == expected_ordered
++        order_by_correct = actual_has_order_by == expected_has_order_by
++        test_passed = ordered_correct and order_by_correct
++        
++        status = "✅ PASS" if test_passed else "❌ FAIL"
++        print(f"{status} {description}")
++        print(f"    .ordered: {actual_ordered} (expected: {expected_ordered})")
++        print(f"    ORDER BY in SQL: {actual_has_order_by} (expected: {expected_has_order_by})")
++        if not test_passed:
++            print(f"    SQL: {sql}")
++        print()
++        
++        if not test_passed:
++            all_passed = False
++    
++    print("=" * 60)
++    if all_passed:
++        print("🎉 All tests passed!")
++    else:
++        print("💥 Some tests failed!")
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success = test_comprehensive_ordered_property()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..758ed50136
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python
++"""
++Debug the test failure.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the tests directory to the path
++sys.path.insert(0, '/workspace/django__django__3.2/tests')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'queries',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Count
++from queries.models import Tag
++
++# Create tables
++from django.core.management import call_command
++call_command('migrate', verbosity=0, interactive=False)
++
++def debug_tag_query():
++    print("Debugging Tag query with annotation")
++    print("=" * 50)
++    
++    qs = Tag.objects.annotate(num_children=Count('children'))
++    
++    print(f"Tag model Meta.ordering: {Tag._meta.ordering}")
++    print(f"qs.query.default_ordering: {qs.query.default_ordering}")
++    print(f"qs.query.get_meta().ordering: {qs.query.get_meta().ordering}")
++    print(f"qs.query.group_by: {qs.query.group_by}")
++    print(f"qs.query.order_by: {qs.query.order_by}")
++    print(f"qs.query.extra_order_by: {qs.query.extra_order_by}")
++    print(f"qs.ordered: {qs.ordered}")
++    
++    # Check the SQL
++    from django.db import connection
++    try:
++        sql = qs.query.get_compiler(connection.alias).as_sql()[0]
++        print(f"SQL: {sql}")
++        print(f"Has ORDER BY: {'ORDER BY' in sql}")
++        print(f"Has GROUP BY: {'GROUP BY' in sql}")
++    except Exception as e:
++        print(f"Error getting SQL: {e}")
++
++if __name__ == '__main__':
++    debug_tag_query()
+\ No newline at end of file
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 85cd8311a7..324d86f2d3 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1225,6 +1225,11 @@ class QuerySet:
+         if self.query.extra_order_by or self.query.order_by:
+             return True
+         elif self.query.default_ordering and self.query.get_meta().ordering:
++            # If there's a GROUP BY clause and the only ordering comes from
++            # Meta.ordering, the ORDER BY clause will be removed by the SQL
++            # compiler, so the query won't actually be ordered.
++            if self.query.group_by is not None:
++                return False
+             return True
+         else:
+             return False
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5e14c36c50
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python
++"""
++Reproduction script for QuerySet.ordered property issue with GROUP BY queries.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class Foo(models.Model):
++    uuid = models.CharField(max_length=36, primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['name']
++
++# Create tables
++from django.db import connection
++
++tables = connection.introspection.table_names()
++
++if 'main_foo' not in tables:
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Foo)
++
++def test_ordered_property():
++    print("Testing QuerySet.ordered property with GROUP BY queries")
++    print("=" * 60)
++    
++    # Test 1: Regular queryset with default ordering
++    qs1 = Foo.objects.all()
++    print(f"Regular queryset:")
++    print(f"  SQL: {qs1.query}")
++    print(f"  ordered: {qs1.ordered}")
++    print(f"  query.default_ordering: {qs1.query.default_ordering}")
++    print(f"  query.get_meta().ordering: {qs1.query.get_meta().ordering}")
++    print()
++    
++    # Test 2: Annotated queryset with Count (should have GROUP BY)
++    qs2 = Foo.objects.annotate(Count("pk")).all()
++    print(f"Annotated queryset with Count:")
++    print(f"  SQL: {qs2.query}")
++    print(f"  ordered: {qs2.ordered}")
++    print(f"  query.default_ordering: {qs2.query.default_ordering}")
++    print(f"  query.get_meta().ordering: {qs2.query.get_meta().ordering}")
++    print(f"  query.group_by: {qs2.query.group_by}")
++    print()
++    
++    # Test 3: Let's see the actual SQL generated
++    from django.db import connection
++    
++    print("Actual SQL generated:")
++    print("Regular queryset SQL:")
++    print(f"  {qs1.query.get_compiler(connection.alias).as_sql()[0]}")
++    print()
++    
++    print("Annotated queryset SQL:")
++    print(f"  {qs2.query.get_compiler(connection.alias).as_sql()[0]}")
++    print()
++    
++    # Test 4: Check if the issue exists
++    print("Issue verification:")
++    regular_sql = qs1.query.get_compiler(connection.alias).as_sql()[0]
++    annotated_sql = qs2.query.get_compiler(connection.alias).as_sql()[0]
++    
++    regular_has_order_by = 'ORDER BY' in regular_sql
++    annotated_has_order_by = 'ORDER BY' in annotated_sql
++    annotated_has_group_by = 'GROUP BY' in annotated_sql
++    
++    print(f"  Regular query has ORDER BY: {regular_has_order_by}")
++    print(f"  Annotated query has ORDER BY: {annotated_has_order_by}")
++    print(f"  Annotated query has GROUP BY: {annotated_has_group_by}")
++    print(f"  Regular query .ordered: {qs1.ordered}")
++    print(f"  Annotated query .ordered: {qs2.ordered}")
++    print()
++    
++    if annotated_has_group_by and not annotated_has_order_by and qs2.ordered:
++        print("❌ ISSUE CONFIRMED: Annotated query has GROUP BY, no ORDER BY, but .ordered is True")
++        return False
++    else:
++        print("✅ No issue found")
++        return True
++
++if __name__ == '__main__':
++    test_ordered_property()
+\ No newline at end of file
+diff --git a/tests/queries/tests.py b/tests/queries/tests.py
+index f9a57b088a..487b4df115 100644
+--- a/tests/queries/tests.py
++++ b/tests/queries/tests.py
+@@ -2084,6 +2084,15 @@ class QuerysetOrderedTests(unittest.TestCase):
+         self.assertIs(qs.ordered, False)
+         self.assertIs(qs.order_by('num_notes').ordered, True)
+ 
++    def test_annotated_ordering_with_default_ordering(self):
++        # Test for models with Meta.ordering and GROUP BY queries
++        # When a model has Meta.ordering but the query has GROUP BY,
++        # the ORDER BY clause is removed, so .ordered should be False
++        qs = Tag.objects.annotate(num_children=Count('children'))
++        self.assertIs(qs.ordered, False)
++        # But if we add explicit ordering, it should be True
++        self.assertIs(qs.order_by('name').ordered, True)
++
+ 
+ @skipUnlessDBFeature('allow_sliced_subqueries_with_in')
+ class SubqueryTests(TestCase):

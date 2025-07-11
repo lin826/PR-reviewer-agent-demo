@@ -1,0 +1,497 @@
+diff --git a/django/db/backends/sqlite3/schema.py b/django/db/backends/sqlite3/schema.py
+index 6752a8e3c0..b7d1e2b58b 100644
+--- a/django/db/backends/sqlite3/schema.py
++++ b/django/db/backends/sqlite3/schema.py
+@@ -327,7 +327,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+         # Fields with default values cannot by handled by ALTER TABLE ADD
+         # COLUMN statement because DROP DEFAULT is not supported in
+         # ALTER TABLE.
+-        if not field.null or self.effective_default(field) is not None:
++        # Fields with unique constraints cannot be added via ALTER TABLE ADD
++        # COLUMN because SQLite doesn't support adding UNIQUE columns.
++        if not field.null or self.effective_default(field) is not None or field.unique:
+             self._remake_table(model, create_field=field)
+         else:
+             super().add_field(model, field)
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..de609df53a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the OneToOneField SQLite fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_edge_cases():
++    """Test various edge cases for unique field addition."""
++    
++    # Test 1: OneToOneField with null=False (should use remake_table due to unique=True)
++    print("Test 1: OneToOneField with null=False")
++    
++    class Model1(models.Model):
++        name = models.CharField(max_length=100)
++        class Meta:
++            app_label = 'test_app'
++    
++    class RefModel1(models.Model):
++        name = models.CharField(max_length=100)
++        class Meta:
++            app_label = 'test_app'
++    
++    with connection.schema_editor() as editor:
++        editor.create_model(RefModel1)
++        editor.create_model(Model1)
++    
++    try:
++        # OneToOneField with null=False should still work (uses remake_table)
++        o2o_field = models.OneToOneField(RefModel1, on_delete=models.CASCADE)
++        o2o_field.set_attributes_from_name('ref_field')
++        
++        with connection.schema_editor() as editor:
++            editor.add_field(Model1, o2o_field)
++        print("✓ OneToOneField with null=False added successfully")
++    except Exception as e:
++        print(f"✗ Error: {e}")
++    
++    # Test 2: Regular field with unique=True and null=False
++    print("\nTest 2: Unique field with null=False")
++    
++    class Model2(models.Model):
++        name = models.CharField(max_length=100)
++        class Meta:
++            app_label = 'test_app'
++    
++    with connection.schema_editor() as editor:
++        editor.create_model(Model2)
++    
++    try:
++        unique_field = models.CharField(max_length=100, unique=True, null=False, default='test')
++        unique_field.set_attributes_from_name('unique_field')
++        
++        with connection.schema_editor() as editor:
++            editor.add_field(Model2, unique_field)
++        print("✓ Unique field with null=False added successfully")
++    except Exception as e:
++        print(f"✗ Error: {e}")
++    
++    # Test 3: Field with db_index=True but unique=False (should use ALTER TABLE)
++    print("\nTest 3: Indexed field (non-unique)")
++    
++    class Model3(models.Model):
++        name = models.CharField(max_length=100)
++        class Meta:
++            app_label = 'test_app'
++    
++    with connection.schema_editor() as editor:
++        editor.create_model(Model3)
++    
++    try:
++        indexed_field = models.CharField(max_length=100, db_index=True, null=True)
++        indexed_field.set_attributes_from_name('indexed_field')
++        
++        with connection.schema_editor() as editor:
++            editor.add_field(Model3, indexed_field)
++        print("✓ Indexed field (non-unique) added successfully")
++    except Exception as e:
++        print(f"✗ Error: {e}")
++    
++    print("\nAll edge case tests completed!")
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_onetoone_issue.py b/test_onetoone_issue.py
+new file mode 100644
+index 0000000000..069891445a
+--- /dev/null
++++ b/test_onetoone_issue.py
+@@ -0,0 +1,212 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the OneToOneField SQLite issue.
++This script creates a model, applies initial migration, then adds a nullable OneToOneField.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.migrations.operations import AddField
++from django.db.backends.sqlite3.schema import DatabaseSchemaEditor
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class RefreshToken(models.Model):
++    token = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class AccessToken(models.Model):
++    token = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_add_nullable_onetoone_field():
++    """Test adding a nullable OneToOneField to an existing table."""
++    print("Testing OneToOneField addition on SQLite...")
++    
++    # Create initial tables
++    with connection.schema_editor() as editor:
++        editor.create_model(RefreshToken)
++        editor.create_model(AccessToken)
++    
++    print("✓ Initial tables created successfully")
++    
++    # Try to add a nullable OneToOneField
++    try:
++        # This should reproduce the issue
++        source_refresh_token_field = models.OneToOneField(
++            RefreshToken,
++            blank=True,
++            null=True,
++            on_delete=models.SET_NULL,
++            related_name="refreshed_access_token"
++        )
++        source_refresh_token_field.set_attributes_from_name('source_refresh_token')
++        
++        with connection.schema_editor() as editor:
++            print("Attempting to add OneToOneField...")
++            editor.add_field(AccessToken, source_refresh_token_field)
++        
++        print("✓ OneToOneField added successfully")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error adding OneToOneField: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++def test_add_unique_field():
++    """Test adding a regular field with unique=True to see if it has the same issue."""
++    print("\nTesting regular unique field addition on SQLite...")
++    
++    # Create a simple model for testing
++    class TestModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    with connection.schema_editor() as editor:
++        editor.create_model(TestModel)
++    
++    print("✓ Test model created successfully")
++    
++    try:
++        # Try to add a unique field
++        unique_field = models.CharField(max_length=100, unique=True, null=True)
++        unique_field.set_attributes_from_name('unique_name')
++        
++        with connection.schema_editor() as editor:
++            print("Attempting to add unique CharField...")
++            editor.add_field(TestModel, unique_field)
++        
++        print("✓ Unique CharField added successfully")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error adding unique CharField: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++def test_add_non_unique_field():
++    """Test that non-unique nullable fields still use the fast ALTER TABLE path."""
++    print("\nTesting non-unique field addition (should use ALTER TABLE)...")
++    
++    class TestModel2(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    with connection.schema_editor() as editor:
++        editor.create_model(TestModel2)
++    
++    print("✓ Test model created successfully")
++    
++    try:
++        # Add a non-unique nullable field (should use ALTER TABLE, not remake)
++        regular_field = models.CharField(max_length=100, null=True)
++        regular_field.set_attributes_from_name('regular_name')
++        
++        with connection.schema_editor() as editor:
++            print("Attempting to add non-unique CharField...")
++            editor.add_field(TestModel2, regular_field)
++        
++        print("✓ Non-unique CharField added successfully")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error adding non-unique CharField: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++def test_add_onetoone_with_default():
++    """Test OneToOneField with a default value (should use remake_table)."""
++    print("\nTesting OneToOneField with default value...")
++    
++    class TestModel3(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    with connection.schema_editor() as editor:
++        editor.create_model(TestModel3)
++    
++    print("✓ Test model created successfully")
++    
++    try:
++        # OneToOneField with default (should use remake_table anyway)
++        onetoone_with_default = models.OneToOneField(
++            RefreshToken,
++            null=True,
++            default=None,
++            on_delete=models.SET_NULL,
++            related_name="test_access_token"
++        )
++        onetoone_with_default.set_attributes_from_name('refresh_token_with_default')
++        
++        with connection.schema_editor() as editor:
++            print("Attempting to add OneToOneField with default...")
++            editor.add_field(TestModel3, onetoone_with_default)
++        
++        print("✓ OneToOneField with default added successfully")
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error adding OneToOneField with default: {e}")
++        print(f"Error type: {type(e).__name__}")
++        return False
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("REPRODUCING ONETOONE FIELD SQLITE ISSUE")
++    print("=" * 60)
++    
++    # Test the main issue
++    onetoone_success = test_add_nullable_onetoone_field()
++    
++    # Test if the issue affects other unique fields
++    unique_success = test_add_unique_field()
++    
++    # Test that non-unique fields still work efficiently
++    non_unique_success = test_add_non_unique_field()
++    
++    # Test OneToOneField with default
++    onetoone_default_success = test_add_onetoone_with_default()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"OneToOneField addition: {'PASSED' if onetoone_success else 'FAILED'}")
++    print(f"Unique field addition: {'PASSED' if unique_success else 'FAILED'}")
++    print(f"Non-unique field addition: {'PASSED' if non_unique_success else 'FAILED'}")
++    print(f"OneToOneField with default: {'PASSED' if onetoone_default_success else 'FAILED'}")
++    print("=" * 60)
++    
++    # Exit with error code if any test failed
++    all_success = all([onetoone_success, unique_success, non_unique_success, onetoone_default_success])
++    sys.exit(0 if all_success else 1)
+\ No newline at end of file
+diff --git a/test_sqlite_onetoone_regression.py b/test_sqlite_onetoone_regression.py
+new file mode 100644
+index 0000000000..e053c04724
+--- /dev/null
++++ b/test_sqlite_onetoone_regression.py
+@@ -0,0 +1,142 @@
++"""
++Regression test for SQLite OneToOneField addition issue.
++This test should be added to the Django test suite to prevent regression.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.test import TransactionTestCase
++from django.test.utils import isolate_apps
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++
++class SQLiteOneToOneFieldRegressionTest(TransactionTestCase):
++    """
++    Test for regression where adding a nullable OneToOneField to an existing
++    table would fail on SQLite with "Cannot add a UNIQUE column" error.
++    
++    This was caused by SQLite's add_field method trying to use ALTER TABLE
++    for nullable fields without defaults, but OneToOneField has unique=True
++    which SQLite doesn't support in ALTER TABLE ADD COLUMN.
++    """
++    
++    def test_add_nullable_onetoone_field(self):
++        """Test adding a nullable OneToOneField to an existing table."""
++        # Create initial models
++        class RefreshToken(models.Model):
++            token = models.CharField(max_length=255)
++            
++            class Meta:
++                app_label = 'test_app'
++        
++        class AccessToken(models.Model):
++            token = models.CharField(max_length=255)
++            
++            class Meta:
++                app_label = 'test_app'
++        
++        # Create initial tables
++        with connection.schema_editor() as editor:
++            editor.create_model(RefreshToken)
++            editor.create_model(AccessToken)
++        
++        # Add a nullable OneToOneField - this should not fail
++        source_refresh_token_field = models.OneToOneField(
++            RefreshToken,
++            blank=True,
++            null=True,
++            on_delete=models.SET_NULL,
++            related_name="refreshed_access_token"
++        )
++        source_refresh_token_field.set_attributes_from_name('source_refresh_token')
++        
++        with connection.schema_editor() as editor:
++            editor.add_field(AccessToken, source_refresh_token_field)
++        
++        # Verify the field was added successfully by checking the table structure
++        with connection.cursor() as cursor:
++            cursor.execute("PRAGMA table_info(test_app_accesstoken)")
++            columns = {row[1]: row for row in cursor.fetchall()}
++            self.assertIn('source_refresh_token_id', columns)
++    
++    def test_add_nullable_unique_field(self):
++        """Test adding a nullable field with unique=True to an existing table."""
++        class TestModel(models.Model):
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test_app'
++        
++        # Create initial table
++        with connection.schema_editor() as editor:
++            editor.create_model(TestModel)
++        
++        # Add a nullable unique field - this should not fail
++        unique_field = models.CharField(max_length=100, unique=True, null=True)
++        unique_field.set_attributes_from_name('unique_name')
++        
++        with connection.schema_editor() as editor:
++            editor.add_field(TestModel, unique_field)
++        
++        # Verify the field was added successfully
++        with connection.cursor() as cursor:
++            cursor.execute("PRAGMA table_info(test_app_testmodel)")
++            columns = {row[1]: row for row in cursor.fetchall()}
++            self.assertIn('unique_name', columns)
++    
++    def test_add_non_unique_nullable_field_still_uses_alter_table(self):
++        """
++        Test that non-unique nullable fields still use the efficient ALTER TABLE
++        approach rather than table recreation.
++        """
++        class TestModel(models.Model):
++            name = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test_app'
++        
++        # Create initial table
++        with connection.schema_editor() as editor:
++            editor.create_model(TestModel)
++        
++        # Add a non-unique nullable field
++        regular_field = models.CharField(max_length=100, null=True)
++        regular_field.set_attributes_from_name('regular_name')
++        
++        # This should use ALTER TABLE, not table recreation
++        with connection.schema_editor() as editor:
++            # We can't easily test that ALTER TABLE was used vs table recreation
++            # without mocking, but we can at least verify it works
++            editor.add_field(TestModel, regular_field)
++        
++        # Verify the field was added successfully
++        with connection.cursor() as cursor:
++            cursor.execute("PRAGMA table_info(test_app_testmodel)")
++            columns = {row[1]: row for row in cursor.fetchall()}
++            self.assertIn('regular_name', columns)
++
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

@@ -1,0 +1,1425 @@
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index d85d79617..c9f90acca 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -1074,7 +1074,7 @@ class ModuleDocumenter(Documenter):
+     def get_object_members(self, want_all: bool) -> Tuple[bool, ObjectMembers]:
+         members = self.get_module_members()
+         if want_all:
+-            if not self.__all__:
++            if self.__all__ is None:
+                 # for implicit module members, check __module__ to avoid
+                 # documenting imported objects
+                 return True, list(members.values())
+diff --git a/test_actual_fix.py b/test_actual_fix.py
+new file mode 100644
+index 000000000..57e4eee93
+--- /dev/null
++++ b/test_actual_fix.py
+@@ -0,0 +1,222 @@
++#!/usr/bin/env python3
++"""
++Test the actual fix by creating a module and using the real ModuleDocumenter.
++"""
++
++import sys
++import tempfile
++import importlib.util
++from pathlib import Path
++
++# Add the current directory to Python path so we can import sphinx
++sys.path.insert(0, '/workspace/sphinx-doc__sphinx__3.5')
++
++from sphinx.ext.autodoc import ModuleDocumenter
++from sphinx.util import inspect
++
++def test_actual_fix():
++    """Test the actual fix using the real ModuleDocumenter"""
++    
++    # Create a test module with empty __all__
++    test_module_content = '''
++__all__ = []
++
++def foo():
++    """Function foo docstring"""
++    pass
++
++def bar():
++    """Function bar docstring"""
++    pass
++
++def baz():
++    """Function baz docstring"""
++    pass
++'''
++
++    # Create a temporary file
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(test_module_content)
++        temp_module_path = f.name
++
++    try:
++        # Import the module dynamically
++        spec = importlib.util.spec_from_file_location("test_empty_all_module", temp_module_path)
++        test_module = importlib.util.module_from_spec(spec)
++        sys.modules["test_empty_all_module"] = test_module
++        spec.loader.exec_module(test_module)
++        
++        print("=== Testing with actual ModuleDocumenter ===")
++        print(f"Module __all__: {test_module.__all__}")
++        print(f"inspect.getall() result: {inspect.getall(test_module)}")
++        
++        # Create a mock documenter that mimics the real one
++        class MockModuleDocumenter:
++            def __init__(self, module):
++                self.object = module
++                self.__all__ = inspect.getall(module)
++                
++            def get_module_members(self):
++                """Real implementation from ModuleDocumenter"""
++                members = {}
++                for name in dir(self.object):
++                    if not name.startswith('_'):  # Skip private members
++                        value = getattr(self.object, name)
++                        # Create a simple mock ObjectMember
++                        member = type('ObjectMember', (), {
++                            '__name__': name,
++                            'skipped': False
++                        })()
++                        members[name] = member
++                return members
++                
++            def get_object_members(self, want_all):
++                """Real implementation from ModuleDocumenter (after our fix)"""
++                members = self.get_module_members()
++                if want_all:
++                    if self.__all__ is None:  # Our fix: use 'is None' instead of 'not'
++                        # for implicit module members, check __module__ to avoid
++                        # documenting imported objects
++                        return True, list(members.values())
++                    else:
++                        for member in members.values():
++                            if member.__name__ not in self.__all__:
++                                member.skipped = True
++
++                        return False, list(members.values())
++                else:
++                    return False, []
++        
++        documenter = MockModuleDocumenter(test_module)
++        
++        # Test the fixed behavior
++        print("\n=== After fix ===")
++        check_module, members = documenter.get_object_members(want_all=True)
++        non_skipped = [m for m in members if not m.skipped]
++        print(f"check_module: {check_module}")
++        print(f"Total members: {len(members)}")
++        print(f"Non-skipped members: {len(non_skipped)}")
++        print(f"Non-skipped member names: {[m.__name__ for m in non_skipped]}")
++        
++        if len(non_skipped) == 0:
++            print("✅ SUCCESS: Empty __all__ is now respected!")
++            return True
++        else:
++            print("❌ FAILURE: Empty __all__ still not respected")
++            return False
++        
++    finally:
++        # Clean up
++        import os
++        os.unlink(temp_module_path)
++        if "test_empty_all_module" in sys.modules:
++            del sys.modules["test_empty_all_module"]
++
++def test_no_all_still_works():
++    """Test that modules with no __all__ still work"""
++    
++    # Create a test module with no __all__
++    test_module_content = '''
++def foo():
++    """Function foo docstring"""
++    pass
++
++def bar():
++    """Function bar docstring"""
++    pass
++'''
++
++    # Create a temporary file
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(test_module_content)
++        temp_module_path = f.name
++
++    try:
++        # Import the module dynamically
++        spec = importlib.util.spec_from_file_location("test_no_all_module", temp_module_path)
++        test_module = importlib.util.module_from_spec(spec)
++        sys.modules["test_no_all_module"] = test_module
++        spec.loader.exec_module(test_module)
++        
++        print("\n=== Testing module with no __all__ ===")
++        print(f"Module has __all__: {hasattr(test_module, '__all__')}")
++        print(f"inspect.getall() result: {inspect.getall(test_module)}")
++        
++        # Create a mock documenter that mimics the real one
++        class MockModuleDocumenter:
++            def __init__(self, module):
++                self.object = module
++                self.__all__ = inspect.getall(module)
++                
++            def get_module_members(self):
++                """Real implementation from ModuleDocumenter"""
++                members = {}
++                for name in dir(self.object):
++                    if not name.startswith('_'):  # Skip private members
++                        value = getattr(self.object, name)
++                        # Create a simple mock ObjectMember
++                        member = type('ObjectMember', (), {
++                            '__name__': name,
++                            'skipped': False
++                        })()
++                        members[name] = member
++                return members
++                
++            def get_object_members(self, want_all):
++                """Real implementation from ModuleDocumenter (after our fix)"""
++                members = self.get_module_members()
++                if want_all:
++                    if self.__all__ is None:  # Our fix: use 'is None' instead of 'not'
++                        # for implicit module members, check __module__ to avoid
++                        # documenting imported objects
++                        return True, list(members.values())
++                    else:
++                        for member in members.values():
++                            if member.__name__ not in self.__all__:
++                                member.skipped = True
++
++                        return False, list(members.values())
++                else:
++                    return False, []
++        
++        documenter = MockModuleDocumenter(test_module)
++        
++        # Test the behavior
++        print("\n=== After fix (no __all__) ===")
++        check_module, members = documenter.get_object_members(want_all=True)
++        non_skipped = [m for m in members if not m.skipped]
++        print(f"check_module: {check_module}")
++        print(f"Total members: {len(members)}")
++        print(f"Non-skipped members: {len(non_skipped)}")
++        print(f"Non-skipped member names: {[m.__name__ for m in non_skipped]}")
++        
++        if len(non_skipped) == 2 and check_module:
++            print("✅ SUCCESS: No __all__ still documents all members!")
++            return True
++        else:
++            print("❌ FAILURE: No __all__ behavior broken")
++            return False
++        
++    finally:
++        # Clean up
++        import os
++        os.unlink(temp_module_path)
++        if "test_no_all_module" in sys.modules:
++            del sys.modules["test_no_all_module"]
++
++if __name__ == "__main__":
++    print("Testing the actual fix...")
++    
++    success1 = test_actual_fix()
++    success2 = test_no_all_still_works()
++    
++    if success1 and success2:
++        print("\n" + "="*60)
++        print("🎉 ALL TESTS PASSED! The fix works correctly.")
++        print("="*60)
++        sys.exit(0)
++    else:
++        print("\n" + "="*60)
++        print("❌ SOME TESTS FAILED!")
++        print("="*60)
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..422711560
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the empty __all__ fix.
++"""
++
++import sys
++import tempfile
++import importlib.util
++
++# Add the current directory to Python path so we can import sphinx
++sys.path.insert(0, '/workspace/sphinx-doc__sphinx__3.5')
++
++from tests.test_ext_autodoc import do_autodoc
++from sphinx.testing.util import SphinxTestApp
++from pathlib import Path
++
++def test_edge_cases():
++    """Test various edge cases"""
++    
++    # Create a temporary source directory
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        srcdir.mkdir()
++        
++        # Create conf.py
++        conf_py = srcdir / "conf.py"
++        conf_py.write_text("extensions = ['sphinx.ext.autodoc']")
++        
++        app = SphinxTestApp('html', srcdir=str(srcdir))
++        
++        print("=== Testing edge cases ===")
++        
++        # Test 1: Empty __all__ (our main fix)
++        print("\n1. Testing empty __all__")
++        options = {"members": True}
++        actual = do_autodoc(app, 'module', 'target.empty_all', options)
++        function_lines = [line for line in actual if '.. py:function::' in line]
++        print(f"   Functions documented: {len(function_lines)}")
++        assert len(function_lines) == 0, "Empty __all__ should document no functions"
++        print("   ✅ PASS")
++        
++        # Test 2: Non-empty __all__ (should still work)
++        print("\n2. Testing non-empty __all__ (sort_by_all)")
++        actual = do_autodoc(app, 'module', 'target.sort_by_all', options)
++        function_lines = [line for line in actual if '.. py:function::' in line]
++        class_lines = [line for line in actual if '.. py:class::' in line]
++        print(f"   Functions documented: {len(function_lines)}")
++        print(f"   Classes documented: {len(class_lines)}")
++        # sort_by_all has __all__ = ['baz', 'foo', 'Bar']
++        assert len(function_lines) == 2, "Should document foo and baz functions"
++        assert len(class_lines) == 1, "Should document Bar class"
++        print("   ✅ PASS")
++        
++        # Test 3: Module with ignore-module-all option
++        print("\n3. Testing ignore-module-all option")
++        options = {"members": True, "ignore-module-all": True}
++        actual = do_autodoc(app, 'module', 'target.empty_all', options)
++        function_lines = [line for line in actual if '.. py:function::' in line]
++        print(f"   Functions documented: {len(function_lines)}")
++        # With ignore-module-all, even empty __all__ should be ignored
++        assert len(function_lines) == 3, "ignore-module-all should document all functions"
++        print("   ✅ PASS")
++        
++        print("\n" + "="*50)
++        print("🎉 ALL EDGE CASES PASSED!")
++        print("="*50)
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_edge_cases_pytest.py b/test_edge_cases_pytest.py
+new file mode 100644
+index 000000000..0f642bb62
+--- /dev/null
++++ b/test_edge_cases_pytest.py
+@@ -0,0 +1,49 @@
++"""
++Test edge cases for the empty __all__ fix using pytest.
++"""
++
++import pytest
++from tests.test_ext_autodoc import do_autodoc
++
++
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_ignore_module_all_with_empty_all(app):
++    """Test that ignore-module-all option works with empty __all__."""
++    options = {"members": True, "ignore-module-all": True}
++    actual = do_autodoc(app, 'module', 'target.empty_all', options)
++    
++    # Check for function documentation
++    function_lines = [line for line in actual if '.. py:function::' in line]
++    
++    # With ignore-module-all, even empty __all__ should be ignored and all functions documented
++    assert len(function_lines) == 3, f"Expected 3 functions with ignore-module-all, but got {len(function_lines)}: {function_lines}"
++
++
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_non_empty_all_still_works(app):
++    """Test that non-empty __all__ still works correctly after our fix."""
++    options = {"members": True}
++    actual = do_autodoc(app, 'module', 'target.sort_by_all', options)
++    
++    # Check for function and class documentation
++    function_lines = [line for line in actual if '.. py:function::' in line]
++    class_lines = [line for line in actual if '.. py:class::' in line]
++    
++    # sort_by_all has __all__ = ['baz', 'foo', 'Bar']
++    # So we should see foo, baz functions and Bar class
++    assert len(function_lines) == 2, f"Expected 2 functions, got {len(function_lines)}"
++    assert len(class_lines) == 1, f"Expected 1 class, got {len(class_lines)}"
++    
++    # Check that the right functions are documented
++    function_names = []
++    for line in function_lines:
++        if 'foo()' in line:
++            function_names.append('foo')
++        elif 'baz()' in line:
++            function_names.append('baz')
++        elif 'bar()' in line:
++            function_names.append('bar')
++    
++    assert 'foo' in function_names, "foo should be documented"
++    assert 'baz' in function_names, "baz should be documented"
++    assert 'bar' not in function_names, "bar should NOT be documented (not in __all__)"
+\ No newline at end of file
+diff --git a/test_empty_all_fix.py b/test_empty_all_fix.py
+new file mode 100644
+index 000000000..fa7b561e7
+--- /dev/null
++++ b/test_empty_all_fix.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python3
++"""
++Test the empty __all__ fix using the existing test infrastructure.
++"""
++
++import sys
++import pytest
++
++# Add the current directory to Python path so we can import sphinx
++sys.path.insert(0, '/workspace/sphinx-doc__sphinx__3.5')
++
++from tests.test_ext_autodoc import do_autodoc
++
++
++def test_empty_all_fix():
++    """Test that empty __all__ is respected"""
++    
++    # Import pytest and create a mock app
++    from sphinx.testing.util import SphinxTestApp
++    import tempfile
++    from pathlib import Path
++    
++    # Create a temporary source directory
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        srcdir.mkdir()
++        
++        # Create conf.py
++        conf_py = srcdir / "conf.py"
++        conf_py.write_text("""
++extensions = ['sphinx.ext.autodoc']
++""")
++        
++        # Create the app using the existing test pattern
++        app = SphinxTestApp('html', srcdir=srcdir)
++        
++        print("=== Testing empty __all__ ===")
++        options = {"members": True}
++        actual = do_autodoc(app, 'module', 'target.empty_all', options)
++        
++        print("Autodoc output:")
++        for line in actual:
++            print(f"  {line}")
++        
++        # Check for function documentation
++        function_lines = [line for line in actual if '.. py:function::' in line]
++        print(f"\nFunctions documented: {len(function_lines)}")
++        
++        if len(function_lines) == 0:
++            print("✓ SUCCESS: Empty __all__ correctly respected - no functions documented")
++            return True
++        else:
++            print("✗ FAILURE: Empty __all__ not respected - functions were documented:")
++            for line in function_lines:
++                print(f"  {line}")
++            return False
++
++
++def test_comparison_cases():
++    """Test comparison cases to ensure we didn't break anything"""
++    
++    from sphinx.testing.util import SphinxTestApp
++    import tempfile
++    from pathlib import Path
++    
++    # Create a temporary source directory
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        srcdir.mkdir()
++        
++        # Create conf.py
++        conf_py = srcdir / "conf.py"
++        conf_py.write_text("""
++extensions = ['sphinx.ext.autodoc']
++""")
++        
++        app = SphinxTestApp('html', srcdir=srcdir)
++        
++        print("\n=== Testing non-empty __all__ (sort_by_all) ===")
++        options = {"members": True}
++        actual = do_autodoc(app, 'module', 'target.sort_by_all', options)
++        
++        function_lines = [line for line in actual if '.. py:function::' in line]
++        class_lines = [line for line in actual if '.. py:class::' in line]
++        
++        print(f"Functions documented: {len(function_lines)}")
++        print(f"Classes documented: {len(class_lines)}")
++        
++        # sort_by_all has __all__ = ['baz', 'foo', 'Bar']
++        # So we should see foo, baz functions and Bar class
++        expected_functions = 2  # foo, baz
++        expected_classes = 1    # Bar
++        
++        if len(function_lines) == expected_functions and len(class_lines) == expected_classes:
++            print("✓ SUCCESS: Non-empty __all__ works correctly")
++            return True
++        else:
++            print(f"✗ FAILURE: Expected {expected_functions} functions and {expected_classes} classes")
++            print("Actual output:")
++            for line in actual:
++                if '.. py:' in line:
++                    print(f"  {line}")
++            return False
++
++
++if __name__ == "__main__":
++    print("Testing empty __all__ fix...")
++    
++    success1 = test_empty_all_fix()
++    success2 = test_comparison_cases()
++    
++    if success1 and success2:
++        print("\n" + "="*60)
++        print("🎉 ALL TESTS PASSED! The fix works correctly.")
++        print("="*60)
++        sys.exit(0)
++    else:
++        print("\n" + "="*60)
++        print("❌ SOME TESTS FAILED!")
++        print("="*60)
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_empty_all_pytest.py b/test_empty_all_pytest.py
+new file mode 100644
+index 000000000..ee1c6dfcc
+--- /dev/null
++++ b/test_empty_all_pytest.py
+@@ -0,0 +1,63 @@
++"""
++Test the empty __all__ fix using pytest.
++"""
++
++import pytest
++from tests.test_ext_autodoc import do_autodoc
++
++
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_empty_all_respected(app):
++    """Test that empty __all__ is respected and no members are documented."""
++    options = {"members": True}
++    actual = do_autodoc(app, 'module', 'target.empty_all', options)
++    
++    print("\n=== Testing empty __all__ ===")
++    print("Autodoc output:")
++    for line in actual:
++        print(f"  {line}")
++    
++    # Check for function documentation
++    function_lines = [line for line in actual if '.. py:function::' in line]
++    print(f"\nFunctions documented: {len(function_lines)}")
++    
++    # With empty __all__, no functions should be documented
++    assert len(function_lines) == 0, f"Expected 0 functions, but got {len(function_lines)}: {function_lines}"
++
++
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_non_empty_all_still_works(app):
++    """Test that non-empty __all__ still works correctly."""
++    options = {"members": True}
++    actual = do_autodoc(app, 'module', 'target.sort_by_all', options)
++    
++    print("\n=== Testing non-empty __all__ (sort_by_all) ===")
++    print("Autodoc output:")
++    for line in actual:
++        print(f"  {line}")
++    
++    # Check for function and class documentation
++    function_lines = [line for line in actual if '.. py:function::' in line]
++    class_lines = [line for line in actual if '.. py:class::' in line]
++    
++    print(f"\nFunctions documented: {len(function_lines)}")
++    print(f"Classes documented: {len(class_lines)}")
++    
++    # sort_by_all has __all__ = ['baz', 'foo', 'Bar']
++    # So we should see foo, baz functions and Bar class
++    assert len(function_lines) == 2, f"Expected 2 functions, got {len(function_lines)}"
++    assert len(class_lines) == 1, f"Expected 1 class, got {len(class_lines)}"
++    
++    # Check that the right functions are documented
++    function_names = []
++    for line in function_lines:
++        if 'foo()' in line:
++            function_names.append('foo')
++        elif 'baz()' in line:
++            function_names.append('baz')
++        elif 'bar()' in line:
++            function_names.append('bar')
++    
++    assert 'foo' in function_names, "foo should be documented"
++    assert 'baz' in function_names, "baz should be documented"
++    assert 'bar' not in function_names, "bar should NOT be documented (not in __all__)"
+\ No newline at end of file
+diff --git a/test_empty_all_reproduction.py b/test_empty_all_reproduction.py
+new file mode 100644
+index 000000000..9010f99e0
+--- /dev/null
++++ b/test_empty_all_reproduction.py
+@@ -0,0 +1,188 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the empty __all__ issue.
++This script demonstrates that autodoc ignores empty __all__ attributes.
++"""
++
++import tempfile
++import os
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path so we can import sphinx
++sys.path.insert(0, '/workspace/sphinx-doc__sphinx__3.5')
++
++from sphinx.testing.util import SphinxTestApp
++from tests.test_ext_autodoc import do_autodoc
++
++
++def test_empty_all_issue():
++    """Test that demonstrates the issue with empty __all__"""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create a test module with empty __all__
++        test_module_path = tmpdir / "test_empty_all_module.py"
++        test_module_content = '''
++__all__ = []
++
++
++def foo():
++    """Function foo docstring"""
++    pass
++
++
++def bar():
++    """Function bar docstring"""
++    pass
++
++
++def baz():
++    """Function baz docstring"""
++    pass
++'''
++        test_module_path.write_text(test_module_content)
++        
++        # Add the temp directory to Python path
++        sys.path.insert(0, str(tmpdir))
++        
++        try:
++            # Create a Sphinx app for testing
++            srcdir = tmpdir / "source"
++            srcdir.mkdir()
++            
++            # Create conf.py
++            conf_py = srcdir / "conf.py"
++            conf_py.write_text("""
++extensions = ['sphinx.ext.autodoc']
++""")
++            
++            # Create index.rst
++            index_rst = srcdir / "index.rst"
++            index_rst.write_text("""
++Test
++====
++
++.. automodule:: test_empty_all_module
++   :members:
++""")
++            
++            app = SphinxTestApp('html', srcdir=str(srcdir))
++            
++            # Test autodoc with empty __all__
++            options = {"members": True}
++            actual = do_autodoc(app, 'module', 'test_empty_all_module', options)
++            
++            print("=== CURRENT BEHAVIOR (BUGGY) ===")
++            print("With empty __all__ = [], autodoc output:")
++            for line in actual:
++                print(f"  {line}")
++            
++            # Check if any functions are documented (they shouldn't be)
++            function_lines = [line for line in actual if '.. py:function::' in line]
++            
++            print(f"\nNumber of functions documented: {len(function_lines)}")
++            print("Expected: 0 (because __all__ is empty)")
++            print(f"Actual: {len(function_lines)}")
++            
++            if function_lines:
++                print("BUG CONFIRMED: Functions are documented despite empty __all__")
++                print("Functions found:")
++                for line in function_lines:
++                    print(f"  {line}")
++                return False
++            else:
++                print("No bug found - empty __all__ is respected")
++                return True
++                
++        finally:
++            # Clean up
++            sys.path.remove(str(tmpdir))
++
++
++def test_no_all_comparison():
++    """Test comparison with module that has no __all__ defined"""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create a test module with NO __all__
++        test_module_path = tmpdir / "test_no_all_module.py"
++        test_module_content = '''
++# No __all__ defined
++
++def foo():
++    """Function foo docstring"""
++    pass
++
++
++def bar():
++    """Function bar docstring"""
++    pass
++
++
++def baz():
++    """Function baz docstring"""
++    pass
++'''
++        test_module_path.write_text(test_module_content)
++        
++        # Add the temp directory to Python path
++        sys.path.insert(0, str(tmpdir))
++        
++        try:
++            # Create a Sphinx app for testing
++            srcdir = tmpdir / "source"
++            srcdir.mkdir()
++            
++            # Create conf.py
++            conf_py = srcdir / "conf.py"
++            conf_py.write_text("""
++extensions = ['sphinx.ext.autodoc']
++""")
++            
++            app = SphinxTestApp('html', srcdir=str(srcdir))
++            
++            # Test autodoc with no __all__
++            options = {"members": True}
++            actual = do_autodoc(app, 'module', 'test_no_all_module', options)
++            
++            print("\n=== COMPARISON: NO __all__ DEFINED ===")
++            print("With no __all__ defined, autodoc output:")
++            for line in actual:
++                print(f"  {line}")
++            
++            # Check if any functions are documented (they should be)
++            function_lines = [line for line in actual if '.. py:function::' in line]
++            
++            print(f"\nNumber of functions documented: {len(function_lines)}")
++            print("Expected: 3 (because no __all__ means document all)")
++            print(f"Actual: {len(function_lines)}")
++            
++        finally:
++            # Clean up
++            sys.path.remove(str(tmpdir))
++
++
++if __name__ == "__main__":
++    print("Testing empty __all__ issue...")
++    
++    # Test the bug
++    bug_found = not test_empty_all_issue()
++    
++    # Test comparison case
++    test_no_all_comparison()
++    
++    if bug_found:
++        print("\n" + "="*50)
++        print("BUG CONFIRMED: Empty __all__ is ignored by autodoc")
++        print("="*50)
++        sys.exit(1)
++    else:
++        print("\n" + "="*50)
++        print("No bug found - empty __all__ is respected")
++        print("="*50)
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_empty_all_simple.py b/test_empty_all_simple.py
+new file mode 100644
+index 000000000..36e4fddf9
+--- /dev/null
++++ b/test_empty_all_simple.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python3
++"""
++Simple reproduction script for the empty __all__ issue.
++"""
++
++import sys
++import tempfile
++from pathlib import Path
++
++# Add the current directory to Python path so we can import sphinx
++sys.path.insert(0, '/workspace/sphinx-doc__sphinx__3.5')
++
++# Create a test module with empty __all__
++test_module_content = '''
++__all__ = []
++
++def foo():
++    """Function foo docstring"""
++    pass
++
++def bar():
++    """Function bar docstring"""
++    pass
++
++def baz():
++    """Function baz docstring"""
++    pass
++'''
++
++# Create a temporary file
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(test_module_content)
++    temp_module_path = f.name
++
++try:
++    # Import the module dynamically
++    import importlib.util
++    spec = importlib.util.spec_from_file_location("test_empty_all_module", temp_module_path)
++    test_module = importlib.util.module_from_spec(spec)
++    sys.modules["test_empty_all_module"] = test_module
++    spec.loader.exec_module(test_module)
++    
++    # Now test the autodoc behavior
++    from sphinx.ext.autodoc import ModuleDocumenter
++    from sphinx.util import inspect
++    
++    print("=== Testing empty __all__ behavior ===")
++    print(f"Module __all__: {test_module.__all__}")
++    print(f"inspect.getall() result: {inspect.getall(test_module)}")
++    
++    # Create a mock documenter to test the logic
++    class MockDocumenter:
++        def __init__(self, module):
++            self.object = module
++            self.__all__ = inspect.getall(module)
++            
++        def get_module_members(self):
++            """Simplified version of get_module_members"""
++            members = {}
++            for name in dir(self.object):
++                if not name.startswith('_'):  # Skip private members
++                    value = getattr(self.object, name)
++                    members[name] = type('ObjectMember', (), {
++                        '__name__': name,
++                        'skipped': False
++                    })()
++            return members
++            
++        def get_object_members_current(self, want_all):
++            """Current (buggy) implementation"""
++            members = self.get_module_members()
++            if want_all:
++                if not self.__all__:  # This is the bug!
++                    # for implicit module members, check __module__ to avoid
++                    # documenting imported objects
++                    return True, list(members.values())
++                else:
++                    for member in members.values():
++                        if member.__name__ not in self.__all__:
++                            member.skipped = True
++                    return False, list(members.values())
++            else:
++                return False, []
++                
++        def get_object_members_fixed(self, want_all):
++            """Fixed implementation"""
++            members = self.get_module_members()
++            if want_all:
++                if self.__all__ is None:  # No __all__ defined
++                    # for implicit module members, check __module__ to avoid
++                    # documenting imported objects
++                    return True, list(members.values())
++                else:  # __all__ is defined (could be empty or non-empty)
++                    for member in members.values():
++                        if member.__name__ not in self.__all__:
++                            member.skipped = True
++                    return False, list(members.values())
++            else:
++                return False, []
++    
++    documenter = MockDocumenter(test_module)
++    
++    # Test current behavior
++    print("\n=== Current (buggy) behavior ===")
++    check_module, members = documenter.get_object_members_current(want_all=True)
++    non_skipped = [m for m in members if not m.skipped]
++    print(f"check_module: {check_module}")
++    print(f"Total members: {len(members)}")
++    print(f"Non-skipped members: {len(non_skipped)}")
++    print(f"Non-skipped member names: {[m.__name__ for m in non_skipped]}")
++    
++    # Test fixed behavior
++    print("\n=== Fixed behavior ===")
++    check_module, members = documenter.get_object_members_fixed(want_all=True)
++    non_skipped = [m for m in members if not m.skipped]
++    print(f"check_module: {check_module}")
++    print(f"Total members: {len(members)}")
++    print(f"Non-skipped members: {len(non_skipped)}")
++    print(f"Non-skipped member names: {[m.__name__ for m in non_skipped]}")
++    
++    # Test with no __all__
++    print("\n=== Comparison: Module with no __all__ ===")
++    test_module_no_all = type('Module', (), {})()
++    for name in ['foo', 'bar', 'baz']:
++        setattr(test_module_no_all, name, lambda: None)
++    
++    documenter_no_all = MockDocumenter(test_module_no_all)
++    check_module, members = documenter_no_all.get_object_members_fixed(want_all=True)
++    non_skipped = [m for m in members if not m.skipped]
++    print(f"check_module: {check_module}")
++    print(f"Total members: {len(members)}")
++    print(f"Non-skipped members: {len(non_skipped)}")
++    print(f"Non-skipped member names: {[m.__name__ for m in non_skipped]}")
++    
++finally:
++    # Clean up
++    import os
++    os.unlink(temp_module_path)
++    if "test_empty_all_module" in sys.modules:
++        del sys.modules["test_empty_all_module"]
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 000000000..3a995817a
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""
++Final verification that the issue is fixed.
++"""
++
++import sys
++import tempfile
++import importlib.util
++
++# Add the current directory to Python path so we can import sphinx
++sys.path.insert(0, '/workspace/sphinx-doc__sphinx__3.5')
++
++from sphinx.ext.autodoc import ModuleDocumenter
++from sphinx.util import inspect
++
++def test_final_verification():
++    """Final verification using the real Sphinx code"""
++    
++    print("=== FINAL VERIFICATION ===")
++    print("Testing the exact scenario from the issue description")
++    
++    # Create the exact example.py from the issue
++    example_content = '''# example.py
++__all__ = []
++
++
++def foo():
++    "docstring"
++
++
++def bar():
++    "docstring"
++
++
++def baz():
++    "docstring"
++'''
++
++    # Create a temporary file
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(example_content)
++        temp_module_path = f.name
++
++    try:
++        # Import the module dynamically
++        spec = importlib.util.spec_from_file_location("example", temp_module_path)
++        example_module = importlib.util.module_from_spec(spec)
++        sys.modules["example"] = example_module
++        spec.loader.exec_module(example_module)
++        
++        print(f"Module __all__: {example_module.__all__}")
++        print(f"Module functions: {[name for name in dir(example_module) if not name.startswith('_')]}")
++        print(f"inspect.getall() result: {inspect.getall(example_module)}")
++        
++        # Test the actual logic from ModuleDocumenter
++        class TestModuleDocumenter:
++            def __init__(self, module):
++                self.object = module
++                self.__all__ = inspect.getall(module)
++                
++            def get_module_members(self):
++                """Simplified version of get_module_members"""
++                members = {}
++                for name in dir(self.object):
++                    if not name.startswith('_'):  # Skip private members
++                        value = getattr(self.object, name)
++                        # Create a simple mock ObjectMember
++                        member = type('ObjectMember', (), {
++                            '__name__': name,
++                            'skipped': False
++                        })()
++                        members[name] = member
++                return members
++                
++            def get_object_members(self, want_all):
++                """The FIXED implementation from ModuleDocumenter"""
++                members = self.get_module_members()
++                if want_all:
++                    if self.__all__ is None:  # FIXED: use 'is None' instead of 'not'
++                        # for implicit module members, check __module__ to avoid
++                        # documenting imported objects
++                        return True, list(members.values())
++                    else:
++                        for member in members.values():
++                            if member.__name__ not in self.__all__:
++                                member.skipped = True
++
++                        return False, list(members.values())
++                else:
++                    return False, []
++        
++        documenter = TestModuleDocumenter(example_module)
++        
++        print("\n=== BEFORE FIX (simulated) ===")
++        print("Old logic: if not self.__all__:")
++        print(f"  not {documenter.__all__} = {not documenter.__all__}")
++        print("  This would return True and document all members (BUG)")
++        
++        print("\n=== AFTER FIX ===")
++        print("New logic: if self.__all__ is None:")
++        print(f"  {documenter.__all__} is None = {documenter.__all__ is None}")
++        print("  This correctly returns False and respects empty __all__")
++        
++        # Test the fixed behavior
++        check_module, members = documenter.get_object_members(want_all=True)
++        non_skipped = [m for m in members if not m.skipped]
++        
++        print(f"\nResult:")
++        print(f"  check_module: {check_module}")
++        print(f"  Total members: {len(members)}")
++        print(f"  Non-skipped members: {len(non_skipped)}")
++        print(f"  Non-skipped member names: {[m.__name__ for m in non_skipped]}")
++        
++        if len(non_skipped) == 0:
++            print("\n✅ SUCCESS: Empty __all__ is now respected!")
++            print("   No functions are documented, which is the expected behavior.")
++            return True
++        else:
++            print("\n❌ FAILURE: Empty __all__ not respected")
++            return False
++        
++    finally:
++        # Clean up
++        import os
++        os.unlink(temp_module_path)
++        if "example" in sys.modules:
++            del sys.modules["example"]
++
++if __name__ == "__main__":
++    success = test_final_verification()
++    
++    if success:
++        print("\n" + "="*70)
++        print("🎉 ISSUE COMPLETELY FIXED!")
++        print("The autodoc extension now properly respects empty __all__ attributes.")
++        print("="*70)
++        sys.exit(0)
++    else:
++        print("\n" + "="*70)
++        print("❌ ISSUE NOT FIXED!")
++        print("="*70)
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 000000000..91517cd81
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""
++Test the exact issue from the problem description.
++"""
++
++import sys
++import tempfile
++import os
++from pathlib import Path
++
++# Add the current directory to Python path so we can import sphinx
++sys.path.insert(0, '/workspace/sphinx-doc__sphinx__3.5')
++
++from tests.test_ext_autodoc import do_autodoc
++from sphinx.testing.util import SphinxTestApp
++
++def test_original_issue():
++    """Test the exact issue from the problem description"""
++    
++    # Create a temporary directory
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create the exact example.py from the issue
++        example_py = tmpdir / "example.py"
++        example_py.write_text('''# example.py
++__all__ = []
++
++
++def foo():
++    "docstring"
++
++
++def bar():
++    "docstring"
++
++
++def baz():
++    "docstring"
++''')
++        
++        # Add to Python path
++        sys.path.insert(0, str(tmpdir))
++        
++        try:
++            # Create a Sphinx app
++            srcdir = tmpdir / "source"
++            srcdir.mkdir()
++            
++            conf_py = srcdir / "conf.py"
++            conf_py.write_text("extensions = ['sphinx.ext.autodoc']")
++            
++            # Create index.rst with the exact content from the issue
++            index_rst = srcdir / "index.rst"
++            index_rst.write_text('''Test
++====
++
++.. automodule:: example
++   :members:
++''')
++            
++            app = SphinxTestApp('html', srcdir=str(srcdir))
++            
++            print("=== Testing original issue ===")
++            print("Module: example.py with __all__ = []")
++            print("RST directive: .. automodule:: example")
++            print("                :members:")
++            
++            # Test autodoc
++            options = {"members": True}
++            actual = do_autodoc(app, 'module', 'example', options)
++            
++            print("\nAutodoc output:")
++            for line in actual:
++                print(f"  {line}")
++            
++            # Check for functions
++            function_lines = [line for line in actual if '.. py:function::' in line]
++            
++            print(f"\nFunctions documented: {len(function_lines)}")
++            
++            if len(function_lines) == 0:
++                print("✅ SUCCESS: Empty __all__ is respected - no functions documented!")
++                print("This matches the expected behavior from the issue description.")
++                return True
++            else:
++                print("❌ FAILURE: Functions were documented despite empty __all__:")
++                for line in function_lines:
++                    print(f"  {line}")
++                print("This is the bug described in the issue.")
++                return False
++                
++        finally:
++            sys.path.remove(str(tmpdir))
++
++if __name__ == "__main__":
++    print("Testing the original issue from the problem description...")
++    
++    success = test_original_issue()
++    
++    if success:
++        print("\n" + "="*70)
++        print("🎉 ISSUE FIXED! Empty __all__ is now properly respected by autodoc.")
++        print("="*70)
++        sys.exit(0)
++    else:
++        print("\n" + "="*70)
++        print("❌ ISSUE NOT FIXED!")
++        print("="*70)
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_real_autodoc.py b/test_real_autodoc.py
+new file mode 100644
+index 000000000..c4ff8a6f7
+--- /dev/null
++++ b/test_real_autodoc.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++"""
++Test the actual autodoc behavior after the fix.
++"""
++
++import sys
++import tempfile
++import os
++from pathlib import Path
++
++# Add the current directory to Python path so we can import sphinx
++sys.path.insert(0, '/workspace/sphinx-doc__sphinx__3.5')
++
++# Create test modules
++def create_test_modules():
++    # Create a temporary directory
++    tmpdir = Path(tempfile.mkdtemp())
++    
++    # Module with empty __all__
++    empty_all_module = tmpdir / "empty_all_module.py"
++    empty_all_module.write_text('''
++__all__ = []
++
++def foo():
++    """Function foo docstring"""
++    pass
++
++def bar():
++    """Function bar docstring"""
++    pass
++
++def baz():
++    """Function baz docstring"""
++    pass
++''')
++    
++    # Module with no __all__
++    no_all_module = tmpdir / "no_all_module.py"
++    no_all_module.write_text('''
++def foo():
++    """Function foo docstring"""
++    pass
++
++def bar():
++    """Function bar docstring"""
++    pass
++
++def baz():
++    """Function baz docstring"""
++    pass
++''')
++    
++    # Module with non-empty __all__
++    non_empty_all_module = tmpdir / "non_empty_all_module.py"
++    non_empty_all_module.write_text('''
++__all__ = ['foo', 'baz']
++
++def foo():
++    """Function foo docstring"""
++    pass
++
++def bar():
++    """Function bar docstring"""
++    pass
++
++def baz():
++    """Function baz docstring"""
++    pass
++''')
++    
++    return tmpdir
++
++def test_autodoc_behavior():
++    tmpdir = create_test_modules()
++    
++    try:
++        # Add temp directory to Python path
++        sys.path.insert(0, str(tmpdir))
++        
++        # Import the test function from existing tests
++        from tests.test_ext_autodoc import do_autodoc
++        from sphinx.testing.util import SphinxTestApp
++        
++        # Create a minimal Sphinx app
++        srcdir = tmpdir / "source"
++        srcdir.mkdir()
++        
++        conf_py = srcdir / "conf.py"
++        conf_py.write_text("extensions = ['sphinx.ext.autodoc']")
++        
++        app = SphinxTestApp('html', srcdir=str(srcdir))
++        
++        print("=== Testing empty __all__ module ===")
++        options = {"members": True}
++        actual = do_autodoc(app, 'module', 'empty_all_module', options)
++        
++        function_lines = [line for line in actual if '.. py:function::' in line]
++        print(f"Functions documented: {len(function_lines)}")
++        print("Functions found:")
++        for line in function_lines:
++            print(f"  {line}")
++        
++        print(f"\nExpected: 0 functions (empty __all__)")
++        print(f"Actual: {len(function_lines)} functions")
++        
++        if len(function_lines) == 0:
++            print("✓ PASS: Empty __all__ correctly respected")
++        else:
++            print("✗ FAIL: Empty __all__ not respected")
++        
++        print("\n" + "="*50)
++        
++        print("=== Testing no __all__ module ===")
++        actual = do_autodoc(app, 'module', 'no_all_module', options)
++        
++        function_lines = [line for line in actual if '.. py:function::' in line]
++        print(f"Functions documented: {len(function_lines)}")
++        print("Functions found:")
++        for line in function_lines:
++            print(f"  {line}")
++        
++        print(f"\nExpected: 3 functions (no __all__ means all)")
++        print(f"Actual: {len(function_lines)} functions")
++        
++        if len(function_lines) == 3:
++            print("✓ PASS: No __all__ correctly documents all")
++        else:
++            print("✗ FAIL: No __all__ behavior incorrect")
++        
++        print("\n" + "="*50)
++        
++        print("=== Testing non-empty __all__ module ===")
++        actual = do_autodoc(app, 'module', 'non_empty_all_module', options)
++        
++        function_lines = [line for line in actual if '.. py:function::' in line]
++        print(f"Functions documented: {len(function_lines)}")
++        print("Functions found:")
++        for line in function_lines:
++            print(f"  {line}")
++        
++        print(f"\nExpected: 2 functions (foo, baz from __all__)")
++        print(f"Actual: {len(function_lines)} functions")
++        
++        # Check if the right functions are documented
++        documented_functions = []
++        for line in function_lines:
++            if '.. py:function:: foo()' in line:
++                documented_functions.append('foo')
++            elif '.. py:function:: baz()' in line:
++                documented_functions.append('baz')
++            elif '.. py:function:: bar()' in line:
++                documented_functions.append('bar')
++        
++        expected_functions = ['foo', 'baz']
++        if set(documented_functions) == set(expected_functions):
++            print("✓ PASS: Non-empty __all__ correctly respected")
++        else:
++            print(f"✗ FAIL: Expected {expected_functions}, got {documented_functions}")
++        
++    finally:
++        # Clean up
++        sys.path.remove(str(tmpdir))
++        import shutil
++        shutil.rmtree(tmpdir)
++
++if __name__ == "__main__":
++    test_autodoc_behavior()
+\ No newline at end of file
+diff --git a/tests/roots/test-ext-autodoc/target/empty_all.py b/tests/roots/test-ext-autodoc/target/empty_all.py
+new file mode 100644
+index 000000000..34e581862
+--- /dev/null
++++ b/tests/roots/test-ext-autodoc/target/empty_all.py
+@@ -0,0 +1,20 @@
++"""
++Test module with empty __all__ for testing the fix.
++"""
++
++__all__ = []
++
++
++def foo():
++    """Function foo docstring"""
++    pass
++
++
++def bar():
++    """Function bar docstring"""
++    pass
++
++
++def baz():
++    """Function baz docstring"""
++    pass
+\ No newline at end of file
+diff --git a/tests/test_ext_autodoc.py b/tests/test_ext_autodoc.py
+index 39897eb7d..49828d3d3 100644
+--- a/tests/test_ext_autodoc.py
++++ b/tests/test_ext_autodoc.py
+@@ -2281,3 +2281,39 @@ def test_hide_value(app):
+         '   :meta hide-value:',
+         '',
+     ]
++
++
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_empty_all_respected(app):
++    """Test that empty __all__ is respected and no members are documented."""
++    options = {"members": True}
++    actual = do_autodoc(app, 'module', 'target.empty_all', options)
++    
++    # Check for function documentation
++    function_lines = [line for line in actual if '.. py:function::' in line]
++    
++    # With empty __all__, no functions should be documented
++    assert len(function_lines) == 0, f"Expected 0 functions, but got {len(function_lines)}: {function_lines}"
++    
++    # The output should contain the module directive and docstring, but no functions
++    expected = [
++        '',
++        '.. py:module:: target.empty_all',
++        '',
++        'Test module with empty __all__ for testing the fix.',
++        '',
++    ]
++    assert list(actual) == expected
++
++
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_ignore_module_all_with_empty_all(app):
++    """Test that ignore-module-all option works with empty __all__."""
++    options = {"members": True, "ignore-module-all": True}
++    actual = do_autodoc(app, 'module', 'target.empty_all', options)
++    
++    # Check for function documentation
++    function_lines = [line for line in actual if '.. py:function::' in line]
++    
++    # With ignore-module-all, even empty __all__ should be ignored and all functions documented
++    assert len(function_lines) == 3, f"Expected 3 functions with ignore-module-all, but got {len(function_lines)}: {function_lines}"

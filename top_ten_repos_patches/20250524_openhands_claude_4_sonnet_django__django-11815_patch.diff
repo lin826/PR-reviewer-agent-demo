@@ -1,0 +1,633 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 27b5cbd379..dbdd7f4726 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -120,9 +120,8 @@ class EnumSerializer(BaseSerializer):
+     def serialize(self):
+         enum_class = self.value.__class__
+         module = enum_class.__module__
+-        v_string, v_imports = serializer_factory(self.value.value).serialize()
+-        imports = {'import %s' % module, *v_imports}
+-        return "%s.%s(%s)" % (module, enum_class.__name__, v_string), imports
++        imports = {'import %s' % module}
++        return "%s.%s['%s']" % (module, enum_class.__name__, self.value.name), imports
+ 
+ 
+ class FloatSerializer(BaseSimpleSerializer):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..58556bcd7e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the enum serialization issue in Django migrations.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from enum import Enum
++from django.utils.translation import gettext_lazy as _
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Test case 1: Regular enum with translatable values (the issue case)
++class Status(Enum):
++    GOOD = _('Good')  # 'Good' will be translated
++    BAD = _('Bad')    # 'Bad' will be translated
++    
++    def __str__(self):
++        return self.name
++
++# Test case 2: Django's TextChoices with translatable values
++class StatusChoices(models.TextChoices):
++    GOOD = 'good', _('Good')
++    BAD = 'bad', _('Bad')
++
++# Test case 3: Regular enum with non-translatable values
++class SimpleStatus(Enum):
++    GOOD = 'good'
++    BAD = 'bad'
++
++def test_enum_serialization():
++    print("=== Testing Enum Serialization ===")
++    
++    # Test regular enum with translatable values
++    print("\n1. Regular Enum with translatable values:")
++    print(f"   Status.GOOD = {Status.GOOD}")
++    print(f"   Status.GOOD.name = {Status.GOOD.name}")
++    print(f"   Status.GOOD.value = {Status.GOOD.value}")
++    
++    try:
++        serialized, imports = serializer_factory(Status.GOOD).serialize()
++        print(f"   Serialized: {serialized}")
++        print(f"   Imports: {imports}")
++        
++        # Try to evaluate the serialized form
++        print(f"   Trying to evaluate: {serialized}")
++        # This should work with current serialization
++        eval_result = eval(serialized)
++        print(f"   Evaluation result: {eval_result}")
++        print(f"   Evaluation successful: {eval_result == Status.GOOD}")
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    # Test Django's TextChoices
++    print("\n2. Django TextChoices with translatable values:")
++    print(f"   StatusChoices.GOOD = {StatusChoices.GOOD}")
++    print(f"   StatusChoices.GOOD.name = {StatusChoices.GOOD.name}")
++    print(f"   StatusChoices.GOOD.value = {StatusChoices.GOOD.value}")
++    
++    try:
++        serialized, imports = serializer_factory(StatusChoices.GOOD).serialize()
++        print(f"   Serialized: {serialized}")
++        print(f"   Imports: {imports}")
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    # Test regular enum with simple values
++    print("\n3. Regular Enum with simple values:")
++    print(f"   SimpleStatus.GOOD = {SimpleStatus.GOOD}")
++    print(f"   SimpleStatus.GOOD.name = {SimpleStatus.GOOD.name}")
++    print(f"   SimpleStatus.GOOD.value = {SimpleStatus.GOOD.value}")
++    
++    try:
++        serialized, imports = serializer_factory(SimpleStatus.GOOD).serialize()
++        print(f"   Serialized: {serialized}")
++        print(f"   Imports: {imports}")
++        
++        # Try to evaluate the serialized form
++        print(f"   Trying to evaluate: {serialized}")
++        eval_result = eval(serialized)
++        print(f"   Evaluation result: {eval_result}")
++        print(f"   Evaluation successful: {eval_result == SimpleStatus.GOOD}")
++    except Exception as e:
++        print(f"   Error: {e}")
++
++def test_proposed_solution():
++    print("\n=== Testing Proposed Solution ===")
++    
++    # Show what the proposed solution would generate
++    print("\n1. Current serialization (by value):")
++    print(f"   Status('Good') -> Status.GOOD")
++    
++    print("\n2. Proposed serialization (by name):")
++    print(f"   Status['GOOD'] -> Status.GOOD")
++    
++    # Test if the proposed approach works
++    print("\n3. Testing proposed approach:")
++    try:
++        # This is what we want to generate
++        result1 = Status['GOOD']
++        print(f"   Status['GOOD'] = {result1}")
++        print(f"   Status['GOOD'] == Status.GOOD: {result1 == Status.GOOD}")
++        
++        result2 = SimpleStatus['GOOD']
++        print(f"   SimpleStatus['GOOD'] = {result2}")
++        print(f"   SimpleStatus['GOOD'] == SimpleStatus.GOOD: {result2 == SimpleStatus.GOOD}")
++        
++    except Exception as e:
++        print(f"   Error: {e}")
++
++if __name__ == '__main__':
++    test_enum_serialization()
++    test_proposed_solution()
+\ No newline at end of file
+diff --git a/test_enum_evaluation.py b/test_enum_evaluation.py
+new file mode 100644
+index 0000000000..deff849122
+--- /dev/null
++++ b/test_enum_evaluation.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""
++Test that serialized enums can be properly evaluated.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from enum import Enum, IntEnum
++from django.utils.translation import gettext_lazy as _
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++import re
++
++def test_enum_evaluation():
++    """Test that serialized enums can be properly evaluated."""
++    
++    # Test cases
++    class Status(Enum):
++        GOOD = _('Good')
++        BAD = _('Bad')
++    
++    class Priority(IntEnum):
++        LOW = 1
++        HIGH = 2
++    
++    class SimpleEnum(Enum):
++        A = 'a'
++        B = 'b'
++    
++    test_cases = [
++        ("Status.GOOD", Status.GOOD),
++        ("Status.BAD", Status.BAD),
++        ("Priority.LOW", Priority.LOW),
++        ("Priority.HIGH", Priority.HIGH),
++        ("SimpleEnum.A", SimpleEnum.A),
++        ("SimpleEnum.B", SimpleEnum.B),
++        ("re.S (RegexFlag.DOTALL)", re.S),
++    ]
++    
++    print("=== Testing Enum Evaluation ===")
++    
++    all_passed = True
++    
++    for name, enum_val in test_cases:
++        print(f"\nTesting {name}:")
++        
++        # Serialize the enum
++        try:
++            serialized, imports = serializer_factory(enum_val).serialize()
++            print(f"  Serialized: {serialized}")
++            print(f"  Imports: {imports}")
++            
++            # Create a namespace with the required imports
++            namespace = {
++                '__main__': type('MockMain', (), {
++                    'Status': Status,
++                    'Priority': Priority,
++                    'SimpleEnum': SimpleEnum,
++                })()
++            }
++            for import_stmt in imports:
++                if import_stmt.startswith('import '):
++                    module_name = import_stmt[7:]  # Remove 'import '
++                    if module_name != '__main__':
++                        # Import the actual module
++                        exec(import_stmt, namespace)
++            
++            # Try to evaluate the serialized form
++            try:
++                result = eval(serialized, namespace)
++                print(f"  Evaluation result: {result}")
++                print(f"  Original == Evaluated: {enum_val == result}")
++                print(f"  Types match: {type(enum_val) == type(result)}")
++                
++                if enum_val == result and type(enum_val) == type(result):
++                    print(f"  ✓ PASS")
++                else:
++                    print(f"  ✗ FAIL")
++                    all_passed = False
++                    
++            except Exception as e:
++                print(f"  ✗ FAIL - Evaluation error: {e}")
++                all_passed = False
++                
++        except Exception as e:
++            print(f"  ✗ FAIL - Serialization error: {e}")
++            all_passed = False
++    
++    print(f"\n=== Summary ===")
++    if all_passed:
++        print("✓ All tests passed!")
++    else:
++        print("✗ Some tests failed!")
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success = test_enum_evaluation()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_issue_fix.py b/test_issue_fix.py
+new file mode 100644
+index 0000000000..9923a63b09
+--- /dev/null
++++ b/test_issue_fix.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python3
++"""
++Test that demonstrates the fix for the enum migration issue.
++This test simulates the exact scenario described in the issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from enum import Enum
++from django.utils.translation import gettext_lazy as _
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Exact code from the issue description
++class Status(Enum):
++    GOOD = _('Good')  # 'Good' will be translated
++    BAD = _('Bad')    # 'Bad' will be translated
++    
++    def __str__(self):
++        return self.name
++
++def test_issue_fix():
++    """Test that the issue is fixed."""
++    
++    print("=== Testing Issue Fix ===")
++    print("Issue: Migrations uses value of enum object instead of its name")
++    print()
++    
++    # Create a model field with enum default (as described in issue)
++    print("1. Creating model field with enum default:")
++    print("   status = models.CharField(default=Status.GOOD, max_length=128)")
++    
++    # Serialize the enum default value
++    enum_value = Status.GOOD
++    print(f"\n2. Enum value to serialize: {enum_value}")
++    print(f"   Name: {enum_value.name}")
++    print(f"   Value: {enum_value.value}")
++    
++    # Get the serialized form
++    serialized, imports = serializer_factory(enum_value).serialize()
++    print(f"\n3. Serialized form: {serialized}")
++    print(f"   Imports: {imports}")
++    
++    # Show what would be in the migration file
++    print(f"\n4. Migration file would contain:")
++    print(f"   ('status', models.CharField(default={serialized}, max_length=128))")
++    
++    # Test that the serialized form uses name, not value
++    print(f"\n5. Verification:")
++    if "'GOOD'" in serialized and "'Good'" not in serialized:
++        print("   ✓ PASS: Uses enum name 'GOOD', not value 'Good'")
++        print("   ✓ PASS: Migration will work even if translation changes")
++    else:
++        print("   ✗ FAIL: Still uses enum value instead of name")
++        return False
++    
++    # Test that the serialized form can be evaluated
++    print(f"\n6. Testing evaluation:")
++    try:
++        # Create namespace for evaluation
++        namespace = {'__main__': type('MockMain', (), {'Status': Status})()}
++        result = eval(serialized, namespace)
++        
++        if result == enum_value:
++            print("   ✓ PASS: Serialized form evaluates correctly")
++        else:
++            print(f"   ✗ FAIL: Evaluation mismatch: {result} != {enum_value}")
++            return False
++            
++    except Exception as e:
++        print(f"   ✗ FAIL: Evaluation error: {e}")
++        return False
++    
++    # Test the specific problem scenario
++    print(f"\n7. Testing problem scenario:")
++    print("   Before fix: Status('Good') would fail when 'Good' is translated")
++    print("   After fix: Status['GOOD'] works regardless of translation")
++    
++    # Simulate what happens when translation changes
++    try:
++        # This would be the old serialization format (should fail in real scenario)
++        old_format = f"__main__.Status('Good')"
++        print(f"   Old format: {old_format}")
++        
++        # This is the new serialization format (should always work)
++        new_format = serialized
++        print(f"   New format: {new_format}")
++        
++        # The new format should work
++        namespace = {'__main__': type('MockMain', (), {'Status': Status})()}
++        result = eval(new_format, namespace)
++        
++        if result == Status.GOOD:
++            print("   ✓ PASS: New format works correctly")
++        else:
++            print("   ✗ FAIL: New format doesn't work")
++            return False
++            
++    except Exception as e:
++        print(f"   ✗ FAIL: Error testing new format: {e}")
++        return False
++    
++    print(f"\n=== Issue Fix Verification Complete ===")
++    print("✓ All tests passed! The issue has been fixed.")
++    return True
++
++if __name__ == '__main__':
++    success = test_issue_fix()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_migration_scenario.py b/test_migration_scenario.py
+new file mode 100644
+index 0000000000..281b25b017
+--- /dev/null
++++ b/test_migration_scenario.py
+@@ -0,0 +1,127 @@
++#!/usr/bin/env python3
++"""
++Script to test the migration scenario described in the issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_I18N=True,
++        USE_L10N=True,
++        USE_TZ=True,
++        LANGUAGE_CODE='en',
++    )
++
++django.setup()
++
++from enum import Enum
++from django.utils.translation import gettext_lazy as _
++from django.db import models
++from django.db.migrations.serializer import serializer_factory
++
++# Simulate the exact scenario from the issue
++class Status(Enum):
++    GOOD = _('Good')  # 'Good' will be translated
++    BAD = _('Bad')    # 'Bad' will be translated
++    
++    def __str__(self):
++        return self.name
++
++def test_migration_issue():
++    print("=== Simulating Migration Issue ===")
++    
++    # Step 1: Create enum instance as it would appear in a model default
++    status_instance = Status.GOOD
++    print(f"1. Model default value: {status_instance}")
++    print(f"   Name: {status_instance.name}")
++    print(f"   Value: {status_instance.value}")
++    
++    # Step 2: Serialize it as Django migrations would
++    print("\n2. Current Django serialization:")
++    serialized, imports = serializer_factory(status_instance).serialize()
++    print(f"   Serialized: {serialized}")
++    print(f"   Imports: {imports}")
++    
++    # Step 3: Show what would be written to migration file
++    print(f"\n3. Migration file would contain:")
++    print(f"   ('status', models.CharField(default={serialized}, max_length=128))")
++    
++    # Step 4: Simulate the problem - when translation changes
++    print(f"\n4. Problem scenario:")
++    print(f"   Current: Status('Good') works because Status.GOOD.value == 'Good'")
++    print(f"   After translation change: Status('Good') fails because 'Good' is now 'Bueno'")
++    
++    # Step 5: Show the proposed solution
++    print(f"\n5. Proposed solution:")
++    proposed_serialization = f"__main__.Status['GOOD']"
++    print(f"   Proposed: {proposed_serialization}")
++    
++    # Test that the proposed solution works
++    try:
++        # This simulates what would be in the migration file with the fix
++        result = Status['GOOD']
++        print(f"   Status['GOOD'] = {result}")
++        print(f"   Status['GOOD'] == Status.GOOD: {result == Status.GOOD}")
++        print(f"   This works regardless of translation changes!")
++    except Exception as e:
++        print(f"   Error: {e}")
++
++def test_edge_cases():
++    print("\n=== Testing Edge Cases ===")
++    
++    # Test with different enum types
++    class IntEnum(Enum):
++        A = 1
++        B = 2
++    
++    class StrEnum(Enum):
++        A = "value_a"
++        B = "value_b"
++    
++    class MixedEnum(Enum):
++        INT_VAL = 42
++        STR_VAL = "string"
++        TRANS_VAL = _("Translated")
++    
++    test_cases = [
++        ("IntEnum.A", IntEnum.A),
++        ("StrEnum.A", StrEnum.A), 
++        ("MixedEnum.INT_VAL", MixedEnum.INT_VAL),
++        ("MixedEnum.STR_VAL", MixedEnum.STR_VAL),
++        ("MixedEnum.TRANS_VAL", MixedEnum.TRANS_VAL),
++    ]
++    
++    for name, enum_val in test_cases:
++        print(f"\n{name}:")
++        print(f"   Value: {enum_val.value}")
++        print(f"   Name: {enum_val.name}")
++        
++        # Current serialization
++        serialized, imports = serializer_factory(enum_val).serialize()
++        print(f"   Current: {serialized}")
++        
++        # Proposed serialization (what we want to implement)
++        module = enum_val.__class__.__module__
++        class_name = enum_val.__class__.__name__
++        proposed = f"{module}.{class_name}['{enum_val.name}']"
++        print(f"   Proposed: {proposed}")
++
++if __name__ == '__main__':
++    test_migration_issue()
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/tests/migrations/test_writer.py b/tests/migrations/test_writer.py
+index f97d76e9ad..989659a5ca 100644
+--- a/tests/migrations/test_writer.py
++++ b/tests/migrations/test_writer.py
+@@ -267,15 +267,15 @@ class WriterTests(SimpleTestCase):
+ 
+         self.assertSerializedResultEqual(
+             TextEnum.A,
+-            ("migrations.test_writer.TextEnum('a-value')", {'import migrations.test_writer'})
++            ("migrations.test_writer.TextEnum['A']", {'import migrations.test_writer'})
+         )
+         self.assertSerializedResultEqual(
+             BinaryEnum.A,
+-            ("migrations.test_writer.BinaryEnum(b'a-value')", {'import migrations.test_writer'})
++            ("migrations.test_writer.BinaryEnum['A']", {'import migrations.test_writer'})
+         )
+         self.assertSerializedResultEqual(
+             IntEnum.B,
+-            ("migrations.test_writer.IntEnum(2)", {'import migrations.test_writer'})
++            ("migrations.test_writer.IntEnum['B']", {'import migrations.test_writer'})
+         )
+ 
+         field = models.CharField(default=TextEnum.B, choices=[(m.value, m) for m in TextEnum])
+@@ -283,27 +283,27 @@ class WriterTests(SimpleTestCase):
+         self.assertEqual(
+             string,
+             "models.CharField(choices=["
+-            "('a-value', migrations.test_writer.TextEnum('a-value')), "
+-            "('value-b', migrations.test_writer.TextEnum('value-b'))], "
+-            "default=migrations.test_writer.TextEnum('value-b'))"
++            "('a-value', migrations.test_writer.TextEnum['A']), "
++            "('value-b', migrations.test_writer.TextEnum['B'])], "
++            "default=migrations.test_writer.TextEnum['B'])"
+         )
+         field = models.CharField(default=BinaryEnum.B, choices=[(m.value, m) for m in BinaryEnum])
+         string = MigrationWriter.serialize(field)[0]
+         self.assertEqual(
+             string,
+             "models.CharField(choices=["
+-            "(b'a-value', migrations.test_writer.BinaryEnum(b'a-value')), "
+-            "(b'value-b', migrations.test_writer.BinaryEnum(b'value-b'))], "
+-            "default=migrations.test_writer.BinaryEnum(b'value-b'))"
++            "(b'a-value', migrations.test_writer.BinaryEnum['A']), "
++            "(b'value-b', migrations.test_writer.BinaryEnum['B'])], "
++            "default=migrations.test_writer.BinaryEnum['B'])"
+         )
+         field = models.IntegerField(default=IntEnum.A, choices=[(m.value, m) for m in IntEnum])
+         string = MigrationWriter.serialize(field)[0]
+         self.assertEqual(
+             string,
+             "models.IntegerField(choices=["
+-            "(1, migrations.test_writer.IntEnum(1)), "
+-            "(2, migrations.test_writer.IntEnum(2))], "
+-            "default=migrations.test_writer.IntEnum(1))"
++            "(1, migrations.test_writer.IntEnum['A']), "
++            "(2, migrations.test_writer.IntEnum['B'])], "
++            "default=migrations.test_writer.IntEnum['A'])"
+         )
+ 
+     def test_serialize_choices(self):
+@@ -454,7 +454,7 @@ class WriterTests(SimpleTestCase):
+         # Test a string regex with flag
+         validator = RegexValidator(r'^[0-9]+$', flags=re.S)
+         string = MigrationWriter.serialize(validator)[0]
+-        self.assertEqual(string, "django.core.validators.RegexValidator('^[0-9]+$', flags=re.RegexFlag(16))")
++        self.assertEqual(string, "django.core.validators.RegexValidator('^[0-9]+$', flags=re.RegexFlag['DOTALL'])")
+         self.serialize_round_trip(validator)
+ 
+         # Test message and code

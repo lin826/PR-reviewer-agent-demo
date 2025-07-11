@@ -1,0 +1,888 @@
+diff --git a/sphinx/util/docfields.py b/sphinx/util/docfields.py
+index 3a3367ebe..7744017e0 100644
+--- a/sphinx/util/docfields.py
++++ b/sphinx/util/docfields.py
+@@ -35,6 +35,49 @@ def _is_single_paragraph(node: nodes.field_body) -> bool:
+     return False
+ 
+ 
++def _split_type_and_name(fieldarg: str) -> Tuple[str, str]:
++    """Split a field argument into type and name, handling nested parentheses.
++    
++    For example:
++    - "dict(str, str) opc_meta" -> ("dict(str, str)", "opc_meta")
++    - "str name" -> ("str", "name")
++    - "List[Tuple[str, int]] items" -> ("List[Tuple[str, int]]", "items")
++    
++    Falls back to simple split if no proper split point is found.
++    """
++    # Find the last space that is not inside parentheses/brackets
++    paren_depth = 0
++    bracket_depth = 0
++    split_pos = -1
++    
++    for i in range(len(fieldarg) - 1, -1, -1):
++        char = fieldarg[i]
++        
++        if char == ')':
++            paren_depth += 1
++        elif char == '(':
++            paren_depth -= 1
++        elif char == ']':
++            bracket_depth += 1
++        elif char == '[':
++            bracket_depth -= 1
++        elif char.isspace() and paren_depth == 0 and bracket_depth == 0:
++            split_pos = i
++            break
++    
++    if split_pos > 0:
++        argtype = fieldarg[:split_pos]
++        argname = fieldarg[split_pos + 1:]
++        return argtype, argname
++    else:
++        # Fall back to original behavior if no suitable split point found
++        # This will raise ValueError if there's no space to split on
++        parts = fieldarg.split(None, 1)
++        if len(parts) != 2:
++            raise ValueError("cannot split into type and name")
++        return parts[0], parts[1]
++
++
+ class Field:
+     """A doc field that is never grouped.  It can have an argument or not, the
+     argument can be linked using a specified *rolename*.  Field should be used
+@@ -298,7 +341,7 @@ class DocFieldTransformer:
+             # also support syntax like ``:param type name:``
+             if typedesc.is_typed:
+                 try:
+-                    argtype, argname = fieldarg.split(None, 1)
++                    argtype, argname = _split_type_and_name(fieldarg)
+                 except ValueError:
+                     pass
+                 else:
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..4e8bfee8e
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the _split_type_and_name function.
++"""
++
++from sphinx.util.docfields import _split_type_and_name
++
++
++def test_edge_cases():
++    """Test various edge cases for the split function."""
++    
++    test_cases = [
++        # Normal cases
++        ("str name", "str", "name"),
++        ("dict(str, str) opc_meta", "dict(str, str)", "opc_meta"),
++        ("List[Tuple[str, int]] items", "List[Tuple[str, int]]", "items"),
++        
++        # Complex nested cases
++        ("Dict[str, List[Tuple[int, str]]] complex_param", "Dict[str, List[Tuple[int, str]]]", "complex_param"),
++        ("Callable[[str, int], bool] func", "Callable[[str, int], bool]", "func"),
++        ("Union[str, int, None] value", "Union[str, int, None]", "value"),
++        
++        # Mixed brackets and parentheses
++        ("Optional[Dict[str, Callable[[int], str]]] callback_dict", "Optional[Dict[str, Callable[[int], str]]]", "callback_dict"),
++        
++        # Multiple spaces in type
++        ("Dict[str,  str] spaced_dict", "Dict[str,  str]", "spaced_dict"),
++        
++        # Type with spaces in parameter name
++        ("str param_with_underscores", "str", "param_with_underscores"),
++        ("List[str] param_123", "List[str]", "param_123"),
++    ]
++    
++    error_cases = [
++        # Cases that should raise ValueError (fall back to original behavior)
++        "name_only",  # No space
++        "",           # Empty string
++        " ",          # Just space
++        "  ",         # Multiple spaces only
++    ]
++    
++    print("Testing normal cases:")
++    all_passed = True
++    
++    for input_str, expected_type, expected_name in test_cases:
++        try:
++            actual_type, actual_name = _split_type_and_name(input_str)
++            if actual_type == expected_type and actual_name == expected_name:
++                print(f"✅ '{input_str}' -> ('{actual_type}', '{actual_name}')")
++            else:
++                print(f"❌ '{input_str}' -> ('{actual_type}', '{actual_name}') [expected: ('{expected_type}', '{expected_name}')]")
++                all_passed = False
++        except Exception as e:
++            print(f"❌ '{input_str}' -> ERROR: {e}")
++            all_passed = False
++    
++    print("\nTesting error cases (should fall back to original behavior):")
++    
++    for input_str in error_cases:
++        try:
++            result = _split_type_and_name(input_str)
++            # For these cases, we expect it to fall back to the original split behavior
++            # which should raise ValueError for single words or empty strings
++            if len(result) == 2:
++                print(f"⚠️  '{input_str}' -> {result} (fallback behavior)")
++            else:
++                print(f"❌ '{input_str}' -> unexpected result: {result}")
++                all_passed = False
++        except ValueError:
++            print(f"✅ '{input_str}' -> ValueError (expected fallback)")
++        except Exception as e:
++            print(f"❌ '{input_str}' -> ERROR: {e}")
++            all_passed = False
++    
++    return all_passed
++
++
++if __name__ == "__main__":
++    print("Testing edge cases for _split_type_and_name function...")
++    
++    if test_edge_cases():
++        print("\n🎉 ALL EDGE CASE TESTS PASSED!")
++    else:
++        print("\n❌ SOME EDGE CASE TESTS FAILED!")
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 000000000..0d2216733
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,189 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for dict(str,str) parameter parsing.
++"""
++
++import tempfile
++import os
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++from sphinx.util.docfields import _split_type_and_name
++
++
++def test_unit_split_function():
++    """Test the new _split_type_and_name function directly."""
++    
++    test_cases = [
++        # (input, expected_type, expected_name)
++        ("dict(str, str) opc_meta", "dict(str, str)", "opc_meta"),
++        ("str name", "str", "name"),
++        ("List[Tuple[str, int]] items", "List[Tuple[str, int]]", "items"),
++        ("Optional[Dict[str, Any]] config", "Optional[Dict[str, Any]]", "config"),
++        ("Union[str, int] value", "Union[str, int]", "value"),
++        ("Callable[[str, int], bool] func", "Callable[[str, int], bool]", "func"),
++        ("int count", "int", "count"),
++    ]
++    
++    print("Testing _split_type_and_name function:")
++    all_passed = True
++    
++    for input_str, expected_type, expected_name in test_cases:
++        try:
++            actual_type, actual_name = _split_type_and_name(input_str)
++            if actual_type == expected_type and actual_name == expected_name:
++                print(f"✅ '{input_str}' -> ('{actual_type}', '{actual_name}')")
++            else:
++                print(f"❌ '{input_str}' -> ('{actual_type}', '{actual_name}') [expected: ('{expected_type}', '{expected_name}')]")
++                all_passed = False
++        except Exception as e:
++            print(f"❌ '{input_str}' -> ERROR: {e}")
++            all_passed = False
++    
++    return all_passed
++
++
++def test_edge_cases():
++    """Test edge cases for the split function."""
++    
++    edge_cases = [
++        # Cases that should fall back to original behavior
++        ("name_only",),  # No space, should raise ValueError
++        ("",),  # Empty string, should raise ValueError
++    ]
++    
++    print("\nTesting edge cases:")
++    all_passed = True
++    
++    for case in edge_cases:
++        input_str = case[0]
++        try:
++            result = _split_type_and_name(input_str)
++            print(f"⚠️  '{input_str}' -> {result} (unexpected success)")
++        except ValueError:
++            print(f"✅ '{input_str}' -> ValueError (expected)")
++        except Exception as e:
++            print(f"❌ '{input_str}' -> ERROR: {e}")
++            all_passed = False
++    
++    return all_passed
++
++
++def test_integration_docfield_parsing():
++    """Test the fix in the context of actual documentation generation."""
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "build"
++        doctreedir = outdir / ".doctrees"
++        
++        srcdir.mkdir()
++        outdir.mkdir()
++        
++        # Create a simple conf.py
++        conf_content = '''
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create an RST file that uses various parameter syntaxes
++        rst_content = '''
++Test Documentation
++==================
++
++.. py:function:: test_function()
++
++   Test function with various parameter types.
++   
++   :param dict(str, str) opc_meta: A dictionary parameter
++   :param List[Tuple[str, int]] items: A list of tuples
++   :param str simple_param: A simple parameter
++   :param Optional[Dict[str, Any]] config: An optional config dict
++   :return: Nothing
++'''
++        (srcdir / "index.rst").write_text(rst_content)
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='html'
++            )
++            app.build()
++        
++        # Read the generated HTML
++        html_file = outdir / "index.html"
++        if html_file.exists():
++            html_content = html_file.read_text()
++            
++            # Check for correct renderings (allowing for HTML markup)
++            checks = [
++                ("opc_meta", "dict parameter name"),
++                ("dict", "dict type component"),
++                ("str", "str type component"),
++                ("items", "list parameter name"),
++                ("List", "List type component"),
++                ("Tuple", "Tuple type component"),
++                ("simple_param", "simple parameter name"),
++                ("config", "optional config parameter name"),
++                ("Optional", "Optional type component"),
++                ("Dict", "Dict type component"),
++                ("Any", "Any type component"),
++            ]
++            
++            print("\nTesting integration with document generation:")
++            all_passed = True
++            
++            for expected_text, description in checks:
++                if expected_text in html_content:
++                    print(f"✅ Found correct rendering for {description}: '{expected_text}'")
++                else:
++                    print(f"❌ Missing correct rendering for {description}: '{expected_text}'")
++                    all_passed = False
++            
++            # Check that we don't have the old broken rendering
++            broken_patterns = [
++                "str) opc_meta",  # The key broken pattern from the original issue
++                "str,) –",        # Another broken pattern
++            ]
++            
++            for broken_pattern in broken_patterns:
++                if broken_pattern in html_content:
++                    print(f"❌ Found broken rendering: '{broken_pattern}'")
++                    all_passed = False
++                else:
++                    print(f"✅ No broken rendering found for pattern: '{broken_pattern}'")
++            
++            if not all_passed:
++                print("\nHTML content for debugging:")
++                print("=" * 50)
++                print(html_content)
++                print("=" * 50)
++            
++            return all_passed
++        else:
++            print("❌ ERROR: HTML file not generated")
++            return False
++
++
++if __name__ == "__main__":
++    print("Testing the fix for dict(str,str) parameter parsing...")
++    
++    unit_passed = test_unit_split_function()
++    edge_passed = test_edge_cases()
++    integration_passed = test_integration_docfield_parsing()
++    
++    if unit_passed and edge_passed and integration_passed:
++        print("\n🎉 ALL TESTS PASSED: The fix works correctly!")
++    else:
++        print("\n❌ SOME TESTS FAILED: The fix needs more work.")
++        if not unit_passed:
++            print("  - Unit tests failed")
++        if not edge_passed:
++            print("  - Edge case tests failed")
++        if not integration_passed:
++            print("  - Integration tests failed")
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 000000000..316d37b49
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Test that reproduces the exact issue from the GitHub issue description.
++"""
++
++import tempfile
++import os
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def test_original_issue():
++    """Test the exact case from the GitHub issue."""
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "build"
++        doctreedir = outdir / ".doctrees"
++        
++        srcdir.mkdir()
++        outdir.mkdir()
++        
++        # Create a simple conf.py
++        conf_content = '''
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create an RST file with the exact problematic parameter from the issue
++        rst_content = '''
++Test Documentation
++==================
++
++.. py:function:: test_method()
++
++   Test method.
++   
++   :param dict(str, str) opc_meta: (optional)
++   :return: Nothing
++'''
++        (srcdir / "index.rst").write_text(rst_content)
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='html'
++            )
++            app.build()
++        
++        # Read the generated HTML
++        html_file = outdir / "index.html"
++        if html_file.exists():
++            html_content = html_file.read_text()
++            
++            print("Generated HTML content:")
++            print("=" * 50)
++            print(html_content)
++            print("=" * 50)
++            
++            # Check that we DON'T have the broken rendering from the issue
++            broken_pattern = "str) opc_meta (dict(str,) –(optional)"
++            if broken_pattern in html_content:
++                print(f"❌ ISSUE NOT FIXED: Found broken rendering '{broken_pattern}'")
++                return False
++            
++            # Check that we have the correct components
++            if "opc_meta" in html_content and "dict" in html_content and "str" in html_content:
++                print("✅ ISSUE FIXED: Parameter is rendered correctly")
++                
++                # Let's also check that we don't have the specific broken pattern
++                if "str) opc_meta" not in html_content:
++                    print("✅ CONFIRMED: No broken 'str) opc_meta' pattern found")
++                    return True
++                else:
++                    print("❌ PARTIAL: Still found 'str) opc_meta' pattern")
++                    return False
++            else:
++                print("⚠️  UNKNOWN: Could not find expected parameter components")
++                return False
++        else:
++            print("❌ ERROR: HTML file not generated")
++            return False
++
++
++if __name__ == "__main__":
++    print("Testing the original issue from GitHub...")
++    
++    if test_original_issue():
++        print("\n🎉 ORIGINAL ISSUE IS FIXED!")
++    else:
++        print("\n❌ ORIGINAL ISSUE IS NOT FIXED!")
+\ No newline at end of file
+diff --git a/test_regression_dict_param.py b/test_regression_dict_param.py
+new file mode 100644
+index 000000000..5ea5888bb
+--- /dev/null
++++ b/test_regression_dict_param.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++"""
++Regression test for the dict(str,str) parameter parsing issue.
++This test can be added to the official test suite.
++"""
++
++import pytest
++from sphinx.util.docfields import _split_type_and_name
++from sphinx.testing.util import SphinxTestApp
++from sphinx.testing.path import path
++
++
++def test_split_type_and_name_complex_types():
++    """Test _split_type_and_name function with complex type annotations."""
++    
++    # Test cases that should work correctly
++    test_cases = [
++        ("dict(str, str) opc_meta", "dict(str, str)", "opc_meta"),
++        ("List[Tuple[str, int]] items", "List[Tuple[str, int]]", "items"),
++        ("Optional[Dict[str, Any]] config", "Optional[Dict[str, Any]]", "config"),
++        ("Union[str, int] value", "Union[str, int]", "value"),
++        ("Callable[[str, int], bool] func", "Callable[[str, int], bool]", "func"),
++        ("str name", "str", "name"),  # Simple case should still work
++        ("int count", "int", "count"),  # Simple case should still work
++    ]
++    
++    for input_str, expected_type, expected_name in test_cases:
++        actual_type, actual_name = _split_type_and_name(input_str)
++        assert actual_type == expected_type, f"Type mismatch for '{input_str}': got '{actual_type}', expected '{expected_type}'"
++        assert actual_name == expected_name, f"Name mismatch for '{input_str}': got '{actual_name}', expected '{expected_name}'"
++
++
++def test_split_type_and_name_error_cases():
++    """Test _split_type_and_name function with cases that should raise ValueError."""
++    
++    error_cases = [
++        "name_only",  # No space
++        "",           # Empty string
++        " ",          # Just space
++    ]
++    
++    for input_str in error_cases:
++        with pytest.raises(ValueError):
++            _split_type_and_name(input_str)
++
++
++def test_dict_param_rendering_integration():
++    """Integration test for dict parameter rendering in documentation."""
++    
++    srcdir = path(__file__).parent.abspath() / 'roots' / 'test-dict-param'
++    srcdir.makedirs()
++    
++    # Create conf.py
++    (srcdir / 'conf.py').write_text('extensions = []\n')
++    
++    # Create index.rst with the problematic parameter syntax
++    rst_content = '''
++Test Documentation
++==================
++
++.. py:function:: test_function()
++
++   Test function with dict parameter.
++   
++   :param dict(str, str) opc_meta: A dictionary parameter
++   :param str simple_param: A simple parameter
++   :return: Nothing
++'''
++    (srcdir / 'index.rst').write_text(rst_content)
++    
++    # Build the documentation
++    app = SphinxTestApp('html', srcdir=srcdir)
++    app.build()
++    
++    # Read the generated HTML
++    html_content = (app.outdir / 'index.html').read_text()
++    
++    # Check that the parameter is rendered correctly
++    # The exact HTML structure may vary, but we should see the parameter name and type components
++    assert 'opc_meta' in html_content, "Parameter name 'opc_meta' not found in HTML"
++    assert 'dict' in html_content, "Type component 'dict' not found in HTML"
++    assert 'str' in html_content, "Type component 'str' not found in HTML"
++    assert 'simple_param' in html_content, "Simple parameter 'simple_param' not found in HTML"
++    
++    # Check that we don't have the broken rendering
++    assert 'str) opc_meta' not in html_content, "Found broken rendering 'str) opc_meta' in HTML"
++    
++    # Clean up
++    srcdir.rmtree()
++
++
++if __name__ == "__main__":
++    test_split_type_and_name_complex_types()
++    test_split_type_and_name_error_cases()
++    test_dict_param_rendering_integration()
++    print("All regression tests passed!")
+\ No newline at end of file
+diff --git a/test_reproduce_direct.py b/test_reproduce_direct.py
+new file mode 100644
+index 000000000..3e19cd9a0
+--- /dev/null
++++ b/test_reproduce_direct.py
+@@ -0,0 +1,149 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the issue with dict(str,str) parameter parsing.
++This version tests the docfields parsing directly.
++"""
++
++import tempfile
++import os
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def test_direct_docfield_parsing():
++    """Test the docfield parsing directly without autodoc."""
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "build"
++        doctreedir = outdir / ".doctrees"
++        
++        srcdir.mkdir()
++        outdir.mkdir()
++        
++        # Create a simple conf.py
++        conf_content = '''
++extensions = []
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create an RST file that uses the problematic parameter syntax
++        rst_content = '''
++Test Documentation
++==================
++
++.. py:function:: test_function()
++
++   Test function with dict parameter.
++   
++   :param dict(str, str) opc_meta: (optional) A dictionary parameter
++   :param str simple_param: A simple parameter
++   :return: Nothing
++'''
++        (srcdir / "index.rst").write_text(rst_content)
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='html'
++            )
++            app.build()
++        
++        # Read the generated HTML
++        html_file = outdir / "index.html"
++        if html_file.exists():
++            html_content = html_file.read_text()
++            print("Generated HTML content:")
++            print("=" * 50)
++            print(html_content)
++            print("=" * 50)
++            
++            # Check for the incorrect rendering
++            if "str) opc_meta (dict(str,)" in html_content:
++                print("❌ BUG REPRODUCED: Found incorrect rendering 'str) opc_meta (dict(str,)'")
++                return False
++            elif "opc_meta (dict(str, str))" in html_content:
++                print("✅ CORRECT: Found correct rendering 'opc_meta (dict(str, str))'")
++                return True
++            else:
++                print("⚠️  UNKNOWN: Could not find expected parameter rendering")
++                # Let's search for any parameter-related content
++                if "opc_meta" in html_content:
++                    print("Found 'opc_meta' in content")
++                if "dict" in html_content:
++                    print("Found 'dict' in content")
++                if "simple_param" in html_content:
++                    print("Found 'simple_param' in content")
++                return False
++        else:
++            print("❌ ERROR: HTML file not generated")
++            return False
++
++
++def test_unit_docfield_parsing():
++    """Test the docfield parsing at the unit level."""
++    
++    from sphinx.util.docfields import TypedField
++    from docutils import nodes
++    from sphinx.domains.python import PyTypedField
++    
++    # Create a mock directive
++    class MockDirective:
++        def __init__(self):
++            self.domain = 'py'
++            self.state = None
++            
++        def get_field_type_map(self):
++            return {
++                'param': (PyTypedField('parameter', label='Parameters',
++                                     names=('param', 'parameter', 'arg', 'argument',
++                                            'keyword', 'kwarg', 'kwparam'),
++                                     typerolename='class', typenames=('paramtype', 'type'),
++                                     can_collapse=True), False)
++            }
++    
++    # Test the problematic case
++    print("Testing parameter parsing logic...")
++    
++    # Simulate the fieldarg that would come from ":param dict(str, str) opc_meta:"
++    fieldarg = "dict(str, str) opc_meta"
++    
++    # Test the new fixed function
++    from sphinx.util.docfields import _split_type_and_name
++    try:
++        argtype, argname = _split_type_and_name(fieldarg)
++        print(f"Current parsing result:")
++        print(f"  argtype: '{argtype}'")
++        print(f"  argname: '{argname}'")
++        
++        if argtype == "dict(str, str)" and argname == "opc_meta":
++            print("✅ FIXED: Correct parsing of complex type annotations")
++            return True
++        else:
++            print(f"❌ UNEXPECTED: Got argtype='{argtype}', argname='{argname}'")
++            return False
++            
++    except ValueError as e:
++        print(f"❌ ERROR: {e}")
++        return False
++
++
++if __name__ == "__main__":
++    print("Testing unit-level parameter parsing...")
++    unit_result = test_unit_docfield_parsing()
++    
++    print("\nTesting direct docfield parsing...")
++    direct_result = test_direct_docfield_parsing()
++    
++    if not unit_result:
++        print("\n🎯 ISSUE CONFIRMED: Parameter parsing logic is broken at the unit level")
++    elif not direct_result:
++        print("\n🎯 ISSUE CONFIRMED: Parameter parsing is broken in document generation")
++    else:
++        print("\n✅ ALL TESTS PASS: Parameter parsing works correctly")
+\ No newline at end of file
+diff --git a/test_reproduce_issue.py b/test_reproduce_issue.py
+new file mode 100644
+index 000000000..5c14fe35f
+--- /dev/null
++++ b/test_reproduce_issue.py
+@@ -0,0 +1,168 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the issue with dict(str,str) parameter parsing.
++"""
++
++import tempfile
++import os
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def test_dict_param_parsing():
++    """Test that reproduces the issue with dict(str,str) parameter parsing."""
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "build"
++        doctreedir = outdir / ".doctrees"
++        
++        srcdir.mkdir()
++        outdir.mkdir()
++        
++        # Create a simple conf.py
++        conf_content = '''
++extensions = ['sphinx.ext.autodoc']
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create a Python module with the problematic docstring
++        module_content = '''
++def test_function():
++    """Test function with dict parameter.
++    
++    :param dict(str, str) opc_meta: (optional) A dictionary parameter
++    :return: Nothing
++    """
++    pass
++'''
++        (srcdir / "test_module.py").write_text(module_content)
++        
++        # Create an RST file that documents the function
++        rst_content = '''
++Test Documentation
++==================
++
++.. autofunction:: test_module.test_function
++'''
++        (srcdir / "index.rst").write_text(rst_content)
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='html'
++            )
++            app.build()
++        
++        # Read the generated HTML
++        html_file = outdir / "index.html"
++        if html_file.exists():
++            html_content = html_file.read_text()
++            print("Generated HTML content:")
++            print("=" * 50)
++            print(html_content)
++            print("=" * 50)
++            
++            # Check for the incorrect rendering
++            if "str) opc_meta (dict(str,)" in html_content:
++                print("❌ BUG REPRODUCED: Found incorrect rendering 'str) opc_meta (dict(str,)'")
++                return False
++            elif "opc_meta (dict(str, str))" in html_content:
++                print("✅ CORRECT: Found correct rendering 'opc_meta (dict(str, str))'")
++                return True
++            else:
++                print("⚠️  UNKNOWN: Could not find expected parameter rendering")
++                return False
++        else:
++            print("❌ ERROR: HTML file not generated")
++            return False
++
++
++def test_simple_param_parsing():
++    """Test a simple parameter to ensure basic functionality works."""
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "build"
++        doctreedir = outdir / ".doctrees"
++        
++        srcdir.mkdir()
++        outdir.mkdir()
++        
++        # Create a simple conf.py
++        conf_content = '''
++extensions = ['sphinx.ext.autodoc']
++'''
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create a Python module with a simple parameter
++        module_content = '''
++def simple_function():
++    """Test function with simple parameter.
++    
++    :param str name: A simple string parameter
++    :return: Nothing
++    """
++    pass
++'''
++        (srcdir / "test_module.py").write_text(module_content)
++        
++        # Create an RST file that documents the function
++        rst_content = '''
++Test Documentation
++==================
++
++.. autofunction:: test_module.simple_function
++'''
++        (srcdir / "index.rst").write_text(rst_content)
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='html'
++            )
++            app.build()
++        
++        # Read the generated HTML
++        html_file = outdir / "index.html"
++        if html_file.exists():
++            html_content = html_file.read_text()
++            
++            # Check for correct simple parameter rendering
++            if "name (str)" in html_content:
++                print("✅ SIMPLE PARAM: Correct rendering 'name (str)'")
++                return True
++            else:
++                print("❌ SIMPLE PARAM: Could not find expected simple parameter rendering")
++                print("HTML content:")
++                print(html_content)
++                return False
++        else:
++            print("❌ ERROR: HTML file not generated")
++            return False
++
++
++if __name__ == "__main__":
++    print("Testing simple parameter parsing...")
++    simple_works = test_simple_param_parsing()
++    
++    print("\nTesting dict(str,str) parameter parsing...")
++    dict_works = test_dict_param_parsing()
++    
++    if simple_works and not dict_works:
++        print("\n🎯 ISSUE CONFIRMED: Simple params work, but dict(str,str) params are broken")
++    elif simple_works and dict_works:
++        print("\n✅ ALL TESTS PASS: Both simple and complex params work")
++    else:
++        print("\n❌ UNEXPECTED: Simple params are also broken")
+\ No newline at end of file

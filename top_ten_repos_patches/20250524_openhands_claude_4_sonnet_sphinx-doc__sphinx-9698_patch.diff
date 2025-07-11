@@ -1,0 +1,342 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..6f0de33de
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where py:method with :property: option
++incorrectly adds parentheses to index entries.
++"""
++
++from sphinx.domains.python import PyMethod, PyProperty
++
++
++def test_get_index_text():
++    """Test the get_index_text methods directly to show the issue."""
++    
++    print("=== TESTING get_index_text METHODS ===")
++    
++    # Create mock objects to test the methods
++    class MockEnv:
++        class Config:
++            add_module_names = True
++        config = Config()
++    
++    # Test PyMethod with :property: option
++    print("\n1. Testing PyMethod with :property: option:")
++    py_method = PyMethod('method', [], {}, None, None, None, None)
++    py_method.env = MockEnv()
++    py_method.options = {'property': True}  # This is the key option
++    
++    # Test the get_index_text method
++    modname = 'mymodule'
++    name_cls = ('Foo.bar', 'Foo')
++    
++    result = py_method.get_index_text(modname, name_cls)
++    print(f"   Result: {result}")
++    if 'bar()' in result:
++        print("   ❌ BUG: Contains parentheses when it shouldn't")
++    else:
++        print("   ✅ GOOD: No parentheses")
++    
++    # Test PyProperty for comparison
++    print("\n2. Testing PyProperty:")
++    py_property = PyProperty('property', [], {}, None, None, None, None)
++    py_property.env = MockEnv()
++    py_property.options = {}
++    
++    result = py_property.get_index_text(modname, ('Foo.baz', 'Foo'))
++    print(f"   Result: {result}")
++    if 'baz()' in result:
++        print("   ❌ UNEXPECTED: Contains parentheses")
++    else:
++        print("   ✅ EXPECTED: No parentheses")
++    
++    # Test PyMethod without :property: option for comparison
++    print("\n3. Testing PyMethod without :property: option:")
++    py_method_normal = PyMethod('method', [], {}, None, None, None, None)
++    py_method_normal.env = MockEnv()
++    py_method_normal.options = {}  # No property option
++    
++    result = py_method_normal.get_index_text(modname, ('Foo.normal_method', 'Foo'))
++    print(f"   Result: {result}")
++    if 'normal_method()' in result:
++        print("   ✅ EXPECTED: Contains parentheses for regular method")
++    else:
++        print("   ❌ UNEXPECTED: Missing parentheses for regular method")
++
++
++def test_needs_arglist():
++    """Test the needs_arglist method to understand the logic."""
++    
++    print("\n=== TESTING needs_arglist METHODS ===")
++    
++    # Test PyMethod with :property: option
++    print("\n1. Testing PyMethod with :property: option:")
++    py_method = PyMethod('method', [], {}, None, None, None, None)
++    py_method.options = {'property': True}
++    
++    result = py_method.needs_arglist()
++    print(f"   needs_arglist(): {result}")
++    print("   ✅ GOOD: Property methods don't need argument lists" if not result else "   ❌ UNEXPECTED: Property methods shouldn't need argument lists")
++    
++    # Test PyMethod without :property: option
++    print("\n2. Testing PyMethod without :property: option:")
++    py_method_normal = PyMethod('method', [], {}, None, None, None, None)
++    py_method_normal.options = {}
++    
++    result = py_method_normal.needs_arglist()
++    print(f"   needs_arglist(): {result}")
++    print("   ✅ EXPECTED: Regular methods need argument lists" if result else "   ❌ UNEXPECTED: Regular methods should need argument lists")
++
++
++if __name__ == "__main__":
++    test_get_index_text()
++    test_needs_arglist()
+\ No newline at end of file
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index cd02eaad5..1a3bd60c7 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -796,7 +796,7 @@ class PyMethod(PyObject):
+         if 'classmethod' in self.options:
+             return _('%s() (%s class method)') % (methname, clsname)
+         elif 'property' in self.options:
+-            return _('%s() (%s property)') % (methname, clsname)
++            return _('%s (%s property)') % (methname, clsname)
+         elif 'staticmethod' in self.options:
+             return _('%s() (%s static method)') % (methname, clsname)
+         else:
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..5bfeea062
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""
++Test edge cases to ensure our fix doesn't break other functionality.
++"""
++
++import tempfile
++from pathlib import Path
++
++
++def test_edge_cases():
++    """Test various method types to ensure they still work correctly."""
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create RST content with various method types
++        rst_content = """
++Test Document
++=============
++
++.. py:class:: TestClass
++
++   .. py:method:: regular_method()
++   
++   .. py:method:: class_method()
++      :classmethod:
++   
++   .. py:method:: static_method()
++      :staticmethod:
++   
++   .. py:method:: property_method
++      :property:
++   
++   .. py:method:: async_method()
++      :async:
++
++.. py:property:: standalone_property
++"""
++        
++        rst_file = tmpdir / "index.rst"
++        rst_file.write_text(rst_content)
++        
++        conf_content = """
++extensions = ['sphinx.ext.autodoc']
++"""
++        conf_file = tmpdir / "conf.py"
++        conf_file.write_text(conf_content)
++        
++        # Build the documentation
++        import subprocess
++        import sys
++        
++        try:
++            result = subprocess.run([
++                sys.executable, "-m", "sphinx", 
++                "-b", "html", 
++                str(tmpdir), 
++                str(tmpdir / "_build")
++            ], capture_output=True, text=True, cwd=tmpdir)
++            
++            if result.returncode == 0:
++                print("✅ Documentation built successfully!")
++                
++                html_file = tmpdir / "_build" / "index.html"
++                if html_file.exists():
++                    html_content = html_file.read_text()
++                    
++                    # Check that regular methods still have parentheses
++                    if "regular_method()" in html_content:
++                        print("✅ Regular methods still have parentheses")
++                    else:
++                        print("❌ Regular methods missing parentheses")
++                    
++                    # Check that class methods still have parentheses
++                    if "class_method()" in html_content:
++                        print("✅ Class methods still have parentheses")
++                    else:
++                        print("❌ Class methods missing parentheses")
++                    
++                    # Check that static methods still have parentheses
++                    if "static_method()" in html_content:
++                        print("✅ Static methods still have parentheses")
++                    else:
++                        print("❌ Static methods missing parentheses")
++                    
++                    # Check that property methods don't have parentheses
++                    if "property_method()" in html_content:
++                        print("❌ Property methods still have parentheses")
++                    elif "property_method" in html_content:
++                        print("✅ Property methods don't have parentheses")
++                    else:
++                        print("❌ Property methods not found")
++                    
++                    # Check that async methods still have parentheses
++                    if "async_method()" in html_content:
++                        print("✅ Async methods still have parentheses")
++                    else:
++                        print("❌ Async methods missing parentheses")
++                    
++                    # Check that standalone properties don't have parentheses
++                    if "standalone_property()" in html_content:
++                        print("❌ Standalone properties have parentheses")
++                    elif "standalone_property" in html_content:
++                        print("✅ Standalone properties don't have parentheses")
++                    else:
++                        print("❌ Standalone properties not found")
++                        
++                else:
++                    print("❌ HTML file not found")
++            else:
++                print(f"❌ Build failed: {result.stderr}")
++                
++        except Exception as e:
++            print(f"❌ Error running sphinx: {e}")
++
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..7cc5a7d56
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for py:method with :property: option
++not adding parentheses to index entries.
++"""
++
++import tempfile
++import os
++from pathlib import Path
++
++
++def test_fix():
++    """Test that the fix works by creating a simple RST document and building it."""
++    
++    # Create a temporary directory
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create a simple RST file
++        rst_content = """
++Test Document
++=============
++
++.. py:class:: Foo
++
++   .. py:method:: bar
++      :property:
++
++   .. py:property:: baz
++"""
++        
++        # Write the RST file
++        rst_file = tmpdir / "index.rst"
++        rst_file.write_text(rst_content)
++        
++        # Create a minimal conf.py
++        conf_content = """
++extensions = ['sphinx.ext.autodoc']
++"""
++        conf_file = tmpdir / "conf.py"
++        conf_file.write_text(conf_content)
++        
++        # Build the documentation
++        import subprocess
++        import sys
++        
++        try:
++            result = subprocess.run([
++                sys.executable, "-m", "sphinx", 
++                "-b", "html", 
++                str(tmpdir), 
++                str(tmpdir / "_build")
++            ], capture_output=True, text=True, cwd=tmpdir)
++            
++            if result.returncode == 0:
++                print("✅ Documentation built successfully!")
++                
++                # Check if the HTML was generated
++                html_file = tmpdir / "_build" / "index.html"
++                if html_file.exists():
++                    html_content = html_file.read_text()
++                    print("✅ HTML file generated")
++                    
++                    # Look for the property entries in the HTML
++                    if "bar()" in html_content:
++                        print("❌ BUG STILL EXISTS: Found 'bar()' with parentheses")
++                    else:
++                        print("✅ FIXED: No 'bar()' with parentheses found")
++                    
++                    if "bar" in html_content:
++                        print("✅ Found 'bar' property entry")
++                    
++                    if "baz" in html_content:
++                        print("✅ Found 'baz' property entry")
++                        
++                else:
++                    print("❌ HTML file not found")
++            else:
++                print(f"❌ Build failed: {result.stderr}")
++                
++        except Exception as e:
++            print(f"❌ Error running sphinx: {e}")
++
++
++if __name__ == "__main__":
++    test_fix()
+\ No newline at end of file
+diff --git a/tests/test_domain_py.py b/tests/test_domain_py.py
+index 682ea76e1..5ba63d0e3 100644
+--- a/tests/test_domain_py.py
++++ b/tests/test_domain_py.py
+@@ -756,7 +756,7 @@ def test_pymethod_options(app):
+ 
+     # :property:
+     assert_node(doctree[1][1][8], addnodes.index,
+-                entries=[('single', 'meth5() (Class property)', 'Class.meth5', '', None)])
++                entries=[('single', 'meth5 (Class property)', 'Class.meth5', '', None)])
+     assert_node(doctree[1][1][9], ([desc_signature, ([desc_annotation, ("property", desc_sig_space)],
+                                                      [desc_name, "meth5"])],
+                                    [desc_content, ()]))

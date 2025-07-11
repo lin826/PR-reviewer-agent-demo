@@ -1,0 +1,654 @@
+diff --git a/debug_parent.py b/debug_parent.py
+new file mode 100644
+index 000000000..7d10b0f3a
+--- /dev/null
++++ b/debug_parent.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++import sys
++sys.path.insert(0, 'src')
++
++import unittest
++from _pytest.unittest import UnitTestCase, TestCaseFunction, _is_skipped
++from _pytest.python import Module
++
++@unittest.skip('test')
++class TestClass(unittest.TestCase):
++    def test_method(self):
++        pass
++
++# Simulate the pytest collection process
++module = Module.from_parent(None, path="test.py")
++unittest_case = UnitTestCase.from_parent(module, name="TestClass", obj=TestClass)
++
++# Check what the parent relationship looks like
++print(f"UnitTestCase.obj: {unittest_case.obj}")
++print(f"UnitTestCase.obj is TestClass: {unittest_case.obj is TestClass}")
++print(f"_is_skipped(TestClass): {_is_skipped(TestClass)}")
++
++# Simulate creating a TestCaseFunction
++test_func = TestCaseFunction.from_parent(unittest_case, name="test_method", callobj=TestClass.test_method)
++print(f"TestCaseFunction.parent: {test_func.parent}")
++print(f"TestCaseFunction.parent.obj: {test_func.parent.obj}")
++print(f"TestCaseFunction.parent.obj is TestClass: {test_func.parent.obj is TestClass}")
++print(f"_is_skipped(test_func.parent.obj): {_is_skipped(test_func.parent.obj)}")
++print(f"_is_skipped(test_func.obj): {_is_skipped(test_func.obj)}")
+\ No newline at end of file
+diff --git a/debug_skip.py b/debug_skip.py
+new file mode 100644
+index 000000000..45637c9c0
+--- /dev/null
++++ b/debug_skip.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++import sys
++sys.path.insert(0, 'src')
++
++from _pytest.unittest import _is_skipped
++import unittest
++
++@unittest.skip('test')
++class TestClass(unittest.TestCase):
++    def test_method(self):
++        pass
++
++class TestMethod(unittest.TestCase):
++    @unittest.skip('test')
++    def test_method(self):
++        pass
++
++print('Class skip:', _is_skipped(TestClass))
++print('Method skip:', _is_skipped(TestMethod.test_method))
++print('Normal class:', _is_skipped(TestMethod))
++
++# Test the actual condition from the fix
++class MockConfig:
++    def getoption(self, name):
++        return name == "usepdb"
++
++class MockParent:
++    def __init__(self, obj):
++        self.obj = obj
++
++class MockTestCase:
++    def __init__(self, obj, parent_obj):
++        self.obj = obj
++        self.parent = MockParent(parent_obj)
++        self.config = MockConfig()
++
++# Test case 1: Class-level skip
++test_case_1 = MockTestCase(TestClass.test_method, TestClass)
++condition_1 = test_case_1.config.getoption("usepdb") and not (_is_skipped(test_case_1.obj) or _is_skipped(test_case_1.parent.obj))
++print(f'Class skip condition (should be False): {condition_1}')
++
++# Test case 2: Method-level skip  
++test_case_2 = MockTestCase(TestMethod.test_method, TestMethod)
++condition_2 = test_case_2.config.getoption("usepdb") and not (_is_skipped(test_case_2.obj) or _is_skipped(test_case_2.parent.obj))
++print(f'Method skip condition (should be False): {condition_2}')
++
++# Test case 3: No skip
++class TestNormal(unittest.TestCase):
++    def test_method(self):
++        pass
++
++test_case_3 = MockTestCase(TestNormal.test_method, TestNormal)
++condition_3 = test_case_3.config.getoption("usepdb") and not (_is_skipped(test_case_3.obj) or _is_skipped(test_case_3.parent.obj))
++print(f'Normal condition (should be True): {condition_3}')
+\ No newline at end of file
+diff --git a/debug_skip_detection.py b/debug_skip_detection.py
+new file mode 100644
+index 000000000..a29b791b4
+--- /dev/null
++++ b/debug_skip_detection.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++import sys
++sys.path.insert(0, 'src')
++
++import unittest
++from _pytest.unittest import _is_skipped
++
++@unittest.skip('test')
++class TestClass(unittest.TestCase):
++    def test_method(self):
++        pass
++
++# Test the skip detection
++print(f"Class skipped: {_is_skipped(TestClass)}")
++print(f"Method skipped: {_is_skipped(TestClass.test_method)}")
++
++# Test instance creation
++instance = TestClass('test_method')
++print(f"Instance class: {instance.__class__}")
++print(f"Instance skipped: {_is_skipped(instance.__class__)}")
++
++# Check the skip attributes
++print(f"Class __unittest_skip__: {getattr(TestClass, '__unittest_skip__', 'Not found')}")
++print(f"Method __unittest_skip__: {getattr(TestClass.test_method, '__unittest_skip__', 'Not found')}")
++print(f"Instance class __unittest_skip__: {getattr(instance.__class__, '__unittest_skip__', 'Not found')}")
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 000000000..2626e4cb8
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,6 @@
++import unittest
++
++@unittest.skip("hello")
++class MyTestCase(unittest.TestCase):
++    def test_one(self):
++        pass
+\ No newline at end of file
+diff --git a/src/_pytest/unittest.py b/src/_pytest/unittest.py
+index 851e4943b..7618ae17b 100644
+--- a/src/_pytest/unittest.py
++++ b/src/_pytest/unittest.py
+@@ -82,6 +82,7 @@ class UnitTestCase(Class):
+             if not getattr(x, "__test__", True):
+                 continue
+             funcobj = getimfunc(x)
++
+             yield TestCaseFunction.from_parent(self, name=name, callobj=funcobj)
+             foundsomething = True
+ 
+@@ -316,7 +317,13 @@ class TestCaseFunction(Function):
+             # Arguably we could always postpone tearDown(), but this changes the moment where the
+             # TestCase instance interacts with the results object, so better to only do it
+             # when absolutely needed.
+-            if self.config.getoption("usepdb") and not _is_skipped(self.obj):
++            # Check if we should postpone tearDown for --pdb
++            usepdb = self.config.getoption("usepdb")
++            obj_skipped = _is_skipped(self.obj)
++            parent_skipped = _is_skipped(self.parent.obj)
++            should_postpone = usepdb and not (obj_skipped or parent_skipped)
++            
++            if should_postpone:
+                 self._explicit_tearDown = self._testcase.tearDown
+                 setattr(self._testcase, "tearDown", lambda *args: None)
+ 
+diff --git a/test_class_skip_fix.py b/test_class_skip_fix.py
+new file mode 100644
+index 000000000..619229fd8
+--- /dev/null
++++ b/test_class_skip_fix.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++"""
++Test to verify that class-level @unittest.skip works correctly with --pdb
++"""
++import pytest
++import subprocess
++import sys
++import tempfile
++import os
++
++def test_class_level_skip_with_pdb():
++    """Test that class-level @unittest.skip doesn't execute tearDown with --pdb"""
++    
++    test_content = '''
++import unittest
++
++@unittest.skip("Class level skip")
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        raise Exception("setUp should not be called")
++    
++    def test_one(self):
++        pass
++        
++    def tearDown(self):
++        raise Exception("tearDown should not be called")
++'''
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(test_content)
++        test_file = f.name
++    
++    try:
++        # Run with --pdb
++        result = subprocess.run(
++            [sys.executable, '-m', 'pytest', '--pdb', test_file],
++            capture_output=True,
++            text=True,
++            timeout=10
++        )
++        
++        # Should succeed without errors
++        assert result.returncode == 0, f"Test failed with return code {result.returncode}\nStdout: {result.stdout}\nStderr: {result.stderr}"
++        assert "1 skipped" in result.stdout, f"Expected '1 skipped' in output: {result.stdout}"
++        assert "Exception" not in result.stdout, f"tearDown/setUp should not be executed: {result.stdout}"
++        
++    except subprocess.TimeoutExpired:
++        pytest.fail("Test timed out - likely stuck in PDB due to tearDown being executed")
++    finally:
++        os.unlink(test_file)
++
++if __name__ == "__main__":
++    test_class_level_skip_with_pdb()
++    print("✅ Class-level skip test passed!")
+\ No newline at end of file
+diff --git a/test_class_skip_pdb.py b/test_class_skip_pdb.py
+new file mode 100644
+index 000000000..2bef50a36
+--- /dev/null
++++ b/test_class_skip_pdb.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""
++Test to verify that class-level @unittest.skip works correctly with --pdb
++This test should be added to the pytest test suite.
++"""
++import pytest
++from _pytest.pytester import Pytester
++from _pytest.monkeypatch import MonkeyPatch
++from typing import List
++
++
++def test_pdb_teardown_skipped_class_level(
++    pytester: Pytester, monkeypatch: MonkeyPatch
++) -> None:
++    """With --pdb, setUp and tearDown should not be called for class-level skipped tests."""
++    tracked: List[str] = []
++    monkeypatch.setattr(pytest, "test_pdb_teardown_skipped_class_level", tracked, raising=False)
++
++    pytester.makepyfile(
++        """
++        import unittest
++        import pytest
++
++        @unittest.skip("Class level skip")
++        class MyTestCase(unittest.TestCase):
++
++            def setUp(self):
++                pytest.test_pdb_teardown_skipped_class_level.append("setUp:" + self.id())
++
++            def tearDown(self):
++                pytest.test_pdb_teardown_skipped_class_level.append("tearDown:" + self.id())
++
++            def test_1(self):
++                pass
++
++    """
++    )
++    result = pytester.runpytest_inprocess("--pdb")
++    result.stdout.fnmatch_lines("* 1 skipped in *")
++    assert tracked == []
++
++
++if __name__ == "__main__":
++    # Simple test runner for verification
++    import subprocess
++    import sys
++    import tempfile
++    import os
++
++    test_content = '''
++import unittest
++
++@unittest.skip("Class level skip")
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        raise Exception("setUp should not be called")
++    
++    def test_one(self):
++        pass
++        
++    def tearDown(self):
++        raise Exception("tearDown should not be called")
++'''
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(test_content)
++        test_file = f.name
++    
++    try:
++        # Run with --pdb
++        result = subprocess.run(
++            [sys.executable, '-m', 'pytest', '--pdb', test_file],
++            capture_output=True,
++            text=True,
++            timeout=10
++        )
++        
++        print(f"Return code: {result.returncode}")
++        print(f"Output: {result.stdout}")
++        
++        if result.returncode == 0 and "1 skipped" in result.stdout and "Exception" not in result.stdout:
++            print("✅ Class-level skip test passed!")
++        else:
++            print("❌ Class-level skip test failed!")
++            print(f"Stderr: {result.stderr}")
++            
++    except subprocess.TimeoutExpired:
++        print("❌ Test timed out - likely stuck in PDB due to tearDown being executed")
++    finally:
++        os.unlink(test_file)
+\ No newline at end of file
+diff --git a/test_class_skip_verification.py b/test_class_skip_verification.py
+new file mode 100644
+index 000000000..15c5dc2cd
+--- /dev/null
++++ b/test_class_skip_verification.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Test to verify that class-level @unittest.skip works correctly with --pdb
++"""
++import pytest
++import subprocess
++import sys
++import tempfile
++import os
++
++def test_class_level_skip_with_pdb():
++    """Test that class-level @unittest.skip doesn't execute tearDown with --pdb"""
++    
++    test_content = '''
++import unittest
++import pytest
++
++tracked = []
++
++@unittest.skip("Class level skip")
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        tracked.append("setUp:" + self.id())
++        xxx  # This should cause NameError if executed
++    
++    def test_one(self):
++        tracked.append("test_one:" + self.id())
++        
++    def tearDown(self):
++        tracked.append("tearDown:" + self.id())
++        xxx  # This should cause NameError if executed
++
++# Export tracked for verification
++pytest.class_skip_tracked = tracked
++'''
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(test_content)
++        test_file = f.name
++    
++    try:
++        # Run with --pdb
++        result = subprocess.run(
++            [sys.executable, '-m', 'pytest', '--pdb', test_file],
++            capture_output=True,
++            text=True,
++            timeout=10
++        )
++        
++        print(f"Return code: {result.returncode}")
++        print(f"Stdout: {result.stdout}")
++        print(f"Stderr: {result.stderr}")
++        
++        # Should succeed without errors
++        assert result.returncode == 0, f"Test failed with return code {result.returncode}"
++        assert "1 skipped" in result.stdout, f"Expected '1 skipped' in output"
++        assert "tearDown" not in result.stdout, f"tearDown should not be executed"
++        assert "setUp" not in result.stdout, f"setUp should not be executed"
++        
++    except subprocess.TimeoutExpired:
++        pytest.fail("Test timed out - likely stuck in PDB due to tearDown being executed")
++    finally:
++        os.unlink(test_file)
++
++if __name__ == "__main__":
++    test_class_level_skip_with_pdb()
++    print("✅ Class-level skip test passed!")
+\ No newline at end of file
+diff --git a/test_comprehensive_skip.py b/test_comprehensive_skip.py
+new file mode 100644
+index 000000000..73499271a
+--- /dev/null
++++ b/test_comprehensive_skip.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test script to verify the unittest skip + pdb issue.
++"""
++import subprocess
++import sys
++import tempfile
++import os
++
++def create_test_file(content):
++    """Create a temporary test file with the given content."""
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(content)
++        return f.name
++
++def run_pytest(test_file, use_pdb=False):
++    """Run pytest on the test file and return the result."""
++    cmd = [sys.executable, '-m', 'pytest', test_file]
++    if use_pdb:
++        cmd.append('--pdb')
++    
++    try:
++        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
++        return result.returncode, result.stdout, result.stderr
++    except subprocess.TimeoutExpired:
++        return -1, "", "Timeout (likely stuck in PDB)"
++
++def test_class_level_skip():
++    """Test class-level @unittest.skip with --pdb"""
++    test_content = '''
++import unittest
++
++@unittest.skip("hello")
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        xxx  # This should cause NameError if executed
++    def test_one(self):
++        pass
++    def tearDown(self):
++        xxx  # This should cause NameError if executed
++'''
++    
++    test_file = create_test_file(test_content)
++    try:
++        # Test without --pdb (should work)
++        returncode, stdout, stderr = run_pytest(test_file, use_pdb=False)
++        print("=== Test without --pdb ===")
++        print(f"Return code: {returncode}")
++        print(f"Stdout: {stdout}")
++        print(f"Stderr: {stderr}")
++        
++        if returncode != 0 or "1 skipped" not in stdout:
++            print("❌ FAIL: Test should be skipped without --pdb")
++            return False
++        else:
++            print("✅ PASS: Test properly skipped without --pdb")
++        
++        # Test with --pdb (currently fails, should pass after fix)
++        returncode, stdout, stderr = run_pytest(test_file, use_pdb=True)
++        print("\n=== Test with --pdb ===")
++        print(f"Return code: {returncode}")
++        print(f"Stdout: {stdout}")
++        print(f"Stderr: {stderr}")
++        
++        if returncode == -1:
++            print("❌ FAIL: Test timed out (stuck in PDB)")
++            return False
++        elif "NameError" in stdout or "xxx" in stdout:
++            print("❌ FAIL: tearDown() was executed for skipped class")
++            return False
++        elif "1 skipped" in stdout and returncode == 0:
++            print("✅ PASS: Test properly skipped with --pdb")
++            return True
++        else:
++            print("❌ FAIL: Unexpected result")
++            return False
++            
++    finally:
++        os.unlink(test_file)
++
++def test_method_level_skip():
++    """Test method-level @unittest.skip with --pdb (should already work)"""
++    test_content = '''
++import unittest
++
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        pass  # This should not cause issues
++    
++    @unittest.skip("hello")
++    def test_one(self):
++        xxx  # This should cause NameError if executed
++        
++    def tearDown(self):
++        pass  # This should not cause issues
++'''
++    
++    test_file = create_test_file(test_content)
++    try:
++        # Test with --pdb (should work)
++        returncode, stdout, stderr = run_pytest(test_file, use_pdb=True)
++        print("\n=== Method-level skip test with --pdb ===")
++        print(f"Return code: {returncode}")
++        print(f"Stdout: {stdout}")
++        print(f"Stderr: {stderr}")
++        
++        if "1 skipped" in stdout and returncode == 0:
++            print("✅ PASS: Method-level skip works with --pdb")
++            return True
++        else:
++            print("❌ FAIL: Method-level skip doesn't work with --pdb")
++            return False
++            
++    finally:
++        os.unlink(test_file)
++
++if __name__ == "__main__":
++    print("Testing unittest skip behavior with --pdb")
++    print("=" * 50)
++    
++    success = True
++    success &= test_class_level_skip()
++    success &= test_method_level_skip()
++    
++    print("\n" + "=" * 50)
++    if success:
++        print("✅ All tests passed!")
++        sys.exit(0)
++    else:
++        print("❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..aa67ccb5f
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,42 @@
++import unittest
++
++# Test 1: Class-level skip with @unittest.skip
++@unittest.skip("Class level skip")
++class TestClassSkip(unittest.TestCase):
++    def setUp(self):
++        xxx  # Should not be executed
++    def test_method(self):
++        pass
++    def tearDown(self):
++        xxx  # Should not be executed
++
++# Test 2: Class-level skip with @unittest.skipIf
++@unittest.skipIf(True, "Class level skipIf")
++class TestClassSkipIf(unittest.TestCase):
++    def setUp(self):
++        xxx  # Should not be executed
++    def test_method(self):
++        pass
++    def tearDown(self):
++        xxx  # Should not be executed
++
++# Test 3: Method-level skip (should still work)
++class TestMethodSkip(unittest.TestCase):
++    def setUp(self):
++        pass  # Should not cause issues
++    
++    @unittest.skip("Method level skip")
++    def test_method(self):
++        xxx  # Should not be executed
++        
++    def tearDown(self):
++        pass  # Should not cause issues
++
++# Test 4: Normal test (should still work with --pdb)
++class TestNormal(unittest.TestCase):
++    def setUp(self):
++        pass
++    def test_method(self):
++        pass
++    def tearDown(self):
++        pass
+\ No newline at end of file
+diff --git a/test_repro_skip_class.py b/test_repro_skip_class.py
+new file mode 100644
+index 000000000..632c72c7f
+--- /dev/null
++++ b/test_repro_skip_class.py
+@@ -0,0 +1,10 @@
++import unittest
++
++@unittest.skip("hello")
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        xxx
++    def test_one(self):
++        pass
++    def tearDown(self):
++        xxx
+\ No newline at end of file
+diff --git a/test_teardown_only.py b/test_teardown_only.py
+new file mode 100644
+index 000000000..a04552011
+--- /dev/null
++++ b/test_teardown_only.py
+@@ -0,0 +1,11 @@
++import unittest
++
++@unittest.skip("hello")
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        print("setUp called")
++    def test_one(self):
++        print("test_one called")
++    def tearDown(self):
++        print("tearDown called")
++        xxx  # This should cause NameError if executed
+\ No newline at end of file
+diff --git a/test_unittest_behavior.py b/test_unittest_behavior.py
+new file mode 100644
+index 000000000..57b65afd3
+--- /dev/null
++++ b/test_unittest_behavior.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++import unittest
++
++@unittest.skip("hello")
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        print("setUp called")
++    def test_one(self):
++        print("test_one called")
++    def tearDown(self):
++        print("tearDown called")
++
++# Test what happens when we create an instance
++print("Creating instance...")
++instance = MyTestCase('test_one')
++print(f"Instance created: {instance}")
++
++print("Running test...")
++result = unittest.TestResult()
++instance(result)
++print(f"Result: {result}")
++print(f"Skipped: {result.skipped}")
++print(f"Errors: {result.errors}")
++print(f"Failures: {result.failures}")
+\ No newline at end of file

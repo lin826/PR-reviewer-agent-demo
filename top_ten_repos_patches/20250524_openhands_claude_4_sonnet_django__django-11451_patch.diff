@@ -1,0 +1,845 @@
+diff --git a/debug_queries.py b/debug_queries.py
+new file mode 100644
+index 0000000000..f9647c77ba
+--- /dev/null
++++ b/debug_queries.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python
++"""
++Debug script to see what queries are being made.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.core.management import execute_from_command_line
++
++def debug_authentication():
++    """Debug authentication queries."""
++    
++    print("Setting up database...")
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Create a test user
++    user = User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    print(f"Created test user: {user.username}")
++    
++    backend = ModelBackend()
++    
++    print("\nTesting invalid username...")
++    connection.queries.clear()
++    result = backend.authenticate(request=None, username='nonexistent', password='testpass')
++    
++    print(f"Result: {result}")
++    print(f"Total queries: {len(connection.queries)}")
++    
++    user_queries = [q for q in connection.queries if 'auth_user' in q['sql']]
++    print(f"User table queries: {len(user_queries)}")
++    
++    for i, query in enumerate(user_queries, 1):
++        print(f"Query {i}: {query['sql']}")
++
++if __name__ == '__main__':
++    debug_authentication()
+\ No newline at end of file
+diff --git a/django/contrib/auth/backends.py b/django/contrib/auth/backends.py
+index f4b1722757..a3765ae0f1 100644
+--- a/django/contrib/auth/backends.py
++++ b/django/contrib/auth/backends.py
+@@ -39,6 +39,8 @@ class ModelBackend(BaseBackend):
+     def authenticate(self, request, username=None, password=None, **kwargs):
+         if username is None:
+             username = kwargs.get(UserModel.USERNAME_FIELD)
++        if username is None or password is None:
++            return
+         try:
+             user = UserModel._default_manager.get_by_natural_key(username)
+         except UserModel.DoesNotExist:
+diff --git a/simple_reproduce_test.py b/simple_reproduce_test.py
+new file mode 100644
+index 0000000000..895914442c
+--- /dev/null
++++ b/simple_reproduce_test.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python
++"""
++Simple test script to reproduce the ModelBackend issue with username=None.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.core.management import execute_from_command_line
++
++def test_modelbackend_with_none_username():
++    """Test that demonstrates the issue."""
++    
++    print("Setting up database...")
++    # Create tables
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    print("\nTesting ModelBackend.authenticate() with username=None...")
++    
++    backend = ModelBackend()
++    
++    # Enable query logging
++    settings.DEBUG = True
++    
++    # Clear any existing queries
++    connection.queries.clear()
++    
++    print("Calling backend.authenticate(request=None, username=None, password='test')")
++    
++    # This should trigger the problematic query
++    result = backend.authenticate(request=None, username=None, password='test')
++    
++    print(f"Result: {result}")
++    print(f"Number of queries executed: {len(connection.queries)}")
++    
++    # Print all queries
++    for i, query in enumerate(connection.queries, 1):
++        print(f"Query {i}: {query['sql']}")
++        if 'IS NULL' in query['sql']:
++            print("  ^^^ This is the problematic query!")
++    
++    # Look for the specific problematic query
++    problematic_queries = [
++        q for q in connection.queries
++        if 'username' in q['sql'] and 'IS NULL' in q['sql']
++    ]
++    
++    if problematic_queries:
++        print(f"\n✓ ISSUE REPRODUCED: Found {len(problematic_queries)} problematic query(ies)")
++        print("The ModelBackend is making unnecessary database queries when username=None")
++        return True
++    else:
++        print("\n✗ Issue not reproduced - no problematic queries found")
++        return False
++
++if __name__ == '__main__':
++    success = test_modelbackend_with_none_username()
++    if success:
++        print("\n" + "="*60)
++        print("ISSUE CONFIRMED: ModelBackend makes unnecessary queries when username=None")
++        print("="*60)
++    else:
++        print("\nIssue not reproduced")
+\ No newline at end of file
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..79ce6db702
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the fix works correctly for all scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.core.management import execute_from_command_line
++
++def clear_queries():
++    """Clear the query log."""
++    connection.queries.clear()
++
++def count_user_queries():
++    """Count queries that access the auth_user table."""
++    return len([q for q in connection.queries if 'auth_user' in q['sql']])
++
++def count_user_select_queries():
++    """Count SELECT queries that access the auth_user table."""
++    return len([q for q in connection.queries if 'auth_user' in q['sql'] and q['sql'].strip().upper().startswith('SELECT')])
++
++def test_scenarios():
++    """Test various scenarios to ensure the fix works correctly."""
++    
++    print("Setting up database...")
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Create a test user
++    user = User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    print(f"Created test user: {user.username}")
++    
++    backend = ModelBackend()
++    
++    print("\n" + "="*60)
++    print("TESTING VARIOUS AUTHENTICATION SCENARIOS")
++    print("="*60)
++    
++    # Test 1: username=None, password=None (should return early, no queries)
++    print("\n1. Testing username=None, password=None")
++    clear_queries()
++    result = backend.authenticate(request=None, username=None, password=None)
++    user_select_queries = count_user_select_queries()
++    print(f"   Result: {result}")
++    print(f"   User SELECT queries: {user_select_queries}")
++    assert result is None, "Should return None"
++    assert user_select_queries == 0, "Should not query user table"
++    print("   ✓ PASS: No unnecessary queries")
++    
++    # Test 2: username=None, password='test' (should return early, no queries)
++    print("\n2. Testing username=None, password='test'")
++    clear_queries()
++    result = backend.authenticate(request=None, username=None, password='test')
++    user_select_queries = count_user_select_queries()
++    print(f"   Result: {result}")
++    print(f"   User SELECT queries: {user_select_queries}")
++    assert result is None, "Should return None"
++    assert user_select_queries == 0, "Should not query user table"
++    print("   ✓ PASS: No unnecessary queries")
++    
++    # Test 3: username='testuser', password=None (should return early, no queries)
++    print("\n3. Testing username='testuser', password=None")
++    clear_queries()
++    result = backend.authenticate(request=None, username='testuser', password=None)
++    user_select_queries = count_user_select_queries()
++    print(f"   Result: {result}")
++    print(f"   User SELECT queries: {user_select_queries}")
++    assert result is None, "Should return None"
++    assert user_select_queries == 0, "Should not query user table"
++    print("   ✓ PASS: No unnecessary queries")
++    
++    # Test 4: Valid credentials (should work normally)
++    print("\n4. Testing valid credentials: username='testuser', password='testpass'")
++    clear_queries()
++    result = backend.authenticate(request=None, username='testuser', password='testpass')
++    user_select_queries = count_user_select_queries()
++    print(f"   Result: {result}")
++    print(f"   User SELECT queries: {user_select_queries}")
++    assert result == user, "Should return the user"
++    assert user_select_queries == 1, "Should make exactly 1 user query"
++    print("   ✓ PASS: Authentication successful with expected queries")
++    
++    # Test 5: Invalid username (should make 1 query + password hashing)
++    print("\n5. Testing invalid username: username='nonexistent', password='testpass'")
++    clear_queries()
++    result = backend.authenticate(request=None, username='nonexistent', password='testpass')
++    user_select_queries = count_user_select_queries()
++    print(f"   Result: {result}")
++    print(f"   User SELECT queries: {user_select_queries}")
++    assert result is None, "Should return None"
++    assert user_select_queries == 1, "Should make exactly 1 user query"
++    print("   ✓ PASS: Timing attack protection maintained")
++    
++    # Test 6: Valid username, invalid password (should make 1 query)
++    print("\n6. Testing valid username, invalid password: username='testuser', password='wrongpass'")
++    clear_queries()
++    result = backend.authenticate(request=None, username='testuser', password='wrongpass')
++    user_select_queries = count_user_select_queries()
++    print(f"   Result: {result}")
++    print(f"   User SELECT queries: {user_select_queries}")
++    assert result is None, "Should return None"
++    assert user_select_queries == 1, "Should make exactly 1 user query"
++    print("   ✓ PASS: Normal authentication flow maintained")
++    
++    # Test 7: Using kwargs for username field
++    print("\n7. Testing kwargs username field: username=None, **{'username': 'testuser'}, password='testpass'")
++    clear_queries()
++    result = backend.authenticate(request=None, username=None, password='testpass', **{'username': 'testuser'})
++    user_select_queries = count_user_select_queries()
++    print(f"   Result: {result}")
++    print(f"   User SELECT queries: {user_select_queries}")
++    assert result == user, "Should return the user"
++    assert user_select_queries == 1, "Should make exactly 1 user query"
++    print("   ✓ PASS: Kwargs username resolution works")
++    
++    # Test 8: Using kwargs but still None
++    print("\n8. Testing kwargs username field None: username=None, **{'username': None}, password='testpass'")
++    clear_queries()
++    result = backend.authenticate(request=None, username=None, password='testpass', **{'username': None})
++    user_select_queries = count_user_select_queries()
++    print(f"   Result: {result}")
++    print(f"   User SELECT queries: {user_select_queries}")
++    assert result is None, "Should return None"
++    assert user_select_queries == 0, "Should not query user table"
++    print("   ✓ PASS: Early return even with kwargs")
++    
++    print("\n" + "="*60)
++    print("ALL TESTS PASSED! ✓")
++    print("The fix successfully prevents unnecessary queries while maintaining")
++    print("all existing functionality and security features.")
++    print("="*60)
++
++if __name__ == '__main__':
++    test_scenarios()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..a3e41aecd0
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.core.management import execute_from_command_line
++
++def test_edge_cases():
++    """Test edge cases for the fix."""
++    
++    print("Setting up database...")
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Create a test user
++    user = User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    print(f"Created test user: {user.username}")
++    
++    backend = ModelBackend()
++    
++    print("\n" + "="*60)
++    print("TESTING EDGE CASES")
++    print("="*60)
++    
++    test_cases = [
++        # (description, username, password, expected_result, should_query)
++        ("username=None, password=None", None, None, None, False),
++        ("username=None, password='test'", None, 'test', None, False),
++        ("username='test', password=None", 'test', None, None, False),
++        ("username='', password='test'", '', 'test', None, True),  # Empty string is not None
++        ("username='test', password=''", 'test', '', None, True),  # Empty string is not None
++        ("username=0, password='test'", 0, 'test', None, True),  # 0 is not None
++        ("username='test', password=0", 'test', 0, None, True),  # 0 is not None
++    ]
++    
++    for i, (description, username, password, expected_result, should_query) in enumerate(test_cases, 1):
++        print(f"\n{i}. Testing {description}")
++        connection.queries.clear()
++        
++        try:
++            result = backend.authenticate(request=None, username=username, password=password)
++        except Exception as e:
++            print(f"   Exception: {e}")
++            result = "EXCEPTION"
++        
++        # Count authentication queries
++        auth_queries = [q for q in connection.queries 
++                       if 'SELECT' in q['sql'] and 'auth_user' in q['sql'] and 'WHERE' in q['sql']]
++        
++        print(f"   Result: {result}")
++        print(f"   Authentication queries: {len(auth_queries)}")
++        
++        if should_query:
++            if len(auth_queries) > 0:
++                print("   ✅ Expected query made")
++            else:
++                print("   ❌ Expected query but none made")
++        else:
++            if len(auth_queries) == 0:
++                print("   ✅ No unnecessary queries (as expected)")
++            else:
++                print("   ❌ Unexpected queries made:")
++                for q in auth_queries:
++                    print(f"     {q['sql']}")
++    
++    print("\n" + "="*60)
++    print("EDGE CASE TESTING COMPLETE")
++    print("="*60)
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..ec032c70a5
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python
++"""
++Final verification test for the fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.core.management import execute_from_command_line
++
++def test_final_verification():
++    """Final verification that the fix works correctly."""
++    
++    print("Setting up database...")
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Create a test user
++    user = User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    print(f"Created test user: {user.username}")
++    
++    backend = ModelBackend()
++    
++    print("\n" + "="*60)
++    print("FINAL VERIFICATION OF THE FIX")
++    print("="*60)
++    
++    # Test the main issue: username=None should not make queries
++    print("\n🔍 MAIN TEST: username=None should not make database queries")
++    connection.queries.clear()
++    result = backend.authenticate(request=None, username=None, password='test')
++    
++    # Count only the authentication-related queries (SELECT on auth_user)
++    auth_queries = [q for q in connection.queries 
++                   if 'SELECT' in q['sql'] and 'auth_user' in q['sql'] and 'WHERE' in q['sql']]
++    
++    print(f"   Result: {result}")
++    print(f"   Authentication queries made: {len(auth_queries)}")
++    
++    if len(auth_queries) == 0:
++        print("   ✅ SUCCESS: No unnecessary database queries!")
++        print("   The fix successfully prevents the problematic query.")
++    else:
++        print("   ❌ FAILURE: Still making unnecessary queries:")
++        for q in auth_queries:
++            print(f"     {q['sql']}")
++        return False
++    
++    # Verify normal authentication still works
++    print("\n🔍 VERIFICATION: Normal authentication should still work")
++    connection.queries.clear()
++    result = backend.authenticate(request=None, username='testuser', password='testpass')
++    
++    auth_queries = [q for q in connection.queries 
++                   if 'SELECT' in q['sql'] and 'auth_user' in q['sql'] and 'WHERE' in q['sql']]
++    
++    print(f"   Result: {result}")
++    print(f"   Authentication queries made: {len(auth_queries)}")
++    
++    if result == user and len(auth_queries) == 1:
++        print("   ✅ SUCCESS: Normal authentication works correctly!")
++    else:
++        print("   ❌ FAILURE: Normal authentication is broken")
++        return False
++    
++    print("\n" + "="*60)
++    print("🎉 ALL TESTS PASSED!")
++    print("The fix successfully resolves the issue while maintaining")
++    print("all existing functionality.")
++    print("="*60)
++    return True
++
++if __name__ == '__main__':
++    success = test_final_verification()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix_simple.py b/test_fix_simple.py
+new file mode 100644
+index 0000000000..1e9dc089bb
+--- /dev/null
++++ b/test_fix_simple.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python
++"""
++Simple test to verify the fix works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.core.management import execute_from_command_line
++
++def test_fix():
++    """Test that the fix prevents unnecessary queries."""
++    
++    print("Setting up database...")
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Create a test user
++    user = User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    print(f"Created test user: {user.username}")
++    
++    backend = ModelBackend()
++    
++    print("\n" + "="*60)
++    print("TESTING THE FIX")
++    print("="*60)
++    
++    # Test 1: Before fix, this would make a query. After fix, it shouldn't.
++    print("\n1. Testing username=None, password='test' (should return early)")
++    connection.queries.clear()
++    result = backend.authenticate(request=None, username=None, password='test')
++    
++    # Look for any SELECT queries on auth_user
++    auth_user_selects = [q for q in connection.queries 
++                        if 'auth_user' in q['sql'] and q['sql'].strip().upper().startswith('SELECT')]
++    
++    print(f"   Result: {result}")
++    print(f"   Auth user SELECT queries: {len(auth_user_selects)}")
++    
++    if len(auth_user_selects) == 0:
++        print("   ✓ SUCCESS: No unnecessary queries!")
++    else:
++        print("   ✗ FAILURE: Still making unnecessary queries:")
++        for q in auth_user_selects:
++            print(f"     {q['sql']}")
++    
++    # Test 2: Normal authentication should still work
++    print("\n2. Testing normal authentication (should work normally)")
++    connection.queries.clear()
++    result = backend.authenticate(request=None, username='testuser', password='testpass')
++    
++    auth_user_selects = [q for q in connection.queries 
++                        if 'auth_user' in q['sql'] and q['sql'].strip().upper().startswith('SELECT')]
++    
++    print(f"   Result: {result}")
++    print(f"   Auth user SELECT queries: {len(auth_user_selects)}")
++    
++    if result == user and len(auth_user_selects) == 1:
++        print("   ✓ SUCCESS: Normal authentication works!")
++    else:
++        print("   ✗ FAILURE: Normal authentication broken")
++        for q in auth_user_selects:
++            print(f"     {q['sql']}")
++    
++    # Test 3: Invalid user should still work (timing attack protection)
++    print("\n3. Testing invalid user (should make 1 query for timing)")
++    connection.queries.clear()
++    result = backend.authenticate(request=None, username='nonexistent', password='testpass')
++    
++    auth_user_selects = [q for q in connection.queries 
++                        if 'auth_user' in q['sql'] and q['sql'].strip().upper().startswith('SELECT')]
++    
++    print(f"   Result: {result}")
++    print(f"   Auth user SELECT queries: {len(auth_user_selects)}")
++    
++    if result is None and len(auth_user_selects) == 1:
++        print("   ✓ SUCCESS: Timing attack protection maintained!")
++    else:
++        print("   ✗ FAILURE: Timing attack protection broken")
++        for q in auth_user_selects:
++            print(f"     {q['sql']}")
++    
++    print("\n" + "="*60)
++    print("FIX VERIFICATION COMPLETE")
++    print("="*60)
++
++if __name__ == '__main__':
++    test_fix()
+\ No newline at end of file
+diff --git a/test_reproduce_issue.py b/test_reproduce_issue.py
+new file mode 100644
+index 0000000000..ffd4caa3f0
+--- /dev/null
++++ b/test_reproduce_issue.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue where ModelBackend.authenticate() 
++makes unnecessary database queries when username is None.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.auth import authenticate
++from django.contrib.auth.backends import ModelBackend
++from django.contrib.auth.models import User
++from django.db import connection
++from django.test import TestCase, override_settings
++from django.test.utils import override_settings as override_settings_decorator
++
++
++class CustomBackend:
++    """A custom backend that accepts different credentials."""
++    
++    def authenticate(self, request, token=None, **kwargs):
++        if token == 'valid_token':
++            # Return a dummy user for testing
++            try:
++                return User.objects.get(username='testuser')
++            except User.DoesNotExist:
++                return None
++        return None
++
++
++class TestModelBackendUnnecessaryQuery(TestCase):
++    """Test case to reproduce the issue."""
++    
++    def setUp(self):
++        # Create a test user
++        self.user = User.objects.create_user('testuser', 'test@example.com', 'testpass')
++    
++    @override_settings(AUTHENTICATION_BACKENDS=[
++        'django.contrib.auth.backends.ModelBackend',
++        'test_reproduce_issue.CustomBackend',
++    ])
++    def test_modelbackend_unnecessary_query_with_none_username(self):
++        """
++        Test that ModelBackend makes unnecessary query when username is None.
++        This reproduces the issue described in the bug report.
++        """
++        print("Testing ModelBackend with username=None...")
++        
++        # Clear any existing queries
++        connection.queries_log.clear()
++        
++        # Count queries before authentication
++        initial_query_count = len(connection.queries)
++        
++        # Authenticate with credentials intended for CustomBackend
++        # This should NOT trigger a database query in ModelBackend
++        result = authenticate(token='valid_token')
++        
++        # Count queries after authentication
++        final_query_count = len(connection.queries)
++        query_count = final_query_count - initial_query_count
++        
++        print(f"Number of queries executed: {query_count}")
++        
++        # Print the actual queries to see what happened
++        for i, query in enumerate(connection.queries[initial_query_count:], 1):
++            print(f"Query {i}: {query['sql']}")
++        
++        # The authentication should succeed (CustomBackend should handle it)
++        self.assertEqual(result, self.user)
++        
++        # But we should see the problematic query from ModelBackend
++        problematic_queries = [
++            q for q in connection.queries[initial_query_count:]
++            if 'WHERE "auth_user"."username" IS NULL' in q['sql']
++        ]
++        
++        if problematic_queries:
++            print(f"\nFound {len(problematic_queries)} problematic query(ies):")
++            for q in problematic_queries:
++                print(f"  {q['sql']}")
++            print("\nThis confirms the issue: ModelBackend is making unnecessary queries when username=None")
++        else:
++            print("\nNo problematic queries found.")
++    
++    def test_modelbackend_direct_call_with_none_username(self):
++        """
++        Test ModelBackend.authenticate() directly with username=None.
++        """
++        print("\nTesting ModelBackend.authenticate() directly with username=None...")
++        
++        backend = ModelBackend()
++        
++        # Reset connection queries
++        connection.queries.clear()
++        
++        # Call authenticate directly with username=None
++        with self.assertNumQueries(1):  # We expect 1 query (the problematic one)
++            result = backend.authenticate(request=None, username=None, password='somepass')
++        
++        print(f"Number of queries executed: {len(connection.queries)}")
++        
++        # Print the actual queries
++        for i, query in enumerate(connection.queries, 1):
++            print(f"Query {i}: {query['sql']}")
++        
++        # Should return None (no authentication)
++        self.assertIsNone(result)
++        
++        # Check for the problematic query
++        problematic_queries = [
++            q for q in connection.queries
++            if 'WHERE "auth_user"."username" IS NULL' in q['sql']
++        ]
++        
++        if problematic_queries:
++            print(f"\nFound {len(problematic_queries)} problematic query(ies):")
++            for q in problematic_queries:
++                print(f"  {q['sql']}")
++            print("This confirms the issue exists when calling ModelBackend directly.")
++            return True
++        else:
++            print("\nNo problematic queries found.")
++            return False
++
++
++if __name__ == '__main__':
++    # Enable query logging
++    settings.DEBUG = True
++    
++    # Create the database tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb'])
++    
++    # Run the test
++    from django.test.utils import get_runner
++    TestRunner = get_runner(settings)
++    test_runner = TestRunner()
++    failures = test_runner.run_tests(['__main__'])
++    
++    if failures:
++        sys.exit(1)
+\ No newline at end of file

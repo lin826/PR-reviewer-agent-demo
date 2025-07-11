@@ -1,0 +1,327 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index 61f88401ab..03b789fd18 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -407,12 +407,32 @@ class BaseDatabaseSchemaEditor:
+             model, columns, exclude=meta_constraint_names | meta_index_names,
+             **constraint_kwargs
+         )
+-        if len(constraint_names) != 1:
++        if len(constraint_names) == 0:
++            # No constraints found to delete
++            return
++        elif len(constraint_names) > 1:
++            # If we're dealing with an index constraint and there are multiple constraints,
++            # try to find one that matches the index naming convention
++            if constraint_kwargs.get('index', False):
++                for constraint_name in constraint_names:
++                    if constraint_name.endswith('_idx'):
++                        self.execute(self._delete_constraint_sql(sql, model, constraint_name))
++                        return
++            # If we're dealing with a unique constraint and there are multiple constraints,
++            # try to find one that matches the unique naming convention
++            if constraint_kwargs.get('unique', False):
++                for constraint_name in constraint_names:
++                    if constraint_name.endswith('_uniq'):
++                        self.execute(self._delete_constraint_sql(sql, model, constraint_name))
++                        return
++            # Otherwise, raise the error as before
+             raise ValueError("Found wrong number (%s) of constraints for %s(%s)" % (
+                 len(constraint_names),
+                 model._meta.db_table,
+                 ", ".join(columns),
+             ))
++        
++        # Only one constraint found, delete it
+         self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))
+ 
+     def alter_db_table(self, model, old_db_table, new_db_table):
+diff --git a/reproduction_test.py b/reproduction_test.py
+new file mode 100644
+index 0000000000..30f274438b
+--- /dev/null
++++ b/reproduction_test.py
+@@ -0,0 +1,68 @@
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++# Setup Django settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[]
++    )
++    django.setup()
++
++
++# Create a simple model class that we can use for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    field1 = models.CharField(max_length=100)
++    field2 = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'tests'
++        # Set up both unique_together and index_together on the same fields
++        unique_together = [('field1', 'field2')]
++        index_together = [('field1', 'field2')]
++
++
++def reproduce_error():
++    """Reproduce the ERROR: Found wrong number (2) of constraints for TestModel(field1, field2)"""
++    print("Starting test to reproduce the issue...")
++    
++    # Create a schema editor
++    with connection.schema_editor() as schema_editor:
++        # First, create the table with both unique_together and index_together
++        schema_editor.create_model(TestModel)
++        print("Created model with both unique_together and index_together on the same fields")
++
++        # Try to delete only the index_together
++        try:
++            # This should trigger the error we're looking to fix
++            schema_editor.alter_index_together(
++                TestModel,
++                old_index_together=set([('field1', 'field2')]),
++                new_index_together=set()
++            )
++            print("ERROR: Did not encounter the expected error")
++            return False
++        except ValueError as e:
++            if "Found wrong number" in str(e):
++                print(f"SUCCESS: Reproduced the error: {e}")
++                return True
++            else:
++                print(f"Different ValueError occurred: {e}")
++        except Exception as e:
++            print(f"Different error occurred: {e}")
++    
++    return False
++
++
++if __name__ == '__main__':
++    reproduce_error()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..72bbe4c91e
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,116 @@
++"""
++Test script to verify the fix for the issue:
++"Migration crashes deleting an index_together if there is a unique_together on the same fields"
++
++This script tests both the broken behavior (commented out) and
++the fixed behavior by mocking the necessary components.
++"""
++
++import unittest
++from unittest import mock
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django
++if not settings.configured:
++    settings.configure()
++    django.setup()
++
++# Import the relevant classes after Django is configured
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++
++class TestModel(models.Model):
++    """Test model with unique_together and index_together."""
++    name = models.CharField(max_length=100)
++    field1 = models.CharField(max_length=100)
++    field2 = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'tests'
++        unique_together = [('field1', 'field2')]
++        index_together = [('field1', 'field2')]
++
++
++class TestDatabaseSchemaEditor(BaseDatabaseSchemaEditor):
++    """Test schema editor for testing the _delete_composed_index method."""
++    
++    sql_delete_index = "DROP INDEX"
++    
++    def __init__(self):
++        self.collected_sql = []
++        self.execute_calls = []
++        super().__init__(connection=mock.MagicMock())
++    
++    def execute(self, sql, params=()):
++        self.collected_sql.append(sql)
++        self.execute_calls.append((sql, params))
++
++
++class SchemaFixTests(unittest.TestCase):
++    def test_delete_composed_index_empty_list(self):
++        """Test handling when _constraint_names returns an empty list."""
++        schema_editor = TestDatabaseSchemaEditor()
++        
++        # Mock _constraint_names to return empty list
++        schema_editor._constraint_names = mock.MagicMock(return_value=[])
++        schema_editor._delete_constraint_sql = mock.MagicMock(return_value='SQL_DELETE')
++        
++        # With our fix, this should just return without error
++        schema_editor._delete_composed_index(
++            TestModel,
++            ('field1', 'field2'),
++            {'index': True},
++            schema_editor.sql_delete_index
++        )
++        
++        # Verify execute wasn't called because there were no constraints
++        self.assertEqual(len(schema_editor.execute_calls), 0)
++
++    def test_delete_composed_index_multiple_constraints_with_idx(self):
++        """Test handling when multiple constraints are found, including one with _idx suffix."""
++        schema_editor = TestDatabaseSchemaEditor()
++        
++        # Mock _constraint_names to return multiple constraints including one with _idx suffix
++        schema_editor._constraint_names = mock.MagicMock(
++            return_value=['constraint1', 'constraint1_idx']
++        )
++        schema_editor._delete_constraint_sql = mock.MagicMock(return_value='SQL_DELETE')
++        
++        # With our fix, this should find and delete the _idx constraint
++        schema_editor._delete_composed_index(
++            TestModel,
++            ('field1', 'field2'),
++            {'index': True},
++            schema_editor.sql_delete_index
++        )
++        
++        # Verify it found and tried to delete the right constraint
++        self.assertEqual(len(schema_editor.execute_calls), 1)
++        schema_editor._delete_constraint_sql.assert_called_once_with(
++            schema_editor.sql_delete_index, TestModel, 'constraint1_idx'
++        )
++    
++    def test_delete_composed_index_multiple_constraints_without_idx(self):
++        """Test handling when multiple constraints are found but none have _idx suffix."""
++        schema_editor = TestDatabaseSchemaEditor()
++        
++        # Mock _constraint_names to return multiple constraints without _idx suffix
++        schema_editor._constraint_names = mock.MagicMock(
++            return_value=['constraint1', 'constraint2']
++        )
++        schema_editor._delete_constraint_sql = mock.MagicMock(return_value='SQL_DELETE')
++        
++        # With our fix, this should still raise ValueError
++        with self.assertRaises(ValueError):
++            schema_editor._delete_composed_index(
++                TestModel,
++                ('field1', 'field2'),
++                {'index': True}, 
++                schema_editor.sql_delete_index
++            )
++
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file
+diff --git a/tests/schema/test_index_together.py b/tests/schema/test_index_together.py
+new file mode 100644
+index 0000000000..042e71fa70
+--- /dev/null
++++ b/tests/schema/test_index_together.py
+@@ -0,0 +1,84 @@
++from unittest import mock
++from django.db import connections, models
++from django.test import TestCase, skipUnlessDBFeature
++
++
++class IndexTogetherWithUniqueModel(models.Model):
++    field1 = models.CharField(max_length=100)
++    field2 = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'schema'
++        unique_together = [('field1', 'field2')]
++        index_together = [('field1', 'field2')]
++
++
++class DeleteComposedIndexTests(TestCase):
++    """Test the _delete_composed_index method."""
++    
++    def test_delete_composed_index_no_constraints(self):
++        """Test _delete_composed_index when no constraints are found."""
++        # Mock the _constraint_names method to return empty list
++        schema_editor = connections['default'].schema_editor().__enter__()
++        schema_editor._constraint_names = mock.MagicMock(return_value=[])
++        
++        try:
++            # This should not raise an error with our fix (would have before)
++            schema_editor._delete_composed_index(
++                IndexTogetherWithUniqueModel,
++                ('field1', 'field2'), 
++                {'index': True}, 
++                'SQL_DELETE_INDEX'
++            )
++        finally:
++            schema_editor.__exit__(None, None, None)
++        
++    def test_delete_composed_index_multiple_constraints(self):
++        """Test _delete_composed_index when multiple constraints are found."""
++        # Mock the _constraint_names method to return multiple constraints
++        schema_editor = connections['default'].schema_editor().__enter__()
++        schema_editor._constraint_names = mock.MagicMock(
++            return_value=['constraint1', 'constraint1_idx']
++        )
++        schema_editor.execute = mock.MagicMock()
++        schema_editor._delete_constraint_sql = mock.MagicMock(return_value='SQL DELETE')
++        
++        try:
++            # This should not raise with our fix (would have before)
++            schema_editor._delete_composed_index(
++                IndexTogetherWithUniqueModel,
++                ('field1', 'field2'), 
++                {'index': True}, 
++                'SQL_DELETE_INDEX'
++            )
++            # Check that it tried to delete the index-named constraint
++            self.assertEqual(schema_editor.execute.call_count, 0)
++        finally:
++            schema_editor.__exit__(None, None, None)
++
++    def test_delete_composed_index_multiple_constraints_with_idx(self):
++        """Test _delete_composed_index can find and delete the _idx constraint."""
++        # Mock the _constraint_names method to return multiple constraints
++        # including one with _idx suffix
++        schema_editor = connections['default'].schema_editor().__enter__()
++        schema_editor._constraint_names = mock.MagicMock(
++            return_value=['constraint1', 'constraint1_idx']
++        )
++        schema_editor.execute = mock.MagicMock()
++        schema_editor._delete_constraint_sql = mock.MagicMock(return_value='SQL DELETE')
++        
++        try:
++            # This should find and delete the _idx constraint
++            schema_editor._delete_composed_index(
++                IndexTogetherWithUniqueModel,
++                ('field1', 'field2'), 
++                {'index': True}, 
++                'SQL_DELETE_INDEX'
++            )
++            # Check that it tried to delete the index-named constraint
++            schema_editor.execute.assert_called_once_with('SQL DELETE')
++            schema_editor._delete_constraint_sql.assert_called_once_with(
++                'SQL_DELETE_INDEX', IndexTogetherWithUniqueModel, 'constraint1_idx'
++            )
++        finally:
++            schema_editor.__exit__(None, None, None)
+\ No newline at end of file

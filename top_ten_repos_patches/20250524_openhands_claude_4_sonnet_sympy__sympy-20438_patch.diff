@@ -1,0 +1,451 @@
+diff --git a/sympy/sets/handlers/issubset.py b/sympy/sets/handlers/issubset.py
+index fdca06025a..a2f9bca498 100644
+--- a/sympy/sets/handlers/issubset.py
++++ b/sympy/sets/handlers/issubset.py
+@@ -1,7 +1,7 @@
+ from sympy import S, Symbol
+ from sympy.core.logic import fuzzy_and, fuzzy_bool, fuzzy_not, fuzzy_or
+ from sympy.core.relational import Eq
+-from sympy.sets.sets import FiniteSet, Interval, Set, Union
++from sympy.sets.sets import FiniteSet, Interval, Set, Union, ProductSet
+ from sympy.sets.fancysets import Complexes, Reals, Range, Rationals
+ from sympy.multipledispatch import dispatch
+ 
+@@ -133,3 +133,24 @@ def is_subset_sets(a, b): # noqa:F811
+ @dispatch(Rationals, Range)  # type: ignore # noqa:F811
+ def is_subset_sets(a, b): # noqa:F811
+     return False
++
++@dispatch(ProductSet, FiniteSet)  # type: ignore # noqa:F811
++def is_subset_sets(a_product, b_finite): # noqa:F811
++    """Check if a ProductSet is a subset of a FiniteSet."""
++    # If the ProductSet is not iterable or finite, it can't be a subset of a FiniteSet
++    if not a_product.is_iterable or a_product.is_finite_set is False:
++        return False
++    
++    # Convert ProductSet to FiniteSet and check subset relationship
++    try:
++        a_as_finite = FiniteSet(*a_product)
++        return a_as_finite.is_subset(b_finite)
++    except (TypeError, ValueError):
++        # If conversion fails, fall back to element-wise checking
++        return fuzzy_and(b_finite._contains(elem) for elem in a_product)
++
++@dispatch(FiniteSet, ProductSet)  # type: ignore # noqa:F811
++def is_subset_sets(a_finite, b_product): # noqa:F811
++    """Check if a FiniteSet is a subset of a ProductSet."""
++    # Check if all elements of the FiniteSet are in the ProductSet
++    return fuzzy_and(b_product._contains(elem) for elem in a_finite)
+diff --git a/sympy/sets/sets.py b/sympy/sets/sets.py
+index 3c4aa86e36..67e79a2e46 100644
+--- a/sympy/sets/sets.py
++++ b/sympy/sets/sets.py
+@@ -474,6 +474,73 @@ def is_proper_superset(self, other):
+         else:
+             raise ValueError("Unknown argument '%s'" % other)
+ 
++    def equals(self, other, failing_expression=False):
++        """
++        Return True if self == other, False if it doesn't, or None.
++        
++        This method provides set equality checking similar to Expr.equals()
++        but adapted for set operations.
++        
++        Parameters
++        ==========
++        other : Set
++            The set to compare with
++        failing_expression : bool, optional
++            If True, return the expression that failed to simplify to empty set
++            instead of None when equality cannot be determined
++            
++        Returns
++        =======
++        True, False, or None
++            True if sets are equal, False if they are not equal,
++            None if equality cannot be determined
++        """
++        from sympy.core.sympify import sympify
++        
++        other = sympify(other)
++        
++        # Quick equality check
++        if self == other:
++            return True
++            
++        # If other is not a Set, they can't be equal
++        if not isinstance(other, Set):
++            return False
++            
++        # Check if both sets are empty
++        if self.is_empty and other.is_empty:
++            return True
++        if self.is_empty or other.is_empty:
++            return False
++            
++        # For finite sets, we can check subset relationships both ways
++        if self.is_finite_set and other.is_finite_set:
++            try:
++                # Two sets are equal if they are subsets of each other
++                return self.is_subset(other) and other.is_subset(self)
++            except (TypeError, ValueError, NotImplementedError):
++                pass
++        
++        # Try symmetric difference - if it's empty, sets are equal
++        try:
++            sym_diff = self.symmetric_difference(other)
++            if sym_diff == S.EmptySet:
++                return True
++            elif sym_diff.is_empty is True:
++                return True
++            elif sym_diff.is_empty is False:
++                return False
++        except (TypeError, ValueError, NotImplementedError):
++            pass
++            
++        # If we can't determine equality, return None or the failing expression
++        if failing_expression:
++            try:
++                return self.symmetric_difference(other)
++            except (TypeError, ValueError, NotImplementedError):
++                return self - other
++        return None
++
+     def _eval_powerset(self):
+         from .powerset import PowerSet
+         return PowerSet(self)
+diff --git a/test_comprehensive_verification.py b/test_comprehensive_verification.py
+new file mode 100644
+index 0000000000..2b054830a7
+--- /dev/null
++++ b/test_comprehensive_verification.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python3
++
++"""
++Comprehensive test to verify the fixes for is_subset and equals issues.
++"""
++
++from sympy import FiniteSet, ProductSet, Eq, S, Interval
++from sympy.sets.sets import Complement
++
++def test_is_subset_fixes():
++    """Test that is_subset works correctly between ProductSet and FiniteSet"""
++    print("=== Testing is_subset fixes ===")
++    
++    # Test case from the original issue
++    a = FiniteSet(1, 2)
++    b = ProductSet(a, a)
++    c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2))
++    
++    assert b.is_subset(c) == True, "ProductSet should be subset of equivalent FiniteSet"
++    assert c.is_subset(b) == True, "FiniteSet should be subset of equivalent ProductSet"
++    print("✓ Original issue case works")
++    
++    # Test with different sets
++    d = FiniteSet((1, 1), (1, 2))  # Subset of b
++    e = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2), (3, 3))  # Superset of b
++    
++    assert d.is_subset(b) == True, "Subset should work"
++    assert b.is_subset(d) == False, "Non-subset should return False"
++    assert b.is_subset(e) == True, "Subset of superset should work"
++    assert e.is_subset(b) == False, "Superset should not be subset"
++    print("✓ Various subset relationships work")
++    
++    # Test with empty sets
++    empty_product = ProductSet(S.EmptySet, a)
++    assert empty_product.is_subset(c) == True, "Empty ProductSet should be subset of any set"
++    assert c.is_subset(empty_product) == False, "Non-empty set should not be subset of empty set"
++    print("✓ Empty set cases work")
++    
++    # Test with infinite sets (should return False when ProductSet is infinite)
++    infinite_interval = Interval(0, 1)
++    infinite_product = ProductSet(infinite_interval, FiniteSet(1))
++    assert infinite_product.is_subset(c) == False, "Infinite ProductSet should not be subset of finite set"
++    print("✓ Infinite set cases work")
++
++def test_equals_method():
++    """Test that the equals method works correctly"""
++    print("\n=== Testing equals method ===")
++    
++    # Test basic equality
++    a = FiniteSet(1, 2)
++    b = ProductSet(a, a)
++    c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2))
++    
++    assert b.equals(c) == True, "Equivalent sets should be equal"
++    assert c.equals(b) == True, "Equality should be symmetric"
++    print("✓ Basic equality works")
++    
++    # Test inequality
++    d = FiniteSet(1, 2, 3)
++    assert b.equals(d) == False, "Different sets should not be equal"
++    assert d.equals(b) == False, "Inequality should be symmetric"
++    print("✓ Inequality works")
++    
++    # Test with empty sets
++    empty1 = S.EmptySet
++    empty2 = ProductSet(S.EmptySet, a)
++    assert empty1.equals(empty2) == True, "Empty sets should be equal"
++    assert empty1.equals(a) == False, "Empty set should not equal non-empty set"
++    print("✓ Empty set equality works")
++    
++    # Test with non-sets
++    assert a.equals(5) == False, "Set should not equal non-set"
++    assert a.equals("hello") == False, "Set should not equal string"
++    print("✓ Non-set comparisons work")
++
++def test_eq_simplify_fix():
++    """Test that Eq().simplify() no longer crashes"""
++    print("\n=== Testing Eq().simplify() fix ===")
++    
++    a = FiniteSet(1, 2)
++    b = ProductSet(a, a)
++    c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2))
++    
++    # This should not crash
++    try:
++        result = Eq(b, c).simplify()
++        print(f"✓ Eq(b, c).simplify() works: {result}")
++    except Exception as e:
++        assert False, f"Eq().simplify() should not crash: {e}"
++    
++    # Test with different sets
++    d = FiniteSet(1, 2, 3)
++    try:
++        result = Eq(b, d).simplify()
++        print(f"✓ Eq(b, d).simplify() works: {result}")
++    except Exception as e:
++        assert False, f"Eq().simplify() should not crash: {e}"
++
++def test_complement_equals():
++    """Test that Complement objects have equals method"""
++    print("\n=== Testing Complement equals method ===")
++    
++    a = FiniteSet(1, 2, 3)
++    b = FiniteSet(2)
++    complement = a - b  # This creates a Complement or simplified set
++    
++    # Test that equals method exists and works
++    assert hasattr(complement, 'equals'), "Complement should have equals method"
++    
++    try:
++        result = complement.equals(0)
++        print(f"✓ complement.equals(0) works: {result}")
++    except Exception as e:
++        assert False, f"complement.equals() should not crash: {e}"
++    
++    # Test complement equality
++    c = FiniteSet(1, 3)  # Should be equal to a - b
++    if isinstance(complement, Complement):
++        # If it's still a Complement object, test equals
++        try:
++            result = complement.equals(c)
++            print(f"✓ complement.equals(equivalent_set) works: {result}")
++        except Exception as e:
++            assert False, f"complement.equals() should not crash: {e}"
++    else:
++        # If it simplified to a FiniteSet, test that
++        assert complement.equals(c) == True, "Simplified complement should equal expected set"
++        print("✓ Complement simplified correctly and equals works")
++
++def test_edge_cases():
++    """Test various edge cases"""
++    print("\n=== Testing edge cases ===")
++    
++    # Test ProductSet with different arities
++    a = FiniteSet(1, 2)
++    b = FiniteSet('a', 'b')
++    triple_product = ProductSet(a, a, a)
++    triple_finite = FiniteSet(*triple_product)
++    
++    assert triple_product.is_subset(triple_finite) == True, "Triple ProductSet subset should work"
++    assert triple_finite.is_subset(triple_product) == True, "Triple FiniteSet subset should work"
++    print("✓ Higher arity ProductSets work")
++    
++    # Test mixed ProductSet
++    mixed_product = ProductSet(a, b)
++    mixed_finite = FiniteSet(*mixed_product)
++    
++    assert mixed_product.is_subset(mixed_finite) == True, "Mixed ProductSet subset should work"
++    assert mixed_finite.is_subset(mixed_product) == True, "Mixed FiniteSet subset should work"
++    print("✓ Mixed ProductSets work")
++    
++    # Test single element sets
++    single_a = FiniteSet(1)
++    single_product = ProductSet(single_a, single_a)
++    single_finite = FiniteSet((1, 1))
++    
++    assert single_product.is_subset(single_finite) == True, "Single element ProductSet should work"
++    assert single_finite.is_subset(single_product) == True, "Single element FiniteSet should work"
++    print("✓ Single element sets work")
++
++def run_all_tests():
++    """Run all tests"""
++    print("Running comprehensive verification tests...\n")
++    
++    test_is_subset_fixes()
++    test_equals_method()
++    test_eq_simplify_fix()
++    test_complement_equals()
++    test_edge_cases()
++    
++    print("\n🎉 All tests passed! The fixes work correctly.")
++
++if __name__ == "__main__":
++    run_all_tests()
+\ No newline at end of file
+diff --git a/test_issue_reproduction.py b/test_issue_reproduction.py
+new file mode 100644
+index 0000000000..063b6ec4d3
+--- /dev/null
++++ b/test_issue_reproduction.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++
++"""
++Test script to reproduce the is_subset issue described in the GitHub issue.
++"""
++
++from sympy import FiniteSet, ProductSet, Eq
++
++def test_is_subset_issue():
++    """Test the is_subset issue between ProductSet and FiniteSet"""
++    print("=== Testing is_subset issue ===")
++    
++    # Create the sets as described in the issue
++    a = FiniteSet(1, 2)
++    b = ProductSet(a, a)
++    c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2))
++    
++    print(f"a = {a}")
++    print(f"b = {b}")
++    print(f"c = {c}")
++    print()
++    
++    # Test intersection equality (this should work)
++    intersection_equal = b.intersection(c) == c.intersection(b)
++    print(f"b.intersection(c) == c.intersection(b): {intersection_equal}")
++    
++    # Test is_subset (this is the main issue)
++    b_subset_c = b.is_subset(c)
++    c_subset_b = c.is_subset(b)
++    print(f"b.is_subset(c): {b_subset_c}")
++    print(f"c.is_subset(b): {c_subset_b}")
++    
++    # Test rewrite to FiniteSet
++    b_rewritten = b.rewrite(FiniteSet)
++    print(f"b.rewrite(FiniteSet): {b_rewritten}")
++    
++    # Test if they should be equal
++    print(f"b == c: {b == c}")
++    print(f"c == b: {c == b}")
++    
++    # Test the problematic Eq().simplify() call
++    print("\n=== Testing Eq().simplify() issue ===")
++    try:
++        eq_result = Eq(b, c).simplify()
++        print(f"Eq(b, c).simplify(): {eq_result}")
++    except Exception as e:
++        print(f"Error in Eq(b, c).simplify(): {type(e).__name__}: {e}")
++    
++    # Let's also test what happens when we subtract the sets
++    print("\n=== Testing set subtraction ===")
++    try:
++        diff = b - c
++        print(f"b - c: {diff}")
++        print(f"Type of (b - c): {type(diff)}")
++        
++        # Test if the difference has equals method
++        print(f"(b - c) has equals method: {hasattr(diff, 'equals')}")
++        
++        if hasattr(diff, 'equals'):
++            try:
++                equals_zero = diff.equals(0)
++                print(f"(b - c).equals(0): {equals_zero}")
++            except Exception as e:
++                print(f"Error calling (b - c).equals(0): {type(e).__name__}: {e}")
++        
++    except Exception as e:
++        print(f"Error in b - c: {type(e).__name__}: {e}")
++
++def test_expected_behavior():
++    """Test what the expected behavior should be"""
++    print("\n=== Expected behavior analysis ===")
++    
++    a = FiniteSet(1, 2)
++    b = ProductSet(a, a)
++    c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2))
++    
++    # Convert ProductSet to FiniteSet for comparison
++    b_as_finite = FiniteSet(*b) if b.is_iterable else None
++    print(f"b as FiniteSet: {b_as_finite}")
++    print(f"c: {c}")
++    if b_as_finite:
++        print(f"b_as_finite == c: {b_as_finite == c}")
++        print(f"b_as_finite.is_subset(c): {b_as_finite.is_subset(c)}")
++        print(f"c.is_subset(b_as_finite): {c.is_subset(b_as_finite)}")
++    
++    # Since they should be equal, both subset checks should return True
++    print("\nExpected results:")
++    print("- b.is_subset(c) should return True")
++    print("- c.is_subset(b) should return True") 
++    print("- Eq(b, c).simplify() should not crash")
++
++if __name__ == "__main__":
++    test_is_subset_issue()
++    test_expected_behavior()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..b59a637687
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++
++"""
++Test the exact code from the original GitHub issue to ensure it's fixed.
++"""
++
++from sympy import FiniteSet, ProductSet, Eq
++
++def test_original_issue():
++    """Test the exact code from the GitHub issue"""
++    print("Testing the exact code from the original GitHub issue...")
++    
++    # Original code from the issue
++    a = FiniteSet(1, 2)
++    b = ProductSet(a, a)
++    c = FiniteSet((1, 1), (1, 2), (2, 1), (2, 2))
++    
++    # Test intersection equality (this was working before)
++    result1 = b.intersection(c) == c.intersection(b)
++    print(f"b.intersection(c) == c.intersection(b): {result1}")
++    assert result1 == True, "Intersection equality should work"
++    
++    # Test is_subset (this was the main issue)
++    result2 = b.is_subset(c)
++    result3 = c.is_subset(b)
++    print(f"b.is_subset(c): {result2}")
++    print(f"c.is_subset(b): {result3}")
++    assert result2 == True, "b.is_subset(c) should return True"
++    assert result3 == True, "c.is_subset(b) should return True"
++    
++    # Test Eq().simplify() (this was crashing before)
++    try:
++        result4 = Eq(b, c).simplify()
++        print(f"Eq(b, c).simplify(): {result4}")
++        print("✓ Eq().simplify() no longer crashes!")
++    except Exception as e:
++        assert False, f"Eq().simplify() should not crash: {e}"
++    
++    # Test rewrite (this was mentioned in the issue)
++    result5 = b.rewrite(FiniteSet)
++    print(f"b.rewrite(FiniteSet): {result5}")
++    
++    print("\n🎉 All original issue cases are now fixed!")
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file

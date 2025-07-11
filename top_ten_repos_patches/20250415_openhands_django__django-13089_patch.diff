@@ -1,0 +1,84 @@
+diff --git a/django/core/cache/backends/db.py b/django/core/cache/backends/db.py
+index 33c79c5a14..fc96b1a944 100644
+--- a/django/core/cache/backends/db.py
++++ b/django/core/cache/backends/db.py
+@@ -267,9 +267,11 @@ class DatabaseCache(BaseDatabaseCache):
+                 cursor.execute(
+                     connection.ops.cache_key_culling_sql() % table,
+                     [cull_num])
+-                cursor.execute("DELETE FROM %s "
+-                               "WHERE cache_key < %%s" % table,
+-                               [cursor.fetchone()[0]])
++                cache_key = cursor.fetchone()
++                if cache_key:
++                    cursor.execute("DELETE FROM %s "
++                                   "WHERE cache_key < %%s" % table,
++                                   [cache_key[0]])
+ 
+     def clear(self):
+         db = router.db_for_write(self.cache_model_class)
+diff --git a/test_db_cache_cull.py b/test_db_cache_cull.py
+new file mode 100644
+index 0000000000..b404688f6c
+--- /dev/null
++++ b/test_db_cache_cull.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce 'NoneType' object is not subscriptable error in db cache backend.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        CACHES={
++            'default': {
++                'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
++                'LOCATION': 'django_cache_table',
++                'OPTIONS': {
++                    'MAX_ENTRIES': 30,
++                }
++            }
++        },
++        INSTALLED_APPS=['django.contrib.contenttypes'],
++    )
++    django.setup()
++
++from django.core.cache import cache
++from django.core.management import call_command
++from django.db import connection, DatabaseError
++
++# Create the cache table
++try:
++    call_command('createcachetable', verbosity=0)
++except DatabaseError:
++    pass  # Table might already exist
++
++# Mock the cache_key_culling_sql to simulate returning no rows
++original_cache_key_culling_sql = connection.ops.cache_key_culling_sql
++
++def mock_cache_key_culling_sql():
++    """Mock that returns SQL that will produce no results"""
++    return "SELECT cache_key FROM %s WHERE 1=0 LIMIT %%s"
++
++# Replace the real function with our mock
++connection.ops.cache_key_culling_sql = mock_cache_key_culling_sql
++
++# Add more entries than MAX_ENTRIES to trigger culling
++for i in range(40):
++    cache.set(f'key{i}', f'value{i}')
++
++# This should trigger culling, which will then try to access cursor.fetchone()[0]
++# If the issue is not fixed, it will raise: TypeError: 'NoneType' object is not subscriptable
++print("Test completed successfully. If no error occurred, the issue is fixed.")
+\ No newline at end of file

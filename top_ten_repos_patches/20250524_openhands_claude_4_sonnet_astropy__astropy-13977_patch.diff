@@ -1,0 +1,636 @@
+diff --git a/astropy/units/quantity.py b/astropy/units/quantity.py
+index b98abfafb0..c874482e90 100644
+--- a/astropy/units/quantity.py
++++ b/astropy/units/quantity.py
+@@ -640,7 +640,16 @@ class Quantity(np.ndarray):
+         # input to that expected (e.g., radian for np.sin), or to get
+         # consistent units between two inputs (e.g., in np.add) --
+         # and the unit of the result (or tuple of units for nout > 1).
+-        converters, unit = converters_and_unit(function, method, *inputs)
++        try:
++            converters, unit = converters_and_unit(function, method, *inputs)
++        except TypeError as e:
++            # Only catch TypeError for unsupported operand types (duck types)
++            if "Unsupported operand type(s) for ufunc" in str(e):
++                # Cannot determine converters for these inputs - let other objects handle it
++                return NotImplemented
++            else:
++                # Re-raise other TypeErrors
++                raise
+ 
+         out = kwargs.get("out", None)
+         # Avoid loop back by turning any Quantity output into array views.
+@@ -667,7 +676,22 @@ class Quantity(np.ndarray):
+         arrays = []
+         for input_, converter in zip(inputs, converters):
+             input_ = getattr(input_, "value", input_)
+-            arrays.append(converter(input_) if converter else input_)
++            if converter:
++                try:
++                    arrays.append(converter(input_))
++                except ValueError as e:
++                    # Check if this is the specific error from _condition_arg
++                    if "Value not scalar compatible" in str(e):
++                        # Cannot convert input - let other objects handle it
++                        return NotImplemented
++                    else:
++                        # Re-raise other ValueErrors (like UnitConversionError)
++                        raise
++                except TypeError:
++                    # Cannot convert input - let other objects handle it
++                    return NotImplemented
++            else:
++                arrays.append(input_)
+ 
+         # Call our superclass's __array_ufunc__
+         result = super().__array_ufunc__(function, method, *arrays, **kwargs)
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..2d07c51734
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,204 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the __array_ufunc__ fix.
++
++This script tests various scenarios to ensure the fix works correctly
++and doesn't break existing functionality.
++"""
++
++import dataclasses
++import numpy as np
++import astropy.units as u
++
++
++@dataclasses.dataclass
++class DuckArray(np.lib.mixins.NDArrayOperatorsMixin):
++    ndarray: u.Quantity
++
++    @property
++    def unit(self) -> u.UnitBase:
++        return self.ndarray.unit
++
++    def __array_ufunc__(self, function, method, *inputs, **kwargs):
++        print(f"DuckArray.__array_ufunc__ called with function={function.__name__}, method={method}")
++        
++        inputs = [inp.ndarray if isinstance(inp, DuckArray) else inp for inp in inputs]
++
++        for inp in inputs:
++            if isinstance(inp, np.ndarray):
++                result = inp.__array_ufunc__(function, method, *inputs, **kwargs)
++                if result is not NotImplemented:
++                    return DuckArray(result)
++
++        return NotImplemented
++
++    def __radd__(self, other):
++        print(f"DuckArray.__radd__ called with other={other}")
++        # Convert other to same units as self and add
++        if hasattr(other, 'unit'):
++            other_converted = other.to(self.unit)
++            return DuckArray(other_converted + self.ndarray)
++        else:
++            # Assume dimensionless
++            return DuckArray(other + self.ndarray)
++
++    def __rmul__(self, other):
++        print(f"DuckArray.__rmul__ called with other={other}")
++        return DuckArray(other * self.ndarray)
++
++    def __rsub__(self, other):
++        print(f"DuckArray.__rsub__ called with other={other}")
++        if hasattr(other, 'unit'):
++            other_converted = other.to(self.unit)
++            return DuckArray(other_converted - self.ndarray)
++        else:
++            return DuckArray(other - self.ndarray)
++
++
++class IncompatibleDuckArray:
++    """A duck array that cannot be converted to numeric types."""
++    def __init__(self, value):
++        self.value = value
++    
++    def __array_ufunc__(self, function, method, *inputs, **kwargs):
++        print(f"IncompatibleDuckArray.__array_ufunc__ called")
++        return NotImplemented
++    
++    def __radd__(self, other):
++        print(f"IncompatibleDuckArray.__radd__ called")
++        return f"IncompatibleDuckArray + {other}"
++
++
++def test_normal_quantity_operations():
++    """Test that normal Quantity operations still work."""
++    print("=== Testing normal Quantity operations ===")
++    
++    # Basic operations
++    q1 = 1 * u.m
++    q2 = 2 * u.m
++    result = q1 + q2
++    assert result == 3 * u.m
++    print("1. Basic addition: PASS")
++    
++    # Unit conversion
++    q3 = 1000 * u.mm
++    result = q1 + q3
++    assert result == 2 * u.m
++    print("2. Unit conversion: PASS")
++    
++    # With numpy arrays
++    arr = np.array([1, 2, 3]) * u.m
++    scalar = 1 * u.m
++    result = arr + scalar
++    expected = np.array([2, 3, 4]) * u.m
++    assert np.allclose(result.value, expected.value) and result.unit == expected.unit
++    print("3. Array operations: PASS")
++
++
++def test_duck_array_operations():
++    """Test DuckArray operations."""
++    print("\n=== Testing DuckArray operations ===")
++    
++    # DuckArray + Quantity (same units)
++    duck = DuckArray(1 * u.mm)
++    q = 1 * u.mm
++    result = duck + q
++    assert isinstance(result, DuckArray)
++    assert result.ndarray == 2 * u.mm
++    print("1. DuckArray + Quantity (same units): PASS")
++    
++    # DuckArray + Quantity (different units)
++    duck = DuckArray(1 * u.mm)
++    q = 1 * u.m
++    result = duck + q
++    assert isinstance(result, DuckArray)
++    assert result.ndarray == 1001 * u.mm
++    print("2. DuckArray + Quantity (different units): PASS")
++    
++    # Quantity + DuckArray (same units)
++    q = 1 * u.mm
++    duck = DuckArray(1 * u.mm)
++    result = q + duck
++    assert isinstance(result, DuckArray)
++    assert result.ndarray == 2 * u.mm
++    print("3. Quantity + DuckArray (same units): PASS")
++    
++    # Quantity + DuckArray (different units) - THE MAIN FIX
++    q = 1 * u.m
++    duck = DuckArray(1 * u.mm)
++    result = q + duck
++    assert isinstance(result, DuckArray)
++    assert result.ndarray == 1.001 * u.m
++    print("4. Quantity + DuckArray (different units): PASS")
++
++
++def test_other_operations():
++    """Test other arithmetic operations."""
++    print("\n=== Testing other operations ===")
++    
++    # Multiplication
++    q = 2 * u.m
++    duck = DuckArray(3 * u.s)
++    result = q * duck
++    assert isinstance(result, DuckArray)
++    print("1. Multiplication: PASS")
++    
++    # Subtraction
++    q = 2 * u.m
++    duck = DuckArray(1 * u.m)
++    result = q - duck
++    assert isinstance(result, DuckArray)
++    print("2. Subtraction: PASS")
++
++
++def test_incompatible_types():
++    """Test with truly incompatible types."""
++    print("\n=== Testing incompatible types ===")
++    
++    # Test with an object that cannot be converted
++    # Both objects return NotImplemented, so numpy raises TypeError
++    q = 1 * u.m
++    incompatible = IncompatibleDuckArray("test")
++    try:
++        result = q + incompatible
++        assert False, "Should have raised TypeError"
++    except TypeError as e:
++        assert "operand type(s) all returned NotImplemented" in str(e)
++        print("1. Incompatible type properly raises TypeError: PASS")
++
++
++def test_edge_cases():
++    """Test edge cases."""
++    print("\n=== Testing edge cases ===")
++    
++    # Test with None converter (should still work)
++    q1 = 1 * u.dimensionless_unscaled
++    q2 = 2 * u.dimensionless_unscaled
++    result = q1 + q2
++    assert result == 3 * u.dimensionless_unscaled
++    print("1. Dimensionless quantities: PASS")
++    
++    # Test with incompatible units that should raise UnitConversionError
++    try:
++        q1 = 1 * u.m
++        q2 = 1 * u.s
++        result = q1 + q2
++        assert False, "Should have raised an error"
++    except u.UnitConversionError:
++        print("2. Incompatible units error: PASS")
++    
++    # Test with arrays
++    duck = DuckArray(np.array([1, 2, 3]) * u.mm)
++    q = np.array([1, 1, 1]) * u.m
++    result = q + duck
++    assert isinstance(result, DuckArray)
++    print("3. Array operations: PASS")
++
++
++if __name__ == "__main__":
++    test_normal_quantity_operations()
++    test_duck_array_operations()
++    test_other_operations()
++    test_incompatible_types()
++    test_edge_cases()
++    print("\n=== ALL TESTS PASSED ===")
+\ No newline at end of file
+diff --git a/debug_errors.py b/debug_errors.py
+new file mode 100644
+index 0000000000..8e3d4e59bb
+--- /dev/null
++++ b/debug_errors.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand the specific errors we need to catch.
++"""
++
++import dataclasses
++import numpy as np
++import astropy.units as u
++
++
++@dataclasses.dataclass
++class DuckArray(np.lib.mixins.NDArrayOperatorsMixin):
++    ndarray: u.Quantity
++
++    @property
++    def unit(self) -> u.UnitBase:
++        return self.ndarray.unit
++
++    def __array_ufunc__(self, function, method, *inputs, **kwargs):
++        # Don't handle anything - force fallback to Quantity
++        return NotImplemented
++
++
++# Temporarily disable our fix to see the original error
++import astropy.units.quantity
++original_array_ufunc = astropy.units.quantity.Quantity.__array_ufunc__
++
++def debug_array_ufunc(self, function, method, *inputs, **kwargs):
++    """Debug version that shows us the exact error."""
++    print(f"Debug: __array_ufunc__ called with inputs: {[type(inp).__name__ for inp in inputs]}")
++    
++    # Call the original logic step by step
++    from astropy.units.quantity_helper.converters import converters_and_unit
++    
++    try:
++        converters, unit = converters_and_unit(function, method, *inputs)
++        print(f"Debug: converters_and_unit succeeded")
++    except Exception as e:
++        print(f"Debug: converters_and_unit failed with {type(e).__name__}: {e}")
++        raise
++    
++    # Try the conversion step
++    arrays = []
++    for i, (input_, converter) in enumerate(zip(inputs, converters)):
++        input_ = getattr(input_, "value", input_)
++        print(f"Debug: Processing input {i}: {type(input_).__name__}, converter: {converter is not None}")
++        if converter:
++            try:
++                converted = converter(input_)
++                arrays.append(converted)
++                print(f"Debug: Conversion succeeded")
++            except Exception as e:
++                print(f"Debug: Conversion failed with {type(e).__name__}: {e}")
++                print(f"Debug: Error message: '{e}'")
++                raise
++        else:
++            arrays.append(input_)
++    
++    # Continue with original logic
++    return original_array_ufunc(self, function, method, *inputs, **kwargs)
++
++# Monkey patch for debugging
++astropy.units.quantity.Quantity.__array_ufunc__ = debug_array_ufunc
++
++if __name__ == "__main__":
++    print("=== Testing incompatible units (should raise UnitConversionError) ===")
++    try:
++        result = (1 * u.m) + (1 * u.s)
++    except Exception as e:
++        print(f"Error type: {type(e).__name__}")
++        print(f"Error message: {e}")
++    
++    print("\n=== Testing duck type (should show conversion error) ===")
++    try:
++        result = (1 * u.m) + DuckArray(1 * u.mm)
++    except Exception as e:
++        print(f"Error type: {type(e).__name__}")
++        print(f"Error message: {e}")
+\ No newline at end of file
+diff --git a/debug_typeerror.py b/debug_typeerror.py
+new file mode 100644
+index 0000000000..cf7a50c897
+--- /dev/null
++++ b/debug_typeerror.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand the specific TypeErrors.
++"""
++
++import dataclasses
++import numpy as np
++import astropy.units as u
++
++
++@dataclasses.dataclass
++class DuckArray(np.lib.mixins.NDArrayOperatorsMixin):
++    ndarray: u.Quantity
++
++    @property
++    def unit(self) -> u.UnitBase:
++        return self.ndarray.unit
++
++    def __array_ufunc__(self, function, method, *inputs, **kwargs):
++        return NotImplemented
++
++
++class IncompatibleDuckArray:
++    def __array_ufunc__(self, function, method, *inputs, **kwargs):
++        return NotImplemented
++
++
++# Test different scenarios
++from astropy.units.quantity_helper.converters import converters_and_unit
++
++print("=== Testing wrong units (should raise specific TypeError) ===")
++try:
++    converters, unit = converters_and_unit(np.sin, "__call__", 3.0 * u.m)
++except Exception as e:
++    print(f"Error type: {type(e).__name__}")
++    print(f"Error message: {e}")
++
++print("\n=== Testing duck type (should succeed in converters_and_unit) ===")
++try:
++    converters, unit = converters_and_unit(np.add, "__call__", 1.0 * u.m, DuckArray(1 * u.mm))
++    print("converters_and_unit succeeded")
++    print(f"converters: {converters}")
++except Exception as e:
++    print(f"Error type: {type(e).__name__}")
++    print(f"Error message: {e}")
++
++print("\n=== Testing incompatible duck type ===")
++try:
++    converters, unit = converters_and_unit(np.add, "__call__", 1.0 * u.m, IncompatibleDuckArray())
++except Exception as e:
++    print(f"Error type: {type(e).__name__}")
++    print(f"Error message: {e}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b59e0ff496
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the __array_ufunc__ issue.
++
++This script reproduces the issue where Quantity.__array_ufunc__() raises
++ValueError instead of returning NotImplemented when inputs are incompatible.
++"""
++
++import dataclasses
++import numpy as np
++import astropy.units as u
++
++
++@dataclasses.dataclass
++class DuckArray(np.lib.mixins.NDArrayOperatorsMixin):
++    ndarray: u.Quantity
++
++    @property
++    def unit(self) -> u.UnitBase:
++        return self.ndarray.unit
++
++    def __array_ufunc__(self, function, method, *inputs, **kwargs):
++        print(f"DuckArray.__array_ufunc__ called with function={function.__name__}, method={method}")
++        
++        inputs = [inp.ndarray if isinstance(inp, DuckArray) else inp for inp in inputs]
++
++        for inp in inputs:
++            if isinstance(inp, np.ndarray):
++                result = inp.__array_ufunc__(function, method, *inputs, **kwargs)
++                if result is not NotImplemented:
++                    return DuckArray(result)
++
++        return NotImplemented
++
++    def __radd__(self, other):
++        print(f"DuckArray.__radd__ called with other={other}")
++        # Convert other to same units as self and add
++        if hasattr(other, 'unit'):
++            other_converted = other.to(self.unit)
++            return DuckArray(other_converted + self.ndarray)
++        else:
++            # Assume dimensionless
++            return DuckArray(other + self.ndarray)
++
++
++def test_working_cases():
++    """Test cases that should work."""
++    print("=== Testing working cases ===")
++    
++    # Case 1: DuckArray + Quantity (same units)
++    print("1. DuckArray(1 * u.mm) + (1 * u.mm)")
++    try:
++        result = DuckArray(1 * u.mm) + (1 * u.mm)
++        print(f"   Result: {result}")
++        print("   SUCCESS")
++    except Exception as e:
++        print(f"   ERROR: {e}")
++    
++    # Case 2: DuckArray + Quantity (different but compatible units)
++    print("2. DuckArray(1 * u.mm) + (1 * u.m)")
++    try:
++        result = DuckArray(1 * u.mm) + (1 * u.m)
++        print(f"   Result: {result}")
++        print("   SUCCESS")
++    except Exception as e:
++        print(f"   ERROR: {e}")
++    
++    # Case 3: Quantity + DuckArray (same units)
++    print("3. (1 * u.mm) + DuckArray(1 * u.mm)")
++    try:
++        result = (1 * u.mm) + DuckArray(1 * u.mm)
++        print(f"   Result: {result}")
++        print("   SUCCESS")
++    except Exception as e:
++        print(f"   ERROR: {e}")
++
++
++def test_problematic_case():
++    """Test the problematic case."""
++    print("\n=== Testing problematic case ===")
++    
++    # Case 4: Quantity + DuckArray (different but compatible units)
++    print("4. (1 * u.m) + DuckArray(1 * u.mm)")
++    try:
++        result = (1 * u.m) + DuckArray(1 * u.mm)
++        print(f"   Result: {result}")
++        print("   SUCCESS")
++    except Exception as e:
++        print(f"   ERROR: {e}")
++        print(f"   Error type: {type(e).__name__}")
++        import traceback
++        traceback.print_exc()
++
++
++if __name__ == "__main__":
++    test_working_cases()
++    test_problematic_case()
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 0000000000..15af29bb61
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""
++Final verification test for the __array_ufunc__ fix.
++
++This test verifies that the fix correctly handles duck types while preserving
++all existing error behavior for invalid operations.
++"""
++
++import dataclasses
++import numpy as np
++import astropy.units as u
++
++
++@dataclasses.dataclass
++class DuckArray(np.lib.mixins.NDArrayOperatorsMixin):
++    """A duck type that mimics Quantity behavior."""
++    ndarray: u.Quantity
++
++    @property
++    def unit(self) -> u.UnitBase:
++        return self.ndarray.unit
++
++    def __array_ufunc__(self, function, method, *inputs, **kwargs):
++        # Convert DuckArray inputs to their underlying Quantity
++        inputs = [inp.ndarray if isinstance(inp, DuckArray) else inp for inp in inputs]
++
++        # Try to delegate to the first numpy array we find
++        for inp in inputs:
++            if isinstance(inp, np.ndarray):
++                result = inp.__array_ufunc__(function, method, *inputs, **kwargs)
++                if result is not NotImplemented:
++                    return DuckArray(result)
++
++        return NotImplemented
++
++    def __radd__(self, other):
++        """Reflected addition - converts other to self's units and adds."""
++        if hasattr(other, 'unit'):
++            other_converted = other.to(self.unit)
++            return DuckArray(other_converted + self.ndarray)
++        else:
++            return DuckArray(other + self.ndarray)
++
++
++def test_duck_type_operations():
++    """Test that duck type operations work correctly."""
++    print("=== Testing Duck Type Operations ===")
++    
++    # The main issue: Quantity + DuckArray with different but compatible units
++    # This should work via DuckArray's __radd__ method
++    q = 1 * u.m
++    duck = DuckArray(1 * u.mm)
++    result = q + duck
++    
++    assert isinstance(result, DuckArray), f"Expected DuckArray, got {type(result)}"
++    assert result.ndarray.value == 1.001, f"Expected 1.001, got {result.ndarray.value}"
++    assert result.ndarray.unit == u.m, f"Expected m, got {result.ndarray.unit}"
++    print("✓ (1 * u.m) + DuckArray(1 * u.mm) works correctly")
++    
++    # Test other operations
++    result = duck + q
++    assert isinstance(result, DuckArray)
++    print("✓ DuckArray(1 * u.mm) + (1 * u.m) works correctly")
++    
++    # Test multiplication
++    result = q * duck
++    assert isinstance(result, DuckArray)
++    print("✓ (1 * u.m) * DuckArray(1 * u.mm) works correctly")
++
++
++def test_existing_error_behavior():
++    """Test that existing error behavior is preserved."""
++    print("\n=== Testing Existing Error Behavior ===")
++    
++    # Test incompatible units still raise UnitConversionError
++    try:
++        result = (1 * u.m) + (1 * u.s)
++        assert False, "Should have raised UnitConversionError"
++    except u.UnitConversionError:
++        print("✓ Incompatible units still raise UnitConversionError")
++    
++    # Test invalid function applications still raise UnitTypeError
++    try:
++        result = np.sin(3 * u.m)
++        assert False, "Should have raised UnitTypeError"
++    except u.UnitTypeError:
++        print("✓ Invalid function applications still raise UnitTypeError")
++    
++    # Test dimensionless function requirements
++    try:
++        result = np.exp(3 * u.m / u.s)
++        assert False, "Should have raised UnitTypeError"
++    except u.UnitTypeError:
++        print("✓ Dimensionless function requirements still enforced")
++
++
++def test_normal_quantity_operations():
++    """Test that normal Quantity operations still work."""
++    print("\n=== Testing Normal Quantity Operations ===")
++    
++    # Basic arithmetic
++    q1 = 1 * u.m
++    q2 = 2 * u.m
++    result = q1 + q2
++    assert result == 3 * u.m
++    print("✓ Basic Quantity arithmetic works")
++    
++    # Unit conversion
++    q3 = 1000 * u.mm
++    result = q1 + q3
++    assert result == 2 * u.m
++    print("✓ Unit conversion in arithmetic works")
++    
++    # Mathematical functions
++    result = np.sin(np.pi/2 * u.rad)
++    assert np.isclose(result.value, 1.0)
++    print("✓ Mathematical functions work")
++
++
++if __name__ == "__main__":
++    test_duck_type_operations()
++    test_existing_error_behavior()
++    test_normal_quantity_operations()
++    print("\n🎉 All tests passed! The fix works correctly.")
+\ No newline at end of file

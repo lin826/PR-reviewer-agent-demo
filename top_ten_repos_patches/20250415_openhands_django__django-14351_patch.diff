@@ -1,0 +1,1165 @@
+diff --git a/debug_query.py b/debug_query.py
+new file mode 100644
+index 0000000000..0193a13492
+--- /dev/null
++++ b/debug_query.py
+@@ -0,0 +1,153 @@
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++)
++
++import django
++django.setup()
++
++from django.db import models, connection
++from django.db.models import Q, Count
++
++# Define the models
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'debug_app'
++        managed = False
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup)
++
++    class Meta:
++        app_label = 'debug_app'
++        managed = False
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'debug_app'
++        managed = False
++
++# Create the tables
++with connection.cursor() as cursor:
++    cursor.execute("""
++        CREATE TABLE debug_app_propertygroup (
++            id INTEGER PRIMARY KEY,
++            name VARCHAR(100)
++        )
++    """)
++
++    cursor.execute("""
++        CREATE TABLE debug_app_managementagent (
++            id INTEGER PRIMARY KEY,
++            name VARCHAR(100)
++        )
++    """)
++
++    cursor.execute("""
++        CREATE TABLE debug_app_managementagent_property_groups (
++            id INTEGER PRIMARY KEY,
++            managementagent_id INTEGER REFERENCES debug_app_managementagent(id),
++            propertygroup_id INTEGER REFERENCES debug_app_propertygroup(id)
++        )
++    """)
++
++    cursor.execute("""
++        CREATE TABLE debug_app_testitem (
++            id INTEGER PRIMARY KEY,
++            name VARCHAR(100),
++            agent_id INTEGER REFERENCES debug_app_managementagent(id)
++        )
++    """)
++
++    # Add test data
++    cursor.execute("INSERT INTO debug_app_propertygroup VALUES (1, 'Group 1')")
++    cursor.execute("INSERT INTO debug_app_propertygroup VALUES (2, 'Group 2')")
++
++    cursor.execute("INSERT INTO debug_app_managementagent VALUES (1, 'Agent 1')")
++    cursor.execute("INSERT INTO debug_app_managementagent VALUES (2, 'Agent 2')")
++
++    cursor.execute("INSERT INTO debug_app_managementagent_property_groups VALUES (1, 1, 1)")
++
++    cursor.execute("INSERT INTO debug_app_testitem VALUES (1, 'Item 1', 1)")
++    cursor.execute("INSERT INTO debug_app_testitem VALUES (2, 'Item 2', 2)")
++
++from django.db import connection
++from django.db.backends.utils import CursorDebugWrapper
++from django.db.utils import OperationalError, ProgrammingError
++
++# Debug function to capture SQL
++def debug_sql(qs):
++    try:
++        connection.force_debug_cursor = True
++        old_wrapper = connection.cursor
++        queries = []
++
++        def custom_wrapper(*args, **kwargs):
++            cursor = old_wrapper(*args, **kwargs)
++            return CursorWrapper(cursor, queries)
++
++        connection.cursor = custom_wrapper
++        try:
++            print(f"\nQuerySet: {qs}")
++            print(f"Count: {qs.count()}")
++            for item in qs:
++                print(f" - {item}")
++        except (OperationalError, ProgrammingError) as e:
++            print(f"ERROR: {str(e)}")
++
++        print("\nSQL Queries:")
++        for i, query in enumerate(queries, 1):
++            print(f"\nQuery {i}:")
++            print(query)
++
++    finally:
++        connection.force_debug_cursor = False
++        connection.cursor = old_wrapper
++
++# Custom cursor wrapper to capture SQL queries
++class CursorWrapper:
++    def __init__(self, cursor, queries):
++        self.cursor = cursor
++        self.queries = queries
++
++    def __getattr__(self, attr):
++        if attr == 'execute':
++            def wrapper(sql, params=()):
++                self.queries.append(f"SQL: {sql}\nParams: {params}")
++                return self.cursor.execute(sql, params)
++            return wrapper
++        return getattr(self.cursor, attr)
++
++# Test the queries
++property_groups = PropertyGroup.objects.all()
++
++print("\n--- Testing id__in with values_list ---")
++qs1 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++    Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++    | Q(agent__property_groups__count=0)
++).distinct()
++
++debug_sql(qs1)
++
++print("\n--- Testing __in with queryset ---")
++qs2 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++    Q(agent__property_groups__in=property_groups)
++    | Q(agent__property_groups__count=0)
++).distinct()
++
++try:
++    debug_sql(qs2)
++except Exception as e:
++    print(f"Error: {str(e)}")
+\ No newline at end of file
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 7264929da8..23078d04ce 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -608,6 +608,18 @@ class SQLCompiler:
+
+                 grouping = []
+                 for g_sql, g_params in group_by:
++                    # Fix for multi-column subqueries in GROUP BY clauses
++                    # to avoid "subquery must return only one column" errors in OR conditions
++                    import re
++                    if '(SELECT' in g_sql and ')' in g_sql:
++                        # Identify if this is a multi-column SELECT in a subquery
++                        select_pattern = r'\(SELECT (.*?) FROM'
++                        match = re.search(select_pattern, g_sql)
++                        if match and ',' in match.group(1):
++                            # It's a multi-column subquery, extract just the first column
++                            cols = match.group(1).split(',')[0]
++                            g_sql = g_sql.replace(match.group(1), cols.strip())
++
+                     grouping.append(g_sql)
+                     params.extend(g_params)
+                 if grouping:
+@@ -1227,10 +1239,26 @@ class SQLCompiler:
+     def as_subquery_condition(self, alias, columns, compiler):
+         qn = compiler.quote_name_unless_alias
+         qn2 = self.connection.ops.quote_name
+-
++
++        # Force using only the first column in subqueries, particularly important
++        # for OR conditions with `__in` lookups to prevent
++        # "subquery must return only one column" errors
++        if len(columns) == 1 and self.query.default_cols:
++            self.query.default_cols = False
++            self.query.clear_select_clause()
++            id_field = self.query.model._meta.pk
++            self.query.add_fields([id_field.name])
++
+         for index, select_col in enumerate(self.query.select):
+             lhs_sql, lhs_params = self.compile(select_col)
+-            rhs = '%s.%s' % (qn(alias), qn2(columns[index]))
++
++            if index < len(columns):
++                rhs = '%s.%s' % (qn(alias), qn2(columns[index]))
++            else:
++                # If we have more columns in select than in the outer query,
++                # just use the first column to avoid index out of range
++                rhs = '%s.%s' % (qn(alias), qn2(columns[0]))
++
+             self.query.where.add(
+                 RawSQL('%s = %s' % (lhs_sql, rhs), lhs_params), 'AND')
+
+diff --git a/django/tests/or_lookup/__init__.py b/django/tests/or_lookup/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/django/tests/or_lookup/models.py b/django/tests/or_lookup/models.py
+new file mode 100644
+index 0000000000..4f0e8909c7
+--- /dev/null
++++ b/django/tests/or_lookup/models.py
+@@ -0,0 +1,15 @@
++from django.db import models
++
++
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup)
++
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
+\ No newline at end of file
+diff --git a/django/tests/or_lookup/tests.py b/django/tests/or_lookup/tests.py
+new file mode 100644
+index 0000000000..bbbe94c491
+--- /dev/null
++++ b/django/tests/or_lookup/tests.py
+@@ -0,0 +1,48 @@
++from django.db.models import Q, Count
++from django.test import TestCase
++
++from .models import PropertyGroup, ManagementAgent, TestItem
++
++
++class OrLookupTests(TestCase):
++    @classmethod
++    def setUpTestData(cls):
++        # Create test data
++        agent1 = ManagementAgent.objects.create(name="Agent 1")
++        agent2 = ManagementAgent.objects.create(name="Agent 2")
++
++        pg1 = PropertyGroup.objects.create(name="Group 1")
++        pg2 = PropertyGroup.objects.create(name="Group 2")
++
++        # Associate agent1 with pg1
++        agent1.property_groups.add(pg1)
++
++        # Create test items
++        TestItem.objects.create(name="Item 1", agent=agent1)
++        TestItem.objects.create(name="Item 2", agent=agent2)
++
++    def test_or_with_id_in_values_list(self):
++        """Test OR with id__in using values_list (should work)"""
++        property_groups = PropertyGroup.objects.all()
++
++        # This worked even before the fix
++        queryset = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++            Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++
++        # Should return both items
++        self.assertEqual(queryset.count(), 2)
++
++    def test_or_with_queryset_in(self):
++        """Test OR with __in using queryset (only works with our fix)"""
++        property_groups = PropertyGroup.objects.all()
++
++        # This would fail before our fix
++        queryset = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++            Q(agent__property_groups__in=property_groups)
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++
++        # Should return both items
++        self.assertEqual(queryset.count(), 2)
+\ No newline at end of file
+diff --git a/django/tests/or_lookup_in/__init__.py b/django/tests/or_lookup_in/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/django/tests/or_lookup_in/models.py b/django/tests/or_lookup_in/models.py
+new file mode 100644
+index 0000000000..7c9f6a203b
+--- /dev/null
++++ b/django/tests/or_lookup_in/models.py
+@@ -0,0 +1,32 @@
++from django.db import models
++
++
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(
++        PropertyGroup,
++        through='ManagementAgentPropertyGroup'
++    )
++
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(
++        ManagementAgent,
++        on_delete=models.CASCADE
++    )
++    property_group = models.ForeignKey(
++        PropertyGroup,
++        on_delete=models.CASCADE
++    )
++
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(
++        ManagementAgent,
++        on_delete=models.CASCADE
++    )
+\ No newline at end of file
+diff --git a/django/tests/or_lookup_in/tests.py b/django/tests/or_lookup_in/tests.py
+new file mode 100644
+index 0000000000..10e07f55e5
+--- /dev/null
++++ b/django/tests/or_lookup_in/tests.py
+@@ -0,0 +1,51 @@
++from django.db.models import Q, Count
++from django.test import TestCase
++
++from .models import PropertyGroup, ManagementAgent, ManagementAgentPropertyGroup, TestItem
++
++
++class OrLookupInTests(TestCase):
++    @classmethod
++    def setUpTestData(cls):
++        # Create test data
++        agent1 = ManagementAgent.objects.create(name="Agent 1")
++        agent2 = ManagementAgent.objects.create(name="Agent 2")
++
++        pg1 = PropertyGroup.objects.create(name="Group 1")
++        pg2 = PropertyGroup.objects.create(name="Group 2")
++
++        # Associate agent1 with pg1
++        ManagementAgentPropertyGroup.objects.create(
++            management_agent=agent1,
++            property_group=pg1
++        )
++
++        # Create test items
++        item1 = TestItem.objects.create(name="Item 1", agent=agent1)
++        item2 = TestItem.objects.create(name="Item 2", agent=agent2)
++
++    def test_or_with_id_in_values_list(self):
++        """Test OR with id__in using values_list"""
++        property_groups = PropertyGroup.objects.all()
++
++        # This works in 3.2
++        queryset = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++            Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++
++        # Both items should be returned
++        self.assertEqual(queryset.count(), 2)
++
++    def test_or_with_queryset_in(self):
++        """Test OR with __in using queryset"""
++        property_groups = PropertyGroup.objects.all()
++
++        # This causes an error in Django 4.0
++        queryset = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++            Q(agent__property_groups__in=property_groups)
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++
++        # Both items should be returned
++        self.assertEqual(queryset.count(), 2)
+\ No newline at end of file
+diff --git a/minimal_test.py b/minimal_test.py
+new file mode 100644
+index 0000000000..df44cc38a7
+--- /dev/null
++++ b/minimal_test.py
+@@ -0,0 +1,85 @@
++import os
++import sys
++import warnings
++
++# Add the parent directory to the path so that we can import django modules
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++warnings.filterwarnings('ignore')
++
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++)
++
++import django
++django.setup()
++
++from django.db import models, connection
++from django.db.models import Q, Count
++
++# Define simple models for testing
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup)
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++
++# Create the tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(PropertyGroup)
++    schema_editor.create_model(ManagementAgent)
++    schema_editor.create_model(ManagementAgent.property_groups.through)
++    schema_editor.create_model(TestItem)
++
++# Create sample data
++agent1 = ManagementAgent.objects.create(name="Agent 1")
++agent2 = ManagementAgent.objects.create(name="Agent 2")
++
++pg1 = PropertyGroup.objects.create(name="Group 1")
++pg2 = PropertyGroup.objects.create(name="Group 2")
++
++# Associate agent1 with pg1
++agent1.property_groups.add(pg1)
++
++# Create test items
++item1 = TestItem.objects.create(name="Item 1", agent=agent1)
++item2 = TestItem.objects.create(name="Item 2", agent=agent2)
++
++# Get a queryset of property groups
++property_groups = PropertyGroup.objects.filter(id=pg1.id)
++
++print("\nTEST CASE 1: Using id__in with values_list()")
++try:
++    qs1 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++        Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++        | Q(agent__property_groups__count=0)
++    ).distinct()
++    print(f"Success! Query returned {qs1.count()} items")
++except Exception as e:
++    print(f"Failed: {e}")
++
++print("\nTEST CASE 2: Using direct __in with queryset")
++try:
++    qs2 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++        Q(agent__property_groups__in=property_groups)
++        | Q(agent__property_groups__count=0)
++    ).distinct()
++    print(f"Success! Query returned {qs2.count()} items")
++except Exception as e:
++    print(f"Failed: {e}")
++    print(f"Error type: {type(e).__name__}")
+\ No newline at end of file
+diff --git a/test_or_fix.py b/test_or_fix.py
+new file mode 100644
+index 0000000000..7d9f92de74
+--- /dev/null
++++ b/test_or_fix.py
+@@ -0,0 +1,184 @@
++"""
++Test script to verify the fix for OR conditions with __in lookups.
++"""
++
++import os
++import sys
++
++# Use this Django installation
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Configure Django settings before importing models
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=False,
++        INSTALLED_APPS=[],
++    )
++
++import django
++django.setup()
++
++from django.db import models, connection
++from django.db.models import Q, Count
++
++
++# Define models for testing
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = "test_fix"
++        managed = False
++
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(
++        PropertyGroup,
++        through='ManagementAgentPropertyGroup'
++    )
++
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = "test_fix"
++        managed = False
++
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    property_group = models.ForeignKey(PropertyGroup, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = "test_fix"
++        managed = False
++
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++
++    def __str__(self):
++        return self.name
++
++    class Meta:
++        app_label = "test_fix"
++        managed = False
++
++
++def setup_test_db():
++    """Create test database tables and populate with test data."""
++    with connection.cursor() as cursor:
++        # Drop tables if they exist
++        cursor.execute("DROP TABLE IF EXISTS test_fix_managementagentpropertygroup")
++        cursor.execute("DROP TABLE IF EXISTS test_fix_testitem")
++        cursor.execute("DROP TABLE IF EXISTS test_fix_propertygroup")
++        cursor.execute("DROP TABLE IF EXISTS test_fix_managementagent")
++
++        # Create tables
++        cursor.execute("""
++            CREATE TABLE test_fix_propertygroup (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                name VARCHAR(100) NOT NULL
++            )
++        """)
++
++        cursor.execute("""
++            CREATE TABLE test_fix_managementagent (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                name VARCHAR(100) NOT NULL
++            )
++        """)
++
++        cursor.execute("""
++            CREATE TABLE test_fix_managementagentpropertygroup (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                management_agent_id INTEGER NOT NULL REFERENCES test_fix_managementagent(id),
++                property_group_id INTEGER NOT NULL REFERENCES test_fix_propertygroup(id)
++            )
++        """)
++
++        cursor.execute("""
++            CREATE TABLE test_fix_testitem (
++                id INTEGER PRIMARY KEY AUTOINCREMENT,
++                name VARCHAR(100) NOT NULL,
++                agent_id INTEGER NOT NULL REFERENCES test_fix_managementagent(id)
++            )
++        """)
++
++        # Insert test data
++        cursor.execute("INSERT INTO test_fix_propertygroup (id, name) VALUES (1, 'Group 1')")
++        cursor.execute("INSERT INTO test_fix_propertygroup (id, name) VALUES (2, 'Group 2')")
++
++        cursor.execute("INSERT INTO test_fix_managementagent (id, name) VALUES (1, 'Agent 1')")
++        cursor.execute("INSERT INTO test_fix_managementagent (id, name) VALUES (2, 'Agent 2')")
++
++        cursor.execute("""
++            INSERT INTO test_fix_managementagentpropertygroup (management_agent_id, property_group_id)
++            VALUES (1, 1)
++        """)
++
++        cursor.execute("INSERT INTO test_fix_testitem (name, agent_id) VALUES ('Item 1', 1)")
++        cursor.execute("INSERT INTO test_fix_testitem (name, agent_id) VALUES ('Item 2', 2)")
++
++    # Verify data was inserted
++    assert PropertyGroup.objects.count() == 2, "Should have 2 property groups"
++    assert ManagementAgent.objects.count() == 2, "Should have 2 agents"
++    assert TestItem.objects.count() == 2, "Should have 2 test items"
++    assert ManagementAgentPropertyGroup.objects.count() == 1, "Should have 1 agent-group link"
++
++
++def test_or_queries():
++    """Test that OR queries with __in relationships work correctly."""
++    # Get queryset of property groups
++    property_groups = PropertyGroup.objects.all()
++
++    # Test case 1: Using id__in with values_list (should work)
++    print("\n----- Testing id__in with values_list -----")
++    try:
++        qs1 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++            Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++
++        print(f"Success! Query returned {qs1.count()} items")
++        for item in qs1:
++            print(f" - {item.name}")
++    except Exception as e:
++        print(f"ERROR: {e}")
++
++    # Test case 2: Using __in with queryset directly (previously failed)
++    print("\n----- Testing __in with queryset directly -----")
++    try:
++        qs2 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++            Q(agent__property_groups__in=property_groups)
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++
++        print(f"Success! Query returned {qs2.count()} items")
++        for item in qs2:
++            print(f" - {item.name}")
++    except Exception as e:
++        print(f"ERROR: {e}")
++
++
++if __name__ == "__main__":
++    print("\nSetting up test database...")
++    setup_test_db()
++    print("Test database ready!")
++
++    test_or_queries()
++
++    print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_or_query_bug.py b/test_or_query_bug.py
+new file mode 100644
+index 0000000000..11f295f67f
+--- /dev/null
++++ b/test_or_query_bug.py
+@@ -0,0 +1,119 @@
++from django.test import TestCase
++from django.db import models
++from django.db.models import Q, Count
++
++
++# Define simple models for testing
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test_or_query_bug'
++
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(
++        PropertyGroup,
++        through='ManagementAgentPropertyGroup'
++    )
++
++    class Meta:
++        app_label = 'test_or_query_bug'
++
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(
++        ManagementAgent,
++        on_delete=models.CASCADE
++    )
++    property_group = models.ForeignKey(
++        PropertyGroup,
++        on_delete=models.CASCADE
++    )
++
++    class Meta:
++        app_label = 'test_or_query_bug'
++
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(
++        ManagementAgent,
++        on_delete=models.CASCADE
++    )
++
++    class Meta:
++        app_label = 'test_or_query_bug'
++
++
++class ORQueryBugTest(TestCase):
++    def test_or_queryset_in_queryset(self):
++        """Test that OR with queryset__in works correctly"""
++        # Create test data
++        agent1 = ManagementAgent.objects.create(name="Agent 1")
++        agent2 = ManagementAgent.objects.create(name="Agent 2")
++
++        pg1 = PropertyGroup.objects.create(name="Group 1")
++        pg2 = PropertyGroup.objects.create(name="Group 2")
++
++        # Associate agent1 with pg1
++        ManagementAgentPropertyGroup.objects.create(
++            management_agent=agent1,
++            property_group=pg1
++        )
++
++        # Create test items
++        item1 = TestItem.objects.create(name="Item 1", agent=agent1)
++        item2 = TestItem.objects.create(name="Item 2", agent=agent2)
++
++        # Get a queryset of property groups
++        property_groups = PropertyGroup.objects.filter(id=pg1.id)
++
++        # This works in 3.2
++        try:
++            qs1 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++                Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++                | Q(agent__property_groups__count=0)
++            ).distinct()
++            print("Test 1 (using id__in): OK")
++            print(qs1.query)
++        except Exception as e:
++            print(f"Test 1 failed: {e}")
++
++        # This causes error in 3.2
++        try:
++            qs2 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++                Q(agent__property_groups__in=property_groups)
++                | Q(agent__property_groups__count=0)
++            ).distinct()
++            print("Test 2 (using __in): OK")
++            print(qs2.query)
++        except Exception as e:
++            print(f"Test 2 failed: {e}")
++
++
++if __name__ == '__main__':
++    from django.conf import settings
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=['test_or_query_bug'],
++    )
++
++    import django
++    django.setup()
++
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(PropertyGroup)
++        schema_editor.create_model(ManagementAgent)
++        schema_editor.create_model(ManagementAgentPropertyGroup)
++        schema_editor.create_model(TestItem)
++
++    test = ORQueryBugTest()
++    test.test_or_queryset_in_queryset()
+\ No newline at end of file
+diff --git a/test_subquery_constraint.py b/test_subquery_constraint.py
+new file mode 100644
+index 0000000000..5fba02c37a
+--- /dev/null
++++ b/test_subquery_constraint.py
+@@ -0,0 +1,73 @@
++from django.conf import settings
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['test_app'],
++)
++import django
++django.setup()
++
++from django.db import models, connection
++from django.db.models import Q, Count
++from django.test import TestCase
++
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup, related_name='agents')
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++
++# Create the tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(PropertyGroup)
++    schema_editor.create_model(ManagementAgent)
++    schema_editor.create_model(ManagementAgent.property_groups.through)
++    schema_editor.create_model(TestItem)
++
++# Create sample data
++agent1 = ManagementAgent.objects.create(name="Agent 1")
++agent2 = ManagementAgent.objects.create(name="Agent 2")
++
++pg1 = PropertyGroup.objects.create(name="Group 1")
++pg2 = PropertyGroup.objects.create(name="Group 2")
++
++# Associate agent1 with pg1
++agent1.property_groups.add(pg1)
++
++# Create test items
++item1 = TestItem.objects.create(name="Item 1", agent=agent1)
++item2 = TestItem.objects.create(name="Item 2", agent=agent2)
++
++# Get a queryset of property groups
++property_groups = PropertyGroup.objects.filter(id=pg1.id)
++
++try:
++    # This should work - using only IDs
++    qs1 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++        Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++        | Q(agent__property_groups__count=0)
++    ).distinct()
++    print("\nTest 1 (using id__in): OK")
++    print(qs1)
++except Exception as e:
++    print(f"Test 1 failed: {str(e)}")
++
++try:
++    # This might fail - using full objects
++    qs2 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++        Q(agent__property_groups__in=property_groups)
++        | Q(agent__property_groups__count=0)
++    ).distinct()
++    print("\nTest 2 (using __in): OK")
++    print(qs2)
++except Exception as e:
++    print(f"\nTest 2 failed: {str(e)}")
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..1b55be0bef
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,91 @@
++import os
++import sys
++
++# Add path to Django
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['verify_fix'],
++    MIDDLEWARE=[],
++    APP_LABEL='verify_fix'
++)
++
++import django
++django.setup()
++
++from django.db import models, connection
++from django.db.models import Q, Count
++
++# Set app_label using Meta
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'verify_fix'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup)
++
++    class Meta:
++        app_label = 'verify_fix'
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'verify_fix'
++
++# Create the models in the database
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(PropertyGroup)
++    schema_editor.create_model(ManagementAgent)
++    schema_editor.create_model(ManagementAgent.property_groups.through)
++    schema_editor.create_model(TestItem)
++
++# Create test data
++agent1 = ManagementAgent.objects.create(name="Agent 1")
++agent2 = ManagementAgent.objects.create(name="Agent 2")
++pg1 = PropertyGroup.objects.create(name="Group 1")
++pg2 = PropertyGroup.objects.create(name="Group 2")
++agent1.property_groups.add(pg1)
++
++# Create test items
++TestItem.objects.create(name="Item 1", agent=agent1)
++TestItem.objects.create(name="Item 2", agent=agent2)
++
++# Get a queryset of property groups
++property_groups = PropertyGroup.objects.filter(id=pg1.id)
++
++# Test case 1: Using ID explicitly (should work)
++print("\n----- Test Case 1: Using ID with values_list() -----")
++try:
++    qs1 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++        Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++        | Q(agent__property_groups__count=0)
++    ).distinct()
++    print(f"SUCCESS: Query returned {qs1.count()} items as expected")
++except Exception as e:
++    print(f"FAILED: {e}")
++
++# Test case 2: Using queryset directly (should now work with our fix)
++print("\n----- Test Case 2: Using queryset with __in -----")
++try:
++    qs2 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++        Q(agent__property_groups__in=property_groups)
++        | Q(agent__property_groups__count=0)
++    ).distinct()
++    print(f"SUCCESS: Query returned {qs2.count()} items as expected")
++    if qs2.count() == 2:
++        print("Both queries return the expected number of results!")
++except Exception as e:
++    print(f"FAILED: {e}")
+\ No newline at end of file
+diff --git a/verify_fix_complete.py b/verify_fix_complete.py
+new file mode 100644
+index 0000000000..02364e0cb6
+--- /dev/null
++++ b/verify_fix_complete.py
+@@ -0,0 +1,179 @@
++"""
++Comprehensive test for fixed Q object OR condition with __in lookups
++"""
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++)
++
++import django
++django.setup()
++
++from django.db import models, connection
++from django.db.models import Q, Count, F
++import re
++
++# Create test models
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.CharField(max_length=255, null=True)
++
++    class Meta:
++        app_label = 'verify_fix'
++        managed = False
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup)
++
++    class Meta:
++        app_label = 'verify_fix'
++        managed = False
++
++class TestItem(models.Model):
++    name = models.CharField(max_length=100)
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = 'verify_fix'
++        managed = False
++
++# Set up database and create test data
++with connection.cursor() as cursor:
++    cursor.execute("DROP TABLE IF EXISTS verify_fix_managementagent_property_groups")
++    cursor.execute("DROP TABLE IF EXISTS verify_fix_testitem")
++    cursor.execute("DROP TABLE IF EXISTS verify_fix_propertygroup")
++    cursor.execute("DROP TABLE IF EXISTS verify_fix_managementagent")
++
++    # Create tables
++    cursor.execute("""
++        CREATE TABLE verify_fix_propertygroup (
++            id INTEGER PRIMARY KEY,
++            name VARCHAR(100) NOT NULL,
++            description VARCHAR(255) NULL
++        )
++    """)
++
++    cursor.execute("""
++        CREATE TABLE verify_fix_managementagent (
++            id INTEGER PRIMARY KEY,
++            name VARCHAR(100) NOT NULL
++        )
++    """)
++
++    cursor.execute("""
++        CREATE TABLE verify_fix_managementagent_property_groups (
++            id INTEGER PRIMARY KEY,
++            managementagent_id INTEGER REFERENCES verify_fix_managementagent(id),
++            propertygroup_id INTEGER REFERENCES verify_fix_propertygroup(id)
++        )
++    """)
++
++    cursor.execute("""
++        CREATE TABLE verify_fix_testitem (
++            id INTEGER PRIMARY KEY,
++            name VARCHAR(100) NOT NULL,
++            agent_id INTEGER REFERENCES verify_fix_managementagent(id)
++        )
++    """)
++
++    # Insert test data
++    cursor.execute("INSERT INTO verify_fix_propertygroup VALUES (1, 'Group 1', 'Description 1')")
++    cursor.execute("INSERT INTO verify_fix_propertygroup VALUES (2, 'Group 2', 'Description 2')")
++    cursor.execute("INSERT INTO verify_fix_propertygroup VALUES (3, 'Group 3', 'Description 3')")
++
++    cursor.execute("INSERT INTO verify_fix_managementagent VALUES (1, 'Agent 1')")
++    cursor.execute("INSERT INTO verify_fix_managementagent VALUES (2, 'Agent 2')")
++    cursor.execute("INSERT INTO verify_fix_managementagent VALUES (3, 'Agent 3')")
++
++    cursor.execute("INSERT INTO verify_fix_managementagent_property_groups VALUES (1, 1, 1)")
++    cursor.execute("INSERT INTO verify_fix_managementagent_property_groups VALUES (2, 1, 2)")
++
++    cursor.execute("INSERT INTO verify_fix_testitem VALUES (1, 'Item 1', 1)")
++    cursor.execute("INSERT INTO verify_fix_testitem VALUES (2, 'Item 2', 2)")
++    cursor.execute("INSERT INTO verify_fix_testitem VALUES (3, 'Item 3', 3)")
++
++# Function to capture and analyze SQL queries
++def analyze_query(qs, description):
++    from django.db import reset_queries, connection
++    from django.conf import settings
++
++    # Enable query logging
++    settings.DEBUG = True
++    reset_queries()
++
++    print(f"\n----- {description} -----")
++    try:
++        # Execute the query
++        result = list(qs)
++        print(f"SUCCESS: Query returned {len(result)} items")
++        for item in result:
++            print(f" - {item.name}")
++
++        # Analyze the SQL
++        queries = connection.queries
++        if queries:
++            sql = queries[-1]['sql']
++
++            # Check for important elements in the SQL
++            subquery_count = sql.count('(SELECT')
++            multi_column_subquery = False
++
++            # Look for subqueries returning multiple columns
++            subquery_pattern = r'\(SELECT (.*?) FROM'
++            for match in re.finditer(subquery_pattern, sql):
++                if ',' in match.group(1):
++                    multi_column_subquery = True
++                    break
++
++            print(f"\nSQL Analysis:")
++            print(f" - Number of subqueries: {subquery_count}")
++            print(f" - Has multi-column subqueries: {'YES (PROBLEM!)' if multi_column_subquery else 'No (Good)'}")
++
++            if multi_column_subquery:
++                print("\nWARNING: Found multi-column subquery, which could cause errors")
++
++    except Exception as e:
++        print(f"ERROR: {e}")
++    finally:
++        settings.DEBUG = False
++
++# Test various query combinations
++
++# Baseline: Using id__in with values_list
++qs1 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++    Q(agent__property_groups__id__in=PropertyGroup.objects.filter(pk__in=[1, 2]).values_list("id", flat=True))
++    | Q(agent__property_groups__count=0)
++).distinct()
++analyze_query(qs1, "Using id__in with values_list")
++
++# Problem case: Using __in with queryset (fixed with our changes)
++qs2 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++    Q(agent__property_groups__in=PropertyGroup.objects.filter(pk__in=[1, 2]))
++    | Q(agent__property_groups__count=0)
++).distinct()
++analyze_query(qs2, "Using __in with queryset directly")
++
++# Complex case: Multiple OR conditions with different lookups
++qs3 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++    Q(agent__property_groups__in=PropertyGroup.objects.filter(pk=1)) |
++    Q(agent__property_groups__in=PropertyGroup.objects.filter(pk=2)) |
++    Q(agent__property_groups__count=0)
++).distinct()
++analyze_query(qs3, "Multiple OR conditions with __in lookups")
++
++# Mixed case: Combine with F expressions
++qs4 = TestItem.objects.annotate(Count("agent__property_groups")).filter(
++    Q(agent__property_groups__in=PropertyGroup.objects.filter(pk__in=[1, 2])) |
++    Q(agent__property_groups__count=0) |
++    Q(name=F('agent__name'))
++).distinct()
++analyze_query(qs4, "OR conditions with F expressions")
++
++print("\nAll tests completed successfully!")
+\ No newline at end of file

@@ -1,0 +1,119 @@
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 823cbe02..b9c3ed13 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1892,6 +1892,8 @@ def polyval(
+     xarray.DataArray.polyfit
+     numpy.polynomial.polynomial.polyval
+     """
++    from .dataarray import DataArray
++    from .missing import get_clean_interp_index
+ 
+     if degree_dim not in coeffs._indexes:
+         raise ValueError(
+@@ -1901,39 +1903,81 @@ def polyval(
+         raise ValueError(
+             f"Dimension `{degree_dim}` should be of integer dtype. Received {coeffs[degree_dim].dtype} instead."
+         )
++
++    # Check for timedelta coordinates
++    has_timedelta = False
++    if isinstance(coord, DataArray) and coord.name:
++        # Check data dtype for timedelta
++        if hasattr(coord, 'dtype') and coord.dtype.kind == 'm':
++            has_timedelta = True
++        # Check coordinate dtypes for timedelta
++        elif hasattr(coord, 'coords'):
++            for name, c in coord.coords.items():
++                if hasattr(c, 'dtype') and c.dtype.kind == 'm':
++                    has_timedelta = True
++                    break
++    
++        # Special handling for timedeltas to maintain backward compatibility with 2022.3.0
++        if has_timedelta:
++            coord_name = coord.name
++            # Get numerical coordinates using the same approach as pre-Horner method
++            x = get_clean_interp_index(coord, coord_name, strict=False)
++            
++            # Get degree information
++            deg_coord = coeffs[degree_dim]
++            max_deg = deg_coord.max().item()
++            
++            # Create Vandermonde matrix for polynomial evaluation
++            lhs = DataArray(
++                np.vander(x, int(max_deg) + 1),
++                dims=(coord_name, degree_dim),
++                coords={coord_name: coord, degree_dim: np.arange(max_deg + 1)[::-1]},
++            )
++            
++            # Evaluate polynomial by multiplying and summing
++            # This matches the pre-Horner behavior in xarray 2022.3.0
++            return (lhs * coeffs).sum(degree_dim)
++    
++    # For all non-timedelta cases, use Horner's method
++    # Convert any datetime values to numeric
++    coord = _ensure_numeric(coord)  # type: ignore
++    
++    # Setup for polynomial evaluation
+     max_deg = coeffs[degree_dim].max().item()
+     coeffs = coeffs.reindex(
+         {degree_dim: np.arange(max_deg + 1)}, fill_value=0, copy=False
+     )
+-    coord = _ensure_numeric(coord)  # type: ignore # https://github.com/python/mypy/issues/1533 ?
+-
+-    # using Horner's method
+-    # https://en.wikipedia.org/wiki/Horner%27s_method
++    
++    # Initialize with highest degree coefficient
+     res = coeffs.isel({degree_dim: max_deg}, drop=True) + zeros_like(coord)
++    
++    # Apply Horner's method
+     for deg in range(max_deg - 1, -1, -1):
+-        res *= coord
+-        res += coeffs.isel({degree_dim: deg}, drop=True)
+-
++        res = res * coord + coeffs.isel({degree_dim: deg}, drop=True)
++    
+     return res
+ 
+ 
+ def _ensure_numeric(data: T_Xarray) -> T_Xarray:
+-    """Converts all datetime64 variables to float64
++    """Converts all datetime64 and timedelta64 variables to float64
+ 
+     Parameters
+     ----------
+     data : DataArray or Dataset
+-        Variables with possible datetime dtypes.
++        Variables with possible datetime or timedelta dtypes.
+ 
+     Returns
+     -------
+     DataArray or Dataset
+-        Variables with datetime64 dtypes converted to float64.
++        Variables with datetime64 or timedelta64
++        dtypes converted to float64.
+     """
+     from .dataset import Dataset
+ 
+     def to_floatable(x: DataArray) -> DataArray:
+-        if x.dtype.kind in "mM":
++        if x.dtype.kind == "M":  # datetime64
++            # For datetime, convert with offset
++            from .duck_array_ops import datetime_to_numeric
+             return x.copy(
+                 data=datetime_to_numeric(
+                     x.data,
+@@ -1941,6 +1985,12 @@ def _ensure_numeric(data: T_Xarray) -> T_Xarray:
+                     datetime_unit="ns",
+                 ),
+             )
++        elif x.dtype.kind == "m":  # timedelta64
++            # For timedeltas, convert to seconds (divide by 1e9)
++            # Important: this follows the same approach as in xarray 2022.3.0
++            # Using astype(float64) and dividing by 1e9 for nanoseconds to seconds
++            seconds_data = x.data.astype(np.float64) / 1e9
++            return x.copy(data=seconds_data)
+         return x
+ 
+     if isinstance(data, Dataset):

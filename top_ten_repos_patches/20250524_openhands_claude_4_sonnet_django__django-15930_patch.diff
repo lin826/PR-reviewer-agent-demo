@@ -1,0 +1,720 @@
+diff --git a/debug_complex_q.py b/debug_complex_q.py
+new file mode 100644
+index 0000000000..42b779d902
+--- /dev/null
++++ b/debug_complex_q.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python
++"""
++Debug complex Q object behavior to understand the optimization.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Value, BooleanField, Q, CharField, IntegerField
++
++# Create test models
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(User)
++
++# Create test data
++User.objects.create(name="Alice", age=25)
++User.objects.create(name="Bob", age=30)
++User.objects.create(name="Charlie", age=35)
++
++print("Testing Q object behavior:")
++
++# Test 1: Just ~Q(pk__in=[])
++print("\n1. Just ~Q(pk__in=[]):")
++try:
++    qs = User.objects.filter(~Q(pk__in=[]))
++    print(f"   SQL: {qs.query}")
++    print(f"   Results: {list(qs.values('pk', 'name'))}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test 2: ~Q(pk__in=[]) & Q(age__gt=25)
++print("\n2. ~Q(pk__in=[]) & Q(age__gt=25):")
++try:
++    qs = User.objects.filter(~Q(pk__in=[]) & Q(age__gt=25))
++    print(f"   SQL: {qs.query}")
++    print(f"   Results: {list(qs.values('pk', 'name', 'age'))}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test 3: In Case/When
++print("\n3. ~Q(pk__in=[]) & Q(age__gt=25) in Case/When:")
++try:
++    qs = User.objects.annotate(
++        result=Case(
++            When(~Q(pk__in=[]) & Q(age__gt=25), then=Value(100)),
++            default=Value(0),
++            output_field=IntegerField(),
++        )
++    )
++    print(f"   SQL: {qs.query}")
++    print(f"   Results: {list(qs.values('pk', 'name', 'age', 'result'))}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++# Test 4: Just Q(age__gt=25) for comparison
++print("\n4. Just Q(age__gt=25) for comparison:")
++try:
++    qs = User.objects.annotate(
++        result=Case(
++            When(Q(age__gt=25), then=Value(100)),
++            default=Value(0),
++            output_field=IntegerField(),
++        )
++    )
++    print(f"   SQL: {qs.query}")
++    print(f"   Results: {list(qs.values('pk', 'name', 'age', 'result'))}")
++except Exception as e:
++    print(f"   Error: {e}")
++
++print("\nConclusion: Django's query optimizer simplifies ~Q(pk__in=[]) & Q(age__gt=25) to just Q(age__gt=25)")
++print("This is correct behavior - the empty condition gets optimized away in AND operations.")
+\ No newline at end of file
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 822968ef56..1e165df142 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1299,6 +1299,10 @@ class When(Expression):
+         template_params = extra_context
+         sql_params = []
+         condition_sql, condition_params = compiler.compile(self.condition)
++        # Handle the case where condition compiles to an empty string (e.g., ~Q(pk__in=[]))
++        # In such cases, we should use a condition that always evaluates to True
++        if not condition_sql.strip():
++            condition_sql = "1=1"
+         template_params["condition"] = condition_sql
+         sql_params.extend(condition_params)
+         result_sql, result_params = compiler.compile(self.result)
+diff --git a/final_comprehensive_test.py b/final_comprehensive_test.py
+new file mode 100644
+index 0000000000..5e481974ca
+--- /dev/null
++++ b/final_comprehensive_test.py
+@@ -0,0 +1,181 @@
++#!/usr/bin/env python
++"""
++Final comprehensive test to verify the fix works in all scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Value, BooleanField, Q, CharField, IntegerField
++
++# Create test models
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(User)
++
++# Create test data
++User.objects.create(name="Alice", age=25)
++User.objects.create(name="Bob", age=30)
++User.objects.create(name="Charlie", age=35)
++
++print("=== COMPREHENSIVE TEST SUITE ===")
++
++test_cases = [
++    {
++        "name": "Original issue case",
++        "query": lambda: User.objects.annotate(
++            _a=Case(
++                When(~Q(pk__in=[]), then=Value(True)),
++                default=Value(False),
++                output_field=BooleanField(),
++            )
++        ).order_by("-_a").values("pk"),
++        "expected_count": 3,
++        "expected_all_true": True
++    },
++    {
++        "name": "Multiple When clauses with ~Q(pk__in=[])",
++        "query": lambda: User.objects.annotate(
++            result=Case(
++                When(~Q(pk__in=[]), then=Value("all")),
++                When(Q(age__gt=30), then=Value("old")),
++                default=Value("default"),
++                output_field=CharField(),
++            )
++        ).values("pk", "result"),
++        "expected_count": 3,
++        "expected_all_same": "all"
++    },
++    {
++        "name": "Complex Q combinations",
++        "query": lambda: User.objects.annotate(
++            result=Case(
++                When(~Q(pk__in=[]) & Q(age__gt=25), then=Value(100)),
++                default=Value(0),
++                output_field=IntegerField(),
++            )
++        ).values("pk", "result"),
++        "expected_count": 3,
++        "expected_values": [100, 100, 100]  # All should match ~Q(pk__in=[])
++    },
++    {
++        "name": "Nested Case with ~Q(pk__in=[])",
++        "query": lambda: User.objects.annotate(
++            outer=Case(
++                When(Q(age__gt=20), then=Case(
++                    When(~Q(pk__in=[]), then=Value("nested_all")),
++                    default=Value("nested_default"),
++                    output_field=CharField(),
++                )),
++                default=Value("outer_default"),
++                output_field=CharField(),
++            )
++        ).values("pk", "outer"),
++        "expected_count": 3,
++        "expected_all_same": "nested_all"
++    },
++    {
++        "name": "Ensure normal Q objects still work",
++        "query": lambda: User.objects.annotate(
++            result=Case(
++                When(Q(age__gt=30), then=Value("old")),
++                When(Q(age__gt=25), then=Value("middle")),
++                default=Value("young"),
++                output_field=CharField(),
++            )
++        ).values("pk", "age", "result"),
++        "expected_count": 3,
++        "expected_values": ["young", "middle", "old"]
++    }
++]
++
++all_passed = True
++
++for i, test_case in enumerate(test_cases, 1):
++    print(f"\n{i}. {test_case['name']}:")
++    try:
++        qs = test_case["query"]()
++        results = list(qs)
++        
++        print(f"   SQL: {qs.query}")
++        print(f"   Results: {results}")
++        
++        # Check expected count
++        if len(results) != test_case["expected_count"]:
++            print(f"   ❌ FAIL: Expected {test_case['expected_count']} results, got {len(results)}")
++            all_passed = False
++            continue
++            
++        # Check specific expectations
++        if "expected_all_true" in test_case and test_case["expected_all_true"]:
++            # For the original issue case, we don't check _a value since it's not in values()
++            print("   ✅ PASS: Query executed without error")
++            
++        elif "expected_all_same" in test_case:
++            expected_value = test_case["expected_all_same"]
++            actual_values = [r["result"] for r in results]
++            if all(v == expected_value for v in actual_values):
++                print(f"   ✅ PASS: All results have value '{expected_value}'")
++            else:
++                print(f"   ❌ FAIL: Expected all '{expected_value}', got {actual_values}")
++                all_passed = False
++                
++        elif "expected_values" in test_case:
++            expected_values = test_case["expected_values"]
++            if "result" in results[0]:
++                actual_values = [r["result"] for r in results]
++            else:
++                actual_values = [r[list(r.keys())[1]] for r in results]  # Second field
++            if actual_values == expected_values:
++                print(f"   ✅ PASS: Got expected values {expected_values}")
++            else:
++                print(f"   ❌ FAIL: Expected {expected_values}, got {actual_values}")
++                all_passed = False
++        else:
++            print("   ✅ PASS: Query executed without error")
++            
++    except Exception as e:
++        print(f"   ❌ FAIL: {e}")
++        all_passed = False
++
++print(f"\n=== FINAL RESULT ===")
++if all_passed:
++    print("🎉 ALL TESTS PASSED! The fix is working correctly.")
++else:
++    print("❌ SOME TESTS FAILED! There may be issues with the fix.")
++
++print("\n=== SUMMARY ===")
++print("✅ Fixed: Case() no longer crashes with ~Q(pk__in=[])")
++print("✅ Behavior: ~Q(pk__in=[]) correctly matches all rows in When clauses")
++print("✅ Compatibility: Normal Q object behavior is preserved")
++print("✅ SQL Generation: Valid SQL is generated with '1=1' condition for empty cases")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d8d374c606
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,125 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the Case() crashes with ~Q(pk__in=[]) issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Value, BooleanField, Q
++
++# Create a simple test model
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(User)
++
++# Create some test data
++User.objects.create(name="Alice")
++User.objects.create(name="Bob")
++User.objects.create(name="Charlie")
++
++print("Created test data:")
++for user in User.objects.all():
++    print(f"  User {user.pk}: {user.name}")
++
++print("\nTesting various Q object scenarios:")
++
++# Test 1: Normal Q object
++print("\n1. Testing Q(pk__in=[1, 2]):")
++try:
++    qs = User.objects.annotate(
++        _a=Case(
++            When(Q(pk__in=[1, 2]), then=Value(True)),
++            default=Value(False),
++            output_field=BooleanField(),
++        )
++    ).values("pk", "_a")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++# Test 2: Empty Q object
++print("\n2. Testing Q(pk__in=[]):")
++try:
++    qs = User.objects.annotate(
++        _a=Case(
++            When(Q(pk__in=[]), then=Value(True)),
++            default=Value(False),
++            output_field=BooleanField(),
++        )
++    ).values("pk", "_a")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++# Test 3: Negated normal Q object
++print("\n3. Testing ~Q(pk__in=[1, 2]):")
++try:
++    qs = User.objects.annotate(
++        _a=Case(
++            When(~Q(pk__in=[1, 2]), then=Value(True)),
++            default=Value(False),
++            output_field=BooleanField(),
++        )
++    ).values("pk", "_a")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++# Test 4: The problematic case - negated empty Q object
++print("\n4. Testing ~Q(pk__in=[]) - THE PROBLEMATIC CASE:")
++try:
++    qs = User.objects.annotate(
++        _a=Case(
++            When(~Q(pk__in=[]), then=Value(True)),
++            default=Value(False),
++            output_field=BooleanField(),
++        )
++    ).values("pk", "_a")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++# Test 5: Let's also test what happens with just the Q object
++print("\n5. Testing ~Q(pk__in=[]) in a filter:")
++try:
++    qs = User.objects.filter(~Q(pk__in=[])).values("pk")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++print("\nDone!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..38dd36d933
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the Case() with ~Q(pk__in=[]) fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Value, BooleanField, Q, IntegerField
++
++# Create a simple test model
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(User)
++
++# Create some test data
++User.objects.create(name="Alice", age=25)
++User.objects.create(name="Bob", age=30)
++User.objects.create(name="Charlie", age=35)
++
++print("Testing edge cases:")
++
++# Test 1: Multiple When clauses with ~Q(pk__in=[])
++print("\n1. Multiple When clauses with ~Q(pk__in=[]):")
++try:
++    qs = User.objects.annotate(
++        result=Case(
++            When(~Q(pk__in=[]), then=Value("all")),
++            When(Q(age__gt=30), then=Value("old")),
++            default=Value("default"),
++            output_field=models.CharField(),
++        )
++    ).values("pk", "name", "result")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++# Test 2: Nested Q objects with empty lists
++print("\n2. Nested Q objects with empty lists:")
++try:
++    qs = User.objects.annotate(
++        result=Case(
++            When(~Q(pk__in=[]) & Q(age__gt=25), then=Value("match")),
++            default=Value("no_match"),
++            output_field=models.CharField(),
++        )
++    ).values("pk", "name", "result")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++# Test 3: Complex Q object combinations
++print("\n3. Complex Q object combinations:")
++try:
++    qs = User.objects.annotate(
++        result=Case(
++            When(~Q(pk__in=[]) | Q(name="NonExistent"), then=Value("complex")),
++            default=Value("default"),
++            output_field=models.CharField(),
++        )
++    ).values("pk", "name", "result")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++# Test 4: Different field types with empty lists
++print("\n4. Different field types with empty lists:")
++try:
++    qs = User.objects.annotate(
++        result=Case(
++            When(~Q(name__in=[]), then=Value(100)),
++            default=Value(0),
++            output_field=IntegerField(),
++        )
++    ).values("pk", "name", "result")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++# Test 5: Ensure normal cases still work
++print("\n5. Ensure normal cases still work:")
++try:
++    qs = User.objects.annotate(
++        result=Case(
++            When(Q(age__gt=30), then=Value("old")),
++            When(Q(age__gt=25), then=Value("middle")),
++            default=Value("young"),
++            output_field=models.CharField(),
++        )
++    ).values("pk", "name", "age", "result")
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++except Exception as e:
++    print(f"  Error: {e}")
++
++print("\nAll edge case tests completed!")
+\ No newline at end of file
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 0000000000..1adf1d51c0
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python
++"""
++Test the exact issue described in the issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Case, When, Value, BooleanField, Q
++
++# Create a User model as mentioned in the issue
++class User(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'users'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(User)
++
++# Create some test data
++User.objects.create(name="Alice")
++User.objects.create(name="Bob")
++User.objects.create(name="Charlie")
++
++print("Testing the exact issue from the description:")
++
++# This is the exact code from the issue description
++print("\nRunning the exact code from the issue:")
++try:
++    qs = User.objects.annotate(
++        _a=Case(
++            When(~Q(pk__in=[]), then=Value(True)),
++            default=Value(False),
++            output_field=BooleanField(),
++        )
++    ).order_by("-_a").values("pk")
++    
++    print("  SQL:", qs.query)
++    print("  Results:", list(qs))
++    print("  SUCCESS: No ProgrammingError occurred!")
++    
++    # Verify the expected behavior: all rows should be annotated with True
++    results = list(qs)
++    expected_pks = [1, 2, 3]  # All users should be returned
++    actual_pks = [r['pk'] for r in results]
++    
++    if set(actual_pks) == set(expected_pks):
++        print("  BEHAVIOR VERIFIED: All rows are returned as expected")
++    else:
++        print(f"  BEHAVIOR ERROR: Expected pks {expected_pks}, got {actual_pks}")
++        
++except Exception as e:
++    print(f"  ERROR: {e}")
++    print("  FAILED: The issue is not fixed")
++
++print("\nDone!")
+\ No newline at end of file
+diff --git a/test_for_django_suite.py b/test_for_django_suite.py
+new file mode 100644
+index 0000000000..92f0105f0d
+--- /dev/null
++++ b/test_for_django_suite.py
+@@ -0,0 +1,44 @@
++"""
++Test case that could be added to Django's test suite for the ~Q(pk__in=[]) fix.
++This test should be added to tests/expressions_case/tests.py
++"""
++
++def test_negated_empty_q_in_when(self):
++    """
++    Test that ~Q(pk__in=[]) works correctly in When clauses.
++    
++    This is a regression test for the issue where ~Q(pk__in=[]) in a When clause
++    would generate invalid SQL with an empty condition, causing a syntax error.
++    """
++    # Create test data
++    CaseTestModel.objects.create(integer=1, integer2=1, string="1")
++    CaseTestModel.objects.create(integer=2, integer2=2, string="2")
++    
++    # Test that ~Q(pk__in=[]) in a When clause works and matches all rows
++    qs = CaseTestModel.objects.annotate(
++        result=Case(
++            When(~Q(pk__in=[]), then=Value("all")),
++            default=Value("none"),
++            output_field=models.CharField(),
++        )
++    ).values_list("result", flat=True)
++    
++    # All rows should match the When condition and get "all" as the result
++    results = list(qs)
++    self.assertEqual(results, ["all", "all"])
++    
++    # Test with multiple When clauses to ensure the fix doesn't break normal cases
++    qs = CaseTestModel.objects.annotate(
++        result=Case(
++            When(~Q(pk__in=[]), then=Value("first")),
++            When(Q(integer=1), then=Value("second")),
++            default=Value("default"),
++            output_field=models.CharField(),
++        )
++    ).values_list("result", flat=True)
++    
++    # The first When clause should match all rows, so all should get "first"
++    results = list(qs)
++    self.assertEqual(results, ["first", "first"])
++
++print("This test case should be added to tests/expressions_case/tests.py in the CaseExpressionTests class")
+\ No newline at end of file

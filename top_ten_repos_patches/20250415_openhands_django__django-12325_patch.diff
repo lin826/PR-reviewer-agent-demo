@@ -1,0 +1,189 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 8ea6c05ef9..a00a79e1d3 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -200,11 +200,19 @@ class ModelBase(type):
+             # Skip concrete parent classes.
+             if base != new_class and not base._meta.abstract:
+                 continue
+-            # Locate OneToOneField instances.
++            # First pass: collect fields with explicit parent_link=True
+             for field in base._meta.local_fields:
+-                if isinstance(field, OneToOneField):
++                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+                     related = resolve_relation(new_class, field.remote_field.model)
+                     parent_links[make_model_tuple(related)] = field
++            
++            # Second pass: collect remaining OneToOneFields if parent_link wasn't already set
++            for field in base._meta.local_fields:
++                if isinstance(field, OneToOneField):
++                    related = resolve_relation(new_class, field.remote_field.model)
++                    related_tuple = make_model_tuple(related)
++                    if related_tuple not in parent_links:
++                        parent_links[related_tuple] = field
+ 
+         # Track fields inherited from base models.
+         inherited_attributes = set()
+diff --git a/test_app/__init__.py b/test_app/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/test_app/models.py b/test_app/models.py
+new file mode 100644
+index 0000000000..d25d438e11
+--- /dev/null
++++ b/test_app/models.py
+@@ -0,0 +1,7 @@
++
++from django.db import models
++
++# These are empty placeholder models to make Django happy
++# The actual test models are defined in the test functions
++class PlaceholderModel(models.Model):
++    pass
+diff --git a/test_mti_issue.py b/test_mti_issue.py
+new file mode 100644
+index 0000000000..2aa2140105
+--- /dev/null
++++ b/test_mti_issue.py
+@@ -0,0 +1,125 @@
++import os
++import sys
++import django
++from django.db import models
++from django.core.exceptions import ImproperlyConfigured
++
++# Setup Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a settings module for our test
++with open('test_settings.py', 'w') as f:
++    f.write('''
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = ['test_app']
++SECRET_KEY = 'test_key'
++''')
++
++# Create a test app
++os.makedirs('test_app', exist_ok=True)
++with open('test_app/__init__.py', 'w') as f:
++    f.write('')
++
++# Create the models.py file for our test app
++with open('test_app/models.py', 'w') as f:
++    f.write('''
++from django.db import models
++
++# These are empty placeholder models to make Django happy
++# The actual test models are defined in the test functions
++class PlaceholderModel(models.Model):
++    pass
++''')
++
++# This is based on the issue description but it's actually flipped from what the description said
++def test_case_1_passing():
++    """Test case that works according to our test (origin before parent_ptr)."""
++    print("\nTesting Case 1 (origin before parent_ptr)...")
++    
++    # Define the models with 'origin' field before 'document_ptr'
++    class Document(models.Model):
++        class Meta:
++            app_label = 'test_app'
++    
++    try:
++        class Picking(Document):
++            # This ordering works: 'origin' comes before 'document_ptr'
++            origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
++            document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            
++            class Meta:
++                app_label = 'test_app'
++        
++        # If we get here, it means no exception was raised
++        print("✓ Case 1 PASSED: No exception was raised")
++    except ImproperlyConfigured as e:
++        print(f"✗ Case 1 FAILED: Unexpected exception: {e}")
++        
++def test_case_2_failing():
++    """Test case that fails according to our test (parent_ptr before origin)."""
++    print("\nTesting Case 2 (parent_ptr before origin)...")
++    
++    # Define the models with 'document2_ptr' field before 'origin'
++    class Document2(models.Model):
++        class Meta:
++            app_label = 'test_app'
++    
++    try:
++        class Picking2(Document2):
++            # This ordering fails: 'document2_ptr' comes before 'origin'
++            document2_ptr = models.OneToOneField(Document2, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            origin = models.OneToOneField(Document2, related_name='picking', on_delete=models.PROTECT)
++            
++            class Meta:
++                app_label = 'test_app'
++        
++        # If we get here, it means no exception was raised 
++        print("✓ Case 2 PASSED: No exception was raised, but we expected one")
++    except ImproperlyConfigured as e:
++        print(f"✗ Case 2 FAILED: Exception raised: {e}")
++
++def test_case_exact_issue_description():
++    """Test the exact case from the issue description."""
++    print("\nTesting the exact case from issue description...")
++    
++    # Define the models exactly as in the issue description
++    class Document(models.Model):
++        class Meta:
++            app_label = 'test_app'
++    
++    try:
++        class Picking(Document):
++            document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
++            
++            class Meta:
++                app_label = 'test_app'
++        
++        print("✓ Issue description case 1 PASSED: No exception was raised")
++    except ImproperlyConfigured as e:
++        print(f"✗ Issue description case 1 FAILED: Unexpected exception: {e}")
++
++    # Test the opposite field ordering
++    try:
++        class Picking2(Document):
++            origin = models.OneToOneField(Document, related_name='picking2', on_delete=models.PROTECT)
++            document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
++            
++            class Meta:
++                app_label = 'test_app'
++        
++        print("✓ Issue description case 2 PASSED: No exception was raised")
++    except ImproperlyConfigured as e:
++        print(f"✗ Issue description case 2 FAILED: Unexpected exception: {e}")
++
++if __name__ == "__main__":
++    django.setup()
++    test_case_1_passing()
++    test_case_2_failing()
++    test_case_exact_issue_description()
++    print("\nTest completed. If our fix works, all tests should pass.")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..a0eb00c874
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,9 @@
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = ['test_app']
++SECRET_KEY = 'test_key'

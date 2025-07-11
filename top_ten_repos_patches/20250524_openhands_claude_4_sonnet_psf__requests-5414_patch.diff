@@ -1,0 +1,297 @@
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 00000000..cbe51b96
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Final comprehensive test to verify the fix addresses the issue completely.
++"""
++
++import requests
++from requests.exceptions import InvalidURL
++
++def test_issue_reproduction():
++    """Test the exact case mentioned in the issue."""
++    print("=== Testing Issue Reproduction ===")
++    
++    try:
++        requests.get("http://.example.com")
++        print("ERROR: Should have raised InvalidURL")
++        return False
++    except InvalidURL as e:
++        print(f"SUCCESS: Got expected InvalidURL: {e}")
++        if "URL has an invalid label." in str(e):
++            print("SUCCESS: Error message matches expected format")
++            return True
++        else:
++            print(f"WARNING: Error message doesn't match expected format: {e}")
++            return False
++    except Exception as e:
++        print(f"ERROR: Got unexpected exception: {type(e).__name__} - {e}")
++        return False
++
++def test_comprehensive_invalid_cases():
++    """Test various invalid URL cases."""
++    print("\n=== Testing Comprehensive Invalid Cases ===")
++    
++    invalid_cases = [
++        "http://.example.com",      # Leading dot (issue case)
++        "http://example..com",      # Double dot
++        "http://ex..ample.com",     # Double dot in middle
++        "http://.ñexample.com",     # Non-ASCII with leading dot
++        "http://ñexample..com",     # Non-ASCII with double dot
++        "http://" + "a" * 64 + ".com",  # Too long label
++        "http://*example.com",      # Wildcard (existing case)
++    ]
++    
++    all_passed = True
++    for url in invalid_cases:
++        try:
++            requests.get(url)
++            print(f"ERROR: {url} should have raised InvalidURL")
++            all_passed = False
++        except InvalidURL as e:
++            print(f"SUCCESS: {url} -> InvalidURL: {e}")
++        except Exception as e:
++            print(f"ERROR: {url} -> {type(e).__name__}: {e}")
++            all_passed = False
++    
++    return all_passed
++
++def test_valid_cases_still_work():
++    """Test that valid URLs still work."""
++    print("\n=== Testing Valid Cases Still Work ===")
++    
++    valid_cases = [
++        "http://example.com",
++        "https://www.example.com", 
++        "http://sub.example.com",
++        "http://ñexample.com",
++        "http://例え.テスト",
++        "http://example.com.",      # Trailing dot is valid
++        "http://a.com",
++        "http://1.2.3.4",
++        "http://" + "a" * 63 + ".com",  # Max valid length
++    ]
++    
++    all_passed = True
++    for url in valid_cases:
++        try:
++            from requests.models import PreparedRequest
++            req = PreparedRequest()
++            req.prepare_url(url, None)
++            print(f"SUCCESS: {url} -> {req.url}")
++        except Exception as e:
++            print(f"ERROR: {url} should be valid but got {type(e).__name__}: {e}")
++            all_passed = False
++    
++    return all_passed
++
++def main():
++    """Run all tests."""
++    print("Running comprehensive tests for the InvalidURL fix...\n")
++    
++    test1 = test_issue_reproduction()
++    test2 = test_comprehensive_invalid_cases()
++    test3 = test_valid_cases_still_work()
++    
++    print(f"\n=== FINAL RESULTS ===")
++    print(f"Issue reproduction test: {'PASS' if test1 else 'FAIL'}")
++    print(f"Invalid cases test: {'PASS' if test2 else 'FAIL'}")
++    print(f"Valid cases test: {'PASS' if test3 else 'FAIL'}")
++    
++    if test1 and test2 and test3:
++        print("\n🎉 ALL TESTS PASSED! The fix successfully addresses the issue.")
++        return True
++    else:
++        print("\n❌ SOME TESTS FAILED! The fix needs more work.")
++        return False
++
++if __name__ == "__main__":
++    success = main()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..67b6cd46
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the UnicodeError issue with invalid URLs.
++"""
++
++import requests
++from requests.exceptions import InvalidURL
++
++def test_invalid_url_cases():
++    """Test various invalid URL cases that should raise InvalidURL."""
++    
++    test_cases = [
++        # ASCII cases with invalid labels
++        "http://.example.com",
++        "http://example..com", 
++        "http://ex..ample.com",
++        
++        # Non-ASCII cases with invalid labels  
++        "http://.ñexample.com",
++        "http://ñexample..com",
++        
++        # Very long labels
++        "http://" + "a" * 64 + ".example.com",
++        "http://.ñ" + "a" * 60 + ".com",
++    ]
++    
++    for url in test_cases:
++        print(f"\nTesting URL: {url}")
++        try:
++            response = requests.get(url)
++            print(f"  SUCCESS: Got response (unexpected)")
++        except InvalidURL as e:
++            print(f"  EXPECTED: InvalidURL - {e}")
++        except UnicodeError as e:
++            print(f"  ISSUE: UnicodeError - {e}")
++        except Exception as e:
++            print(f"  OTHER: {type(e).__name__} - {e}")
++
++if __name__ == "__main__":
++    test_invalid_url_cases()
+\ No newline at end of file
+diff --git a/requests/models.py b/requests/models.py
+index e7d292d5..e54e5e27 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -357,6 +357,27 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+             raise UnicodeError
+         return host
+ 
++    @staticmethod
++    def _validate_ascii_host(host):
++        """Validate ASCII hostname for invalid label patterns.
++        
++        Raises UnicodeError if the hostname has invalid labels.
++        """
++        # Split hostname into labels
++        labels = host.split('.')
++        
++        # Handle trailing dot case (valid in DNS)
++        if host.endswith('.') and labels[-1] == '':
++            labels = labels[:-1]
++        
++        for label in labels:
++            # Check for empty labels (caused by leading '.', '..', etc.)
++            if not label:
++                raise UnicodeError
++            # Check for labels that are too long (DNS limit is 63 characters)
++            if len(label) > 63:
++                raise UnicodeError
++
+     def prepare_url(self, url, params):
+         """Prepares the given HTTP URL."""
+         #: Accept objects that have string representations.
+@@ -397,14 +418,20 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+         # In general, we want to try IDNA encoding the hostname if the string contains
+         # non-ASCII characters. This allows users to automatically get the correct IDNA
+         # behaviour. For strings containing only ASCII characters, we need to also verify
+-        # it doesn't start with a wildcard (*), before allowing the unencoded hostname.
++        # it doesn't start with a wildcard (*) and doesn't have other invalid label patterns.
+         if not unicode_is_ascii(host):
+             try:
+                 host = self._get_idna_encoded_host(host)
+             except UnicodeError:
+                 raise InvalidURL('URL has an invalid label.')
+-        elif host.startswith(u'*'):
+-            raise InvalidURL('URL has an invalid label.')
++        else:
++            # For ASCII hostnames, validate label patterns
++            if host.startswith(u'*'):
++                raise InvalidURL('URL has an invalid label.')
++            try:
++                self._validate_ascii_host(host)
++            except UnicodeError:
++                raise InvalidURL('URL has an invalid label.')
+ 
+         # Carefully reconstruct the network location
+         netloc = auth or ''
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..228f6c6f
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""
++Test edge cases to ensure our fix doesn't break valid URLs.
++"""
++
++import requests
++from requests.exceptions import InvalidURL
++
++def test_valid_urls():
++    """Test that valid URLs still work."""
++    
++    valid_cases = [
++        # Normal cases
++        "http://example.com",
++        "https://www.example.com",
++        "http://sub.example.com",
++        
++        # International domains
++        "http://ñexample.com",
++        "http://例え.テスト",
++        
++        # Edge cases that should be valid
++        "http://example.com.",  # Trailing dot is valid
++        "http://a.com",         # Single character label
++        "http://1.2.3.4",       # IP addresses
++        
++        # Long but valid labels (63 chars is the limit)
++        "http://" + "a" * 63 + ".com",
++    ]
++    
++    for url in valid_cases:
++        print(f"Testing valid URL: {url}")
++        try:
++            # We don't actually make the request, just prepare it
++            from requests.models import PreparedRequest
++            req = PreparedRequest()
++            req.prepare_url(url, None)
++            print(f"  SUCCESS: URL prepared as {req.url}")
++        except Exception as e:
++            print(f"  ERROR: {type(e).__name__} - {e}")
++
++def test_invalid_urls():
++    """Test that invalid URLs are properly rejected."""
++    
++    invalid_cases = [
++        # Cases that should raise InvalidURL
++        "http://.example.com",
++        "http://example..com", 
++        "http://ex..ample.com",
++        "http://.ñexample.com",
++        "http://ñexample..com",
++        "http://" + "a" * 64 + ".com",  # Too long label
++        "http://*example.com",          # Wildcard
++    ]
++    
++    for url in invalid_cases:
++        print(f"Testing invalid URL: {url}")
++        try:
++            from requests.models import PreparedRequest
++            req = PreparedRequest()
++            req.prepare_url(url, None)
++            print(f"  ERROR: Should have failed but got {req.url}")
++        except InvalidURL as e:
++            print(f"  SUCCESS: Got expected InvalidURL - {e}")
++        except Exception as e:
++            print(f"  ERROR: Got unexpected exception: {type(e).__name__} - {e}")
++
++if __name__ == "__main__":
++    print("=== Testing Valid URLs ===")
++    test_valid_urls()
++    print("\n=== Testing Invalid URLs ===")
++    test_invalid_urls()
+\ No newline at end of file

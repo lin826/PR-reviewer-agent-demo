@@ -1,0 +1,114 @@
+diff --git a/sphinx/domains/cpp.py b/sphinx/domains/cpp.py
+index fe52d881d..9c7b183df 100644
+--- a/sphinx/domains/cpp.py
++++ b/sphinx/domains/cpp.py
+@@ -35,7 +35,7 @@ from sphinx.util.cfamily import (
+     BaseParser, DefinitionError, UnsupportedMultiCharacterCharLiteral,
+     identifier_re, anon_identifier_re, integer_literal_re, octal_literal_re,
+     hex_literal_re, binary_literal_re, float_literal_re,
+-    char_literal_re
++    char_literal_re, udl_suffix_re
+ )
+ from sphinx.util.docfields import Field, GroupedField
+ from sphinx.util.docutils import SphinxDirective
+@@ -882,6 +882,24 @@ class ASTCharLiteral(ASTLiteral):
+         signode.append(nodes.Text(txt, txt))
+
+
++class ASTUserDefinedLiteral(ASTLiteral):
++    def __init__(self, literal: ASTLiteral, suffix: str) -> None:
++        self.literal = literal
++        self.suffix = suffix
++
++    def _stringify(self, transform: StringifyTransform) -> str:
++        return transform(self.literal) + self.suffix
++
++    def get_id(self, version: int) -> str:
++        # Append suffix to the literal's id
++        return self.literal.get_id(version) + self.suffix
++
++    def describe_signature(self, signode: TextElement, mode: str,
++                           env: "BuildEnvironment", symbol: "Symbol") -> None:
++        self.literal.describe_signature(signode, mode, env, symbol)
++        signode.append(nodes.Text(self.suffix))
++
++
+ class ASTThisLiteral(ASTExpression):
+     def _stringify(self, transform: StringifyTransform) -> str:
+         return "this"
+@@ -4658,16 +4676,32 @@ class DefinitionParser(BaseParser):
+             return ASTBooleanLiteral(True)
+         if self.skip_word('false'):
+             return ASTBooleanLiteral(False)
++
++        # Check for number literals first
+         for regex in [float_literal_re, binary_literal_re, hex_literal_re,
+                       integer_literal_re, octal_literal_re]:
+             pos = self.pos
+             if self.match(regex):
++                start_pos = pos
++                # Standard number suffixes
+                 while self.current_char in 'uUlLfF':
+                     self.pos += 1
+-                return ASTNumberLiteral(self.definition[pos:self.pos])
+-
++
++                # Check for user-defined literal suffix
++                udl_pos = self.pos
++                udl_match = self.match(udl_suffix_re)
++                if udl_match:
++                    # Create a number literal without the UDL suffix
++                    number = ASTNumberLiteral(self.definition[start_pos:udl_pos])
++                    # Create a user-defined literal with the number and suffix
++                    return ASTUserDefinedLiteral(number, self.definition[udl_pos:self.pos])
++
++                return ASTNumberLiteral(self.definition[start_pos:self.pos])
++
++        # Check for string literals
+         string = self._parse_string()
+         if string is not None:
++            # TODO: Handle UDL suffixes for strings if needed
+             return ASTStringLiteral(string)
+
+         # character-literal
+@@ -4675,14 +4709,20 @@ class DefinitionParser(BaseParser):
+             prefix = self.last_match.group(1)  # may be None when no prefix
+             data = self.last_match.group(2)
+             try:
+-                return ASTCharLiteral(prefix, data)
++                char_lit = ASTCharLiteral(prefix, data)
++
++                # Check for user-defined literal suffix
++                udl_pos = self.pos
++                udl_match = self.match(udl_suffix_re)
++                if udl_match:
++                    return ASTUserDefinedLiteral(char_lit, self.definition[udl_pos:self.pos])
++
++                return char_lit
+             except UnicodeDecodeError as e:
+                 self.fail("Can not handle character literal. Internal error was: %s" % e)
+             except UnsupportedMultiCharacterCharLiteral:
+                 self.fail("Can not handle character literal"
+                           " resulting in multiple decoded characters.")
+-
+-        # TODO: user-defined lit
+         return None
+
+     def _parse_fold_or_paren_expression(self) -> ASTExpression:
+diff --git a/sphinx/util/cfamily.py b/sphinx/util/cfamily.py
+index 790a492a5..e5b657898 100644
+--- a/sphinx/util/cfamily.py
++++ b/sphinx/util/cfamily.py
+@@ -67,6 +67,12 @@ char_literal_re = re.compile(r'''(?x)
+     )'
+ ''')
+
++# User-defined literal suffix regex
++udl_suffix_re = re.compile(r'''(?x)
++    # Only allow alphanumeric characters and underscore
++    q?_[a-zA-Z0-9_]+
++''')
++
+
+ def verify_description_mode(mode: str) -> None:
+     if mode not in ('lastIsName', 'noneIsName', 'markType', 'markName', 'param'):

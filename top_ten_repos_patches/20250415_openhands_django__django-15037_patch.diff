@@ -1,0 +1,303 @@
+diff --git a/django/core/management/commands/inspectdb.py b/django/core/management/commands/inspectdb.py
+index f9b4bfb477..8c762b8bbf 100644
+--- a/django/core/management/commands/inspectdb.py
++++ b/django/core/management/commands/inspectdb.py
+@@ -124,10 +124,21 @@ class Command(BaseCommand):
+                             "self" if relations[column_name][1] == table_name
+                             else table2model(relations[column_name][1])
+                         )
++                        # Get the field reference
++                        rel_field = relations[column_name][0]
++                        
+                         if rel_to in known_models:
+                             field_type = '%s(%s' % (rel_type, rel_to)
+                         else:
+                             field_type = "%s('%s'" % (rel_type, rel_to)
++                            
++                        # If there's a reference to a field other than primary key, add the to_field parameter
++                        try:
++                            referenced_pk = connection.introspection.get_primary_key_column(cursor, relations[column_name][1])
++                            if rel_field != referenced_pk:
++                                extra_params['to_field'] = rel_field
++                        except NotImplementedError:
++                            pass
+                     else:
+                         # Calling `get_field_type` to get the field type string and any
+                         # additional parameters and notes.
+diff --git a/test_fk_fix.py b/test_fk_fix.py
+new file mode 100644
+index 0000000000..428deb4d08
+--- /dev/null
++++ b/test_fk_fix.py
+@@ -0,0 +1,61 @@
++import os
++import django
++from io import StringIO
++from django.conf import settings
++from django.core.management import call_command
++from django.db import connection
++import sqlite3
++
++# Set up a clean SQLite database file
++db_path = '/tmp/test_fk_to_field.db'
++if os.path.exists(db_path):
++    os.remove(db_path)
++
++# Configure Django
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': db_path,
++        },
++    },
++    INSTALLED_APPS=[],
++    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++)
++
++django.setup()
++
++# Create the test tables directly using SQLite
++conn = sqlite3.connect(db_path)
++cursor = conn.cursor()
++
++cursor.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY AUTOINCREMENT, other_id INTEGER UNIQUE);")
++cursor.execute("""
++    CREATE TABLE bar (
++        id INTEGER PRIMARY KEY AUTOINCREMENT, 
++        other_id INTEGER,
++        FOREIGN KEY(other_id) REFERENCES foo(other_id)
++    );
++""")
++conn.commit()
++conn.close()
++
++# Run inspectdb and capture the output
++out = StringIO()
++call_command('inspectdb', 'bar', stdout=out)
++output = out.getvalue()
++
++print("Inspectdb output for 'bar' table:")
++print(output)
++
++# Check if the output contains the correct foreign key reference with to_field
++if "to_field='other_id'" in output:
++    print("\nSUCCESS: Foreign key correctly references foo.other_id with to_field parameter")
++else:
++    print("\nFAILURE: Foreign key incorrectly references without to_field='other_id'")
++    for line in output.splitlines():
++        if 'other_id' in line:
++            print(f"Line found: {line.strip()}")
++
++# Clean up
++os.remove(db_path)
+\ No newline at end of file
+diff --git a/test_fk_fix_edge_cases.py b/test_fk_fix_edge_cases.py
+new file mode 100644
+index 0000000000..67a963c19d
+--- /dev/null
++++ b/test_fk_fix_edge_cases.py
+@@ -0,0 +1,97 @@
++import os
++import django
++from io import StringIO
++from django.conf import settings
++from django.core.management import call_command
++from django.db import connection
++import sqlite3
++
++# Set up a clean SQLite database file
++db_path = '/tmp/test_fk_edge_cases.db'
++if os.path.exists(db_path):
++    os.remove(db_path)
++
++# Configure Django
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': db_path,
++        },
++    },
++    INSTALLED_APPS=[],
++    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++)
++
++django.setup()
++
++# Create the test tables directly using SQLite
++conn = sqlite3.connect(db_path)
++cursor = conn.cursor()
++
++# Test case 1: Regular FK to PK
++cursor.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY AUTOINCREMENT);")
++cursor.execute("""
++    CREATE TABLE child_to_pk (
++        id INTEGER PRIMARY KEY AUTOINCREMENT, 
++        parent_id INTEGER,
++        FOREIGN KEY(parent_id) REFERENCES parent(id)
++    );
++""")
++
++# Test case 2: FK to non-PK field
++cursor.execute("CREATE TABLE parent_with_unique (id INTEGER PRIMARY KEY AUTOINCREMENT, code VARCHAR(10) UNIQUE);")
++cursor.execute("""
++    CREATE TABLE child_to_field (
++        id INTEGER PRIMARY KEY AUTOINCREMENT, 
++        parent_code VARCHAR(10),
++        FOREIGN KEY(parent_code) REFERENCES parent_with_unique(code)
++    );
++""")
++
++# Test case 3: Self-referential FK
++cursor.execute("""
++    CREATE TABLE tree_node (
++        id INTEGER PRIMARY KEY AUTOINCREMENT, 
++        parent_id INTEGER,
++        code VARCHAR(10) UNIQUE,
++        child_code VARCHAR(10),
++        FOREIGN KEY(parent_id) REFERENCES tree_node(id),
++        FOREIGN KEY(child_code) REFERENCES tree_node(code)
++    );
++""")
++
++conn.commit()
++conn.close()
++
++# Run inspectdb and capture the output for each table
++results = {}
++
++for table in ['child_to_pk', 'child_to_field', 'tree_node']:
++    out = StringIO()
++    call_command('inspectdb', table, stdout=out)
++    results[table] = out.getvalue()
++
++print("Test Case 1: Regular FK to PK")
++print(results['child_to_pk'])
++if "to_field=" not in results['child_to_pk']:
++    print("OK: Regular FK to PK doesn't use to_field parameter\n")
++else:
++    print("ERROR: Regular FK to PK shouldn't use to_field parameter\n")
++
++print("Test Case 2: FK to non-PK field")
++print(results['child_to_field'])
++if "to_field='code'" in results['child_to_field']:
++    print("OK: FK to non-PK field uses to_field parameter correctly\n")
++else:
++    print("ERROR: FK to non-PK field should use to_field parameter\n")
++
++print("Test Case 3: Self-referential FK")
++print(results['tree_node'])
++if "parent = models.ForeignKey('self', models.DO_NOTHING" in results['tree_node'] and "to_field=" not in results['tree_node']:
++    print("OK: Self-referential FK to PK handled correctly")
++if "child_code = models.ForeignKey('self', models.DO_NOTHING, db_column='child_code', to_field='code'" in results['tree_node']:
++    print("OK: Self-referential FK to non-PK field handled correctly")
++
++# Clean up
++os.remove(db_path)
+\ No newline at end of file
+diff --git a/test_inspectdb_fk.py b/test_inspectdb_fk.py
+new file mode 100644
+index 0000000000..57b69c3381
+--- /dev/null
++++ b/test_inspectdb_fk.py
+@@ -0,0 +1,59 @@
++import os
++import sys
++import tempfile
++import django
++from io import StringIO
++from django.conf import settings
++from django.core.management import call_command
++from django.db import connection
++
++# Configure Django with SQLite
++temp_db = tempfile.NamedTemporaryFile(suffix='.db')
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': temp_db.name,
++        },
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++)
++
++django.setup()
++
++# Create the test tables
++with connection.cursor() as cursor:
++    # Create the tables as described in the issue
++    cursor.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY AUTOINCREMENT, other_id INTEGER UNIQUE);")
++    cursor.execute("""
++        CREATE TABLE bar (
++            id INTEGER PRIMARY KEY AUTOINCREMENT, 
++            other_id INTEGER,
++            CONSTRAINT myconst FOREIGN KEY(other_id) REFERENCES foo(other_id)
++        );
++    """)
++
++# Run inspectdb and capture the output
++out = StringIO()
++call_command('inspectdb', 'bar', no_color=True, stdout=out)
++output = out.getvalue()
++
++print("Inspectdb output for 'bar' table:")
++print(output)
++
++# Check if the output contains the correct foreign key reference
++if 'other_id = models.ForeignKey(Foo, models.DO_NOTHING, db_column=\'other_id\', to_field=\'other_id\')' in output:
++    print("\nSUCCESS: Foreign key correctly references foo.other_id")
++else:
++    print("\nFAILURE: Foreign key incorrectly references foo.id instead of foo.other_id")
++    print("Here's the relevant line from the output:")
++    for line in output.splitlines():
++        if 'other_id' in line and 'ForeignKey' in line:
++            print(line.strip())
++
++# Clean up
++temp_db.close()
+\ No newline at end of file
+diff --git a/test_inspectdb_with_fix.py b/test_inspectdb_with_fix.py
+new file mode 100644
+index 0000000000..c7fb687c88
+--- /dev/null
++++ b/test_inspectdb_with_fix.py
+@@ -0,0 +1,32 @@
++import os
++import sys
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++import unittest
++
++# Configure Django
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        },
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++        'tests.inspectdb',
++    ],
++    ROOT_URLCONF='tests.urls',
++    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++)
++
++django.setup()
++
++# Import tests
++from tests.inspectdb.tests import InspectDBTestCase
++
++# Run the tests
++if __name__ == "__main__":
++    unittest.main(argv=['test_inspectdb_with_fix.py'])
+\ No newline at end of file

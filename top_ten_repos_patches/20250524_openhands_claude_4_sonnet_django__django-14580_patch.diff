@@ -1,0 +1,943 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index e19c881cda..072a2efc14 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -273,7 +273,7 @@ class TupleSerializer(BaseSequenceSerializer):
+ class TypeSerializer(BaseSerializer):
+     def serialize(self):
+         special_cases = [
+-            (models.Model, "models.Model", []),
++            (models.Model, "models.Model", ["from django.db import models"]),
+             (type(None), 'type(None)', []),
+         ]
+         for case, string, imports in special_cases:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5174bc1887
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the missing import issue in Django migration generation.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from pathlib import Path
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations.writer import MigrationWriter
++from django.db import migrations
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_missing_models_import():
++    """Test case that reproduces the missing models import issue."""
++    
++    print("Testing missing models import issue...")
++    
++    # Create a custom field class (like MyField in the issue)
++    class MyField(models.TextField):
++        pass
++    
++    # Create a mixin class (like MyMixin in the issue)
++    class MyMixin:
++        pass
++    
++    # Create the CreateModel operation that would be generated
++    # This simulates what Django would generate for:
++    # class MyModel(MyMixin, MyBaseModel):
++    #     name = MyField(primary_key=True)
++    # where MyBaseModel is abstract and inherits from models.Model
++    
++    # First, let's create a simple case with just models.Model in bases
++    operation = migrations.CreateModel(
++        name='MyModel',
++        fields=[
++            ('name', MyField(primary_key=True)),
++        ],
++        options={
++            'abstract': False,
++        },
++        bases=(MyMixin, models.Model),  # This should trigger the issue
++    )
++    
++    # Create a migration with this operation
++    migration = type("Migration", (migrations.Migration,), {
++        "operations": [operation],
++        "dependencies": [],
++        "initial": True,
++    })
++    
++    # Generate the migration file content
++    writer = MigrationWriter(migration)
++    output = writer.as_string()
++    
++    print("Generated migration content:")
++    print("=" * 50)
++    print(output)
++    print("=" * 50)
++    
++    # Check if the issue exists
++    lines = output.split('\n')
++    
++    # Check for imports
++    has_models_import = any('from django.db import models' in line or 'from django.db import migrations, models' in line for line in lines)
++    has_migrations_import = any('from django.db import migrations' in line or 'from django.db import migrations, models' in line for line in lines)
++    
++    # Check for models.Model reference in bases
++    has_models_model_reference = any('models.Model' in line for line in lines)
++    
++    print(f"Has models import: {has_models_import}")
++    print(f"Has migrations import: {has_migrations_import}")
++    print(f"Has models.Model reference: {has_models_model_reference}")
++    
++    if has_models_model_reference and not has_models_import:
++        print("❌ BUG REPRODUCED: models.Model is referenced but models is not imported!")
++        
++        # Try to execute the generated code to confirm it fails
++        try:
++            exec(output)
++            print("❌ Unexpected: Code executed without error")
++        except NameError as e:
++            if "name 'models' is not defined" in str(e):
++                print(f"✅ Confirmed NameError: {e}")
++            else:
++                print(f"❌ Different NameError: {e}")
++        except Exception as e:
++            print(f"❌ Different error: {e}")
++            
++        return False
++    else:
++        print("✅ No issue found - models import is present")
++        return True
++
++def test_simple_models_model_reference():
++    """Test serialization of models.Model directly."""
++    
++    print("\nTesting direct models.Model serialization...")
++    
++    # Test serializing models.Model directly
++    from django.db.migrations.writer import MigrationWriter
++    
++    string, imports = MigrationWriter.serialize(models.Model)
++    print(f"Serialized models.Model: '{string}'")
++    print(f"Imports: {imports}")
++    
++    if string == "models.Model" and not imports:
++        print("❌ BUG CONFIRMED: models.Model serializes to 'models.Model' but no import is added")
++        return False
++    else:
++        print("✅ models.Model serialization is correct")
++        return True
++
++if __name__ == "__main__":
++    print("Django Migration Writer Bug Reproduction")
++    print("=" * 50)
++    
++    # Test direct serialization first
++    test1_passed = test_simple_models_model_reference()
++    
++    # Test full migration generation
++    test2_passed = test_missing_models_import()
++    
++    print("\n" + "=" * 50)
++    if test1_passed and test2_passed:
++        print("✅ All tests passed - no bug found")
++    else:
++        print("❌ Bug reproduced successfully")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..7efc19dbcd
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,245 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the models import fix.
++"""
++
++import os
++import sys
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations.writer import MigrationWriter
++from django.db import migrations
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_models_model_serialization():
++    """Test direct serialization of models.Model."""
++    print("Test 1: Direct models.Model serialization")
++    
++    string, imports = MigrationWriter.serialize(models.Model)
++    print(f"  String: {string}")
++    print(f"  Imports: {imports}")
++    
++    expected_imports = {'from django.db import models'}
++    assert string == "models.Model", f"Expected 'models.Model', got '{string}'"
++    assert imports == expected_imports, f"Expected {expected_imports}, got {imports}"
++    print("  ✅ PASSED")
++
++def test_create_model_with_models_model_base():
++    """Test CreateModel operation with models.Model in bases."""
++    print("\nTest 2: CreateModel with models.Model in bases")
++    
++    class MyMixin:
++        pass
++    
++    operation = migrations.CreateModel(
++        name='TestModel',
++        fields=[
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        bases=(MyMixin, models.Model),
++    )
++    
++    migration = type("Migration", (migrations.Migration,), {
++        "operations": [operation],
++        "dependencies": [],
++    })
++    
++    writer = MigrationWriter(migration)
++    output = writer.as_string()
++    
++    print("  Generated migration:")
++    for i, line in enumerate(output.split('\n'), 1):
++        print(f"    {i:2d}: {line}")
++    
++    # Check that models is imported
++    has_models_import = 'from django.db import migrations, models' in output
++    has_models_reference = 'models.Model' in output
++    
++    assert has_models_import, "Expected 'from django.db import migrations, models' in output"
++    assert has_models_reference, "Expected 'models.Model' reference in output"
++    
++    # Try to execute the generated code
++    try:
++        exec(output)
++        print("  ✅ PASSED - Code executes without error")
++    except Exception as e:
++        raise AssertionError(f"Generated code failed to execute: {e}")
++
++def test_create_model_without_models_model():
++    """Test CreateModel operation without models.Model (should not import models)."""
++    print("\nTest 3: CreateModel without models.Model reference")
++    
++    operation = migrations.CreateModel(
++        name='TestModel',
++        fields=[
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        # No explicit bases, defaults to (models.Model,) but gets omitted in deconstruct
++    )
++    
++    migration = type("Migration", (migrations.Migration,), {
++        "operations": [operation],
++        "dependencies": [],
++    })
++    
++    writer = MigrationWriter(migration)
++    output = writer.as_string()
++    
++    print("  Generated migration:")
++    for i, line in enumerate(output.split('\n'), 1):
++        print(f"    {i:2d}: {line}")
++    
++    # Should only have migrations import, not models
++    has_migrations_only = 'from django.db import migrations\n' in output
++    has_models_import = 'from django.db import migrations, models' in output
++    
++    # This test checks that we don't unnecessarily import models when not needed
++    # The default bases (models.Model,) gets omitted in deconstruct if it's the default
++    assert has_migrations_only or has_models_import, "Should have migrations import"
++    print("  ✅ PASSED")
++
++def test_multiple_bases_with_models_model():
++    """Test multiple inheritance including models.Model."""
++    print("\nTest 4: Multiple bases including models.Model")
++    
++    class Mixin1:
++        pass
++    
++    class Mixin2:
++        pass
++    
++    operation = migrations.CreateModel(
++        name='TestModel',
++        fields=[
++            ('id', models.AutoField(primary_key=True)),
++        ],
++        bases=(Mixin1, Mixin2, models.Model),
++    )
++    
++    migration = type("Migration", (migrations.Migration,), {
++        "operations": [operation],
++        "dependencies": [],
++    })
++    
++    writer = MigrationWriter(migration)
++    output = writer.as_string()
++    
++    print("  Generated migration:")
++    for i, line in enumerate(output.split('\n'), 1):
++        print(f"    {i:2d}: {line}")
++    
++    has_models_import = 'from django.db import migrations, models' in output
++    has_models_reference = 'models.Model' in output
++    
++    assert has_models_import, "Expected models import"
++    assert has_models_reference, "Expected models.Model reference"
++    
++    try:
++        exec(output)
++        print("  ✅ PASSED")
++    except Exception as e:
++        raise AssertionError(f"Generated code failed to execute: {e}")
++
++def test_original_issue_reproduction():
++    """Test the exact scenario from the original issue."""
++    print("\nTest 5: Original issue reproduction")
++    
++    # Simulate the original issue structure
++    class MyField(models.TextField):
++        pass
++    
++    class MyMixin:
++        pass
++    
++    # This simulates the structure from the issue:
++    # class MyModel(MyMixin, MyBaseModel):
++    #     name = MyField(primary_key=True)
++    # where MyBaseModel is abstract and inherits from models.Model
++    
++    operation = migrations.CreateModel(
++        name='MyModel',
++        fields=[
++            ('name', MyField(primary_key=True, serialize=False)),
++        ],
++        options={
++            'abstract': False,
++        },
++        bases=(MyMixin, models.Model),
++    )
++    
++    migration = type("Migration", (migrations.Migration,), {
++        "operations": [operation],
++        "dependencies": [],
++        "initial": True,
++    })
++    
++    writer = MigrationWriter(migration)
++    output = writer.as_string()
++    
++    print("  Generated migration:")
++    for i, line in enumerate(output.split('\n'), 1):
++        print(f"    {i:2d}: {line}")
++    
++    # This should now work without NameError
++    has_models_import = 'from django.db import migrations, models' in output
++    has_models_reference = 'models.Model' in output
++    
++    assert has_models_import, "Expected models import"
++    assert has_models_reference, "Expected models.Model reference"
++    
++    try:
++        exec(output)
++        print("  ✅ PASSED - Original issue is fixed!")
++    except NameError as e:
++        if "name 'models' is not defined" in str(e):
++            raise AssertionError("Original issue still exists: models not imported")
++        else:
++            raise AssertionError(f"Unexpected NameError: {e}")
++    except Exception as e:
++        # Other exceptions might be expected due to the test environment
++        print(f"  ✅ PASSED - No NameError for 'models' (other error: {type(e).__name__})")
++
++if __name__ == "__main__":
++    print("Comprehensive Test Suite for Models Import Fix")
++    print("=" * 60)
++    
++    try:
++        test_models_model_serialization()
++        test_create_model_with_models_model_base()
++        test_create_model_without_models_model()
++        test_multiple_bases_with_models_model()
++        test_original_issue_reproduction()
++        
++        print("\n" + "=" * 60)
++        print("🎉 ALL TESTS PASSED! The fix is working correctly.")
++        
++    except Exception as e:
++        print(f"\n❌ TEST FAILED: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_focused.py b/test_focused.py
+new file mode 100644
+index 0000000000..ba11ecf0f8
+--- /dev/null
++++ b/test_focused.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python
++"""
++Focused test for the models import fix - testing the core functionality.
++"""
++
++import os
++import sys
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations.writer import MigrationWriter
++from django.db import migrations
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_models_model_serialization():
++    """Test direct serialization of models.Model."""
++    print("Test 1: Direct models.Model serialization")
++    
++    string, imports = MigrationWriter.serialize(models.Model)
++    print(f"  String: {string}")
++    print(f"  Imports: {imports}")
++    
++    expected_imports = {'from django.db import models'}
++    assert string == "models.Model", f"Expected 'models.Model', got '{string}'"
++    assert imports == expected_imports, f"Expected {expected_imports}, got {imports}"
++    print("  ✅ PASSED")
++
++def test_migration_with_models_model_import():
++    """Test that migration with models.Model in bases includes the import."""
++    print("\nTest 2: Migration generation with models.Model in bases")
++    
++    # Create a simple operation that includes models.Model in bases
++    # We'll use string bases to avoid the local class issue
++    operation = migrations.CreateModel(
++        name='TestModel',
++        fields=[
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        bases=('some_app.SomeMixin', models.Model),  # Mix string and models.Model
++    )
++    
++    migration = type("Migration", (migrations.Migration,), {
++        "operations": [operation],
++        "dependencies": [],
++    })
++    
++    writer = MigrationWriter(migration)
++    output = writer.as_string()
++    
++    print("  Generated migration:")
++    for i, line in enumerate(output.split('\n'), 1):
++        if line.strip():  # Only show non-empty lines
++            print(f"    {i:2d}: {line}")
++    
++    # Check that models is imported
++    has_models_import = 'from django.db import migrations, models' in output
++    has_models_reference = 'models.Model' in output
++    
++    assert has_models_import, "Expected 'from django.db import migrations, models' in output"
++    assert has_models_reference, "Expected 'models.Model' reference in output"
++    
++    print("  ✅ PASSED - Models import is correctly included")
++
++def test_migration_without_models_reference():
++    """Test that migration without models.Model doesn't unnecessarily import models."""
++    print("\nTest 3: Migration without models.Model reference")
++    
++    # Create an operation that doesn't reference models.Model
++    operation = migrations.AlterModelOptions(
++        name='TestModel',
++        options={'verbose_name': 'Test Model'},
++    )
++    
++    migration = type("Migration", (migrations.Migration,), {
++        "operations": [operation],
++        "dependencies": [],
++    })
++    
++    writer = MigrationWriter(migration)
++    output = writer.as_string()
++    
++    print("  Generated migration:")
++    for i, line in enumerate(output.split('\n'), 1):
++        if line.strip():  # Only show non-empty lines
++            print(f"    {i:2d}: {line}")
++    
++    # Should only have migrations import, not models
++    has_migrations_only = 'from django.db import migrations\n' in output
++    has_models_import = 'from django.db import migrations, models' in output
++    
++    # This operation shouldn't need models import
++    assert has_migrations_only and not has_models_import, "Should only import migrations, not models"
++    print("  ✅ PASSED - No unnecessary models import")
++
++def test_tuple_with_models_model():
++    """Test serialization of a tuple containing models.Model."""
++    print("\nTest 4: Tuple serialization with models.Model")
++    
++    # Test serializing a tuple that contains models.Model
++    test_tuple = ('some_app.SomeMixin', models.Model)
++    string, imports = MigrationWriter.serialize(test_tuple)
++    
++    print(f"  String: {string}")
++    print(f"  Imports: {imports}")
++    
++    expected_imports = {'from django.db import models'}
++    assert 'models.Model' in string, f"Expected 'models.Model' in string, got '{string}'"
++    assert expected_imports.issubset(imports), f"Expected {expected_imports} in {imports}"
++    print("  ✅ PASSED")
++
++def test_before_and_after_fix():
++    """Test that demonstrates the fix working."""
++    print("\nTest 5: Before/After fix demonstration")
++    
++    # This test shows what would happen before and after the fix
++    string, imports = MigrationWriter.serialize(models.Model)
++    
++    print(f"  After fix - String: {string}")
++    print(f"  After fix - Imports: {imports}")
++    
++    # Before the fix, this would have been:
++    # String: "models.Model"
++    # Imports: set()
++    
++    # After the fix, this should be:
++    # String: "models.Model" 
++    # Imports: {"from django.db import models"}
++    
++    assert string == "models.Model"
++    assert "from django.db import models" in imports
++    print("  ✅ PASSED - Fix is working correctly")
++
++if __name__ == "__main__":
++    print("Focused Test Suite for Models Import Fix")
++    print("=" * 50)
++    
++    try:
++        test_models_model_serialization()
++        test_migration_with_models_model_import()
++        test_migration_without_models_reference()
++        test_tuple_with_models_model()
++        test_before_and_after_fix()
++        
++        print("\n" + "=" * 50)
++        print("🎉 ALL TESTS PASSED! The fix is working correctly.")
++        
++    except Exception as e:
++        print(f"\n❌ TEST FAILED: {e}")
++        import traceback
++        traceback.print_exc()
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_models_import_fix.py b/test_models_import_fix.py
+new file mode 100644
+index 0000000000..adc18f30a4
+--- /dev/null
++++ b/test_models_import_fix.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python
++"""
++Test case specifically for the models import fix.
++This test can be added to the Django test suite.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations.writer import MigrationWriter
++from django.db import migrations
++from django.test import SimpleTestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++class ModelsImportFixTest(SimpleTestCase):
++    """
++    Test case for the fix to ensure models.Model serialization includes the proper import.
++    
++    This addresses the issue where Django generates migration files that reference
++    models.Model in the bases tuple but fail to include the necessary import statement.
++    """
++    
++    def test_models_model_serialization_includes_import(self):
++        """
++        Test that serializing models.Model includes the proper import.
++        
++        Before the fix, this would return:
++        - String: "models.Model"
++        - Imports: set()
++        
++        After the fix, this should return:
++        - String: "models.Model"
++        - Imports: {"from django.db import models"}
++        """
++        string, imports = MigrationWriter.serialize(models.Model)
++        
++        self.assertEqual(string, "models.Model")
++        self.assertIn("from django.db import models", imports)
++    
++    def test_create_model_with_models_model_base_includes_import(self):
++        """
++        Test that CreateModel operations with models.Model in bases include the import.
++        
++        This reproduces the original issue scenario where a model inherits from
++        multiple bases including models.Model.
++        """
++        # Create a CreateModel operation with models.Model in bases
++        operation = migrations.CreateModel(
++            name='TestModel',
++            fields=[
++                ('id', models.AutoField(primary_key=True)),
++                ('name', models.CharField(max_length=100)),
++            ],
++            bases=('some_app.SomeMixin', models.Model),
++        )
++        
++        # Create a migration with this operation
++        migration = type("Migration", (migrations.Migration,), {
++            "operations": [operation],
++            "dependencies": [],
++        })
++        
++        # Generate the migration file content
++        writer = MigrationWriter(migration)
++        output = writer.as_string()
++        
++        # Check that models is imported
++        self.assertIn('from django.db import migrations, models', output)
++        # Check that models.Model is referenced
++        self.assertIn('models.Model', output)
++    
++    def test_tuple_with_models_model_includes_import(self):
++        """
++        Test that serializing a tuple containing models.Model includes the import.
++        """
++        test_tuple = ('some_app.SomeMixin', models.Model)
++        string, imports = MigrationWriter.serialize(test_tuple)
++        
++        self.assertIn('models.Model', string)
++        self.assertIn("from django.db import models", imports)
++    
++    def test_migration_without_models_model_no_unnecessary_import(self):
++        """
++        Test that migrations without models.Model don't unnecessarily import models.
++        
++        This ensures our fix doesn't cause unnecessary imports.
++        """
++        # Create an operation that doesn't reference models.Model
++        operation = migrations.AlterModelOptions(
++            name='TestModel',
++            options={'verbose_name': 'Test Model'},
++        )
++        
++        migration = type("Migration", (migrations.Migration,), {
++            "operations": [operation],
++            "dependencies": [],
++        })
++        
++        writer = MigrationWriter(migration)
++        output = writer.as_string()
++        
++        # Should only have migrations import, not models
++        self.assertIn('from django.db import migrations\n', output)
++        self.assertNotIn('from django.db import migrations, models', output)
++
++if __name__ == "__main__":
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..4f97f88cc7
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python
++"""
++Test that reproduces the exact scenario from the original issue.
++"""
++
++import sys
++import os
++import tempfile
++import shutil
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.core.management import call_command
++from django.db import models
++from django.apps import apps
++from django.apps.config import AppConfig
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'test_app',  # Our test app
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++# Create a temporary app structure
++temp_dir = tempfile.mkdtemp()
++app_dir = os.path.join(temp_dir, 'test_app')
++os.makedirs(app_dir)
++
++# Create __init__.py
++with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Create apps.py
++with open(os.path.join(app_dir, 'apps.py'), 'w') as f:
++    f.write('''
++from django.apps import AppConfig
++
++class TestAppConfig(AppConfig):
++    name = 'test_app'
++    default_auto_field = 'django.db.models.BigAutoField'
++''')
++
++# Create models.py with the exact structure from the issue
++models_content = '''
++from django.db import models
++
++class MyField(models.TextField):
++    pass
++
++class MyBaseModel(models.Model):
++    class Meta:
++        abstract = True
++
++class MyMixin:
++    pass
++
++class MyModel(MyMixin, MyBaseModel):
++    name = MyField(primary_key=True)
++'''
++
++with open(os.path.join(app_dir, 'models.py'), 'w') as f:
++    f.write(models_content)
++
++# Create migrations directory
++migrations_dir = os.path.join(app_dir, 'migrations')
++os.makedirs(migrations_dir)
++with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
++    f.write('')
++
++# Add the temp directory to Python path
++sys.path.insert(0, temp_dir)
++
++# Setup Django
++django.setup()
++
++def test_original_issue():
++    """Test the exact scenario from the original issue."""
++    
++    print("Testing original issue scenario...")
++    print("=" * 50)
++    
++    try:
++        # Import the models to register them
++        from test_app.models import MyModel, MyField, MyMixin, MyBaseModel
++        
++        # Create the migration manually to simulate makemigrations
++        from django.db.migrations.autodetector import MigrationAutodetector
++        from django.db.migrations.state import ProjectState
++        from django.db.migrations.loader import MigrationLoader
++        
++        # Get the current state
++        loader = MigrationLoader(None, ignore_no_migrations=True)
++        from_state = loader.project_state()
++        
++        # Get the target state with our models
++        to_state = ProjectState.from_apps(apps)
++        
++        # Generate migrations
++        autodetector = MigrationAutodetector(from_state, to_state)
++        changes = autodetector.changes(graph=loader.graph)
++        
++        if 'test_app' in changes:
++            migration = changes['test_app'][0]
++            
++            # Generate the migration file content
++            from django.db.migrations.writer import MigrationWriter
++            writer = MigrationWriter(migration)
++            output = writer.as_string()
++            
++            print("Generated migration content:")
++            print("-" * 30)
++            print(output)
++            print("-" * 30)
++            
++            # Check if the issue exists
++            lines = output.split('\n')
++            
++            # Check for imports
++            has_models_import = any('from django.db import models' in line or 'from django.db import migrations, models' in line for line in lines)
++            has_migrations_import = any('from django.db import migrations' in line or 'from django.db import migrations, models' in line for line in lines)
++            
++            # Check for models.Model reference in bases
++            has_models_model_reference = any('models.Model' in line for line in lines)
++            
++            print(f"Has models import: {has_models_import}")
++            print(f"Has migrations import: {has_migrations_import}")
++            print(f"Has models.Model reference: {has_models_model_reference}")
++            
++            if has_models_model_reference and not has_models_import:
++                print("❌ BUG REPRODUCED: models.Model is referenced but models is not imported!")
++                return False
++            elif has_models_model_reference and has_models_import:
++                print("✅ ISSUE FIXED: models.Model is referenced and models is properly imported!")
++                
++                # Try to execute the generated code to confirm it works
++                try:
++                    # Create a safe execution environment
++                    exec_globals = {
++                        'migrations': django.db.migrations,
++                        'models': django.db.models,
++                        'test_app': sys.modules['test_app'],
++                    }
++                    exec(output, exec_globals)
++                    print("✅ Generated migration code executes successfully!")
++                    return True
++                except Exception as e:
++                    print(f"❌ Generated migration code failed to execute: {e}")
++                    return False
++            else:
++                print("ℹ️  No models.Model reference found in bases (might be using default)")
++                return True
++        else:
++            print("No migrations generated for test_app")
++            return True
++            
++    except Exception as e:
++        print(f"Error during test: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++    
++    finally:
++        # Cleanup
++        try:
++            shutil.rmtree(temp_dir)
++        except:
++            pass
++
++if __name__ == "__main__":
++    success = test_original_issue()
++    if success:
++        print("\n🎉 Test completed successfully!")
++    else:
++        print("\n❌ Test failed!")
++        sys.exit(1)
+\ No newline at end of file

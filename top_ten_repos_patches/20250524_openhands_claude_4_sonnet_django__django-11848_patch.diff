@@ -1,0 +1,354 @@
+diff --git a/django/utils/http.py b/django/utils/http.py
+index 572cfb4347..dfad3fc267 100644
+--- a/django/utils/http.py
++++ b/django/utils/http.py
+@@ -176,10 +176,17 @@ def parse_http_date(date):
+     try:
+         year = int(m.group('year'))
+         if year < 100:
+-            if year < 70:
+-                year += 2000
++            # RFC 7231: If a two-digit year appears to be more than 50 years
++            # in the future, interpret as the most recent year in the past
++            # that had the same last two digits.
++            current_year = datetime.datetime.now().year
++            century_2000 = 2000 + year
++            century_1900 = 1900 + year
++            
++            if century_2000 - current_year > 50:
++                year = century_1900
+             else:
+-                year += 1900
++                year = century_2000
+         month = MONTHS.index(m.group('mon').lower()) + 1
+         day = int(m.group('day'))
+         hour = int(m.group('hour'))
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..77300bee1c
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test of the RFC 7231 compliant two-digit year parsing.
++"""
++
++import datetime
++from django.utils.http import parse_http_date
++
++def test_rfc7231_compliance():
++    """Test RFC 7231 compliance with various years."""
++    print("=== RFC 7231 Compliance Test ===")
++    current_year = datetime.datetime.now().year
++    print(f"Current year: {current_year}")
++    print()
++    
++    # Test all two-digit years from 00 to 99
++    test_years = [0, 1, 10, 20, 30, 40, 50, 60, 69, 70, 75, 80, 90, 99]
++    
++    for year_2digit in test_years:
++        year_str = f"{year_2digit:02d}"
++        date_str = f"Sunday, 06-Nov-{year_str} 08:49:37 GMT"
++        
++        try:
++            timestamp = parse_http_date(date_str)
++            parsed_date = datetime.datetime.utcfromtimestamp(timestamp)
++            actual_year = parsed_date.year
++            
++            # Calculate expected year according to RFC 7231
++            century_2000 = 2000 + year_2digit
++            century_1900 = 1900 + year_2digit
++            
++            if century_2000 - current_year > 50:
++                expected_year = century_1900
++            else:
++                expected_year = century_2000
++            
++            status = "✓" if actual_year == expected_year else "✗"
++            print(f"Year {year_str}: {actual_year} (expected {expected_year}) {status}")
++            
++            if actual_year != expected_year:
++                print(f"  ERROR: Expected {expected_year}, got {actual_year}")
++                
++        except Exception as e:
++            print(f"Year {year_str}: ERROR - {e}")
++    
++    print()
++
++def test_boundary_conditions():
++    """Test boundary conditions around the 50-year threshold."""
++    print("=== Boundary Conditions Test ===")
++    current_year = datetime.datetime.now().year
++    print(f"Current year: {current_year}")
++    
++    # Find the year that would be exactly 50 years in the future
++    future_50_year = current_year + 50
++    boundary_2digit = future_50_year % 100
++    
++    print(f"Year that would be exactly 50 years in future: {future_50_year}")
++    print(f"Its two-digit representation: {boundary_2digit:02d}")
++    print()
++    
++    # Test years around this boundary
++    test_offsets = [-2, -1, 0, 1, 2]
++    
++    for offset in test_offsets:
++        test_2digit = (boundary_2digit + offset) % 100
++        year_str = f"{test_2digit:02d}"
++        date_str = f"Sunday, 06-Nov-{year_str} 08:49:37 GMT"
++        
++        try:
++            timestamp = parse_http_date(date_str)
++            parsed_date = datetime.datetime.utcfromtimestamp(timestamp)
++            actual_year = parsed_date.year
++            
++            # Calculate expected year
++            century_2000 = 2000 + test_2digit
++            century_1900 = 1900 + test_2digit
++            
++            years_in_future = century_2000 - current_year
++            
++            if years_in_future > 50:
++                expected_year = century_1900
++                reason = f"({years_in_future} years in future > 50)"
++            else:
++                expected_year = century_2000
++                reason = f"({years_in_future} years in future ≤ 50)"
++            
++            status = "✓" if actual_year == expected_year else "✗"
++            print(f"Year {year_str}: {actual_year} (expected {expected_year}) {reason} {status}")
++            
++        except Exception as e:
++            print(f"Year {year_str}: ERROR - {e}")
++
++def test_four_digit_years():
++    """Test that four-digit years are not affected by the change."""
++    print("\n=== Four-Digit Years Test (should be unaffected) ===")
++    
++    test_cases = [
++        "Sun, 06 Nov 1994 08:49:37 GMT",  # RFC1123 format
++        "Sun Nov  6 08:49:37 1994",       # ASCTIME format
++    ]
++    
++    for date_str in test_cases:
++        try:
++            timestamp = parse_http_date(date_str)
++            parsed_date = datetime.datetime.utcfromtimestamp(timestamp)
++            print(f"{date_str} → {parsed_date.year} ✓")
++        except Exception as e:
++            print(f"{date_str} → ERROR: {e}")
++
++if __name__ == "__main__":
++    test_rfc7231_compliance()
++    test_boundary_conditions()
++    test_four_digit_years()
+\ No newline at end of file
+diff --git a/test_issue_demo.py b/test_issue_demo.py
+new file mode 100644
+index 0000000000..a3ef23b141
+--- /dev/null
++++ b/test_issue_demo.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python3
++"""
++Demonstrate the specific issue with two-digit year parsing.
++
++The current year is 2025. According to RFC 7231:
++- Year "69" should be interpreted as 2069 (only 44 years in future, < 50)
++- Year "70" should be interpreted as 1970 (2070 would be 45 years in future, but we use past)
++
++But the current hardcoded logic gives:
++- Year "69" → 2069 (correct by coincidence)
++- Year "70" → 1970 (correct by coincidence)
++
++However, the issue becomes apparent with other years:
++- Year "76" should be 1976 (2076 would be 51 years in future, > 50)
++- But current logic gives 1976 (correct by coincidence)
++
++The real issue shows up when we consider what happens in different years.
++Let's simulate what would happen if this code ran in 2030:
++- Year "69" should be 1969 (2069 would be 39 years in future, but 1969 is more recent past)
++- Year "70" should be 1970 (2070 would be 40 years in future, < 50)
++
++But the hardcoded logic would still give:
++- Year "69" → 2069 (WRONG! Should be 1969)
++- Year "70" → 1970 (correct by coincidence)
++"""
++
++import datetime
++from django.utils.http import parse_http_date
++
++def demonstrate_issue():
++    """Demonstrate the issue with specific examples."""
++    print("=== Demonstrating the Issue ===")
++    print(f"Current year: {datetime.datetime.now().year}")
++    print()
++    
++    # Test case that shows the problem
++    test_cases = [
++        "Sunday, 06-Nov-69 08:49:37 GMT",  # Year 69
++        "Sunday, 06-Nov-70 08:49:37 GMT",  # Year 70
++        "Sunday, 06-Nov-76 08:49:37 GMT",  # Year 76
++        "Sunday, 06-Nov-80 08:49:37 GMT",  # Year 80
++    ]
++    
++    for date_str in test_cases:
++        timestamp = parse_http_date(date_str)
++        parsed_date = datetime.datetime.utcfromtimestamp(timestamp)
++        year_2digit = date_str.split('-')[2].split()[0]
++        
++        print(f"Input: {date_str}")
++        print(f"  Two-digit year: {year_2digit}")
++        print(f"  Current result: {parsed_date.year}")
++        
++        # Calculate what RFC 7231 should give
++        current_year = datetime.datetime.now().year
++        year_int = int(year_2digit)
++        century_2000 = 2000 + year_int
++        century_1900 = 1900 + year_int
++        
++        if century_2000 - current_year > 50:
++            rfc_expected = century_1900
++        else:
++            rfc_expected = century_2000
++            
++        print(f"  RFC 7231 should give: {rfc_expected}")
++        
++        if parsed_date.year == rfc_expected:
++            print("  ✓ CORRECT")
++        else:
++            print("  ✗ INCORRECT")
++        print()
++
++def simulate_future_year():
++    """Simulate what would happen if we ran this in a future year."""
++    print("=== Simulation: Running in year 2030 ===")
++    
++    # Simulate current year being 2030
++    simulated_current_year = 2030
++    
++    test_cases = [
++        ("69", "Should be 1969 (2069 is 39 years future, but 1969 is more recent past)"),
++        ("70", "Should be 2070 (only 40 years in future, < 50)"),
++        ("80", "Should be 1980 (2080 is 50 years future, use past)"),
++        ("81", "Should be 1981 (2081 is 51 years future, > 50)"),
++    ]
++    
++    for year_str, description in test_cases:
++        year_int = int(year_str)
++        century_2000 = 2000 + year_int
++        century_1900 = 1900 + year_int
++        
++        # RFC 7231 logic
++        if century_2000 - simulated_current_year > 50:
++            rfc_expected = century_1900
++        else:
++            rfc_expected = century_2000
++            
++        # Current hardcoded logic
++        if year_int < 70:
++            current_logic = 2000 + year_int
++        else:
++            current_logic = 1900 + year_int
++            
++        print(f"Year {year_str}:")
++        print(f"  RFC 7231 (correct): {rfc_expected}")
++        print(f"  Current logic: {current_logic}")
++        print(f"  Description: {description}")
++        
++        if current_logic == rfc_expected:
++            print("  ✓ Current logic happens to be correct")
++        else:
++            print("  ✗ Current logic would be WRONG")
++        print()
++
++if __name__ == "__main__":
++    demonstrate_issue()
++    simulate_future_year()
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..42f79ee05f
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the two-digit year issue in parse_http_date.
++
++According to RFC 7231:
++"Recipients of a timestamp value in rfc850-date format, which uses a
++two-digit year, MUST interpret a timestamp that appears to be more
++than 50 years in the future as representing the most recent year in
++the past that had the same last two digits."
++
++Current behavior (hardcoded):
++- Years 0-69 → 2000-2069
++- Years 70-99 → 1970-1999
++
++Expected behavior (RFC 7231 compliant):
++- If two-digit year appears to be more than 50 years in the future from current year,
++  interpret as the most recent year in the past with same last two digits.
++"""
++
++import datetime
++from django.utils.http import parse_http_date
++
++def test_current_behavior():
++    """Test the current hardcoded behavior."""
++    print("=== Current Behavior ===")
++    
++    # Test cases with RFC850 format: "Weekday, DD-Mon-YY HH:MM:SS GMT"
++    test_cases = [
++        ("Sunday, 06-Nov-94 08:49:37 GMT", "94 should be 1994"),
++        ("Sunday, 06-Nov-37 08:49:37 GMT", "37 should be 2037"),
++        ("Sunday, 06-Nov-69 08:49:37 GMT", "69 should be 2069"),
++        ("Sunday, 06-Nov-70 08:49:37 GMT", "70 should be 1970"),
++        ("Sunday, 06-Nov-00 08:49:37 GMT", "00 should be 2000"),
++        ("Sunday, 06-Nov-99 08:49:37 GMT", "99 should be 1999"),
++    ]
++    
++    for date_str, description in test_cases:
++        try:
++            timestamp = parse_http_date(date_str)
++            parsed_date = datetime.datetime.utcfromtimestamp(timestamp)
++            print(f"{date_str} → {parsed_date.year} ({description})")
++        except Exception as e:
++            print(f"{date_str} → ERROR: {e}")
++
++def test_rfc7231_compliant_behavior():
++    """Test what the RFC 7231 compliant behavior should be."""
++    print("\n=== RFC 7231 Compliant Behavior (Expected) ===")
++    
++    current_year = datetime.datetime.now().year
++    print(f"Current year: {current_year}")
++    
++    # Test cases with expected RFC 7231 behavior
++    test_cases = [
++        ("94", "Should be 1994 (not more than 50 years in future)"),
++        ("37", "Should be 2037 if current year < 1987, else 1937"),
++        ("69", "Should be 2069 if current year < 2019, else 1969"),
++        ("70", "Should be 2070 if current year < 2020, else 1970"),
++        ("00", "Should be 2000 if current year < 1950, else 1900"),
++        ("99", "Should be 2099 if current year < 2049, else 1999"),
++    ]
++    
++    for year_str, description in test_cases:
++        year = int(year_str)
++        
++        # RFC 7231 logic: if more than 50 years in future, use past century
++        century_2000 = 2000 + year
++        century_1900 = 1900 + year
++        
++        if century_2000 - current_year > 50:
++            expected_year = century_1900
++        else:
++            expected_year = century_2000
++            
++        print(f"Year {year_str}: {expected_year} ({description})")
++
++if __name__ == "__main__":
++    test_current_behavior()
++    test_rfc7231_compliant_behavior()
+\ No newline at end of file

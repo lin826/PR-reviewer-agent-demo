@@ -1,0 +1,490 @@
+diff --git a/django/contrib/admin/helpers.py b/django/contrib/admin/helpers.py
+index 83719f4346..859db9b2b8 100644
+--- a/django/contrib/admin/helpers.py
++++ b/django/contrib/admin/helpers.py
+@@ -300,15 +300,18 @@ class InlineAdminFormSet:
+ 
+     def inline_formset_data(self):
+         verbose_name = self.opts.verbose_name
++        options = {
++            'prefix': self.formset.prefix,
++        }
++        if self.has_add_permission:
++            options['addText'] = gettext('Add another %(verbose_name)s') % {
++                'verbose_name': capfirst(verbose_name),
++            }
++        if self.has_delete_permission:
++            options['deleteText'] = gettext('Remove')
+         return json.dumps({
+             'name': '#%s' % self.formset.prefix,
+-            'options': {
+-                'prefix': self.formset.prefix,
+-                'addText': gettext('Add another %(verbose_name)s') % {
+-                    'verbose_name': capfirst(verbose_name),
+-                },
+-                'deleteText': gettext('Remove'),
+-            }
++            'options': options,
+         })
+ 
+     @property
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 880a2cc17b..dfe1c3bb46 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -2115,27 +2115,51 @@ class InlineModelAdmin(BaseModelAdmin):
+         if self.opts.auto_created:
+             # We're checking the rights to an auto-created intermediate model,
+             # which doesn't have its own individual permissions. The user needs
+-            # to have the view permission for the related model in order to
+-            # be able to do anything with the intermediate model.
+-            return self.has_view_permission(request, obj)
++            # to have the add permission for the related model in order to
++            # be able to add to the intermediate model.
++            opts = self.opts
++            # The model was auto-created as intermediary for a many-to-many
++            # relationship; find the target model.
++            for field in opts.fields:
++                if field.remote_field and field.remote_field.model != self.parent_model:
++                    opts = field.remote_field.model._meta
++                    break
++            perm_name = '%s.%s' % (opts.app_label, get_permission_codename('add', opts))
++            result = request.user.has_perm(perm_name)
++            print(f"DEBUG has_add_permission: checking {perm_name} = {result}")
++            return result
+         return super().has_add_permission(request)
+ 
+     def has_change_permission(self, request, obj=None):
+         if self.opts.auto_created:
+             # We're checking the rights to an auto-created intermediate model,
+             # which doesn't have its own individual permissions. The user needs
+-            # to have the view permission for the related model in order to
+-            # be able to do anything with the intermediate model.
+-            return self.has_view_permission(request, obj)
++            # to have the change permission for the related model in order to
++            # be able to change the intermediate model.
++            opts = self.opts
++            # The model was auto-created as intermediary for a many-to-many
++            # relationship; find the target model.
++            for field in opts.fields:
++                if field.remote_field and field.remote_field.model != self.parent_model:
++                    opts = field.remote_field.model._meta
++                    break
++            return request.user.has_perm('%s.%s' % (opts.app_label, get_permission_codename('change', opts)))
+         return super().has_change_permission(request)
+ 
+     def has_delete_permission(self, request, obj=None):
+         if self.opts.auto_created:
+             # We're checking the rights to an auto-created intermediate model,
+             # which doesn't have its own individual permissions. The user needs
+-            # to have the view permission for the related model in order to
+-            # be able to do anything with the intermediate model.
+-            return self.has_view_permission(request, obj)
++            # to have the delete permission for the related model in order to
++            # be able to delete from the intermediate model.
++            opts = self.opts
++            # The model was auto-created as intermediary for a many-to-many
++            # relationship; find the target model.
++            for field in opts.fields:
++                if field.remote_field and field.remote_field.model != self.parent_model:
++                    opts = field.remote_field.model._meta
++                    break
++            return request.user.has_perm('%s.%s' % (opts.app_label, get_permission_codename('delete', opts)))
+         return super().has_delete_permission(request, obj)
+ 
+     def has_view_permission(self, request, obj=None):
+diff --git a/test_bug_simple.py b/test_bug_simple.py
+new file mode 100644
+index 0000000000..df20a1e678
+--- /dev/null
++++ b/test_bug_simple.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python
++"""
++Simple test to reproduce the bug with view-only permissions on ManyToMany inlines.
++"""
++
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0/tests')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++
++import django
++django.setup()
++
++from django.contrib.auth.models import User, Permission
++from django.contrib.contenttypes.models import ContentType
++from django.test import RequestFactory
++from django.contrib.admin.sites import AdminSite
++from django.contrib import admin
++
++from admin_inlines.models import Author, Book
++
++
++# Create admin classes using existing models
++class BookInlineAdmin(admin.TabularInline):
++    model = Author.books.through
++    show_change_link = True
++
++
++def test_bug():
++    """Test that demonstrates the bug."""
++    
++    # Create test data
++    book = Book.objects.create(name='Test Book')
++    author = Author.objects.create(name='Test Author')
++    author.books.add(book)
++    
++    # Create a user with only view permissions
++    user = User.objects.create_user(username='viewonly', password='test', is_staff=True)
++    
++    # Give the user view permission on Book model only
++    book_ct = ContentType.objects.get_for_model(Book)
++    view_book_perm = Permission.objects.get(codename='view_book', content_type=book_ct)
++    user.user_permissions.add(view_book_perm)
++    
++    # Create a request factory and mock request
++    factory = RequestFactory()
++    request = factory.get('/admin/admin_inlines/author/{}/change/'.format(author.id))
++    request.user = user
++    
++    # Create the inline admin instance
++    inline_admin = BookInlineAdmin(Author, AdminSite())
++    
++    # Test the permission methods
++    print("Testing permission methods for auto-created ManyToMany through model:")
++    print(f"Model: {inline_admin.model}")
++    print(f"Is auto-created: {inline_admin.opts.auto_created}")
++    print(f"User has view permission on Book: {user.has_perm('admin_inlines.view_book')}")
++    print(f"User has change permission on Book: {user.has_perm('admin_inlines.change_book')}")
++    print(f"User has add permission on Book: {user.has_perm('admin_inlines.add_book')}")
++    print(f"User has delete permission on Book: {user.has_perm('admin_inlines.delete_book')}")
++    print()
++    
++    # Test inline permissions - these should be False for add/change/delete if user only has view permission
++    print("Inline permission results:")
++    print(f"has_view_permission: {inline_admin.has_view_permission(request)}")
++    print(f"has_add_permission: {inline_admin.has_add_permission(request, author)}")
++    print(f"has_change_permission: {inline_admin.has_change_permission(request, author)}")
++    print(f"has_delete_permission: {inline_admin.has_delete_permission(request, author)}")
++    print()
++    
++    # The bug: add/change/delete permissions should be False, but they return True
++    # because they only check for view permission
++    if (inline_admin.has_add_permission(request, author) or 
++        inline_admin.has_change_permission(request, author) or 
++        inline_admin.has_delete_permission(request, author)):
++        print("BUG CONFIRMED: User with only view permission can add/change/delete inline items!")
++        return True
++    else:
++        print("No bug detected: User with only view permission cannot add/change/delete inline items.")
++        return False
++
++
++if __name__ == '__main__':
++    bug_exists = test_bug()
++    sys.exit(1 if bug_exists else 0)
+\ No newline at end of file
+diff --git a/test_permission_fix.py b/test_permission_fix.py
+new file mode 100644
+index 0000000000..dd1823bafd
+--- /dev/null
++++ b/test_permission_fix.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python
++"""
++Direct test of the permission fix.
++"""
++
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0/tests')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++
++import django
++django.setup()
++
++from django.contrib.auth.models import User, Permission
++from django.contrib.contenttypes.models import ContentType
++from django.test import RequestFactory
++from django.contrib.admin.sites import AdminSite
++from django.contrib import admin
++
++from admin_inlines.models import Author, Book
++
++
++# Create admin classes using existing models
++class BookInlineAdmin(admin.TabularInline):
++    model = Author.books.through
++    show_change_link = True
++
++
++def test_permission_fix():
++    """Test that the permission fix works correctly."""
++    
++    # Create test data
++    book = Book.objects.create(name='Test Book')
++    author = Author.objects.create(name='Test Author')
++    author.books.add(book)
++    
++    # Create a user with only view permissions
++    user = User.objects.create_user(username='viewonly', password='test', is_staff=True)
++    
++    # Give the user view permission on Book model only
++    book_ct = ContentType.objects.get_for_model(Book)
++    view_book_perm = Permission.objects.get(codename='view_book', content_type=book_ct)
++    user.user_permissions.add(view_book_perm)
++    
++    # Create a request factory and mock request
++    factory = RequestFactory()
++    request = factory.get('/admin/admin_inlines/author/{}/change/'.format(author.id))
++    request.user = user
++    
++    # Create the inline admin instance
++    inline_admin = BookInlineAdmin(Author, AdminSite())
++    
++    # Test the permission methods directly
++    print("Testing permission methods for auto-created ManyToMany through model:")
++    print(f"Model: {inline_admin.model}")
++    print(f"Is auto-created: {inline_admin.opts.auto_created}")
++    print(f"User has view permission on Book: {user.has_perm('admin_inlines.view_book')}")
++    print(f"User has change permission on Book: {user.has_perm('admin_inlines.change_book')}")
++    print(f"User has add permission on Book: {user.has_perm('admin_inlines.add_book')}")
++    print(f"User has delete permission on Book: {user.has_perm('admin_inlines.delete_book')}")
++    print()
++    
++    # Test inline permissions - these should be False for add/change/delete if user only has view permission
++    print("Inline permission results:")
++    view_perm = inline_admin.has_view_permission(request)
++    add_perm = inline_admin.has_add_permission(request, author)
++    change_perm = inline_admin.has_change_permission(request, author)
++    delete_perm = inline_admin.has_delete_permission(request, author)
++    
++    print(f"has_view_permission: {view_perm}")
++    print(f"has_add_permission: {add_perm}")
++    print(f"has_change_permission: {change_perm}")
++    print(f"has_delete_permission: {delete_perm}")
++    print()
++    
++    # The fix: add/change/delete permissions should be False for view-only users
++    if add_perm or change_perm or delete_perm:
++        print("BUG STILL EXISTS: User with only view permission can add/change/delete inline items!")
++        return False
++    else:
++        print("FIX WORKING: User with only view permission cannot add/change/delete inline items.")
++        return True
++
++
++if __name__ == '__main__':
++    fix_working = test_permission_fix()
++    sys.exit(0 if fix_working else 1)
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..47d28a8b65
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the issue where admin inlines for auto-created 
++ManyToManyFields are editable if the user only has view permission.
++
++This script reproduces the bug described in the issue.
++"""
++
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++sys.path.insert(0, '/workspace/django__django__3.0/tests')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++
++import django
++django.setup()
++
++# Now we can import Django modules
++from django.db import models
++from django.contrib import admin
++from django.contrib.auth.models import User, Permission
++from django.contrib.contenttypes.models import ContentType
++from django.test import RequestFactory
++from django.contrib.admin.sites import AdminSite
++
++# Import existing test models
++from admin_inlines.models import Author, Book
++
++
++# Create admin classes using existing models
++class BookInlineAdmin(admin.TabularInline):
++    model = Author.books.through
++    show_change_link = True
++
++
++class AuthorAdmin(admin.ModelAdmin):
++    inlines = [BookInlineAdmin]
++
++
++def test_view_only_permission_bug():
++    """Test that demonstrates the bug where users with view-only permissions can edit inlines."""
++    
++    # Create test data
++    book = Book.objects.create(name='Test Book')
++    author = Author.objects.create(name='Test Author')
++    author.books.add(book)
++    
++    # Create a user with only view permissions
++    user = User.objects.create_user(username='viewonly', password='test', is_staff=True)
++    
++    # Give the user view permission on Book and Author models
++    book_ct = ContentType.objects.get_for_model(Book)
++    author_ct = ContentType.objects.get_for_model(Author)
++    
++    view_book_perm = Permission.objects.get(codename='view_book', content_type=book_ct)
++    view_author_perm = Permission.objects.get(codename='view_author', content_type=author_ct)
++    
++    user.user_permissions.add(view_book_perm, view_author_perm)
++    
++    # Create a request factory and mock request
++    factory = RequestFactory()
++    request = factory.get('/admin/admin_inlines/author/{}/change/'.format(author.id))
++    request.user = user
++    
++    # Create admin site and register models
++    test_admin_site = AdminSite(name='test_admin')
++    test_admin_site.register(Author, AuthorAdmin)
++    test_admin_site.register(Book)
++    
++    # Get the inline admin instance
++    author_admin = test_admin_site._registry[Author]
++    inline_admin = author_admin.inlines[0](Author, test_admin_site)
++    
++    # Test the permission methods
++    print("Testing permission methods for auto-created ManyToMany through model:")
++    print(f"Model: {inline_admin.model}")
++    print(f"Is auto-created: {inline_admin.opts.auto_created}")
++    print(f"User has view permission on Book: {user.has_perm('admin_inlines.view_book')}")
++    print(f"User has change permission on Book: {user.has_perm('admin_inlines.change_book')}")
++    print(f"User has add permission on Book: {user.has_perm('admin_inlines.add_book')}")
++    print(f"User has delete permission on Book: {user.has_perm('admin_inlines.delete_book')}")
++    print()
++    
++    # Test inline permissions - these should be False for add/change/delete if user only has view permission
++    print("Inline permission results:")
++    print(f"has_view_permission: {inline_admin.has_view_permission(request)}")
++    print(f"has_add_permission: {inline_admin.has_add_permission(request, author)}")
++    print(f"has_change_permission: {inline_admin.has_change_permission(request, author)}")
++    print(f"has_delete_permission: {inline_admin.has_delete_permission(request, author)}")
++    print()
++    
++    # The bug: add/change/delete permissions should be False, but they return True
++    # because they only check for view permission
++    if (inline_admin.has_add_permission(request, author) or 
++        inline_admin.has_change_permission(request, author) or 
++        inline_admin.has_delete_permission(request, author)):
++        print("BUG CONFIRMED: User with only view permission can add/change/delete inline items!")
++        return True
++    else:
++        print("No bug detected: User with only view permission cannot add/change/delete inline items.")
++        return False
++
++
++if __name__ == '__main__':
++    bug_exists = test_view_only_permission_bug()
++    sys.exit(1 if bug_exists else 0)
+\ No newline at end of file
+diff --git a/test_view_only_bug.py b/test_view_only_bug.py
+new file mode 100644
+index 0000000000..b421991e51
+--- /dev/null
++++ b/test_view_only_bug.py
+@@ -0,0 +1,29 @@
++"""
++Test to add to the existing TestInlinePermissions class to reproduce the bug.
++"""
++
++def test_inline_change_m2m_view_only_perm(self):
++    """
++    Test that users with only view permission cannot add/change/delete M2M inline items.
++    This test reproduces the bug where view-only users can edit auto-created M2M through models.
++    """
++    from django.contrib.auth.models import Permission
++    from django.contrib.contenttypes.models import ContentType
++    
++    # Give user only view permission on books (not add/change/delete)
++    book_ct = ContentType.objects.get_for_model(Book)
++    view_book_perm = Permission.objects.get(codename='view_book', content_type=book_ct)
++    self.user.user_permissions.add(view_book_perm)
++    
++    response = self.client.get(self.author_change_url)
++    
++    # User should be able to view the inline but not add/change/delete
++    # Currently this fails because the user can add/change/delete with only view permission
++    self.assertContains(response, '<h2>Author-book relationships</h2>')
++    
++    # These should NOT be present for view-only users, but currently they are (the bug)
++    self.assertNotContains(response, 'Add another Author-book relationship')
++    self.assertNotContains(response, 'id="id_Author_books-0-DELETE"')
++    
++    # The inline should be read-only - no form inputs for editing
++    # This is the expected behavior that's currently broken
+\ No newline at end of file
+diff --git a/tests/admin_inlines/tests.py b/tests/admin_inlines/tests.py
+index 5272d44f35..25556e53be 100644
+--- a/tests/admin_inlines/tests.py
++++ b/tests/admin_inlines/tests.py
+@@ -804,6 +804,43 @@ class TestInlinePermissions(TestCase):
+             html=True,
+         )
+ 
++    def test_inline_change_m2m_view_only_perm(self):
++        """
++        Test that users with only view permission cannot add/change/delete M2M inline items.
++        This test reproduces the bug where view-only users can edit auto-created M2M through models.
++        """
++        # Give user only view permission on books (not add/change/delete)
++        view_book_perm = Permission.objects.get(codename='view_book', content_type=self.book_ct)
++        self.user.user_permissions.add(view_book_perm)
++        
++        # Test the permission methods directly first
++        from admin_inlines.admin import BookInline, site
++        inline_admin = BookInline(Author, site)
++        
++        # Create a mock request
++        from django.test import RequestFactory
++        factory = RequestFactory()
++        request = factory.get('/admin/admin_inlines/author/1/change/')
++        request.user = self.user
++        
++        # Test that the permission methods work correctly
++        view_result = inline_admin.has_view_permission(request)
++        add_result = inline_admin.has_add_permission(request, None)
++        change_result = inline_admin.has_change_permission(request, None)
++        delete_result = inline_admin.has_delete_permission(request, None)
++        
++        self.assertTrue(view_result)
++        self.assertFalse(add_result)
++        self.assertFalse(change_result)
++        self.assertFalse(delete_result)
++        
++        response = self.client.get(self.author_change_url)
++        
++        # User should be able to view the inline but not add/change/delete
++        # With the fix, these should NOT be present for view-only users
++        self.assertNotContains(response, 'Add another Author-book relationship')
++        self.assertNotContains(response, 'id="id_Author_books-0-DELETE"')
++
+ 
+ @override_settings(ROOT_URLCONF='admin_inlines.urls')
+ class SeleniumTests(AdminSeleniumTestCase):

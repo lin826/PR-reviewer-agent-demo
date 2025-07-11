@@ -1,0 +1,566 @@
+diff --git a/django/urls/base.py b/django/urls/base.py
+index 0e1c3d909c..6bc2ac378b 100644
+--- a/django/urls/base.py
++++ b/django/urls/base.py
+@@ -7,7 +7,7 @@ from django.utils.functional import lazy
+ from django.utils.translation import override
+ 
+ from .exceptions import NoReverseMatch, Resolver404
+-from .resolvers import get_ns_resolver, get_resolver
++from .resolvers import get_ns_resolver, get_resolver, _get_resolver_cached
+ from .utils import get_callable
+ 
+ # SCRIPT_NAME prefixes for each thread are stored here. If there's no entry for
+@@ -92,7 +92,7 @@ reverse_lazy = lazy(reverse, str)
+ 
+ def clear_url_caches():
+     get_callable.cache_clear()
+-    get_resolver.cache_clear()
++    _get_resolver_cached.cache_clear()
+     get_ns_resolver.cache_clear()
+ 
+ 
+diff --git a/django/urls/resolvers.py b/django/urls/resolvers.py
+index 247e3680c0..7511615150 100644
+--- a/django/urls/resolvers.py
++++ b/django/urls/resolvers.py
+@@ -64,10 +64,14 @@ class ResolverMatch:
+ 
+ 
+ @functools.lru_cache(maxsize=None)
++def _get_resolver_cached(urlconf):
++    return URLResolver(RegexPattern(r'^/'), urlconf)
++
++
+ def get_resolver(urlconf=None):
+     if urlconf is None:
+         urlconf = settings.ROOT_URLCONF
+-    return URLResolver(RegexPattern(r'^/'), urlconf)
++    return _get_resolver_cached(urlconf)
+ 
+ 
+ @functools.lru_cache(maxsize=None)
+diff --git a/test_cache_clearing.py b/test_cache_clearing.py
+new file mode 100644
+index 0000000000..d21eda943a
+--- /dev/null
++++ b/test_cache_clearing.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python
++"""
++Test that clear_url_caches works correctly with our changes.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='test_urls',
++        SECRET_KEY='test-secret-key',
++        USE_I18N=False,
++        USE_L10N=False,
++        USE_TZ=False,
++    )
++
++django.setup()
++
++# Create a simple URLconf for testing
++import tempfile
++import importlib.util
++
++urlconf_content = '''
++from django.urls import path
++from django.http import HttpResponse
++
++def test_view(request):
++    return HttpResponse("Test")
++
++urlpatterns = [
++    path('test/', test_view, name='test'),
++]
++'''
++
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(urlconf_content)
++    temp_file = f.name
++
++spec = importlib.util.spec_from_file_location("test_urls", temp_file)
++test_urls = importlib.util.module_from_spec(spec)
++sys.modules['test_urls'] = test_urls
++spec.loader.exec_module(test_urls)
++
++# Test cache clearing
++from django.urls.resolvers import get_resolver, _get_resolver_cached
++from django.urls.base import clear_url_caches
++
++def test_cache_clearing():
++    """Test that clear_url_caches works correctly."""
++    print("Testing cache clearing...")
++    
++    # Build up some cache
++    resolver1 = get_resolver(None)
++    resolver2 = get_resolver('django.contrib.admin.urls')
++    
++    cache_info_before = _get_resolver_cached.cache_info()
++    print(f"Cache before clearing: {cache_info_before}")
++    
++    # Clear the cache
++    clear_url_caches()
++    
++    cache_info_after = _get_resolver_cached.cache_info()
++    print(f"Cache after clearing: {cache_info_after}")
++    
++    # Verify cache was cleared
++    if cache_info_after.currsize == 0:
++        print("✓ Cache was successfully cleared")
++    else:
++        print("✗ Cache was not cleared properly")
++    
++    # Verify that new calls work after clearing
++    resolver3 = get_resolver(None)
++    cache_info_final = _get_resolver_cached.cache_info()
++    print(f"Cache after new call: {cache_info_final}")
++    
++    if cache_info_final.currsize == 1 and cache_info_final.misses == 1:
++        print("✓ Cache works correctly after clearing")
++    else:
++        print("✗ Cache doesn't work correctly after clearing")
++
++if __name__ == '__main__':
++    test_cache_clearing()
++    
++    # Clean up
++    try:
++        os.unlink(temp_file)
++    except:
++        pass
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..3ace785ef5
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the URLResolver optimization fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='test_urls',
++        SECRET_KEY='test-secret-key',
++        USE_I18N=False,
++        USE_L10N=False,
++        USE_TZ=False,
++    )
++
++django.setup()
++
++# Create a simple URLconf for testing
++import tempfile
++import importlib.util
++
++# Create a temporary URLconf module
++urlconf_content = '''
++from django.urls import path
++from django.http import HttpResponse
++
++def test_view(request):
++    return HttpResponse("Test")
++
++urlpatterns = [
++    path('test/', test_view, name='test'),
++]
++'''
++
++# Write the URLconf to a temporary file and import it
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(urlconf_content)
++    temp_file = f.name
++
++# Import the temporary module as test_urls
++spec = importlib.util.spec_from_file_location("test_urls", temp_file)
++test_urls = importlib.util.module_from_spec(spec)
++sys.modules['test_urls'] = test_urls
++spec.loader.exec_module(test_urls)
++
++# Now test edge cases
++from django.urls.resolvers import get_resolver, _get_resolver_cached
++from django.urls.base import get_urlconf, set_urlconf, clear_url_caches
++
++def test_edge_cases():
++    """Test edge cases for the resolver optimization."""
++    print("Testing edge cases...")
++    
++    # Test 1: Multiple calls with None should all hit cache
++    print("\n1. Testing multiple calls with None:")
++    _get_resolver_cached.cache_clear()
++    
++    resolver1 = get_resolver(None)
++    resolver2 = get_resolver(None)
++    resolver3 = get_resolver(None)
++    
++    print(f"   All resolvers are the same: {resolver1 is resolver2 is resolver3}")
++    print(f"   Cache info: {_get_resolver_cached.cache_info()}")
++    
++    # Test 2: Multiple calls with explicit ROOT_URLCONF should hit cache
++    print("\n2. Testing multiple calls with explicit ROOT_URLCONF:")
++    _get_resolver_cached.cache_clear()
++    
++    resolver1 = get_resolver(settings.ROOT_URLCONF)
++    resolver2 = get_resolver(settings.ROOT_URLCONF)
++    resolver3 = get_resolver(settings.ROOT_URLCONF)
++    
++    print(f"   All resolvers are the same: {resolver1 is resolver2 is resolver3}")
++    print(f"   Cache info: {_get_resolver_cached.cache_info()}")
++    
++    # Test 3: Mix of None and explicit ROOT_URLCONF should hit cache
++    print("\n3. Testing mix of None and explicit ROOT_URLCONF:")
++    _get_resolver_cached.cache_clear()
++    
++    resolver1 = get_resolver(None)
++    resolver2 = get_resolver(settings.ROOT_URLCONF)
++    resolver3 = get_resolver(None)
++    resolver4 = get_resolver(settings.ROOT_URLCONF)
++    
++    print(f"   All resolvers are the same: {resolver1 is resolver2 is resolver3 is resolver4}")
++    print(f"   Cache info: {_get_resolver_cached.cache_info()}")
++    
++    # Test 4: Different URLconf should create different resolver
++    print("\n4. Testing different URLconf:")
++    _get_resolver_cached.cache_clear()
++    
++    resolver1 = get_resolver(None)  # Will use 'test_urls'
++    resolver2 = get_resolver('django.contrib.admin.urls')  # Different URLconf
++    
++    print(f"   Resolvers are different: {resolver1 is not resolver2}")
++    print(f"   Resolver1 URLconf: {resolver1.urlconf_name}")
++    print(f"   Resolver2 URLconf: {resolver2.urlconf_name}")
++    print(f"   Cache info: {_get_resolver_cached.cache_info()}")
++    
++    # Test 5: clear_url_caches should work
++    print("\n5. Testing clear_url_caches:")
++    cache_info_before = _get_resolver_cached.cache_info()
++    clear_url_caches()
++    cache_info_after = _get_resolver_cached.cache_info()
++    
++    print(f"   Cache before clear: {cache_info_before}")
++    print(f"   Cache after clear: {cache_info_after}")
++    print(f"   Cache was cleared: {cache_info_after.currsize == 0}")
++
++if __name__ == '__main__':
++    test_edge_cases()
++    
++    # Clean up
++    try:
++        os.unlink(temp_file)
++    except:
++        pass
+\ No newline at end of file
+diff --git a/test_realistic_scenario.py b/test_realistic_scenario.py
+new file mode 100644
+index 0000000000..d27639103e
+--- /dev/null
++++ b/test_realistic_scenario.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python
++"""
++Test realistic scenario for the URLResolver optimization fix.
++
++This simulates the actual scenario described in the issue:
++1. reverse() called at import time (before any request)
++2. Request handling (which calls set_urlconf)
++3. reverse() called during request handling
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='test_urls',
++        SECRET_KEY='test-secret-key',
++        USE_I18N=False,
++        USE_L10N=False,
++        USE_TZ=False,
++    )
++
++django.setup()
++
++# Create a realistic URLconf for testing
++import tempfile
++import importlib.util
++
++# Create a URLconf with many patterns (like a real app)
++urlconf_content = '''
++from django.urls import path, include
++from django.http import HttpResponse
++
++def home_view(request):
++    return HttpResponse("Home")
++
++def detail_view(request, id):
++    return HttpResponse(f"Detail {id}")
++
++def category_view(request, category):
++    return HttpResponse(f"Category {category}")
++
++# Create many URL patterns to make _populate() expensive
++urlpatterns = [
++    path('', home_view, name='home'),
++    path('about/', home_view, name='about'),
++    path('contact/', home_view, name='contact'),
++]
++
++# Add many patterns to simulate a large app
++for i in range(500):
++    urlpatterns.extend([
++        path(f'item{i}/', detail_view, name=f'item{i}'),
++        path(f'category{i}/', category_view, name=f'category{i}'),
++        path(f'api/v1/item{i}/', detail_view, name=f'api_item{i}'),
++    ])
++'''
++
++# Write the URLconf to a temporary file and import it
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(urlconf_content)
++    temp_file = f.name
++
++# Import the temporary module as test_urls
++spec = importlib.util.spec_from_file_location("test_urls", temp_file)
++test_urls = importlib.util.module_from_spec(spec)
++sys.modules['test_urls'] = test_urls
++spec.loader.exec_module(test_urls)
++
++# Now test the realistic scenario
++from django.urls import reverse
++from django.urls.resolvers import _get_resolver_cached
++from django.urls.base import get_urlconf, set_urlconf
++from django.core.handlers.base import BaseHandler
++import time
++
++def test_realistic_scenario():
++    """Test the realistic scenario described in the issue."""
++    print("Testing realistic scenario...")
++    
++    # Clear cache to start fresh
++    _get_resolver_cached.cache_clear()
++    
++    # Simulate import-time reverse() call (before any request handling)
++    print("\n1. Import-time reverse() call (before request handling):")
++    print(f"   get_urlconf() returns: {get_urlconf()}")
++    
++    start_time = time.time()
++    url1 = reverse('home')  # This calls get_resolver(None) internally
++    time1 = time.time() - start_time
++    
++    print(f"   reverse('home') = '{url1}' (took {time1:.4f}s)")
++    cache_info1 = _get_resolver_cached.cache_info()
++    print(f"   Cache after import-time call: {cache_info1}")
++    
++    # Simulate request handling (BaseHandler.get_response calls set_urlconf)
++    print("\n2. Simulating request handling:")
++    set_urlconf(settings.ROOT_URLCONF)
++    print(f"   After set_urlconf, get_urlconf() returns: {get_urlconf()}")
++    
++    # Simulate reverse() call during request handling
++    print("\n3. Request-time reverse() call (after set_urlconf):")
++    start_time = time.time()
++    url2 = reverse('about')  # This calls get_resolver(settings.ROOT_URLCONF) internally
++    time2 = time.time() - start_time
++    
++    print(f"   reverse('about') = '{url2}' (took {time2:.4f}s)")
++    cache_info2 = _get_resolver_cached.cache_info()
++    print(f"   Cache after request-time call: {cache_info2}")
++    
++    # Analysis
++    print("\n4. Analysis:")
++    cache_hits = cache_info2.hits - cache_info1.hits
++    cache_misses = cache_info2.misses - cache_info1.misses
++    
++    if cache_hits > 0 and cache_misses == 0:
++        print(f"   ✓ EXCELLENT: Second call was a cache hit!")
++        print(f"   ✓ This means _populate() was only called once (optimization working)")
++    elif cache_misses > 0:
++        print(f"   ✗ BAD: Second call was a cache miss")
++        print(f"   ✗ This means _populate() was called twice (optimization failed)")
++    
++    print(f"   Cache hits between calls: {cache_hits}")
++    print(f"   Cache misses between calls: {cache_misses}")
++    print(f"   Total cache size: {cache_info2.currsize}")
++    
++    # Test multiple reverse calls to ensure they all hit cache
++    print("\n5. Multiple reverse calls test:")
++    start_cache = _get_resolver_cached.cache_info()
++    
++    urls = []
++    for name in ['home', 'about', 'contact', 'item1', 'category1']:
++        urls.append(reverse(name))
++    
++    end_cache = _get_resolver_cached.cache_info()
++    additional_hits = end_cache.hits - start_cache.hits
++    additional_misses = end_cache.misses - start_cache.misses
++    
++    print(f"   Made 5 additional reverse() calls")
++    print(f"   Additional cache hits: {additional_hits}")
++    print(f"   Additional cache misses: {additional_misses}")
++    
++    if additional_hits == 5 and additional_misses == 0:
++        print(f"   ✓ PERFECT: All additional calls hit the cache")
++    else:
++        print(f"   ✗ ISSUE: Some calls missed the cache")
++
++if __name__ == '__main__':
++    test_realistic_scenario()
++    
++    # Clean up
++    try:
++        os.unlink(temp_file)
++    except:
++        pass
+\ No newline at end of file
+diff --git a/test_resolver_optimization.py b/test_resolver_optimization.py
+new file mode 100644
+index 0000000000..483ad6d5be
+--- /dev/null
++++ b/test_resolver_optimization.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the URLResolver optimization issue.
++
++This script demonstrates that get_resolver() creates multiple URLResolver instances
++when called with None vs settings.ROOT_URLCONF, leading to multiple expensive
++_populate() calls.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='test_urls',
++        SECRET_KEY='test-secret-key',
++        USE_I18N=False,
++        USE_L10N=False,
++        USE_TZ=False,
++    )
++
++django.setup()
++
++# Create a simple URLconf for testing
++import tempfile
++import importlib.util
++
++# Create a temporary URLconf module
++urlconf_content = '''
++from django.urls import path
++from django.http import HttpResponse
++
++def test_view(request):
++    return HttpResponse("Test")
++
++# Create many URL patterns to make _populate() expensive
++urlpatterns = []
++for i in range(1000):
++    urlpatterns.append(path(f'test{i}/', test_view, name=f'test{i}'))
++'''
++
++# Write the URLconf to a temporary file and import it
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write(urlconf_content)
++    temp_file = f.name
++
++# Import the temporary module as test_urls
++spec = importlib.util.spec_from_file_location("test_urls", temp_file)
++test_urls = importlib.util.module_from_spec(spec)
++sys.modules['test_urls'] = test_urls
++spec.loader.exec_module(test_urls)
++
++# Now test the issue
++from django.urls.resolvers import get_resolver, _get_resolver_cached
++from django.urls.base import get_urlconf, set_urlconf
++import time
++
++def test_resolver_caching_issue():
++    """Test that demonstrates the caching issue."""
++    print("Testing URLResolver caching issue...")
++    
++    # Clear any existing cache
++    _get_resolver_cached.cache_clear()
++    
++    # Simulate the scenario described in the issue
++    print("\n1. Before request handling (get_urlconf() returns None):")
++    urlconf_before = get_urlconf()
++    print(f"   get_urlconf() returns: {urlconf_before}")
++    
++    # Time the first call to get_resolver (with None)
++    start_time = time.time()
++    resolver1 = get_resolver(urlconf_before)  # This will be None
++    time1 = time.time() - start_time
++    print(f"   get_resolver(None) took: {time1:.4f} seconds")
++    print(f"   Resolver ID: {id(resolver1)}")
++    print(f"   URLconf: {resolver1.urlconf_name}")
++    
++    print("\n2. Simulating request handling (set_urlconf called):")
++    set_urlconf(settings.ROOT_URLCONF)
++    urlconf_after = get_urlconf()
++    print(f"   After set_urlconf, get_urlconf() returns: {urlconf_after}")
++    
++    # Time the second call to get_resolver (with settings.ROOT_URLCONF)
++    start_time = time.time()
++    resolver2 = get_resolver(urlconf_after)  # This will be 'test_urls'
++    time2 = time.time() - start_time
++    print(f"   get_resolver('{urlconf_after}') took: {time2:.4f} seconds")
++    print(f"   Resolver ID: {id(resolver2)}")
++    print(f"   URLconf: {resolver2.urlconf_name}")
++    
++    print("\n3. Analysis:")
++    if resolver1 is resolver2:
++        print("   ✓ GOOD: Same resolver instance returned (cached properly)")
++    else:
++        print("   ✗ BAD: Different resolver instances returned (cache miss)")
++        print(f"   This means _populate() was called twice unnecessarily!")
++    
++    print(f"\n4. Cache info:")
++    print(f"   _get_resolver_cached cache info: {_get_resolver_cached.cache_info()}")
++    
++    # Test that both resolvers actually work the same way
++    print(f"\n5. Functional test:")
++    try:
++        match1 = resolver1.resolve('/test1/')
++        match2 = resolver2.resolve('/test1/')
++        print(f"   Both resolvers can resolve '/test1/': {match1.url_name == match2.url_name}")
++    except Exception as e:
++        print(f"   Error resolving: {e}")
++
++if __name__ == '__main__':
++    test_resolver_caching_issue()
++    
++    # Clean up
++    try:
++        os.unlink(temp_file)
++    except:
++        pass
+\ No newline at end of file

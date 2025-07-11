@@ -1,0 +1,68 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index d17232e4ec..2352843253 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -936,6 +936,9 @@ class RenameIndex(IndexOperation):
+         if not self.allow_migrate_model(schema_editor.connection.alias, model):
+             return
+
++        to_model_state = to_state.models[app_label, self.model_name_lower]
++        new_index = to_model_state.get_index_by_name(self.new_name)
++
+         if self.old_fields:
+             from_model = from_state.apps.get_model(app_label, self.model_name)
+             columns = [
+@@ -944,7 +947,21 @@ class RenameIndex(IndexOperation):
+             matching_index_name = schema_editor._constraint_names(
+                 from_model, column_names=columns, index=True
+             )
+-            if len(matching_index_name) != 1:
++            if len(matching_index_name) == 0:
++                # The old index doesn't exist, check if the new one exists
++                if schema_editor._constraint_names(from_model, [new_index.name], index=True):
++                    # The new index already exists, no need to rename
++                    return
++                # Neither old nor new index exists, something's wrong
++                raise ValueError(
++                    "Found wrong number (%s) of indexes for %s(%s)."
++                    % (
++                        len(matching_index_name),
++                        from_model._meta.db_table,
++                        ", ".join(columns),
++                    )
++                )
++            elif len(matching_index_name) != 1:
+                 raise ValueError(
+                     "Found wrong number (%s) of indexes for %s(%s)."
+                     % (
+@@ -957,12 +974,13 @@ class RenameIndex(IndexOperation):
+                 fields=self.old_fields,
+                 name=matching_index_name[0],
+             )
++            # Skip if the old index already has the new name (after a backward operation)
++            if old_index.name == new_index.name:
++                return
+         else:
+             from_model_state = from_state.models[app_label, self.model_name_lower]
+             old_index = from_model_state.get_index_by_name(self.old_name)
+
+-        to_model_state = to_state.models[app_label, self.model_name_lower]
+-        new_index = to_model_state.get_index_by_name(self.new_name)
+         schema_editor.rename_index(model, old_index, new_index)
+
+     def database_backwards(self, app_label, schema_editor, from_state, to_state):
+diff --git a/tests/migrations/test_operations.py b/tests/migrations/test_operations.py
+index cfd28b1b39..c0a55023bb 100644
+--- a/tests/migrations/test_operations.py
++++ b/tests/migrations/test_operations.py
+@@ -2988,6 +2988,10 @@ class OperationTests(OperationTestBase):
+         with connection.schema_editor() as editor, self.assertNumQueries(0):
+             operation.database_backwards(app_label, editor, new_state, project_state)
+         self.assertIndexNameExists(table_name, "new_pony_test_idx")
++        # Re-apply renaming.
++        with connection.schema_editor() as editor:
++            operation.database_forwards(app_label, editor, project_state, new_state)
++        self.assertIndexNameExists(table_name, "new_pony_test_idx")
+         # Deconstruction.
+         definition = operation.deconstruct()
+         self.assertEqual(definition[0], "RenameIndex")

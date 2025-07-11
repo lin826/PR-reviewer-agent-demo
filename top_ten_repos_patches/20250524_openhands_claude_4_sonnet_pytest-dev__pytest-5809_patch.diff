@@ -1,0 +1,272 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..24ea53e5f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the pastebin HTTP 400 error issue.
++
++This script demonstrates the problem where using lexer=python3 
++causes HTTP 400 errors for non-Python content.
++"""
++
++import sys
++import tempfile
++from urllib.parse import urlencode
++
++# Import the pastebin module to test
++sys.path.insert(0, '/workspace/pytest-dev__pytest__4.6/src')
++from _pytest.pastebin import create_new_paste
++
++def test_current_implementation_with_bytes():
++    """Test the current implementation with bytes (sessionlog case)."""
++    print("Testing current implementation with bytes (sessionlog case)...")
++    
++    # Create some non-Python content that would be typical pytest output
++    test_content = b"""
++=========================== FAILURES ===========================
++_________________________ test_example _________________________
++
++    def test_example():
++>       assert False, "This is a test failure"
++E       AssertionError: This is a test failure
++E       assert False
++
++test_file.py:2: AssertionError
++=========================== short test summary info ============================
++FAILED test_file.py::test_example - AssertionError: This is a test failure
++=========================== 1 failed in 0.01s ===========================
++"""
++    
++    try:
++        result = create_new_paste(test_content)
++        print(f"Success: {result}")
++        return True
++    except Exception as e:
++        print(f"Error: {e}")
++        print(f"Error type: {type(e)}")
++        return False
++
++def test_current_implementation_with_string():
++    """Test the current implementation with string (failed test case)."""
++    print("Testing current implementation with string (failed test case)...")
++    
++    # Create some non-Python content that would be typical pytest output
++    test_content = """
++=========================== FAILURES ===========================
++_________________________ test_example _________________________
++
++    def test_example():
++>       assert False, "This is a test failure"
++E       AssertionError: This is a test failure
++E       assert False
++
++test_file.py:2: AssertionError
++=========================== short test summary info ============================
++FAILED test_file.py::test_example - AssertionError: This is a test failure
++=========================== 1 failed in 0.01s ===========================
++"""
++    
++    try:
++        result = create_new_paste(test_content)
++        print(f"Success: {result}")
++        return True
++    except Exception as e:
++        print(f"Error: {e}")
++        print(f"Error type: {type(e)}")
++        return False
++
++def test_with_text_lexer():
++    """Test what happens if we manually use text lexer."""
++    print("\nTesting with lexer=text...")
++    
++    if sys.version_info < (3, 0):
++        from urllib import urlopen, urlencode
++    else:
++        from urllib.request import urlopen
++        from urllib.parse import urlencode
++    
++    test_content = b"""
++=========================== FAILURES ===========================
++_________________________ test_example _________________________
++
++    def test_example():
++>       assert False, "This is a test failure"
++E       AssertionError: This is a test failure
++E       assert False
++
++test_file.py:2: AssertionError
++=========================== short test summary info ============================
++FAILED test_file.py::test_example - AssertionError: This is a test failure
++=========================== 1 failed in 0.01s ===========================
++"""
++    
++    params = {
++        "code": test_content.decode('utf-8'),  # Decode bytes to string
++        "lexer": "text",  # Use text instead of python3
++        "expiry": "1week",
++    }
++    url = "https://bpaste.net"
++    
++    try:
++        response = urlopen(url, data=urlencode(params).encode("ascii")).read()
++        print("Success with text lexer!")
++        return True
++    except Exception as e:
++        print(f"Error with text lexer: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Reproducing pastebin HTTP 400 error issue...")
++    print("=" * 50)
++    
++    # Test current implementation with bytes
++    current_bytes_works = test_current_implementation_with_bytes()
++    
++    # Test current implementation with string
++    current_string_works = test_current_implementation_with_string()
++    
++    # Test with text lexer
++    text_works = test_with_text_lexer()
++    
++    print("\n" + "=" * 50)
++    print("Results:")
++    print(f"Current implementation with bytes: {'WORKS' if current_bytes_works else 'FAILS'}")
++    print(f"Current implementation with string: {'WORKS' if current_string_works else 'FAILS'}")
++    print(f"Text lexer implementation: {'WORKS' if text_works else 'FAILS'}")
++    
++    if (not current_bytes_works or not current_string_works) and text_works:
++        print("\nConfirmed: The issue is with using python3 lexer for non-Python content!")
++    elif current_bytes_works and current_string_works:
++        print("\nNote: Current implementation worked - the issue might be content-specific.")
+\ No newline at end of file
+diff --git a/src/_pytest/pastebin.py b/src/_pytest/pastebin.py
+index 41576a615..fdbc67e9e 100644
+--- a/src/_pytest/pastebin.py
++++ b/src/_pytest/pastebin.py
+@@ -77,9 +77,12 @@ def create_new_paste(contents):
+         from urllib.request import urlopen
+         from urllib.parse import urlencode
+ 
++    if isinstance(contents, bytes):
++        contents = contents.decode("utf-8")
++    
+     params = {
+         "code": contents,
+-        "lexer": "python3" if sys.version_info[0] >= 3 else "python",
++        "lexer": "text",
+         "expiry": "1week",
+     }
+     url = "https://bpaste.net"
+@@ -88,7 +91,7 @@ def create_new_paste(contents):
+     if m:
+         return "%s/show/%s" % (url, m.group(1))
+     else:
+-        return "bad response: " + response
++        return "bad response: " + response.decode("utf-8")
+ 
+ 
+ def pytest_terminal_summary(terminalreporter):
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 000000000..1c922bbd6
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python
++"""
++Test the fix for pastebin functionality.
++"""
++
++import sys
++import os
++
++# Add the source directory to the path
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
++
++def test_pastebin_fix():
++    """Test the fixed pastebin functionality."""
++    from _pytest.pastebin import create_new_paste
++    
++    print("Testing fixed pastebin functionality...")
++    
++    # Test with bytes
++    print("Testing with bytes...")
++    try:
++        result = create_new_paste(b"test content with bytes")
++        print(f"Success with bytes: {result}")
++        bytes_works = True
++    except Exception as e:
++        print(f"Error with bytes: {e}")
++        import traceback
++        traceback.print_exc()
++        bytes_works = False
++    
++    # Test with string
++    print("Testing with string...")
++    try:
++        result = create_new_paste("test content with string")
++        print(f"Success with string: {result}")
++        string_works = True
++    except Exception as e:
++        print(f"Error with string: {e}")
++        string_works = False
++    
++    return bytes_works, string_works
++
++if __name__ == "__main__":
++    bytes_works, string_works = test_pastebin_fix()
++    print(f"\nResults:")
++    print(f"Bytes input: {'WORKS' if bytes_works else 'FAILS'}")
++    print(f"String input: {'WORKS' if string_works else 'FAILS'}")
+\ No newline at end of file
+diff --git a/test_real_pastebin.py b/test_real_pastebin.py
+new file mode 100644
+index 000000000..0ead267e3
+--- /dev/null
++++ b/test_real_pastebin.py
+@@ -0,0 +1,27 @@
++#!/usr/bin/env python
++"""
++Test the real pastebin functionality without mocks to see the actual error.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/pytest-dev__pytest__4.6/src')
++
++# Force reload to pick up changes
++import importlib
++if '_pytest.pastebin' in sys.modules:
++    importlib.reload(sys.modules['_pytest.pastebin'])
++
++from _pytest.pastebin import create_new_paste
++
++def test_real_pastebin():
++    """Test with real pastebin call (no mocks)."""
++    try:
++        # This should fail with the current implementation
++        result = create_new_paste(b"test content")
++        print(f"Unexpected success: {result}")
++    except Exception as e:
++        print(f"Expected error: {e}")
++        print(f"Error type: {type(e)}")
++
++if __name__ == "__main__":
++    test_real_pastebin()
+\ No newline at end of file
+diff --git a/testing/test_pastebin.py b/testing/test_pastebin.py
+index bac8f9802..aac0b651e 100644
+--- a/testing/test_pastebin.py
++++ b/testing/test_pastebin.py
+@@ -126,8 +126,7 @@ class TestPaste(object):
+         assert len(mocked_urlopen) == 1
+         url, data = mocked_urlopen[0]
+         assert type(data) is bytes
+-        lexer = "python3" if sys.version_info[0] >= 3 else "python"
+         assert url == "https://bpaste.net"
+-        assert "lexer=%s" % lexer in data.decode()
++        assert "lexer=text" in data.decode()
+         assert "code=full-paste-contents" in data.decode()
+         assert "expiry=1week" in data.decode()

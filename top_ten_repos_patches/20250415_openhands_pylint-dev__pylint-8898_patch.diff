@@ -1,0 +1,145 @@
+diff --git a/pylint/config/argument.py b/pylint/config/argument.py
+index 30a5fd175..f63da4830 100644
+--- a/pylint/config/argument.py
++++ b/pylint/config/argument.py
+@@ -112,10 +112,84 @@ def _regex_transformer(value: str) -> Pattern[str]:
+ 
+ 
+ def _regexp_csv_transfomer(value: str) -> Sequence[Pattern[str]]:
+-    """Transforms a comma separated list of regular expressions."""
+-    patterns: list[Pattern[str]] = []
+-    for pattern in _csv_transformer(value):
+-        patterns.append(_regex_transformer(pattern))
++    """Transforms a comma separated list of regular expressions.
++    
++    There are two ways to include patterns with commas:
++    
++    1. Each part split by commas is treated as a separate pattern if it's a valid regex.
++       If a part is not a valid regex by itself, then special handling is applied.
++    
++    2. Commas can be escaped with a backslash to include them as part of a pattern
++       (e.g. "foo\\,bar" will be treated as a single pattern containing a comma).
++    """
++    if not value:
++        return []
++    
++    # First, handle explicitly escaped commas
++    placeholder = "\0COMMA\0"
++    processed_value = ""
++    escape_next = False
++    
++    # Replace escaped commas with a placeholder
++    i = 0
++    while i < len(value):
++        if value[i] == "\\" and i + 1 < len(value) and value[i + 1] == ",":
++            processed_value += placeholder
++            i += 2  # Skip both the backslash and the comma
++        else:
++            processed_value += value[i]
++            i += 1
++    
++    # Split on unescaped commas
++    parts = _csv_transformer(processed_value)
++    patterns = []
++    
++    # If there's only one part, simply compile it
++    if len(parts) == 1:
++        pattern = parts[0].replace(placeholder, ",")
++        return [_regex_transformer(pattern)]
++    
++    # Try to process each part individually
++    i = 0
++    while i < len(parts):
++        part = parts[i].replace(placeholder, ",")
++        
++        # Try to compile the current part
++        try:
++            pattern = re.compile(part)
++            patterns.append(pattern)
++            i += 1
++            continue
++        except re.error as e:
++            # This part couldn't be compiled as a regex
++            pass
++        
++        # If we can't compile this part alone, try combining with next part(s)
++        if i < len(parts) - 1:
++            combined = part
++            j = i + 1
++            valid_combined = False
++            
++            # Try combining with subsequent parts until we get a valid regex
++            while j < len(parts):
++                combined += "," + parts[j].replace(placeholder, ",")
++                try:
++                    pattern = re.compile(combined)
++                    patterns.append(pattern)
++                    valid_combined = True
++                    break
++                except re.error:
++                    j += 1
++            
++            if valid_combined:
++                i = j + 1
++                continue
++        
++        # If we couldn't make a valid pattern, use _regex_transformer 
++        # which will raise a proper error message
++        patterns.append(_regex_transformer(part))
++        i += 1
++    
+     return patterns
+ 
+ 
+diff --git a/tests/config/test_config.py b/tests/config/test_config.py
+index 83c8b072e..3a1073b56 100644
+--- a/tests/config/test_config.py
++++ b/tests/config/test_config.py
+@@ -132,19 +132,19 @@ def test_regex_error(capsys: CaptureFixture) -> None:
+ 
+ 
+ def test_csv_regex_error(capsys: CaptureFixture) -> None:
+-    """Check that we correctly error when an option is passed and one
+-    of its comma-separated regular expressions values is an invalid regular expression.
++    """Check that we can correctly handle when a regex with commas is passed.
++    
++    Previously, this would error out with a regex parsing error, but with the
++    fix for handling commas in regex patterns, this should now work correctly.
+     """
+-    with pytest.raises(SystemExit):
+-        Run(
+-            [str(EMPTY_MODULE), r"--bad-names-rgx=(foo{1,3})"],
+-            exit=False,
+-        )
+-    output = capsys.readouterr()
+-    assert (
+-        r"Error in provided regular expression: (foo{1 beginning at index 0: missing ), unterminated subpattern"
+-        in output.err
++    # This should no longer raise SystemExit because our fix allows regexes with commas
++    Run(
++        [str(EMPTY_MODULE), r"--bad-names-rgx=(foo{1,3})"],
++        exit=False,
+     )
++    output = capsys.readouterr()
++    # No error should be present in the output
++    assert "Error in provided regular expression" not in output.err
+ 
+ 
+ def test_short_verbose(capsys: CaptureFixture) -> None:
+diff --git a/tmp/foo.py b/tmp/foo.py
+new file mode 100644
+index 000000000..eba385ff0
+--- /dev/null
++++ b/tmp/foo.py
+@@ -0,0 +1 @@
++foo = 123
+diff --git a/tmp/test_pylintrc.toml b/tmp/test_pylintrc.toml
+new file mode 100644
+index 000000000..ac6568e5e
+--- /dev/null
++++ b/tmp/test_pylintrc.toml
+@@ -0,0 +1,4 @@
++[tool.pylint.basic]
++# capture group ensures that the part after the comma is an invalid regular
++# expression, causing pylint to crash
++bad-names-rgxs = "(foo{1,3})"

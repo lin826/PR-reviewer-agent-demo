@@ -1,0 +1,342 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..5df47f047
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the ColumnTransformer.set_output issue with remainder estimator.
++"""
++
++import pandas as pd
++from sklearn.compose import make_column_selector, make_column_transformer
++from sklearn.feature_selection import VarianceThreshold
++
++def test_remainder_estimator_set_output():
++    """Test that set_output works correctly with remainder estimator."""
++    print("Testing ColumnTransformer.set_output with remainder estimator...")
++    
++    # Create test data
++    df = pd.DataFrame({"a": [True, False, True], "b": [1, 2, 3]})
++    print(f"Input DataFrame:\n{df}")
++    print(f"Input dtypes:\n{df.dtypes}")
++    print()
++    
++    # Test case 1: Using remainder estimator (this should fail)
++    print("=== Test case 1: Using remainder estimator ===")
++    ct1 = make_column_transformer(
++        (VarianceThreshold(), make_column_selector(dtype_include=bool)),
++        remainder=VarianceThreshold(),
++        verbose_feature_names_out=False,
++    ).set_output(transform="pandas")
++    
++    out1 = ct1.fit_transform(df)
++    print(f"Output with remainder estimator:\n{out1}")
++    print(f"Output dtypes:\n{out1.dtypes}")
++    print(f"Expected boolean column 'a' to have dtype bool, got: {out1['a'].dtype}")
++    print()
++    
++    # Test case 2: Using explicit transformers (this should work)
++    print("=== Test case 2: Using explicit transformers ===")
++    ct2 = make_column_transformer(
++        (VarianceThreshold(), make_column_selector(dtype_include=bool)),
++        (VarianceThreshold(), make_column_selector(dtype_exclude=bool)),
++        verbose_feature_names_out=False,
++    ).set_output(transform="pandas")
++    
++    out2 = ct2.fit_transform(df)
++    print(f"Output with explicit transformers:\n{out2}")
++    print(f"Output dtypes:\n{out2.dtypes}")
++    print(f"Boolean column 'a' has dtype: {out2['a'].dtype}")
++    print()
++    
++    # Check if the outputs are equivalent
++    print("=== Comparison ===")
++    print(f"Are outputs equal? {out1.equals(out2)}")
++    print(f"Are dtypes equal? {out1.dtypes.equals(out2.dtypes)}")
++    
++    # The issue: out1['a'] should be boolean but it's int64/object
++    # This happens because the remainder transformer doesn't get the pandas output config
++    
++    return out1, out2
++
++if __name__ == "__main__":
++    test_remainder_estimator_set_output()
+\ No newline at end of file
+diff --git a/sklearn/compose/_column_transformer.py b/sklearn/compose/_column_transformer.py
+index 4eddd12b1..33e1cceb8 100644
+--- a/sklearn/compose/_column_transformer.py
++++ b/sklearn/compose/_column_transformer.py
+@@ -275,8 +275,8 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
+     def set_output(self, *, transform=None):
+         """Set the output container when `"transform"` and `"fit_transform"` are called.
+ 
+-        Calling `set_output` will set the output of all estimators in `transformers`
+-        and `transformers_`.
++        Calling `set_output` will set the output of all estimators in `transformers`,
++        `transformers_`, and `remainder`.
+ 
+         Parameters
+         ----------
+@@ -303,6 +303,10 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
+         for trans in transformers:
+             _safe_set_output(trans, transform=transform)
+ 
++        # Also set output for remainder transformer if it's an estimator
++        if self.remainder not in {"passthrough", "drop"}:
++            _safe_set_output(self.remainder, transform=transform)
++
+         return self
+ 
+     def get_params(self, deep=True):
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 000000000..4983233b5
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the ColumnTransformer.set_output fix.
++"""
++
++import pandas as pd
++import numpy as np
++from sklearn.compose import make_column_selector, make_column_transformer, ColumnTransformer
++from sklearn.feature_selection import VarianceThreshold
++from sklearn.preprocessing import StandardScaler, LabelEncoder
++
++def test_remainder_estimator_comprehensive():
++    """Test various scenarios with remainder estimator and set_output."""
++    print("=== Comprehensive test for ColumnTransformer.set_output with remainder ===")
++    
++    # Create test data with mixed types
++    df = pd.DataFrame({
++        "bool_col": [True, False, True, False],
++        "int_col": [1, 2, 3, 4],
++        "float_col": [1.1, 2.2, 3.3, 4.4]
++    })
++    print(f"Input DataFrame:\n{df}")
++    print(f"Input dtypes:\n{df.dtypes}")
++    print()
++    
++    # Test 1: remainder as estimator with pandas output
++    print("=== Test 1: remainder as estimator with pandas output ===")
++    ct1 = ColumnTransformer([
++        ("bool_trans", VarianceThreshold(), ["bool_col"]),
++    ], remainder=StandardScaler()).set_output(transform="pandas")
++    
++    out1 = ct1.fit_transform(df)
++    print(f"Output:\n{out1}")
++    print(f"Output dtypes:\n{out1.dtypes}")
++    print(f"Is pandas DataFrame: {isinstance(out1, pd.DataFrame)}")
++    print()
++    
++    # Test 2: remainder as "passthrough" with pandas output
++    print("=== Test 2: remainder as 'passthrough' with pandas output ===")
++    ct2 = ColumnTransformer([
++        ("bool_trans", VarianceThreshold(), ["bool_col"]),
++    ], remainder="passthrough").set_output(transform="pandas")
++    
++    out2 = ct2.fit_transform(df)
++    print(f"Output:\n{out2}")
++    print(f"Output dtypes:\n{out2.dtypes}")
++    print(f"Is pandas DataFrame: {isinstance(out2, pd.DataFrame)}")
++    print()
++    
++    # Test 3: remainder as "drop" with pandas output
++    print("=== Test 3: remainder as 'drop' with pandas output ===")
++    ct3 = ColumnTransformer([
++        ("bool_trans", VarianceThreshold(), ["bool_col"]),
++    ], remainder="drop").set_output(transform="pandas")
++    
++    out3 = ct3.fit_transform(df)
++    print(f"Output:\n{out3}")
++    print(f"Output dtypes:\n{out3.dtypes}")
++    print(f"Is pandas DataFrame: {isinstance(out3, pd.DataFrame)}")
++    print()
++    
++    # Test 4: Test with default output (should work as before)
++    print("=== Test 4: remainder as estimator with default output ===")
++    ct4 = ColumnTransformer([
++        ("bool_trans", VarianceThreshold(), ["bool_col"]),
++    ], remainder=StandardScaler())
++    
++    out4 = ct4.fit_transform(df)
++    print(f"Output type: {type(out4)}")
++    print(f"Output shape: {out4.shape}")
++    print()
++    
++    # Test 5: Test that set_output can be called multiple times
++    print("=== Test 5: Multiple set_output calls ===")
++    ct5 = ColumnTransformer([
++        ("bool_trans", VarianceThreshold(), ["bool_col"]),
++    ], remainder=StandardScaler())
++    
++    # First set to pandas
++    ct5.set_output(transform="pandas")
++    out5a = ct5.fit_transform(df)
++    print(f"After set_output(pandas): {type(out5a)}")
++    
++    # Then set to default
++    ct5.set_output(transform="default")
++    out5b = ct5.fit_transform(df)
++    print(f"After set_output(default): {type(out5b)}")
++    print()
++    
++    print("All tests completed successfully!")
++
++if __name__ == "__main__":
++    test_remainder_estimator_comprehensive()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 000000000..9e23d197e
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""
++Test the exact example from the original issue.
++"""
++
++import pandas as pd
++from sklearn.compose import make_column_selector, make_column_transformer
++from sklearn.feature_selection import VarianceThreshold
++
++def test_original_issue():
++    """Test the exact code from the original issue."""
++    print("Testing the exact example from the original issue...")
++    
++    df = pd.DataFrame({"a": [True, False, True], "b": [1, 2, 3]})
++    
++    # This was the problematic case
++    out1 = make_column_transformer(
++        (VarianceThreshold(), make_column_selector(dtype_include=bool)),
++        remainder=VarianceThreshold(),
++        verbose_feature_names_out=False,
++    ).set_output(transform="pandas").fit_transform(df)
++    print("Output with remainder estimator:")
++    print(out1)
++    print()
++
++    # This was the working case
++    out2 = make_column_transformer(
++        (VarianceThreshold(), make_column_selector(dtype_include=bool)),
++        (VarianceThreshold(), make_column_selector(dtype_exclude=bool)),
++        verbose_feature_names_out=False,
++    ).set_output(transform="pandas").fit_transform(df)
++    print("Output with explicit transformers:")
++    print(out2)
++    print()
++    
++    # Check if they're now equal (they should be)
++    print(f"Are outputs equal? {out1.equals(out2)}")
++    print(f"Are dtypes equal? {out1.dtypes.equals(out2.dtypes)}")
++    
++    # Expected output should be:
++    expected = pd.DataFrame({
++        "a": [True, False, True],
++        "b": [1, 2, 3]
++    })
++    
++    print(f"Matches expected output? {out1.equals(expected)}")
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file
+diff --git a/test_remainder_set_output.py b/test_remainder_set_output.py
+new file mode 100644
+index 000000000..1d77a1b61
+--- /dev/null
++++ b/test_remainder_set_output.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Test case that could be added to the test suite to prevent regression.
++"""
++
++import pandas as pd
++import pytest
++from sklearn.compose import ColumnTransformer
++from sklearn.feature_selection import VarianceThreshold
++from sklearn.preprocessing import StandardScaler
++
++
++def test_column_transformer_set_output_remainder_estimator():
++    """Test that set_output works correctly with remainder estimator."""
++    # Create test data
++    df = pd.DataFrame({
++        "bool_col": [True, False, True, False],
++        "num_col": [1.0, 2.0, 3.0, 4.0]
++    })
++    
++    # Test with remainder as estimator
++    ct = ColumnTransformer([
++        ("bool_trans", VarianceThreshold(), ["bool_col"]),
++    ], remainder=StandardScaler()).set_output(transform="pandas")
++    
++    result = ct.fit_transform(df)
++    
++    # Check that result is a pandas DataFrame
++    assert isinstance(result, pd.DataFrame)
++    
++    # Check that boolean column maintains its dtype
++    assert result.iloc[:, 0].dtype == bool
++    
++    # Check that numeric column was transformed by StandardScaler
++    # (should have mean ~0 and std ~1)
++    numeric_col = result.iloc[:, 1]
++    assert abs(numeric_col.mean()) < 1e-10  # approximately 0
++    assert abs(numeric_col.std(ddof=0) - 1.0) < 1e-10  # approximately 1
++
++
++def test_column_transformer_set_output_remainder_passthrough():
++    """Test that set_output works correctly with remainder='passthrough'."""
++    df = pd.DataFrame({
++        "bool_col": [True, False, True, False],
++        "num_col": [1.0, 2.0, 3.0, 4.0]
++    })
++    
++    ct = ColumnTransformer([
++        ("bool_trans", VarianceThreshold(), ["bool_col"]),
++    ], remainder="passthrough").set_output(transform="pandas")
++    
++    result = ct.fit_transform(df)
++    
++    # Check that result is a pandas DataFrame
++    assert isinstance(result, pd.DataFrame)
++    
++    # Check that both columns maintain their original dtypes
++    assert result.iloc[:, 0].dtype == bool
++    assert result.iloc[:, 1].dtype == float
++
++
++def test_column_transformer_set_output_remainder_drop():
++    """Test that set_output works correctly with remainder='drop'."""
++    df = pd.DataFrame({
++        "bool_col": [True, False, True, False],
++        "num_col": [1.0, 2.0, 3.0, 4.0]
++    })
++    
++    ct = ColumnTransformer([
++        ("bool_trans", VarianceThreshold(), ["bool_col"]),
++    ], remainder="drop").set_output(transform="pandas")
++    
++    result = ct.fit_transform(df)
++    
++    # Check that result is a pandas DataFrame
++    assert isinstance(result, pd.DataFrame)
++    
++    # Check that only the bool column is present
++    assert result.shape[1] == 1
++    assert result.iloc[:, 0].dtype == bool
++
++
++if __name__ == "__main__":
++    test_column_transformer_set_output_remainder_estimator()
++    test_column_transformer_set_output_remainder_passthrough()
++    test_column_transformer_set_output_remainder_drop()
++    print("All tests passed!")
+\ No newline at end of file

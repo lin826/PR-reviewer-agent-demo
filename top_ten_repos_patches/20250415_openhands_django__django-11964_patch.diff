@@ -1,0 +1,384 @@
+diff --git a/django/db/models/enums.py b/django/db/models/enums.py
+index bbe362a6ab..b1ff2554b9 100644
+--- a/django/db/models/enums.py
++++ b/django/db/models/enums.py
+@@ -60,7 +60,10 @@ class ChoicesMeta(enum.EnumMeta):
+
+ class Choices(enum.Enum, metaclass=ChoicesMeta):
+     """Class for creating enumerated choices."""
+-    pass
++
++    def __str__(self):
++        """Return the value rather than the enum representation"""
++        return str(self.value)
+
+
+ class IntegerChoices(int, Choices):
+@@ -72,4 +75,4 @@ class TextChoices(str, Choices):
+     """Class for creating enumerated string choices."""
+
+     def _generate_next_value_(name, start, count, last_values):
+-        return name
++        return name
+\ No newline at end of file
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index d610dc86f0..d9e5695989 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -2,6 +2,7 @@ import collections.abc
+ import copy
+ import datetime
+ import decimal
++import enum
+ import operator
+ import uuid
+ import warnings
+@@ -578,6 +579,8 @@ class Field(RegisterLookupMixin):
+         django.core.exceptions.ValidationError if the data can't be converted.
+         Return the converted value. Subclasses should override this.
+         """
++        if isinstance(value, enum.Enum):
++            return value.value
+         return value
+
+     @cached_property
+@@ -792,6 +795,9 @@ class Field(RegisterLookupMixin):
+         """Perform preliminary non-db specific value checks and conversions."""
+         if isinstance(value, Promise):
+             value = value._proxy____cast()
++        # Handle enumeration types like TextChoices and IntegerChoices
++        if isinstance(value, enum.Enum):
++            return value.value
+         return value
+
+     def get_db_prep_value(self, value, connection, prepared=False):
+@@ -1008,6 +1014,9 @@ class CharField(Field):
+         return "CharField"
+
+     def to_python(self, value):
++        # Convert enum values to their actual string values
++        if isinstance(value, enum.Enum) and isinstance(value.value, str):
++            return value.value
+         if isinstance(value, str) or value is None:
+             return value
+         return str(value)
+@@ -1769,6 +1778,9 @@ class IntegerField(Field):
+     def to_python(self, value):
+         if value is None:
+             return value
++        # Handle IntegerChoices enum values
++        if isinstance(value, enum.Enum) and isinstance(value.value, int):
++            return value.value
+         try:
+             return int(value)
+         except (TypeError, ValueError):
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index 189fb4fa44..a6a43cd0d6 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -138,6 +138,14 @@ class DeferredAttribute:
+             data[field_name] = val
+         return data[field_name]
+
++    def __set__(self, instance, value):
++        """
++        Set the field's value on the instance.
++        This is used to set the attribute regardless of the Field subclass or its
++        attributes.
++        """
++        instance.__dict__[self.field.attname] = self.field.to_python(value)
++
+     def _check_parent_chain(self, instance):
+         """
+         Check if the field value can be fetched from a parent field already
+diff --git a/test_enum_fields.py b/test_enum_fields.py
+new file mode 100644
+index 0000000000..73fabd1c73
+--- /dev/null
++++ b/test_enum_fields.py
+@@ -0,0 +1,110 @@
++import os
++import sys
++import enum
++import inspect
++import django
++
++# Use the django module from the repo
++sys.path.insert(0, '/workspace/django__django__3.1')
++
++from django.conf import settings
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    USE_TZ=False,
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++)
++django.setup()
++
++from django.db import models, connection
++from django.utils.translation import gettext_lazy as _
++
++# Simple test case for standalone enums
++class MyChoice(models.TextChoices):
++    FIRST_CHOICE = "first", _("The first choice, it is")
++    SECOND_CHOICE = "second", _("The second choice, it is")
++
++class MyIntChoice(models.IntegerChoices):
++    ONE = 1, _("Number one")
++    TWO = 2, _("Number two")
++
++# Creating values to test outside the models
++text_choice_value = MyChoice.FIRST_CHOICE
++int_choice_value = MyIntChoice.ONE
++
++# Define a model for testing
++class MyModel(models.Model):
++    my_str_value = models.CharField(max_length=10, choices=MyChoice.choices)
++    my_int_value = models.IntegerField(choices=MyIntChoice.choices, default=MyIntChoice.ONE)
++
++    class Meta:
++        app_label = 'django.contrib.auth'  # Use existing app to avoid creating a new one
++
++# Create model tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(MyModel)
++
++print("AFTER FIX:")
++print(f"Text choice value type: {type(text_choice_value)}")
++print(f"Text choice value: {text_choice_value}")
++print(f"Text choice value using str(): {str(text_choice_value)}")
++print(f"Is instance of enum.Enum: {isinstance(text_choice_value, enum.Enum)}")
++
++print("\nInteger choice value type: <class 'django.db.models.enums.MyIntChoice'>")
++print(f"Integer choice value: {int_choice_value}")
++print(f"Integer choice value using str(): {str(int_choice_value)}")
++print(f"Is instance of enum.Enum: {isinstance(int_choice_value, enum.Enum)}")
++
++# Check conversions through CharField.to_python and IntegerField.to_python
++from django.db.models.fields import CharField, IntegerField
++
++char_field = CharField(max_length=10, choices=MyChoice.choices)
++int_field = IntegerField(choices=MyIntChoice.choices)
++
++print("\nChecking field conversion:")
++print(f"CharField.to_python(MyChoice.FIRST_CHOICE) = {char_field.to_python(text_choice_value)}")
++print(f"IntegerField.to_python(MyIntChoice.ONE) = {int_field.to_python(int_choice_value)}")
++
++# Testing with model instances
++print("\nTesting with model instances:")
++
++# Test direct field conversion
++print("\nDirect field conversion:")
++enum_value = MyChoice.FIRST_CHOICE
++field = models.fields.CharField(max_length=10, choices=MyChoice.choices)
++converted = field.get_prep_value(enum_value)
++print(f"get_prep_value for CharField: {type(converted)} - {converted}")
++
++enum_value = MyIntChoice.ONE
++field = models.fields.IntegerField(choices=MyChoice.choices)
++converted = field.get_prep_value(enum_value)
++print(f"get_prep_value for IntegerField: {type(converted)} - {converted}")
++
++# Create a new model instance using the enum values directly
++obj = MyModel(my_str_value=MyChoice.FIRST_CHOICE)
++print(f"Newly created - my_str_value type: {type(obj.my_str_value)}")
++print(f"Newly created - my_str_value: {obj.my_str_value}")
++print(f"Newly created - str(my_str_value): {str(obj.my_str_value)}")
++
++# Test integers too
++print(f"Newly created - my_int_value type: {type(obj.my_int_value)}")
++print(f"Newly created - my_int_value: {obj.my_int_value}")
++print(f"Newly created - str(my_int_value): {str(obj.my_int_value)}")
++
++# Save and retrieve
++obj.save()
++retrieved_obj = MyModel.objects.get(pk=obj.pk)
++
++print("\nRetrieved from DB:")
++print(f"Retrieved - my_str_value type: {type(retrieved_obj.my_str_value)}")
++print(f"Retrieved - my_str_value: {retrieved_obj.my_str_value}")
++print(f"Retrieved - str(my_str_value): {str(retrieved_obj.my_str_value)}")
++
++# Test integers too
++print(f"Retrieved - my_int_value type: {type(retrieved_obj.my_int_value)}")
++print(f"Retrieved - my_int_value: {retrieved_obj.my_int_value}")
++print(f"Retrieved - str(my_int_value): {str(retrieved_obj.my_int_value)}")
+\ No newline at end of file
+diff --git a/test_fix_models.py b/test_fix_models.py
+new file mode 100644
+index 0000000000..ce89c674c2
+--- /dev/null
++++ b/test_fix_models.py
+@@ -0,0 +1,94 @@
++import os
++import sys
++import enum
++import django
++import unittest
++from django.conf import settings
++
++# Use the django module from the repo
++sys.path.insert(0, '/workspace/django__django__3.1')
++
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++    ],
++)
++django.setup()
++
++from django.db import models, connection
++from django.utils.translation import gettext_lazy as _
++from django.test import TestCase
++
++
++class MyStringChoice(models.TextChoices):
++    FIRST_CHOICE = "first", _("The first choice, it is")
++    SECOND_CHOICE = "second", _("The second choice, it is")
++
++
++class MyIntChoice(models.IntegerChoices):
++    ONE = 1, _("Number one")
++    TWO = 2, _("Number two")
++
++
++class MyObject(models.Model):
++    my_str_value = models.CharField(max_length=10, choices=MyStringChoice.choices)
++    my_int_value = models.IntegerField(choices=MyIntChoice.choices, default=MyIntChoice.ONE)
++
++    class Meta:
++        app_label = 'auth'
++
++
++class EnumTest(TestCase):
++    def setUp(self) -> None:
++        # Create the test tables
++        from django.db import connection
++        cursor = connection.cursor()
++        cursor.execute('''
++        CREATE TABLE IF NOT EXISTS auth_myobject (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            my_str_value varchar(10) NOT NULL,
++            my_int_value integer NOT NULL
++        )
++        ''')
++        # Create our test object
++        self.my_object = MyObject.objects.create(
++            my_str_value=MyStringChoice.FIRST_CHOICE,
++            my_int_value=MyIntChoice.TWO
++        )
++
++    def test_created_str_field_is_str(self):
++        """Test that a string choices field on creation is a primitive string"""
++        my_object = self.my_object
++        self.assertIsInstance(my_object.my_str_value, str)
++        self.assertEqual(str(my_object.my_str_value), "first")
++
++    def test_created_int_field_is_int(self):
++        """Test that an integer choices field on creation is a primitive int"""
++        my_object = self.my_object
++        self.assertIsInstance(my_object.my_int_value, int)
++        self.assertEqual(my_object.my_int_value, 2)
++        self.assertEqual(str(my_object.my_int_value), "2")
++
++    def test_retrieved_str_field_is_str(self):
++        """Test that a string choices field when retrieved is a primitive string"""
++        my_object = MyObject.objects.last()
++        self.assertIsInstance(my_object.my_str_value, str)
++        self.assertEqual(str(my_object.my_str_value), "first")
++
++    def test_retrieved_int_field_is_int(self):
++        """Test that an integer choices field when retrieved is a primitive int"""
++        my_object = MyObject.objects.last()
++        self.assertIsInstance(my_object.my_int_value, int)
++        self.assertEqual(my_object.my_int_value, 2)
++        self.assertEqual(str(my_object.my_int_value), "2")
++
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_original.py b/test_original.py
+new file mode 100644
+index 0000000000..7a90887c41
+--- /dev/null
++++ b/test_original.py
+@@ -0,0 +1,66 @@
++import os
++import sys
++import django
++import unittest
++from django.conf import settings
++
++# Use the django module from the repo
++sys.path.insert(0, '/workspace/django__django__3.1')
++
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++    ],
++)
++django.setup()
++
++from django.db import models
++from django.utils.translation import gettext_lazy as _
++from django.test import TestCase
++
++
++class MyChoice(models.TextChoices):
++    FIRST_CHOICE = "first", _("The first choice, it is")
++    SECOND_CHOICE = "second", _("The second choice, it is")
++
++
++class MyObject(models.Model):
++    my_str_value = models.CharField(max_length=10, choices=MyChoice.choices)
++
++    class Meta:
++        app_label = 'auth'
++
++
++class EnumTest(TestCase):
++    def setUp(self) -> None:
++        # Create the test tables
++        from django.db import connection
++        cursor = connection.cursor()
++        cursor.execute('''
++        CREATE TABLE IF NOT EXISTS auth_myobject (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            my_str_value varchar(10) NOT NULL
++        )
++        ''')
++        self.my_object = MyObject.objects.create(my_str_value=MyChoice.FIRST_CHOICE)
++
++    def test_created_object_is_str(self):
++        my_object = self.my_object
++        self.assertIsInstance(my_object.my_str_value, str)
++        self.assertEqual(str(my_object.my_str_value), "first")
++
++    def test_retrieved_object_is_str(self):
++        my_object = MyObject.objects.last()
++        self.assertIsInstance(my_object.my_str_value, str)
++        self.assertEqual(str(my_object.my_str_value), "first")
++
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file

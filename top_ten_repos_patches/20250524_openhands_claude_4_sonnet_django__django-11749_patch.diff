@@ -1,0 +1,897 @@
+diff --git a/django/core/management/__init__.py b/django/core/management/__init__.py
+index 5f2e64761e..30cb239f89 100644
+--- a/django/core/management/__init__.py
++++ b/django/core/management/__init__.py
+@@ -136,6 +136,18 @@ def call_command(command_name, *args, **options):
+         '{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+         for opt in parser_actions if opt.required and opt.dest in options
+     ]
++    # Handle arguments that are part of required mutually exclusive groups.
++    for group in parser._mutually_exclusive_groups:
++        if group.required:
++            for action in group._group_actions:
++                if action.dest in arg_options:
++                    option_string = min(action.option_strings)
++                    if action.nargs == 0:
++                        # For store_true, store_false, etc. actions that don't take values
++                        parse_args.append(option_string)
++                    else:
++                        # For actions that take values
++                        parse_args.append('{}={}'.format(option_string, arg_options[action.dest]))
+     defaults = parser.parse_args(args=parse_args)
+     defaults = dict(defaults._get_kwargs(), **arg_options)
+     # Raise an error if any unknown options were passed.
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..2ba0158450
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,233 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the mutually exclusive group fix.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from io import StringIO
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Set up minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++SECRET_KEY = 'test-secret-key'
++INSTALLED_APPS = [
++    'test_app',
++]
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++'''
++
++# Create temporary test app structure
++test_dir = tempfile.mkdtemp()
++test_app_dir = os.path.join(test_dir, 'test_app')
++management_dir = os.path.join(test_app_dir, 'management')
++commands_dir = os.path.join(management_dir, 'commands')
++
++os.makedirs(commands_dir)
++
++# Create __init__.py files
++for dir_path in [test_app_dir, management_dir]:
++    with open(os.path.join(dir_path, '__init__.py'), 'w') as f:
++        f.write('')
++
++# Create comprehensive test command
++command_content = '''
++from django.core.management.base import BaseCommand
++
++class Command(BaseCommand):
++    help = 'Comprehensive test command'
++
++    def add_arguments(self, parser):
++        # Individual required argument
++        parser.add_argument('--required-individual', required=True, help='Individual required')
++        
++        # Required mutually exclusive group with different action types
++        shop_group = parser.add_mutually_exclusive_group(required=True)
++        shop_group.add_argument('--shop-id', type=int, dest='shop_id', help='Shop ID')
++        shop_group.add_argument('--shop-name', type=str, dest='shop_name', help='Shop name')
++        shop_group.add_argument('--shop-auto', action='store_true', dest='shop_auto', help='Auto shop')
++        
++        # Optional mutually exclusive group
++        format_group = parser.add_mutually_exclusive_group(required=False)
++        format_group.add_argument('--json', action='store_true', dest='use_json')
++        format_group.add_argument('--xml', action='store_true', dest='use_xml')
++        
++        # Another required mutually exclusive group
++        mode_group = parser.add_mutually_exclusive_group(required=True)
++        mode_group.add_argument('--verbose', action='store_true', dest='verbose_mode')
++        mode_group.add_argument('--quiet', action='store_true', dest='quiet_mode')
++        mode_group.add_argument('--level', type=int, dest='level')
++        
++        # Optional individual argument
++        parser.add_argument('--optional', type=str, help='Optional argument')
++
++    def handle(self, *args, **options):
++        result = []
++        result.append(f"Required individual: {options['required_individual']}")
++        
++        if options['shop_id']:
++            result.append(f"Shop ID: {options['shop_id']}")
++        elif options['shop_name']:
++            result.append(f"Shop name: {options['shop_name']}")
++        elif options['shop_auto']:
++            result.append("Shop: auto")
++            
++        if options['use_json']:
++            result.append("Format: JSON")
++        elif options['use_xml']:
++            result.append("Format: XML")
++        else:
++            result.append("Format: default")
++            
++        if options['verbose_mode']:
++            result.append("Mode: verbose")
++        elif options['quiet_mode']:
++            result.append("Mode: quiet")
++        elif options['level'] is not None:
++            result.append(f"Mode: level {options['level']}")
++            
++        if options['optional']:
++            result.append(f"Optional: {options['optional']}")
++            
++        self.stdout.write(" | ".join(result))
++'''
++
++with open(os.path.join(commands_dir, 'comprehensive.py'), 'w') as f:
++    f.write(command_content)
++
++# Create settings file
++with open(os.path.join(test_dir, 'test_settings.py'), 'w') as f:
++    f.write(settings_content)
++
++# Add test directory to Python path
++sys.path.insert(0, test_dir)
++
++try:
++    import django
++    django.setup()
++    
++    from django.core.management import call_command
++    from django.core.management.base import CommandError
++    
++    print("Comprehensive testing...")
++    print("=" * 60)
++    
++    test_cases = [
++        {
++            'name': 'All required args with values',
++            'kwargs': {
++                'required_individual': 'test',
++                'shop_id': 123,
++                'verbose_mode': True,
++                'optional': 'extra'
++            },
++            'should_pass': True
++        },
++        {
++            'name': 'Required args with store_true actions',
++            'kwargs': {
++                'required_individual': 'test',
++                'shop_auto': True,
++                'quiet_mode': True,
++                'use_json': True
++            },
++            'should_pass': True
++        },
++        {
++            'name': 'Required args with level (int value)',
++            'kwargs': {
++                'required_individual': 'test',
++                'shop_name': 'myshop',
++                'level': 5
++            },
++            'should_pass': True
++        },
++        {
++            'name': 'Missing required individual arg',
++            'kwargs': {
++                'shop_id': 123,
++                'verbose_mode': True
++            },
++            'should_pass': False
++        },
++        {
++            'name': 'Missing required shop group',
++            'kwargs': {
++                'required_individual': 'test',
++                'verbose_mode': True
++            },
++            'should_pass': False
++        },
++        {
++            'name': 'Missing required mode group',
++            'kwargs': {
++                'required_individual': 'test',
++                'shop_id': 123
++            },
++            'should_pass': False
++        },
++        {
++            'name': 'Conflicting shop args',
++            'kwargs': {
++                'required_individual': 'test',
++                'shop_id': 123,
++                'shop_name': 'myshop',
++                'verbose_mode': True
++            },
++            'should_pass': False
++        },
++        {
++            'name': 'Conflicting mode args',
++            'kwargs': {
++                'required_individual': 'test',
++                'shop_id': 123,
++                'verbose_mode': True,
++                'quiet_mode': True
++            },
++            'should_pass': False
++        },
++        {
++            'name': 'Conflicting format args (optional group - currently allowed)',
++            'kwargs': {
++                'required_individual': 'test',
++                'shop_id': 123,
++                'verbose_mode': True,
++                'use_json': True,
++                'use_xml': True
++            },
++            'should_pass': True  # Note: This is inconsistent with positional args but is current behavior
++        }
++    ]
++    
++    for i, test_case in enumerate(test_cases, 1):
++        print(f"Test {i}: {test_case['name']}")
++        try:
++            out = StringIO()
++            call_command('comprehensive', stdout=out, **test_case['kwargs'])
++            result = out.getvalue().strip()
++            if test_case['should_pass']:
++                print(f"✓ SUCCESS: {result}")
++            else:
++                print(f"✗ UNEXPECTED SUCCESS: {result}")
++        except Exception as e:
++            if test_case['should_pass']:
++                print(f"✗ UNEXPECTED FAILURE: {e}")
++            else:
++                print(f"✓ EXPECTED FAILURE: {e}")
++        print()
++
++finally:
++    # Clean up
++    shutil.rmtree(test_dir)
+\ No newline at end of file
+diff --git a/test_duplicate_args.py b/test_duplicate_args.py
+new file mode 100644
+index 0000000000..d88f8dbbe0
+--- /dev/null
++++ b/test_duplicate_args.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python
++"""
++Test for potential duplicate argument issue.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from io import StringIO
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Set up minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++SECRET_KEY = 'test-secret-key'
++INSTALLED_APPS = [
++    'test_app',
++]
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++'''
++
++# Create temporary test app structure
++test_dir = tempfile.mkdtemp()
++test_app_dir = os.path.join(test_dir, 'test_app')
++management_dir = os.path.join(test_app_dir, 'management')
++commands_dir = os.path.join(management_dir, 'commands')
++
++os.makedirs(commands_dir)
++
++# Create __init__.py files
++for dir_path in [test_app_dir, management_dir]:
++    with open(os.path.join(dir_path, '__init__.py'), 'w') as f:
++        f.write('')
++
++# Test command: Required argument that's also in a required mutually exclusive group
++# This is a bit contrived but could theoretically happen
++command_content = '''
++from django.core.management.base import BaseCommand
++
++class Command(BaseCommand):
++    help = 'Test command with potentially duplicate required arg'
++
++    def add_arguments(self, parser):
++        # Add a required argument
++        parser.add_argument('--required-arg', required=True, dest='required_arg')
++        
++        # Add the same argument to a required mutually exclusive group
++        # Note: This would actually cause an argparse error in practice,
++        # but let's test what our code does
++        group = parser.add_mutually_exclusive_group(required=True)
++        group.add_argument('--shop-id', type=int, dest='shop_id')
++        group.add_argument('--shop', type=str, dest='shop_name')
++
++    def handle(self, *args, **options):
++        self.stdout.write(f'Required: {options["required_arg"]}')
++        if options['shop_id']:
++            self.stdout.write(f'Shop ID: {options["shop_id"]}')
++        elif options['shop_name']:
++            self.stdout.write(f'Shop Name: {options["shop_name"]}')
++'''
++
++with open(os.path.join(commands_dir, 'test_duplicate.py'), 'w') as f:
++    f.write(command_content)
++
++# Create settings file
++with open(os.path.join(test_dir, 'test_settings.py'), 'w') as f:
++    f.write(settings_content)
++
++# Add test directory to Python path
++sys.path.insert(0, test_dir)
++
++try:
++    import django
++    django.setup()
++    
++    from django.core.management import call_command
++    
++    print("Testing for duplicate arguments...")
++    print("=" * 50)
++    
++    # Test: Check what parse_args looks like
++    from django.core.management import get_commands, load_command_class
++    
++    app_name = get_commands()['test_duplicate']
++    command = load_command_class(app_name, 'test_duplicate')
++    parser = command.create_parser('', 'test_duplicate')
++    
++    # Simulate the logic from call_command
++    options = {'required_arg': 'test', 'shop_id': 1}
++    
++    opt_mapping = {
++        min(s_opt.option_strings).lstrip('-').replace('-', '_'): s_opt.dest
++        for s_opt in parser._actions if s_opt.option_strings
++    }
++    arg_options = {opt_mapping.get(key, key): value for key, value in options.items()}
++    parse_args = []
++    
++    def get_actions(parser):
++        for opt in parser._actions:
++            yield opt
++    
++    parser_actions = list(get_actions(parser))
++    
++    # Original logic for required args
++    original_args = [
++        '{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
++        for opt in parser_actions if opt.required and opt.dest in options
++    ]
++    
++    # New logic for mutually exclusive groups
++    group_args = []
++    for group in parser._mutually_exclusive_groups:
++        if group.required:
++            for action in group._group_actions:
++                if action.dest in arg_options:
++                    option_string = min(action.option_strings)
++                    if action.nargs == 0:
++                        group_args.append(option_string)
++                    else:
++                        group_args.append('{}={}'.format(option_string, arg_options[action.dest]))
++    
++    print(f"Original required args: {original_args}")
++    print(f"Group args: {group_args}")
++    print(f"Combined: {original_args + group_args}")
++    
++    # Check for duplicates
++    all_args = original_args + group_args
++    unique_args = list(set(all_args))
++    if len(all_args) != len(unique_args):
++        print("⚠️  WARNING: Duplicate arguments detected!")
++        print(f"All args: {all_args}")
++        print(f"Unique args: {unique_args}")
++    else:
++        print("✓ No duplicate arguments")
++    
++    print()
++    
++    # Test the actual call
++    print("Testing actual call_command:")
++    try:
++        out = StringIO()
++        call_command('test_duplicate', required_arg='test', shop_id=1, stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++
++finally:
++    # Clean up
++    shutil.rmtree(test_dir)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..84f87979d8
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the mutually exclusive group fix.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from io import StringIO
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Set up minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++SECRET_KEY = 'test-secret-key'
++INSTALLED_APPS = [
++    'test_app',
++]
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++'''
++
++# Create temporary test app structure
++test_dir = tempfile.mkdtemp()
++test_app_dir = os.path.join(test_dir, 'test_app')
++management_dir = os.path.join(test_app_dir, 'management')
++commands_dir = os.path.join(management_dir, 'commands')
++
++os.makedirs(commands_dir)
++
++# Create __init__.py files
++for dir_path in [test_app_dir, management_dir]:
++    with open(os.path.join(dir_path, '__init__.py'), 'w') as f:
++        f.write('')
++
++# Test command 1: Required mutually exclusive group + individual required arg
++command1_content = '''
++from django.core.management.base import BaseCommand
++
++class Command(BaseCommand):
++    help = 'Test command with required group + individual required arg'
++
++    def add_arguments(self, parser):
++        parser.add_argument('--required-arg', required=True, help='Individual required arg')
++        shop = parser.add_mutually_exclusive_group(required=True)
++        shop.add_argument('--shop-id', type=int, dest='shop_id')
++        shop.add_argument('--shop', type=str, dest='shop_name')
++
++    def handle(self, *args, **options):
++        self.stdout.write(f'Required: {options["required_arg"]}')
++        if options['shop_id']:
++            self.stdout.write(f'Shop ID: {options["shop_id"]}')
++        elif options['shop_name']:
++            self.stdout.write(f'Shop Name: {options["shop_name"]}')
++'''
++
++# Test command 2: Non-required mutually exclusive group
++command2_content = '''
++from django.core.management.base import BaseCommand
++
++class Command(BaseCommand):
++    help = 'Test command with non-required mutually exclusive group'
++
++    def add_arguments(self, parser):
++        format_group = parser.add_mutually_exclusive_group(required=False)
++        format_group.add_argument('--json', action='store_true', dest='use_json')
++        format_group.add_argument('--xml', action='store_true', dest='use_xml')
++
++    def handle(self, *args, **options):
++        if options['use_json']:
++            self.stdout.write('Using JSON format')
++        elif options['use_xml']:
++            self.stdout.write('Using XML format')
++        else:
++            self.stdout.write('Using default format')
++'''
++
++# Test command 3: Multiple mutually exclusive groups
++command3_content = '''
++from django.core.management.base import BaseCommand
++
++class Command(BaseCommand):
++    help = 'Test command with multiple mutually exclusive groups'
++
++    def add_arguments(self, parser):
++        shop = parser.add_mutually_exclusive_group(required=True)
++        shop.add_argument('--shop-id', type=int, dest='shop_id')
++        shop.add_argument('--shop', type=str, dest='shop_name')
++        
++        format_group = parser.add_mutually_exclusive_group(required=True)
++        format_group.add_argument('--json', action='store_true', dest='use_json')
++        format_group.add_argument('--xml', action='store_true', dest='use_xml')
++
++    def handle(self, *args, **options):
++        if options['shop_id']:
++            self.stdout.write(f'Shop ID: {options["shop_id"]}')
++        elif options['shop_name']:
++            self.stdout.write(f'Shop Name: {options["shop_name"]}')
++        
++        if options['use_json']:
++            self.stdout.write('Using JSON format')
++        elif options['use_xml']:
++            self.stdout.write('Using XML format')
++'''
++
++with open(os.path.join(commands_dir, 'test_edge1.py'), 'w') as f:
++    f.write(command1_content)
++
++with open(os.path.join(commands_dir, 'test_edge2.py'), 'w') as f:
++    f.write(command2_content)
++
++with open(os.path.join(commands_dir, 'test_edge3.py'), 'w') as f:
++    f.write(command3_content)
++
++# Create settings file
++with open(os.path.join(test_dir, 'test_settings.py'), 'w') as f:
++    f.write(settings_content)
++
++# Add test directory to Python path
++sys.path.insert(0, test_dir)
++
++try:
++    import django
++    django.setup()
++    
++    from django.core.management import call_command
++    from django.core.management.base import CommandError
++    
++    print("Testing edge cases...")
++    print("=" * 50)
++    
++    # Test 1: Required group + individual required arg
++    print("Test 1: Required group + individual required arg")
++    try:
++        out = StringIO()
++        call_command('test_edge1', required_arg='test', shop_id=1, stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++    
++    print()
++    
++    # Test 2: Non-required mutually exclusive group
++    print("Test 2: Non-required mutually exclusive group (no args)")
++    try:
++        out = StringIO()
++        call_command('test_edge2', stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++    
++    print()
++    
++    print("Test 2b: Non-required mutually exclusive group (with arg)")
++    try:
++        out = StringIO()
++        call_command('test_edge2', use_json=True, stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++    
++    print()
++    
++    # Test 3: Multiple required groups
++    print("Test 3: Multiple required groups")
++    try:
++        out = StringIO()
++        call_command('test_edge3', shop_id=1, use_json=True, stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++    
++    print()
++    
++    # Test 4: Multiple required groups (missing one)
++    print("Test 4: Multiple required groups (missing format - should fail)")
++    try:
++        out = StringIO()
++        call_command('test_edge3', shop_id=1, stdout=out)
++        print("✗ UNEXPECTED SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✓ EXPECTED FAILURE:", str(e))
++
++finally:
++    # Clean up
++    shutil.rmtree(test_dir)
+\ No newline at end of file
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 0000000000..e0a5dc4540
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python
++"""
++Test the exact scenario from the issue description.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from io import StringIO
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Set up minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++SECRET_KEY = 'test-secret-key'
++INSTALLED_APPS = [
++    'test_app',
++]
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++'''
++
++# Create temporary test app structure
++test_dir = tempfile.mkdtemp()
++test_app_dir = os.path.join(test_dir, 'test_app')
++management_dir = os.path.join(test_app_dir, 'management')
++commands_dir = os.path.join(management_dir, 'commands')
++
++os.makedirs(commands_dir)
++
++# Create __init__.py files
++for dir_path in [test_app_dir, management_dir]:
++    with open(os.path.join(dir_path, '__init__.py'), 'w') as f:
++        f.write('')
++
++# Create the exact command from the issue description
++command_content = '''
++from django.core.management.base import BaseCommand
++
++class Command(BaseCommand):
++    help = 'Test command from issue description'
++
++    def add_arguments(self, parser):
++        shop = parser.add_mutually_exclusive_group(required=True)
++        shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++        shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++
++    def handle(self, *args, **options):
++        if options['shop_id']:
++            self.stdout.write(f'Shop ID: {options["shop_id"]}')
++        elif options['shop_name']:
++            self.stdout.write(f'Shop Name: {options["shop_name"]}')
++        else:
++            self.stdout.write('No shop specified')
++'''
++
++with open(os.path.join(commands_dir, 'my_command.py'), 'w') as f:
++    f.write(command_content)
++
++# Create settings file
++with open(os.path.join(test_dir, 'test_settings.py'), 'w') as f:
++    f.write(settings_content)
++
++# Add test directory to Python path
++sys.path.insert(0, test_dir)
++
++try:
++    import django
++    django.setup()
++    
++    from django.core.management import call_command
++    from django.core.management.base import CommandError
++    
++    print("Testing exact scenario from issue description...")
++    print("=" * 50)
++    
++    # Test the exact failing case from the issue
++    print("call_command('my_command', shop_id=1)")
++    try:
++        out = StringIO()
++        call_command('my_command', shop_id=1, stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++    
++    print()
++    
++    # Test the working case from the issue
++    print("call_command('my_command', '--shop-id=1')")
++    try:
++        out = StringIO()
++        call_command('my_command', '--shop-id=1', stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++
++finally:
++    # Clean up
++    shutil.rmtree(test_dir)
+\ No newline at end of file
+diff --git a/test_mutually_exclusive_issue.py b/test_mutually_exclusive_issue.py
+new file mode 100644
+index 0000000000..9c3bc3d55d
+--- /dev/null
++++ b/test_mutually_exclusive_issue.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the mutually exclusive group issue in call_command.
++
++This script demonstrates the bug where call_command fails when arguments
++of required mutually exclusive groups are passed as kwargs.
++"""
++
++import os
++import sys
++import tempfile
++import shutil
++from io import StringIO
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Set up minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++settings_content = '''
++SECRET_KEY = 'test-secret-key'
++INSTALLED_APPS = [
++    'test_app',
++]
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++'''
++
++# Create temporary test app structure
++test_dir = tempfile.mkdtemp()
++test_app_dir = os.path.join(test_dir, 'test_app')
++management_dir = os.path.join(test_app_dir, 'management')
++commands_dir = os.path.join(management_dir, 'commands')
++
++os.makedirs(commands_dir)
++
++# Create __init__.py files
++for dir_path in [test_app_dir, management_dir]:
++    with open(os.path.join(dir_path, '__init__.py'), 'w') as f:
++        f.write('')
++
++# Create the test command with mutually exclusive group
++command_content = '''
++from django.core.management.base import BaseCommand
++
++class Command(BaseCommand):
++    help = 'Test command with mutually exclusive group'
++
++    def add_arguments(self, parser):
++        shop = parser.add_mutually_exclusive_group(required=True)
++        shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
++        shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
++
++    def handle(self, *args, **options):
++        if options['shop_id']:
++            self.stdout.write(f'Shop ID: {options["shop_id"]}')
++        elif options['shop_name']:
++            self.stdout.write(f'Shop Name: {options["shop_name"]}')
++        else:
++            self.stdout.write('No shop specified')
++'''
++
++with open(os.path.join(commands_dir, 'test_mutually_exclusive.py'), 'w') as f:
++    f.write(command_content)
++
++# Create settings file
++with open(os.path.join(test_dir, 'test_settings.py'), 'w') as f:
++    f.write(settings_content)
++
++# Add test directory to Python path
++sys.path.insert(0, test_dir)
++
++try:
++    import django
++    django.setup()
++    
++    from django.core.management import call_command
++    from django.core.management.base import CommandError
++    
++    print("Testing mutually exclusive group issue...")
++    print("=" * 50)
++    
++    # Test 1: This should work (positional argument)
++    print("Test 1: Using positional argument '--shop-id=1'")
++    try:
++        out = StringIO()
++        call_command('test_mutually_exclusive', '--shop-id=1', stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++    
++    print()
++    
++    # Test 2: This should work but currently fails (kwargs)
++    print("Test 2: Using kwargs shop_id=1")
++    try:
++        out = StringIO()
++        call_command('test_mutually_exclusive', shop_id=1, stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++    
++    print()
++    
++    # Test 3: This should work but currently fails (kwargs with shop_name)
++    print("Test 3: Using kwargs shop_name='test'")
++    try:
++        out = StringIO()
++        call_command('test_mutually_exclusive', shop_name='test', stdout=out)
++        print("✓ SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✗ FAILED:", str(e))
++    
++    print()
++    
++    # Test 4: This should fail (no arguments)
++    print("Test 4: No arguments (should fail)")
++    try:
++        out = StringIO()
++        call_command('test_mutually_exclusive', stdout=out)
++        print("✗ UNEXPECTED SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✓ EXPECTED FAILURE:", str(e))
++    
++    print()
++    
++    # Test 5: This should fail (both arguments)
++    print("Test 5: Both arguments (should fail)")
++    try:
++        out = StringIO()
++        call_command('test_mutually_exclusive', shop_id=1, shop_name='test', stdout=out)
++        print("✗ UNEXPECTED SUCCESS:", out.getvalue().strip())
++    except Exception as e:
++        print("✓ EXPECTED FAILURE:", str(e))
++
++finally:
++    # Clean up
++    shutil.rmtree(test_dir)
+\ No newline at end of file

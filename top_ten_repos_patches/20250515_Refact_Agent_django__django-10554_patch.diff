@@ -1,0 +1,67 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 1544beb613..b2975b0322 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -931,7 +931,25 @@ class QuerySet:
+         # Clear limits and ordering so they can be reapplied
+         clone.query.clear_ordering(True)
+         clone.query.clear_limits()
+-        clone.query.combined_queries = (self.query,) + tuple(qs.query for qs in other_qs)
++        
++        # For databases that don't support ordering in subqueries of compound statements,
++        # we need to clear the ordering in the component queries
++        combined_queries = []
++        for query in (self.query,) + tuple(qs.query for qs in other_qs):
++            # Clone the query to avoid modifying the original
++            query_copy = query.clone()
++            # If the database doesn't support ordering in subqueries of compound statements,
++            # clear the ordering in the component query
++            if not self.db:
++                # Default to assuming the database doesn't support it
++                query_copy.clear_ordering(True)
++            else:
++                features = connections[self.db].features
++                if not getattr(features, 'supports_slicing_ordering_in_compound', False):
++                    query_copy.clear_ordering(True)
++            combined_queries.append(query_copy)
++            
++        clone.query.combined_queries = tuple(combined_queries)
+         clone.query.combinator = combinator
+         clone.query.combinator_all = all
+         return clone
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 08d7faf194..f65e65f9de 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -23,7 +23,7 @@ from django.db import DEFAULT_DB_ALIAS, NotSupportedError, connections
+ from django.db.models.aggregates import Count
+ from django.db.models.constants import LOOKUP_SEP
+ from django.db.models.expressions import (
+-    BaseExpression, Col, F, OuterRef, Ref, SimpleCol,
++    BaseExpression, Col, F, OuterRef, RawSQL, Ref, SimpleCol,
+ )
+ from django.db.models.fields import Field
+ from django.db.models.fields.related_lookups import MultiColSource
+@@ -2037,6 +2037,22 @@ class Query(BaseExpression):
+             self.set_group_by()
+             self.clear_select_fields()
+ 
++        # If this query is a combinator (UNION/INTERSECTION/DIFFERENCE) and the
++        # ordering we currently have consists of positional column references
++        # (RawSQL objects like "1", "2", …) they are now stale because the
++        # projection has just changed. Clear the ordering to avoid producing
++        # invalid SQL such as "ORDER BY (4)" when the select list only has
++        # fewer columns.
++        if self.combinator and self.order_by:
++            def _positional(order_expr):
++                if hasattr(order_expr, 'get_source_expressions'):
++                    srcs = order_expr.get_source_expressions()
++                    return len(srcs) == 1 and isinstance(srcs[0], RawSQL) and \
++                           srcs[0].sql.isdigit()
++                return False
++            if any(_positional(o) for o in self.order_by):
++                self.clear_ordering(True)
++
+         if fields:
+             field_names = []
+             extra_names = []

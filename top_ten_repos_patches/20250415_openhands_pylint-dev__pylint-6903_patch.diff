@@ -1,0 +1,160 @@
+diff --git a/pylint/lint/run.py b/pylint/lint/run.py
+index a7e5d5574..d47407136 100644
+--- a/pylint/lint/run.py
++++ b/pylint/lint/run.py
+@@ -76,7 +76,7 @@ def _cpu_count() -> int:
+     else:
+         cpu_count = 1
+     if cpu_share is not None:
+-        return min(cpu_share, cpu_count)
++        return max(1, min(cpu_share, cpu_count))
+     return cpu_count
+
+
+diff --git a/test_jobs_zero.py b/test_jobs_zero.py
+new file mode 100644
+index 000000000..d23f5fa3d
+--- /dev/null
++++ b/test_jobs_zero.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Test specifically for the --jobs=0 case in Kubernetes environments.
++This test simulates the Kubernetes Pod environment described in the issue.
++"""
++
++import io
++import os
++import sys
++import unittest
++from unittest.mock import patch, mock_open
++import multiprocessing
++
++from pylint.lint.run import Run, _cpu_count, _query_cpu
++
++class TestJobsZero(unittest.TestCase):
++    """Test for the --jobs=0 functionality in a Kubernetes Pod."""
++
++    @patch('pylint.lint.run.Path.is_file')
++    def test_cpu_count_minimum_value(self, mock_is_file):
++        """Test that _cpu_count() always returns at least 1, even when _query_cpu() returns 0."""
++        # Configure mocks to simulate the Kubernetes environment
++        mock_is_file.return_value = True
++
++        # Mock the file contents with the values from the issue
++        file_contents = {
++            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
++            "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
++            "/sys/fs/cgroup/cpu/cpu.shares": "2\n"
++        }
++
++        def mock_open_side_effect(file_path, *args, **kwargs):
++            for path, content in file_contents.items():
++                if path in file_path:
++                    return unittest.mock.mock_open(read_data=content)(*args, **kwargs)
++            return unittest.mock.mock_open(read_data="")(*args, **kwargs)
++
++        # Use patch to replace 'open' calls with our mock
++        with patch('builtins.open', side_effect=mock_open_side_effect):
++            # Call _query_cpu and verify it returns 0
++            cpu_count = _query_cpu()
++            print(f"_query_cpu() returned: {cpu_count}")
++            self.assertEqual(cpu_count, 0, "_query_cpu() should return 0 with the provided values")
++
++            # Call _cpu_count and verify it returns at least 1
++            with patch('os.sched_getaffinity', return_value=set(range(4))):
++                full_cpu_count = _cpu_count()
++                print(f"_cpu_count() returned: {full_cpu_count}")
++                self.assertGreaterEqual(full_cpu_count, 1, "_cpu_count() should always return at least 1")
++
++    @patch('sys.stderr', new_callable=io.StringIO)
++    @patch('sys.stdout', new_callable=io.StringIO)
++    @patch('sys.exit')
++    @patch('pylint.lint.run.Path.is_file')
++    @patch('pylint.lint.run._cpu_count')
++    def test_run_with_jobs_zero(self, mock_cpu_count, mock_is_file, mock_exit,
++                               mock_stdout, mock_stderr):
++        """Test that Run class with --jobs=0 works correctly."""
++        # Set up mocks
++        mock_cpu_count.return_value = 1  # Our fix ensures this is at least 1
++        mock_is_file.return_value = True
++        mock_exit.side_effect = SystemExit
++
++        # Create a temporary dummy file
++        with open("dummy.py", "w") as f:
++            f.write("print('hello world')")
++
++        try:
++            # Run pylint with --jobs=0
++            with self.assertRaises(SystemExit):
++                Run(["--jobs=0", "dummy.py"])
++
++            # Check that it didn't fail with a ValueError
++            self.assertNotIn("Number of processes must be at least 1", mock_stderr.getvalue())
++
++        finally:
++            # Clean up
++            if os.path.exists("dummy.py"):
++                os.remove("dummy.py")
++
++if __name__ == "__main__":
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_reproduce.py b/test_reproduce.py
+new file mode 100644
+index 000000000..a67305081
+--- /dev/null
++++ b/test_reproduce.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue with jobs=0 in a Kubernetes environment.
++"""
++
++import os
++import sys
++import unittest
++from unittest.mock import patch, mock_open
++from pylint.lint.run import _query_cpu, _cpu_count
++
++class TestCPUCount(unittest.TestCase):
++    """Test case to reproduce the issue with _query_cpu() returning 0."""
++
++    @patch('pylint.lint.run.Path.is_file')
++    def test_query_cpu_returns_zero(self, mock_is_file):
++        """Test that _query_cpu() returns 0 with the values from the issue."""
++        # Configure mocks to simulate the Kubernetes environment
++        mock_is_file.return_value = True
++
++        # Mock the file contents with the values from the issue
++        file_contents = {
++            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
++            "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
++            "/sys/fs/cgroup/cpu/cpu.shares": "2\n"
++        }
++
++        # Define a side effect function for mock_open
++        def mock_open_side_effect(file_path, *args, **kwargs):
++            for path, content in file_contents.items():
++                if path in file_path:
++                    return unittest.mock.mock_open(read_data=content)(*args, **kwargs)
++            return unittest.mock.mock_open(read_data="")(*args, **kwargs)
++
++        # Use patch to replace 'open' calls with our mock
++        with patch('builtins.open', side_effect=mock_open_side_effect):
++            # Call _query_cpu and verify it returns 0
++            cpu_count = _query_cpu()
++            print(f"_query_cpu() returned: {cpu_count}")
++            self.assertEqual(cpu_count, 0)
++
++            # Call _cpu_count and see what it returns
++            with patch('os.sched_getaffinity', return_value=set(range(4))):
++                full_cpu_count = _cpu_count()
++                print(f"_cpu_count() returned: {full_cpu_count}")
++                # With the fix, this should be 1 or higher, regardless of _query_cpu() result
++                self.assertGreaterEqual(full_cpu_count, 1,
++                                      "_cpu_count() should always return at least 1")
++
++if __name__ == "__main__":
++    unittest.main()
+\ No newline at end of file

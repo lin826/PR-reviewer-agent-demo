@@ -1,0 +1,109 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index aaf35ee37c..a449a51ae1 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -846,8 +846,103 @@ class Query(BaseExpression):
+         relabelling any references to them in select columns and the where
+         clause.
+         """
++        # If no changes to make, return early
++        if not change_map:
++            return
++
++        # If keys and values in change_map intersect, an alias might be changed twice
++        # (e.g., first T4 -> T5, then T5 -> T6), leading to incorrect results.
++        #
++        # When executing a query like:
++        #    qs1 | qs2  where qs1 is related to qs2
++        # Django might create aliases that conflict with each other, causing an
++        # AssertionError in change_aliases method.
++        #
++        # To resolve this, we use a two-phase alias transformation:
++        # 1. Identify aliases that appear both as keys and values (conflicts)
++        # 2. Create unique temporary aliases for all conflicts
++        # 3. First phase: Map all conflicts to their temporary aliases
++        # 4. Second phase: Map from temporary aliases to final destinations
++        #
++        # This ensures we never have a conflict during the transformation and
++        # the assert statement doesn't fail when the QuerySet operation is performed.
++
++        # Check for conflicts (intersection between keys and values)
++        aliases_used = set(change_map) | set(change_map.values())
++        conflicts = set(change_map) & set(change_map.values())
++
++        if conflicts:
++            # Create a non-conflicting map using temporary aliases
++            # First find the highest existing alias number to avoid conflicts
++            highest_alias = -1
++            for alias in aliases_used:
++                if alias.startswith('T') and alias[1:].isdigit():
++                    highest_alias = max(highest_alias, int(alias[1:]))
++
++            # For each conflicting key in change_map, we need to:
++            # 1. Create a unique temporary alias
++            # 2. Change the conflicting key to that temporary alias
++            # 3. Then change the temporary alias to the final value
++
++            # Create temporary values for all the conflicts
++            temp_aliases = {}
++            base_map = {}  # Will contain the first round of remapping
++            second_map = {} # Will contain the second round of remapping
++
++            # Create temporary aliases for all conflicts
++            for alias in conflicts:
++                highest_alias += 1
++                temp = f"T{highest_alias}"
++                temp_aliases[alias] = temp
++
++            # Now create a two-phase change map
++            # First phase: remap the conflicting keys to temporary values
++            for old_alias, new_alias in change_map.items():
++                if old_alias in conflicts:
++                    # Remap the conflict source to a temp alias
++                    base_map[old_alias] = temp_aliases[old_alias]
++                    # And in the second phase, remap from temp to final destination
++                    second_map[temp_aliases[old_alias]] = new_alias
++                elif new_alias in conflicts:
++                    # If destination is a conflict, we can't map directly to where
++                    # the conflict would go because it could create a conflict in the base_map.
++                    # Instead, we need to use a temporary alias here too.
++                    highest_alias += 1
++                    temp = f"T{highest_alias}"
++                    base_map[old_alias] = temp
++                    second_map[temp] = change_map[new_alias]
++                else:
++                    # Non-conflict case goes in the first map
++                    base_map[old_alias] = new_alias
++
++            # Apply the first phase: remap conflicts to temporary aliases
++            # This shouldn't have any clashes because we're using brand new temp aliases
++            assert set(base_map).isdisjoint(base_map.values())
++            self._change_aliases_impl(base_map)
++
++            # Now apply the second phase: remap from temporaries to final destinations
++            # Since the first phase moved all conflicts to unique temporary aliases,
++            # this phase shouldn't have conflicts either
++            if second_map:
++                assert set(second_map).isdisjoint(second_map.values())
++                self._change_aliases_impl(second_map)
++        else:
++            # No conflicts, apply the changes directly
++            # The assertion will pass since we've already checked there are no conflicts
++            assert set(change_map).isdisjoint(change_map.values())
++            self._change_aliases_impl(change_map)
++
++    def _change_aliases_impl(self, change_map):
++        """
++        Internal implementation of change_aliases.
++
++        Assumes the change_map has no conflicts (keys and values are disjoint sets).
++
++        This functionality was extracted from the original change_aliases method
++        to allow the outer change_aliases to resolve conflicts before applying changes.
++        """
+         assert set(change_map).isdisjoint(change_map.values())
+-
++
+         # 1. Update references in "select" (normal columns plus aliases),
+         # "group by" and "where".
+         self.where.relabel_aliases(change_map)

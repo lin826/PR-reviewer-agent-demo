@@ -1,0 +1,171 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 90d90119d0..aff11e66be 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1327,6 +1327,34 @@ class Window(Expression):
+         params.extend(window_params)
+         template = template or self.template
+ 
++        # SQLite doesn't allow the CAST function to be placed inside the window
++        # function's expression where it would split the window specification.
++        # If using a DecimalField with window functions on SQLite, we need to modify
++        # the SQL to cast the entire window expression instead of just the inner function.
++        # Example problem:
++        #   CAST(LAG("col", 7) AS NUMERIC) OVER (...) -- Syntax error at OVER
++        # Should be:
++        #   CAST(LAG("col", 7) OVER (...) AS NUMERIC) -- Correct syntax
++        cast_prefix = "CAST("
++        cast_suffix = " AS NUMERIC)"
++        
++        expr_is_cast = (connection.vendor == 'sqlite' and 
++                        expr_sql.startswith(cast_prefix) and 
++                        cast_suffix in expr_sql)
++        
++        if expr_is_cast:
++            # Extract the inner expression from the CAST
++            inner_expr = expr_sql[len(cast_prefix):expr_sql.find(cast_suffix)]
++            
++            # Build the result without the CAST
++            sql = template % {
++                'expression': inner_expr,
++                'window': ''.join(window_sql).strip()
++            }
++            
++            # Apply the CAST around the entire window expression
++            return f"{cast_prefix}{sql}{cast_suffix}", params
++            
+         return template % {
+             'expression': expr_sql,
+             'window': ''.join(window_sql).strip()
+diff --git a/test_lag_decimal.py b/test_lag_decimal.py
+new file mode 100644
+index 0000000000..bc09c6d5ff
+--- /dev/null
++++ b/test_lag_decimal.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import django
++from django.db import models, connection
++from django.db.models import F, Window
++from django.db.models.functions import Lag
++
++# Configure minimal Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++# Create a test model
++class LagTest(models.Model):
++    modified = models.DateField()
++    data = models.FloatField()
++    amount = models.DecimalField(decimal_places=4, max_digits=7)
++    
++    class Meta:
++        app_label = 'test'
++        
++
++# This will create the schema
++from django.db import connections
++connection = connections['default']
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(LagTest)
++
++print("Testing Lag with FloatField (should work):")
++try:
++    # This should work fine
++    w = Window(
++        expression=Lag('data', 7),
++        partition_by=[F('modified')],
++        order_by=F('modified').asc()
++    )
++    q = LagTest.objects.all().annotate(w=w)
++    print(q.query)
++    print("Success! Query works with Lag on FloatField")
++except Exception as e:
++    print(f"Error with Lag on FloatField: {e}")
++
++print("\nTesting Lag with DecimalField (current issue):")
++try:
++    # This will raise an error
++    w = Window(
++        expression=Lag('amount', 7),
++        partition_by=[F('modified')],
++        order_by=F('modified').asc()
++    )
++    q = LagTest.objects.all().annotate(w=w)
++    print(q.query)
++    # Actually execute the query
++    list(q)  
++    print("Success! Query works with Lag on DecimalField")
++except Exception as e:
++    print(f"Error with Lag on DecimalField: {e}")
++    print(f"Exception type: {type(e).__name__}")
++    
++print("\nTesting Lag with DecimalField and different parameters:")
++try:
++    # Add more complex window function with additional parameters
++    w = Window(
++        expression=Lag('amount', 2, default=0),
++        partition_by=[F('modified')],
++        order_by=[F('data').asc(), F('amount').desc()]
++    )
++    q = LagTest.objects.all().annotate(w=w)
++    print(q.query)
++    # Actually execute the query
++    list(q)
++    print("Success! Complex query works with Lag on DecimalField")
++except Exception as e:
++    print(f"Error with complex Lag on DecimalField: {e}")
++    print(f"Exception type: {type(e).__name__}")
++
++print("\nTesting Lead with DecimalField (similar function):")
++try:
++    from django.db.models.functions import Lead
++    
++    w = Window(
++        expression=Lead('amount', 3),
++        partition_by=[F('modified')],
++        order_by=F('data').desc()
++    )
++    q = LagTest.objects.all().annotate(w=w)
++    print(q.query)
++    # Actually execute the query
++    list(q)
++    print("Success! Query works with Lead on DecimalField")
++except Exception as e:
++    print(f"Error with Lead on DecimalField: {e}")
++    print(f"Exception type: {type(e).__name__}")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..817290b1bc
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,7 @@
++SECRET_KEY = 'test'
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
+\ No newline at end of file

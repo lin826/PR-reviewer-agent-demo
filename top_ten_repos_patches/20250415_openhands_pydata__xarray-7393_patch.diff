@@ -1,0 +1,87 @@
+diff --git a/xarray/core/indexes.py b/xarray/core/indexes.py
+index f3f03c94..0f900ed6 100644
+--- a/xarray/core/indexes.py
++++ b/xarray/core/indexes.py
+@@ -706,7 +706,18 @@ class PandasMultiIndex(PandasIndex):
+                     f"from variable {name!r} that wraps a multi-index"
+                 )
+ 
+-        split_labels, levels = zip(*[lev.factorize() for lev in level_indexes])
++        split_labels, levels_factorized = zip(*[lev.factorize() for lev in level_indexes])
++        
++        # Convert factorized levels back to original dtypes
++        original_dtypes = [var.dtype for var in variables.values()]
++        levels = []
++        for level_vals, dtype in zip(levels_factorized, original_dtypes):
++            # Convert back to original dtype if necessary
++            if level_vals.dtype != dtype:
++                levels.append(pd.Index(level_vals.astype(dtype)))
++            else:
++                levels.append(level_vals)
++                
+         labels_mesh = np.meshgrid(*split_labels, indexing="ij")
+         labels = [x.ravel() for x in labels_mesh]
+ 
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index ba937183..6883dcf5 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -1532,7 +1532,13 @@ class PandasMultiIndexingAdapter(PandasIndexingAdapter):
+ 
+     def __array__(self, dtype: DTypeLike = None) -> np.ndarray:
+         if self.level is not None:
+-            return self.array.get_level_values(self.level).values
++            # Get the level values and make sure we preserve the original dtype
++            values = self.array.get_level_values(self.level).values
++            if dtype is None:
++                dtype = self.dtype
++            if values.dtype != dtype:
++                values = values.astype(dtype)
++            return values
+         else:
+             return super().__array__(dtype)
+ 
+diff --git a/xarray/tests/test_stack_dtype.py b/xarray/tests/test_stack_dtype.py
+new file mode 100644
+index 00000000..9889110c
+--- /dev/null
++++ b/xarray/tests/test_stack_dtype.py
+@@ -0,0 +1,37 @@
++import pytest
++import numpy as np
++import xarray as xr
++
++def test_stack_preserves_dtype():
++    """Test that stacking preserves dtypes of coordinates."""
++    # Test with int32
++    ds_int32 = xr.Dataset(coords={'a': np.array([0, 1, 2], dtype='i4')})
++    assert ds_int32['a'].values.dtype == ds_int32.stack(b=('a',))['a'].values.dtype
++    
++    # Test with int64
++    ds_int64 = xr.Dataset(coords={'a': np.array([0, 1, 2], dtype='i8')})
++    assert ds_int64['a'].values.dtype == ds_int64.stack(b=('a',))['a'].values.dtype
++    
++    # Test with float32
++    ds_float32 = xr.Dataset(coords={'a': np.array([0.0, 1.0, 2.0], dtype='f4')})
++    assert ds_float32['a'].values.dtype == ds_float32.stack(b=('a',))['a'].values.dtype
++    
++    # Test with multiple coordinates
++    ds_multi = xr.Dataset(coords={
++        'x': np.array([10, 20, 30], dtype='i4'),
++        'y': np.array([1, 2], dtype='i4')
++    })
++    stacked_multi = ds_multi.stack(z=('x', 'y'))
++    assert ds_multi['x'].values.dtype == stacked_multi['x'].values.dtype
++    assert ds_multi['y'].values.dtype == stacked_multi['y'].values.dtype
++    
++    # Test with mixed dtypes
++    ds_mixed = xr.Dataset(coords={
++        'a': np.array([1, 2, 3], dtype='i4'),
++        'b': np.array([0.1, 0.2, 0.3], dtype='f4'),
++        'c': np.array(['x', 'y', 'z'], dtype='U1')
++    })
++    stacked_mixed = ds_mixed.stack(d=('a', 'b', 'c'))
++    assert ds_mixed['a'].values.dtype == stacked_mixed['a'].values.dtype
++    assert ds_mixed['b'].values.dtype == stacked_mixed['b'].values.dtype
++    assert ds_mixed['c'].values.dtype == stacked_mixed['c'].values.dtype
+\ No newline at end of file

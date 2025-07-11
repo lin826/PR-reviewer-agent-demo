@@ -1,0 +1,120 @@
+diff --git a/django/contrib/auth/checks.py b/django/contrib/auth/checks.py
+index 65fc266f7e..5eddf9c3de 100644
+--- a/django/contrib/auth/checks.py
++++ b/django/contrib/auth/checks.py
+@@ -4,6 +4,7 @@ from types import MethodType
+ from django.apps import apps
+ from django.conf import settings
+ from django.core import checks
++from django.db import models
+ 
+ from .management import _get_builtin_permissions
+ 
+@@ -51,8 +52,18 @@ def check_user_model(app_configs=None, **kwargs):
+             )
+         )
+ 
+-    # Check that the username field is unique
+-    if not cls._meta.get_field(cls.USERNAME_FIELD).unique:
++    # Check that the username field is unique (via field.unique or UniqueConstraint)
++    field_is_unique = cls._meta.get_field(cls.USERNAME_FIELD).unique
++    
++    # Check if there's a UniqueConstraint that ensures USERNAME_FIELD is unique
++    has_unique_constraint = False
++    for constraint in cls._meta.constraints:
++        if (isinstance(constraint, models.UniqueConstraint) and 
++            cls.USERNAME_FIELD in constraint.fields):
++            has_unique_constraint = True
++            break
++    
++    if not (field_is_unique or has_unique_constraint):
+         if (settings.AUTHENTICATION_BACKENDS ==
+                 ['django.contrib.auth.backends.ModelBackend']):
+             errors.append(
+diff --git a/tests/auth_tests/test_unique_constraint.py b/tests/auth_tests/test_unique_constraint.py
+new file mode 100644
+index 0000000000..65b7f285ed
+--- /dev/null
++++ b/tests/auth_tests/test_unique_constraint.py
+@@ -0,0 +1,80 @@
++from django.apps import apps
++from django.contrib.auth.checks import check_user_model
++from django.contrib.auth.models import AbstractBaseUser
++from django.core import checks
++from django.db import models
++from django.db.models import UniqueConstraint
++from django.test import SimpleTestCase, override_settings
++from django.test.utils import isolate_apps
++
++
++@isolate_apps('auth_tests', attr_name='apps')
++class UniqueConstraintTest(SimpleTestCase):
++    @override_settings(AUTHENTICATION_BACKENDS=['django.contrib.auth.backends.ModelBackend'])
++    def test_username_with_unique_constraint(self):
++        """
++        A USERNAME_FIELD can be enforced as unique either via the field's
++        unique=True attribute or through a UniqueConstraint in Meta.constraints.
++        """
++        class UserWithUniqueConstraint(AbstractBaseUser):
++            username = models.CharField(max_length=30)  # Not using unique=True
++            USERNAME_FIELD = 'username'
++
++            class Meta:
++                app_label = 'auth_tests'
++                # Using UniqueConstraint instead
++                constraints = [
++                    UniqueConstraint(fields=['username'], name='user_username_unq')
++                ]
++
++        # Should not raise auth.E003
++        errors = check_user_model(app_configs=self.apps.get_app_configs())
++        self.assertEqual([e.id for e in errors], [])
++
++    @override_settings(AUTHENTICATION_BACKENDS=['django.contrib.auth.backends.ModelBackend'])
++    def test_username_with_wrong_unique_constraint(self):
++        """
++        A UniqueConstraint that doesn't include the USERNAME_FIELD won't pass the check.
++        """
++        # We need a separate isolate_apps context for this test
++        with isolate_apps('auth_tests') as apps:
++            class UserWithWrongUniqueConstraint(AbstractBaseUser):
++                username = models.CharField(max_length=30)  # Not using unique=True
++                email = models.EmailField()
++                USERNAME_FIELD = 'username'
++
++                class Meta:
++                    app_label = 'auth_tests'
++                    # Using UniqueConstraint on a different field
++                    constraints = [
++                        UniqueConstraint(fields=['email'], name='user_email_unq')
++                    ]
++
++            # Set AUTH_USER_MODEL to this model to ensure it's checked
++            from django.conf import settings
++            with self.settings(AUTH_USER_MODEL='auth_tests.UserWithWrongUniqueConstraint'):
++                # Should raise auth.E003
++                errors = check_user_model(app_configs=apps.get_app_configs())
++                self.assertEqual([e.id for e in errors], ['auth.E003'])
++
++    @override_settings(AUTHENTICATION_BACKENDS=['django.contrib.auth.backends.ModelBackend'])
++    def test_username_with_unique_constraint_and_other_fields(self):
++        """
++        A UniqueConstraint that includes the USERNAME_FIELD along with other fields
++        is still valid for enforcing uniqueness.
++        """
++        class UserWithCompoundUniqueConstraint(AbstractBaseUser):
++            username = models.CharField(max_length=30)  # Not using unique=True
++            tenant_id = models.IntegerField()
++            USERNAME_FIELD = 'username'
++
++            class Meta:
++                app_label = 'auth_tests'
++                # Using a compound UniqueConstraint that includes username
++                constraints = [
++                    UniqueConstraint(fields=['username', 'tenant_id'], name='user_tenant_username_unq')
++                ]
++
++        # Should not raise auth.E003
++        errors = check_user_model(app_configs=self.apps.get_app_configs())
++        self.assertEqual([e.id for e in errors], [])
+\ No newline at end of file

@@ -1,0 +1,82 @@
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -479,6 +479,71 @@
+     pass
+ 
+ 
++class KeyTransformIn(lookups.In):
++    can_use_none_as_rhs = True
++    
++    def process_rhs(self, compiler, connection):
++        if not getattr(self, 'rhs_is_direct_value', lambda: True)():
++            # Handle subqueries the same way as the base In lookup
++            return super().process_rhs(compiler, connection)
++        
++        # Handle None values by converting them to 'null' before processing
++        if self.rhs_is_direct_value():
++            # Convert None values to 'null' string to match JSONExact behavior
++            processed_rhs = []
++            for value in self.rhs:
++                if value is None:
++                    processed_rhs.append('null')
++                else:
++                    processed_rhs.append(value)
++            
++            # Temporarily replace rhs to prevent base In from removing None values
++            original_rhs = self.rhs
++            self.rhs = processed_rhs
++            
++            try:
++                rhs, rhs_params = super().process_rhs(compiler, connection)
++            finally:
++                # Restore original rhs
++                self.rhs = original_rhs
++        else:
++            rhs, rhs_params = super().process_rhs(compiler, connection)
++        
++        if connection.vendor == 'oracle':
++            func = []
++            for value in rhs_params:
++                # Use JSON_EXTRACT for Oracle like in KeyTransformExact but for IN clause
++                if value == 'null':
++                    func.append('null')
++                else:
++                    parsed_value = json.loads(value)
++                    function = 'JSON_QUERY' if isinstance(parsed_value, (list, dict)) else 'JSON_VALUE'
++                    func.append("%s('%s', '$.value')" % (
++                        function,
++                        json.dumps({'value': parsed_value}),
++                    ))
++            # Replace placeholders with wrapped values
++            placeholder_pattern = r'%s'
++            import re
++            rhs = re.sub(placeholder_pattern, lambda m: func.pop(0), rhs)
++            rhs_params = []
++        elif connection.vendor == 'sqlite':
++            # Wrap each value with JSON_EXTRACT like in KeyTransformExact
++            func = ["JSON_EXTRACT(%s, '$')" if value != 'null' else '%s' for value in rhs_params]
++            # Replace placeholders with wrapped values 
++            placeholder_pattern = r'%s'
++            import re
++            rhs = re.sub(placeholder_pattern, lambda m: func.pop(0), rhs)
++        elif connection.vendor == 'mysql':
++            # For MySQL, wrap each value with JSON_EXTRACT like in DataContains
++            func = ["JSON_EXTRACT(%s, '$')" for _ in rhs_params]
++            placeholder_pattern = r'%s'
++            import re
++            rhs = re.sub(placeholder_pattern, lambda m: func.pop(0), rhs)
++        
++        return rhs, rhs_params
++
++
+ KeyTransform.register_lookup(KeyTransformExact)
+ KeyTransform.register_lookup(KeyTransformIExact)
+ KeyTransform.register_lookup(KeyTransformIsNull)
+@@ -489,6 +554,7 @@
+ KeyTransform.register_lookup(KeyTransformIEndsWith)
+ KeyTransform.register_lookup(KeyTransformRegex)
+ KeyTransform.register_lookup(KeyTransformIRegex)
++KeyTransform.register_lookup(KeyTransformIn)
+ 
+ KeyTransform.register_lookup(KeyTransformLt)
+ KeyTransform.register_lookup(KeyTransformLte)

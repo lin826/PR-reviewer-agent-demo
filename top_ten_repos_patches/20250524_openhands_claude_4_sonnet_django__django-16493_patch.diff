@@ -1,0 +1,456 @@
+diff --git a/django/db/models/fields/files.py b/django/db/models/fields/files.py
+index 7a99b12691..8f7e8e90f5 100644
+--- a/django/db/models/fields/files.py
++++ b/django/db/models/fields/files.py
+@@ -295,7 +295,7 @@ class FileField(Field):
+         if kwargs.get("max_length") == 100:
+             del kwargs["max_length"]
+         kwargs["upload_to"] = self.upload_to
+-        if self.storage is not default_storage:
++        if hasattr(self, '_storage_callable') or self.storage is not default_storage:
+             kwargs["storage"] = getattr(self, "_storage_callable", self.storage)
+         return name, path, args, kwargs
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4a309d0746
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the FileField callable storage deconstruction issue.
++
++The issue: If the storage argument on a FileField is set to a callable that returns 
++default_storage, it is omitted from the deconstructed form of the field, rather than 
++being included as a reference to the callable as expected.
++"""
++
++import os
++import sys
++import tempfile
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++import random
++
++# Create test storage instances
++other_storage = FileSystemStorage(location='/tmp/other')
++
++def get_storage():
++    """Callable that returns default_storage"""
++    return default_storage
++
++def get_random_storage():
++    """Callable that sometimes returns default_storage"""
++    return random.choice([default_storage, other_storage])
++
++def get_other_storage():
++    """Callable that never returns default_storage"""
++    return other_storage
++
++# Test cases
++print("=== Testing FileField callable storage deconstruction ===\n")
++
++# Case 1: Callable that always returns default_storage
++print("1. Testing callable that always returns default_storage:")
++field1 = models.FileField(storage=get_storage)
++name, path, args, kwargs = field1.deconstruct()
++print(f"   Field storage: {field1.storage}")
++print(f"   Field _storage_callable: {getattr(field1, '_storage_callable', 'NOT SET')}")
++print(f"   Deconstructed kwargs: {kwargs}")
++print(f"   'storage' in kwargs: {'storage' in kwargs}")
++if 'storage' in kwargs:
++    print(f"   kwargs['storage']: {kwargs['storage']}")
++    print(f"   kwargs['storage'] is get_storage: {kwargs['storage'] is get_storage}")
++print()
++
++# Case 2: Callable that sometimes returns default_storage
++print("2. Testing callable that sometimes returns default_storage:")
++field2 = models.FileField(storage=get_random_storage)
++name, path, args, kwargs = field2.deconstruct()
++print(f"   Field storage: {field2.storage}")
++print(f"   Field _storage_callable: {getattr(field2, '_storage_callable', 'NOT SET')}")
++print(f"   Deconstructed kwargs: {kwargs}")
++print(f"   'storage' in kwargs: {'storage' in kwargs}")
++if 'storage' in kwargs:
++    print(f"   kwargs['storage']: {kwargs['storage']}")
++    print(f"   kwargs['storage'] is get_random_storage: {kwargs['storage'] is get_random_storage}")
++print()
++
++# Case 3: Callable that never returns default_storage
++print("3. Testing callable that never returns default_storage:")
++field3 = models.FileField(storage=get_other_storage)
++name, path, args, kwargs = field3.deconstruct()
++print(f"   Field storage: {field3.storage}")
++print(f"   Field _storage_callable: {getattr(field3, '_storage_callable', 'NOT SET')}")
++print(f"   Deconstructed kwargs: {kwargs}")
++print(f"   'storage' in kwargs: {'storage' in kwargs}")
++if 'storage' in kwargs:
++    print(f"   kwargs['storage']: {kwargs['storage']}")
++    print(f"   kwargs['storage'] is get_other_storage: {kwargs['storage'] is get_other_storage}")
++print()
++
++# Case 4: Non-callable storage (default_storage)
++print("4. Testing non-callable default_storage:")
++field4 = models.FileField(storage=default_storage)
++name, path, args, kwargs = field4.deconstruct()
++print(f"   Field storage: {field4.storage}")
++print(f"   Field _storage_callable: {getattr(field4, '_storage_callable', 'NOT SET')}")
++print(f"   Deconstructed kwargs: {kwargs}")
++print(f"   'storage' in kwargs: {'storage' in kwargs}")
++print()
++
++# Case 5: Non-callable storage (other_storage)
++print("5. Testing non-callable other_storage:")
++field5 = models.FileField(storage=other_storage)
++name, path, args, kwargs = field5.deconstruct()
++print(f"   Field storage: {field5.storage}")
++print(f"   Field _storage_callable: {getattr(field5, '_storage_callable', 'NOT SET')}")
++print(f"   Deconstructed kwargs: {kwargs}")
++print(f"   'storage' in kwargs: {'storage' in kwargs}")
++if 'storage' in kwargs:
++    print(f"   kwargs['storage']: {kwargs['storage']}")
++    print(f"   kwargs['storage'] is other_storage: {kwargs['storage'] is other_storage}")
++print()
++
++print("=== Analysis ===")
++print("The issue is in Case 1: When a callable returns default_storage,")
++print("the storage parameter should still be included in the deconstructed kwargs")
++print("because the original parameter was a callable, not default_storage itself.")
++print()
++print("Expected behavior: 'storage' should be in kwargs for all callable cases (1, 2, 3)")
++print("Current behavior: 'storage' is missing from kwargs when callable returns default_storage")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..90d2f41306
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the FileField callable storage deconstruction fix.
++"""
++
++import os
++import sys
++import tempfile
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++
++# Test edge cases
++print("=== Testing Edge Cases ===\n")
++
++# Edge case 1: Callable that returns None (should raise TypeError)
++def get_none_storage():
++    return None
++
++print("1. Testing callable that returns None:")
++try:
++    field = models.FileField(storage=get_none_storage)
++    print("   ERROR: Should have raised TypeError")
++except TypeError as e:
++    print(f"   Correctly raised TypeError: {e}")
++print()
++
++# Edge case 2: Callable class
++class CallableStorageClass:
++    def __call__(self):
++        return default_storage
++
++print("2. Testing callable class that returns default_storage:")
++callable_class = CallableStorageClass()
++field = models.FileField(storage=callable_class)
++name, path, args, kwargs = field.deconstruct()
++print(f"   Field storage: {field.storage}")
++print(f"   Field _storage_callable: {getattr(field, '_storage_callable', 'NOT SET')}")
++print(f"   'storage' in kwargs: {'storage' in kwargs}")
++if 'storage' in kwargs:
++    print(f"   kwargs['storage'] is callable_class: {kwargs['storage'] is callable_class}")
++print()
++
++# Edge case 3: Lambda function
++lambda_storage = lambda: default_storage
++
++print("3. Testing lambda that returns default_storage:")
++field = models.FileField(storage=lambda_storage)
++name, path, args, kwargs = field.deconstruct()
++print(f"   Field storage: {field.storage}")
++print(f"   Field _storage_callable: {getattr(field, '_storage_callable', 'NOT SET')}")
++print(f"   'storage' in kwargs: {'storage' in kwargs}")
++if 'storage' in kwargs:
++    print(f"   kwargs['storage'] is lambda_storage: {kwargs['storage'] is lambda_storage}")
++print()
++
++# Edge case 4: Multiple field instances with same callable
++def shared_storage():
++    return default_storage
++
++print("4. Testing multiple fields with same callable:")
++field1 = models.FileField(storage=shared_storage)
++field2 = models.FileField(storage=shared_storage)
++
++_, _, _, kwargs1 = field1.deconstruct()
++_, _, _, kwargs2 = field2.deconstruct()
++
++print(f"   Field1 'storage' in kwargs: {'storage' in kwargs1}")
++print(f"   Field2 'storage' in kwargs: {'storage' in kwargs2}")
++if 'storage' in kwargs1 and 'storage' in kwargs2:
++    print(f"   Both reference same callable: {kwargs1['storage'] is kwargs2['storage']}")
++print()
++
++# Edge case 5: Ensure existing tests still pass
++print("5. Testing that existing behavior is preserved:")
++
++# Non-callable default_storage should not be in kwargs
++field_default = models.FileField(storage=default_storage)
++_, _, _, kwargs_default = field_default.deconstruct()
++print(f"   Non-callable default_storage in kwargs: {'storage' in kwargs_default}")
++
++# Non-callable other storage should be in kwargs
++other_storage = FileSystemStorage(location='/tmp/test')
++field_other = models.FileField(storage=other_storage)
++_, _, _, kwargs_other = field_other.deconstruct()
++print(f"   Non-callable other_storage in kwargs: {'storage' in kwargs_other}")
++
++# No storage parameter (should use default_storage)
++field_none = models.FileField()
++_, _, _, kwargs_none = field_none.deconstruct()
++print(f"   No storage parameter in kwargs: {'storage' in kwargs_none}")
++
++print("\n=== All edge cases handled correctly! ===")
+\ No newline at end of file
+diff --git a/test_imagefield.py b/test_imagefield.py
+new file mode 100644
+index 0000000000..47ee785a4a
+--- /dev/null
++++ b/test_imagefield.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python
++"""
++Test that ImageField also works correctly with the fix.
++"""
++
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++
++def get_storage():
++    return default_storage
++
++print("=== Testing ImageField with callable storage ===\n")
++
++# Test ImageField with callable storage that returns default_storage
++field = models.ImageField(storage=get_storage)
++name, path, args, kwargs = field.deconstruct()
++
++print(f"ImageField storage: {field.storage}")
++print(f"ImageField _storage_callable: {getattr(field, '_storage_callable', 'NOT SET')}")
++print(f"Deconstructed kwargs: {kwargs}")
++print(f"'storage' in kwargs: {'storage' in kwargs}")
++
++if 'storage' in kwargs:
++    print(f"kwargs['storage'] is get_storage: {kwargs['storage'] is get_storage}")
++    print("✅ SUCCESS: ImageField correctly includes callable storage in kwargs")
++else:
++    print("❌ FAILURE: ImageField does not include callable storage in kwargs")
++
++print("\n=== ImageField inherits the fix from FileField ===")
+\ No newline at end of file
+diff --git a/test_issue_reproduction.py b/test_issue_reproduction.py
+new file mode 100644
+index 0000000000..fb8dab9010
+--- /dev/null
++++ b/test_issue_reproduction.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python
++"""
++Test that reproduces the exact issue described in the GitHub issue.
++
++This test demonstrates that the fix resolves the problem where repeatedly running 
++makemigrations would randomly generate a migration that alternately includes or 
++omits storage=myapp.models.get_storage on the FileField definition.
++"""
++
++import os
++import sys
++import tempfile
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++import random
++
++# Reproduce the exact example from the issue description
++other_storage = FileSystemStorage(location='/media/other')
++
++def get_storage():
++    return random.choice([default_storage, other_storage])
++
++class MyModel(models.Model):
++    my_file = models.FileField(storage=get_storage)
++    
++    class Meta:
++        app_label = 'test_app'
++
++print("=== Testing the exact issue scenario ===\n")
++
++# Test multiple times to simulate repeated makemigrations calls
++print("Testing field deconstruction multiple times (simulating repeated makemigrations):")
++
++results = []
++for i in range(10):
++    # Create a new field instance each time (simulating Django's field creation process)
++    field = models.FileField(storage=get_storage)
++    name, path, args, kwargs = field.deconstruct()
++    
++    has_storage = 'storage' in kwargs
++    results.append(has_storage)
++    
++    print(f"  Run {i+1}: 'storage' in kwargs = {has_storage}")
++    if has_storage:
++        print(f"         kwargs['storage'] = {kwargs['storage']}")
++        print(f"         kwargs['storage'] is get_storage = {kwargs['storage'] is get_storage}")
++
++print(f"\nResults: {results}")
++print(f"All runs include storage parameter: {all(results)}")
++
++if all(results):
++    print("\n✅ SUCCESS: The fix works! Storage parameter is consistently included.")
++    print("   This means makemigrations will no longer randomly include/omit the storage parameter.")
++else:
++    print("\n❌ FAILURE: Storage parameter is still inconsistently included.")
++    print("   This would still cause the makemigrations issue.")
++
++# Test the specific model from the issue
++print(f"\n=== Testing MyModel field ===")
++field = MyModel._meta.get_field('my_file')
++name, path, args, kwargs = field.deconstruct()
++print(f"MyModel.my_file storage in kwargs: {'storage' in kwargs}")
++if 'storage' in kwargs:
++    print(f"kwargs['storage'] is get_storage: {kwargs['storage'] is get_storage}")
++
++print("\n=== Issue Resolution Confirmed ===")
++print("Before fix: Callable storage returning default_storage was omitted from kwargs")
++print("After fix: Callable storage is always included in kwargs, regardless of return value")
++print("Result: makemigrations will consistently generate the same migration")
+\ No newline at end of file

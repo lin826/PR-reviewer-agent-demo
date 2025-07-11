@@ -1,0 +1,73 @@
+diff --git a/astropy/utils/introspection.py b/astropy/utils/introspection.py
+index 3e784f9fc3..9e1947d476 100644
+--- a/astropy/utils/introspection.py
++++ b/astropy/utils/introspection.py
+@@ -6,7 +6,35 @@
+ import inspect
+ import types
+ import importlib
+-from distutils.version import LooseVersion
++
++# --------------------------------------------------------------------
++# Robust version parsing/comparison
++# --------------------------------------------------------------------
++# 1.  Try the std-lib dependency 'packaging' (preferred, PEP-440 aware)
++# 2.  Fall back to  pkg_resources.parse_version  which ships with
++#     setuptools and was used in Astropy <3.2
++# 3.  Ultimately fall back to distutils.version.LooseVersion, but wrap
++#     the call in a helper that converts the result to a string when
++#     LooseVersion would mix ints and strs, thus avoiding the
++#     TypeError that motivated this change.  This final path should be
++#     hit only on the most constrained Python installations.
++
++try:                              # 1.
++    from packaging.version import parse as _parse_version  # type: ignore
++except Exception:                 # packaging not importable
++    try:                          # 2.
++        from pkg_resources import parse_version as _parse_version  # type: ignore
++    except Exception:             # 3. last-ditch fall-back
++        from distutils.version import LooseVersion as _LV   # noqa
++
++        def _parse_version(v):  # type: ignore
++            """Return an object that compares like LooseVersion but
++            never mixes ints/strs in the same position."""
++            lv = _LV(str(v))     # ensure 'v' is text
++            # LooseVersion stores its pieces in  .version
++            # Force every component to *string*, then compare
++            lv.version = [str(p) for p in lv.version]
++            return lv
+ 
+ 
+ __all__ = ['resolve_name', 'minversion', 'find_current_module',
+@@ -139,10 +167,13 @@ def minversion(module, version, inclusive=True, version_path='__version__'):
+     else:
+         have_version = resolve_name(module.__name__, version_path)
+ 
++    want = _parse_version(version)
++    have = _parse_version(have_version)
++
+     if inclusive:
+-        return LooseVersion(have_version) >= LooseVersion(version)
++        return have >= want
+     else:
+-        return LooseVersion(have_version) > LooseVersion(version)
++        return have > want
+ 
+ 
+ def find_current_module(depth=1, finddiff=False):
+diff --git a/astropy/utils/tests/test_introspection.py b/astropy/utils/tests/test_introspection.py
+index d8262d4581..6889cb3d99 100644
+--- a/astropy/utils/tests/test_introspection.py
++++ b/astropy/utils/tests/test_introspection.py
+@@ -73,3 +73,11 @@ def test_minversion():
+         assert minversion(test_module, version)
+     for version in bad_versions:
+         assert not minversion(test_module, version)
++
++
++def test_minversion_mixed_components():
++    from types import ModuleType
++    mod = ModuleType('dummy')
++    mod.__version__ = '1.14.3'
++    assert minversion(mod, '1.14dev')          # should be True
++    assert not minversion(mod, '1.15rc1')      # should be False

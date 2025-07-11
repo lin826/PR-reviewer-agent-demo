@@ -1,0 +1,879 @@
+diff --git a/django/contrib/contenttypes/fields.py b/django/contrib/contenttypes/fields.py
+index ed98ecb48c..6098b71a39 100644
+--- a/django/contrib/contenttypes/fields.py
++++ b/django/contrib/contenttypes/fields.py
+@@ -202,7 +202,7 @@ class GenericForeignKey(FieldCacheMixin):
+             else:
+                 model = self.get_content_type(id=ct_id,
+                                               using=obj._state.db).model_class()
+-                return (model._meta.pk.get_prep_value(getattr(obj, self.fk_field)),
++                return (model._meta.pk.to_python(getattr(obj, self.fk_field)),
+                         model)
+ 
+         return (
+diff --git a/test_debug_object_construction.py b/test_debug_object_construction.py
+new file mode 100644
+index 0000000000..c13038542b
+--- /dev/null
++++ b/test_debug_object_construction.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python
++"""
++Debug object construction during prefetch_related.
++"""
++import os
++import sys
++import uuid
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',  # This script as an app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++from django.db import models
++
++
++class Foo(models.Model):
++    """Model with UUID as primary key"""
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"Foo({self.name})"
++
++
++class Bar(models.Model):
++    """Model with GenericForeignKey to Foo"""
++    foo_content_type = models.ForeignKey(
++        ContentType, related_name='actor',
++        on_delete=models.CASCADE, db_index=True, null=True, blank=True
++    )
++    foo_object_id = models.CharField(max_length=255, db_index=True, null=True, blank=True)
++    foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __init__(self, *args, **kwargs):
++        print(f"Bar.__init__ called with args={args}, kwargs={kwargs}, id(self)={id(self)}")
++        super().__init__(*args, **kwargs)
++        print(f"  After super().__init__: foo_content_type_id={getattr(self, 'foo_content_type_id', 'NOT_SET')}, foo_object_id={getattr(self, 'foo_object_id', 'NOT_SET')}")
++    
++    def __setattr__(self, name, value):
++        if name in ('foo_content_type_id', 'foo_object_id'):
++            if hasattr(self, 'id') and self.id is not None:  # Only track after object is created
++                print(f"Bar.__setattr__: {name} = {value}, id(self)={id(self)}")
++                if value is None:
++                    import traceback
++                    print("  Setting to None, traceback:")
++                    traceback.print_stack(limit=10)
++        super().__setattr__(name, value)
++    
++    def __str__(self):
++        return f"Bar({self.name})"
++
++
++def test_debug():
++    """Debug object construction"""
++    
++    # Create tables for our models
++    from django.db import connection
++    from django.contrib.contenttypes.models import ContentType
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(Foo)
++        schema_editor.create_model(Bar)
++    
++    print("=== Debug object construction ===")
++    
++    # Create test data
++    foo1 = Foo.objects.create(name="Test Foo 1")
++    print(f"Created: {foo1} (id={foo1.id})")
++    
++    # Create Bar object with GenericForeignKey pointing to Foo object
++    print(f"\n--- Creating Bar object ---")
++    bar1 = Bar.objects.create(name="Test Bar 1")
++    bar1.foo = foo1
++    bar1.save()
++    print(f"Created: {bar1}")
++    
++    # Test: Query with prefetch_related
++    print(f"\n--- Query with prefetch_related ---")
++    # Mark objects for debugging
++    for bar in Bar.objects.all():
++        bar._debug_prefetch = True
++    
++    bars_prefetch = list(Bar.objects.all().prefetch_related('foo'))
++    print(f"Retrieved {len(bars_prefetch)} bars")
++    
++    for bar in bars_prefetch:
++        print(f"  {bar}: foo_content_type_id={bar.foo_content_type_id}, foo_object_id={bar.foo_object_id}, id(bar)={id(bar)}")
++
++
++if __name__ == '__main__':
++    test_debug()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..243cef6588
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the UUID GenericForeignKey fix.
++"""
++import os
++import sys
++import uuid
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',  # This script as an app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++from django.db import models
++
++
++class UUIDModel(models.Model):
++    """Model with UUID as primary key"""
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"UUIDModel({self.name})"
++
++
++class IntModel(models.Model):
++    """Model with integer primary key"""
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"IntModel({self.name})"
++
++
++class StringModel(models.Model):
++    """Model with string primary key"""
++    id = models.CharField(primary_key=True, max_length=100)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"StringModel({self.name})"
++
++
++class GenericContainer(models.Model):
++    """Model with GenericForeignKey that can point to any model"""
++    content_type = models.ForeignKey(
++        ContentType, on_delete=models.CASCADE, null=True, blank=True
++    )
++    object_id = models.CharField(max_length=255, null=True, blank=True)
++    content_object = GenericForeignKey('content_type', 'object_id')
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"GenericContainer({self.name})"
++
++
++def test_edge_cases():
++    """Test edge cases for the UUID GenericForeignKey fix"""
++    
++    # Create tables for our models
++    from django.db import connection
++    from django.contrib.contenttypes.models import ContentType
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(UUIDModel)
++        schema_editor.create_model(IntModel)
++        schema_editor.create_model(StringModel)
++        schema_editor.create_model(GenericContainer)
++    
++    print("=== Testing edge cases ===")
++    
++    # Test 1: UUID model (the main fix)
++    print(f"\n--- Test 1: UUID model ---")
++    uuid_obj = UUIDModel.objects.create(name="UUID Test")
++    container1 = GenericContainer.objects.create(name="Container 1")
++    container1.content_object = uuid_obj
++    container1.save()
++    
++    # Test prefetch_related
++    containers = list(GenericContainer.objects.filter(id=container1.id).prefetch_related('content_object'))
++    result1 = containers[0].content_object
++    print(f"UUID model result: {result1} (expected: {uuid_obj})")
++    print(f"Success: {result1 == uuid_obj}")
++    
++    # Test 2: Integer model (should still work)
++    print(f"\n--- Test 2: Integer model ---")
++    int_obj = IntModel.objects.create(name="Int Test")
++    container2 = GenericContainer.objects.create(name="Container 2")
++    container2.content_object = int_obj
++    container2.save()
++    
++    # Test prefetch_related
++    containers = list(GenericContainer.objects.filter(id=container2.id).prefetch_related('content_object'))
++    result2 = containers[0].content_object
++    print(f"Integer model result: {result2} (expected: {int_obj})")
++    print(f"Success: {result2 == int_obj}")
++    
++    # Test 3: String model (should still work)
++    print(f"\n--- Test 3: String model ---")
++    string_obj = StringModel.objects.create(id="test-string-id", name="String Test")
++    container3 = GenericContainer.objects.create(name="Container 3")
++    container3.content_object = string_obj
++    container3.save()
++    
++    # Test prefetch_related
++    containers = list(GenericContainer.objects.filter(id=container3.id).prefetch_related('content_object'))
++    result3 = containers[0].content_object
++    print(f"String model result: {result3} (expected: {string_obj})")
++    print(f"Success: {result3 == string_obj}")
++    
++    # Test 4: Multiple objects with prefetch_related
++    print(f"\n--- Test 4: Multiple objects ---")
++    containers = list(GenericContainer.objects.all().prefetch_related('content_object'))
++    print(f"Retrieved {len(containers)} containers:")
++    for container in containers:
++        print(f"  {container}: content_object = {container.content_object}")
++    
++    # Test 5: None/null content_object
++    print(f"\n--- Test 5: None content_object ---")
++    container_null = GenericContainer.objects.create(name="Container Null")
++    # Don't set content_object, leave it as None
++    
++    containers = list(GenericContainer.objects.filter(id=container_null.id).prefetch_related('content_object'))
++    result_null = containers[0].content_object
++    print(f"Null content_object result: {result_null} (expected: None)")
++    print(f"Success: {result_null is None}")
++
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_gfk_key_debug.py b/test_gfk_key_debug.py
+new file mode 100644
+index 0000000000..193c68d75b
+--- /dev/null
++++ b/test_gfk_key_debug.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python
++"""
++Debug the gfk_key function specifically.
++"""
++import os
++import sys
++import uuid
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',  # This script as an app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++from django.db import models
++
++
++class Foo(models.Model):
++    """Model with UUID as primary key"""
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"Foo({self.name})"
++
++
++class Bar(models.Model):
++    """Model with GenericForeignKey to Foo"""
++    foo_content_type = models.ForeignKey(
++        ContentType, related_name='actor',
++        on_delete=models.CASCADE, db_index=True, null=True, blank=True
++    )
++    foo_object_id = models.CharField(max_length=255, db_index=True, null=True, blank=True)
++    foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"Bar({self.name})"
++
++
++def test_gfk_key_debug():
++    """Debug the gfk_key function specifically"""
++    
++    # Create tables for our models
++    from django.db import connection
++    from django.contrib.contenttypes.models import ContentType
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(Foo)
++        schema_editor.create_model(Bar)
++    
++    print("=== Debug gfk_key function ===")
++    
++    # Create test data
++    foo1 = Foo.objects.create(name="Test Foo 1")
++    print(f"Created: {foo1} (id={foo1.id})")
++    
++    # Create Bar object with GenericForeignKey pointing to Foo object
++    bar1 = Bar.objects.create(name="Test Bar 1")
++    bar1.foo = foo1
++    bar1.save()
++    print(f"Created: {bar1}")
++    print(f"  bar1.foo_content_type_id = {bar1.foo_content_type_id}")
++    print(f"  bar1.foo_object_id = {bar1.foo_object_id}")
++    
++    # Get the GenericForeignKey field
++    gfk_field = Bar._meta.get_field('foo')
++    print(f"GenericForeignKey field: {gfk_field}")
++    print(f"  ct_field: {gfk_field.ct_field}")
++    print(f"  fk_field: {gfk_field.fk_field}")
++    
++    # Test the gfk_key function manually on a fresh object
++    print(f"\n--- Testing gfk_key on fresh object ---")
++    bar_fresh = Bar.objects.get(id=bar1.id)
++    print(f"Fresh bar: {bar_fresh}")
++    print(f"  foo_content_type_id = {bar_fresh.foo_content_type_id}")
++    print(f"  foo_object_id = {bar_fresh.foo_object_id}")
++    
++    # Manually call the gfk_key logic
++    ct_attname = Bar._meta.get_field(gfk_field.ct_field).get_attname()
++    print(f"  ct_attname = {ct_attname}")
++    
++    ct_id = getattr(bar_fresh, ct_attname)
++    print(f"  ct_id = {ct_id} (type: {type(ct_id)})")
++    
++    if ct_id is not None:
++        model = gfk_field.get_content_type(id=ct_id, using=bar_fresh._state.db).model_class()
++        print(f"  model = {model}")
++        
++        fk_val = getattr(bar_fresh, gfk_field.fk_field)
++        print(f"  fk_val = {fk_val} (type: {type(fk_val)})")
++        
++        prep_val = model._meta.pk.to_python(fk_val)
++        print(f"  prep_val = {prep_val} (type: {type(prep_val)})")
++        
++        gfk_key_result = (prep_val, model)
++        print(f"  gfk_key result = {gfk_key_result}")
++    else:
++        print(f"  ct_id is None!")
++    
++    # Test the rel_obj_attr function
++    print(f"\n--- Testing rel_obj_attr ---")
++    rel_obj_attr_result = (foo1.pk, foo1.__class__)
++    print(f"rel_obj_attr result = {rel_obj_attr_result}")
++    
++    # Test matching
++    if ct_id is not None:
++        print(f"\n--- Testing matching ---")
++        print(f"gfk_key[0] == rel_obj_attr[0]: {gfk_key_result[0]} == {rel_obj_attr_result[0]} -> {gfk_key_result[0] == rel_obj_attr_result[0]}")
++        print(f"gfk_key[1] == rel_obj_attr[1]: {gfk_key_result[1]} == {rel_obj_attr_result[1]} -> {gfk_key_result[1] == rel_obj_attr_result[1]}")
++        print(f"Full match: {gfk_key_result == rel_obj_attr_result}")
++
++
++if __name__ == '__main__':
++    test_gfk_key_debug()
+\ No newline at end of file
+diff --git a/test_simple_uuid_gfk.py b/test_simple_uuid_gfk.py
+new file mode 100644
+index 0000000000..09e468c8bd
+--- /dev/null
++++ b/test_simple_uuid_gfk.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python
++"""
++Simplified test to isolate the UUID GenericForeignKey prefetch_related issue.
++"""
++import os
++import sys
++import uuid
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',  # This script as an app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++from django.db import models
++
++
++class Foo(models.Model):
++    """Model with UUID as primary key"""
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"Foo({self.name})"
++
++
++class Bar(models.Model):
++    """Model with GenericForeignKey to Foo"""
++    foo_content_type = models.ForeignKey(
++        ContentType, related_name='actor',
++        on_delete=models.CASCADE, db_index=True, null=True, blank=True
++    )
++    foo_object_id = models.CharField(max_length=255, db_index=True, null=True, blank=True)
++    foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"Bar({self.name})"
++
++
++def test_simple():
++    """Simple test to isolate the issue"""
++    
++    # Create tables for our models
++    from django.db import connection
++    from django.contrib.contenttypes.models import ContentType
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(Foo)
++        schema_editor.create_model(Bar)
++    
++    print("=== Simple UUID GenericForeignKey test ===")
++    
++    # Create test data
++    foo1 = Foo.objects.create(name="Test Foo 1")
++    print(f"Created: {foo1} (id={foo1.id})")
++    
++    # Create Bar object with GenericForeignKey pointing to Foo object
++    bar1 = Bar.objects.create(name="Test Bar 1")
++    bar1.foo = foo1
++    bar1.save()
++    print(f"Created: {bar1}")
++    print(f"  bar1.foo_content_type_id = {bar1.foo_content_type_id}")
++    print(f"  bar1.foo_object_id = {bar1.foo_object_id}")
++    
++    # Test 1: Simple query without prefetch
++    print(f"\n=== Test 1: Simple query ===")
++    bar_simple = Bar.objects.get(id=bar1.id)
++    print(f"bar_simple.foo_content_type_id = {bar_simple.foo_content_type_id}")
++    print(f"bar_simple.foo_object_id = {bar_simple.foo_object_id}")
++    print(f"bar_simple.foo = {bar_simple.foo}")
++    
++    # Test 2: Query with prefetch_related
++    print(f"\n=== Test 2: Query with prefetch_related ===")
++    bar_prefetch = Bar.objects.prefetch_related('foo').get(id=bar1.id)
++    print(f"bar_prefetch.foo_content_type_id = {bar_prefetch.foo_content_type_id}")
++    print(f"bar_prefetch.foo_object_id = {bar_prefetch.foo_object_id}")
++    print(f"bar_prefetch.foo = {bar_prefetch.foo}")
++    
++    # Test 3: All objects with prefetch_related
++    print(f"\n=== Test 3: All objects with prefetch_related ===")
++    bars_all = list(Bar.objects.all().prefetch_related('foo'))
++    for bar in bars_all:
++        print(f"{bar}:")
++        print(f"  foo_content_type_id = {bar.foo_content_type_id}")
++        print(f"  foo_object_id = {bar.foo_object_id}")
++        print(f"  foo = {bar.foo}")
++
++
++if __name__ == '__main__':
++    test_simple()
+\ No newline at end of file
+diff --git a/test_uuid_comparison.py b/test_uuid_comparison.py
+new file mode 100644
+index 0000000000..23e5242cfe
+--- /dev/null
++++ b/test_uuid_comparison.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python
++"""
++Test UUID comparison to understand the matching issue.
++"""
++import uuid
++
++def test_uuid_comparison():
++    # Create a UUID
++    original_uuid = uuid.uuid4()
++    print(f"Original UUID: {original_uuid} (type: {type(original_uuid)})")
++    
++    # Convert to string
++    uuid_str = str(original_uuid)
++    print(f"UUID string: {uuid_str} (type: {type(uuid_str)})")
++    
++    # Convert back to UUID
++    converted_uuid = uuid.UUID(uuid_str)
++    print(f"Converted UUID: {converted_uuid} (type: {type(converted_uuid)})")
++    
++    # Test equality
++    print(f"original_uuid == converted_uuid: {original_uuid == converted_uuid}")
++    print(f"original_uuid is converted_uuid: {original_uuid is converted_uuid}")
++    print(f"hash(original_uuid) == hash(converted_uuid): {hash(original_uuid) == hash(converted_uuid)}")
++    
++    # Test with specific UUID from our test
++    test_uuid_str = 'f8ffb017-de1e-45e2-a189-66c1a5eea13f'
++    uuid1 = uuid.UUID(test_uuid_str)
++    uuid2 = uuid.UUID(test_uuid_str)
++    
++    print(f"\nTest with specific UUID:")
++    print(f"uuid1: {uuid1} (type: {type(uuid1)})")
++    print(f"uuid2: {uuid2} (type: {type(uuid2)})")
++    print(f"uuid1 == uuid2: {uuid1 == uuid2}")
++    print(f"uuid1 is uuid2: {uuid1 is uuid2}")
++    print(f"hash(uuid1) == hash(uuid2): {hash(uuid1) == hash(uuid2)}")
++
++if __name__ == '__main__':
++    test_uuid_comparison()
+\ No newline at end of file
+diff --git a/test_uuid_gfk_issue.py b/test_uuid_gfk_issue.py
+new file mode 100644
+index 0000000000..4158fb87f6
+--- /dev/null
++++ b/test_uuid_gfk_issue.py
+@@ -0,0 +1,180 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the UUID GenericForeignKey prefetch_related issue.
++"""
++import os
++import sys
++import uuid
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',  # This script as an app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++from django.db import models
++
++
++class Foo(models.Model):
++    """Model with UUID as primary key"""
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"Foo({self.name})"
++
++
++class Bar(models.Model):
++    """Model with GenericForeignKey to Foo"""
++    foo_content_type = models.ForeignKey(
++        ContentType, related_name='actor',
++        on_delete=models.CASCADE, db_index=True, null=True, blank=True
++    )
++    foo_object_id = models.CharField(max_length=255, db_index=True, null=True, blank=True)
++    foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++    
++    def __str__(self):
++        return f"Bar({self.name})"
++
++
++def test_uuid_gfk_prefetch():
++    """Test that demonstrates the issue with UUID GFK prefetch_related"""
++    
++    # Create tables for our models
++    from django.db import connection
++    from django.contrib.contenttypes.models import ContentType
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(Foo)
++        schema_editor.create_model(Bar)
++    
++    print("=== Testing UUID GenericForeignKey prefetch_related issue ===")
++    
++    # Create test data
++    foo1 = Foo.objects.create(name="Test Foo 1")
++    foo2 = Foo.objects.create(name="Test Foo 2")
++    
++    print(f"Created Foo objects:")
++    print(f"  foo1: {foo1} (id={foo1.id}, type={type(foo1.id)})")
++    print(f"  foo2: {foo2} (id={foo2.id}, type={type(foo2.id)})")
++    
++    # Create Bar objects with GenericForeignKey pointing to Foo objects
++    bar1 = Bar.objects.create(name="Test Bar 1")
++    bar1.foo = foo1
++    bar1.save()
++    
++    bar2 = Bar.objects.create(name="Test Bar 2") 
++    bar2.foo = foo2
++    bar2.save()
++    
++    print(f"\nCreated Bar objects:")
++    print(f"  bar1: {bar1} -> foo_object_id={bar1.foo_object_id} (type={type(bar1.foo_object_id)})")
++    print(f"  bar2: {bar2} -> foo_object_id={bar2.foo_object_id} (type={type(bar2.foo_object_id)})")
++    
++    # Test without prefetch_related (should work)
++    print(f"\n=== Testing without prefetch_related ===")
++    bars_no_prefetch = Bar.objects.all()
++    for bar in bars_no_prefetch:
++        print(f"  {bar}.foo = {bar.foo}")
++        print(f"    bar.foo_content_type_id = {bar.foo_content_type_id}")
++        print(f"    bar.foo_object_id = {bar.foo_object_id}")
++    
++    # Test with prefetch_related (this should fail/return None)
++    print(f"\n=== Testing with prefetch_related ===")
++    from django.db import connection
++    from django.conf import settings
++    
++    # Enable query logging
++    settings.DEBUG = True
++    
++    bars_with_prefetch = Bar.objects.all().prefetch_related('foo')
++    
++    # Print queries
++    print(f"  Queries executed:")
++    for query in connection.queries:
++        print(f"    {query['sql']}")
++    
++    for bar in bars_with_prefetch:
++        print(f"  {bar}.foo = {bar.foo}")
++        print(f"    bar.foo_content_type_id = {bar.foo_content_type_id}")
++        print(f"    bar.foo_object_id = {bar.foo_object_id}")
++        print(f"    bar.__dict__ = {bar.__dict__}")
++        if bar.foo is None:
++            print(f"    ERROR: foo is None! Expected {bar.foo_object_id}")
++        else:
++            print(f"    SUCCESS: foo is {bar.foo}")
++    
++    # Let's also debug the internal values
++    print(f"\n=== Debugging internal values ===")
++    from django.contrib.contenttypes.fields import GenericForeignKey
++    
++    # Get the GenericForeignKey field
++    gfk_field = Bar._meta.get_field('foo')
++    
++    # Test the gfk_key function manually
++    bar_instance = bars_with_prefetch[0]
++    ct_attname = Bar._meta.get_field(gfk_field.ct_field).get_attname()
++    
++    def debug_gfk_key(obj):
++        ct_id = getattr(obj, ct_attname)
++        print(f"    ct_id={ct_id} (type={type(ct_id)})")
++        if ct_id is None:
++            print(f"    ct_id is None, returning None")
++            return None
++        else:
++            model = gfk_field.get_content_type(id=ct_id, using=obj._state.db).model_class()
++            fk_val = getattr(obj, gfk_field.fk_field)
++            prep_val = model._meta.pk.get_prep_value(fk_val)
++            print(f"    obj={obj}, fk_val={fk_val} (type={type(fk_val)})")
++            print(f"    model={model}, prep_val={prep_val} (type={type(prep_val)})")
++            return (prep_val, model)
++    
++    print(f"  Debug gfk_key for {bar_instance}:")
++    print(f"    ct_attname={ct_attname}")
++    print(f"    bar_instance.foo_content_type={bar_instance.foo_content_type}")
++    print(f"    bar_instance.foo_content_type_id={bar_instance.foo_content_type_id}")
++    gfk_key_result = debug_gfk_key(bar_instance)
++    print(f"    gfk_key result: {gfk_key_result}")
++    
++    # Test the rel_obj_attr function
++    foo_obj = foo1
++    rel_obj_attr_result = (foo_obj.pk, foo_obj.__class__)
++    print(f"  rel_obj_attr for {foo_obj}: {rel_obj_attr_result}")
++    print(f"    foo_obj.pk={foo_obj.pk} (type={type(foo_obj.pk)})")
++    
++    # Check if they match
++    if gfk_key_result and rel_obj_attr_result:
++        match = gfk_key_result[0] == rel_obj_attr_result[0] and gfk_key_result[1] == rel_obj_attr_result[1]
++        print(f"  Keys match: {match}")
++        if not match:
++            print(f"    gfk_key[0] == rel_obj_attr[0]: {gfk_key_result[0]} == {rel_obj_attr_result[0]} -> {gfk_key_result[0] == rel_obj_attr_result[0]}")
++            print(f"    gfk_key[1] == rel_obj_attr[1]: {gfk_key_result[1]} == {rel_obj_attr_result[1]} -> {gfk_key_result[1] == rel_obj_attr_result[1]}")
++
++
++if __name__ == '__main__':
++    test_uuid_gfk_prefetch()
+\ No newline at end of file
+diff --git a/test_uuid_prep_value.py b/test_uuid_prep_value.py
+new file mode 100644
+index 0000000000..ccd32eb14a
+--- /dev/null
++++ b/test_uuid_prep_value.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python
++"""
++Test UUIDField's get_prep_value method.
++"""
++import uuid
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++
++class TestModel(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def test_uuid_prep_value():
++    """Test UUIDField's get_prep_value method"""
++    
++    # Get the UUIDField
++    uuid_field = TestModel._meta.get_field('id')
++    print(f"UUIDField: {uuid_field}")
++    print(f"Type: {type(uuid_field)}")
++    
++    # Test with string input
++    test_uuid_str = '01c57090-eb11-40e0-8975-6a33a792c448'
++    print(f"\nTesting with string: {test_uuid_str}")
++    
++    prep_result = uuid_field.get_prep_value(test_uuid_str)
++    print(f"get_prep_value result: {prep_result} (type: {type(prep_result)})")
++    
++    # Test with UUID input
++    test_uuid_obj = uuid.UUID(test_uuid_str)
++    print(f"\nTesting with UUID object: {test_uuid_obj}")
++    
++    prep_result2 = uuid_field.get_prep_value(test_uuid_obj)
++    print(f"get_prep_value result: {prep_result2} (type: {type(prep_result2)})")
++    
++    # Test to_python method
++    print(f"\nTesting to_python method:")
++    to_python_result = uuid_field.to_python(test_uuid_str)
++    print(f"to_python result: {to_python_result} (type: {type(to_python_result)})")
++
++
++if __name__ == '__main__':
++    test_uuid_prep_value()
+\ No newline at end of file

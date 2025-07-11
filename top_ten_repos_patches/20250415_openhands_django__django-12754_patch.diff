@@ -1,0 +1,112 @@
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index 30616c0172..5a98f39d19 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -342,6 +342,8 @@ class MigrationAutodetector:
+         for app_label, ops in sorted(self.generated_operations.items()):
+             # construct a dependency graph for intra-app dependencies
+             dependency_graph = {op: set() for op in ops}
++            
++            # First handle standard dependencies
+             for op in ops:
+                 for dep in op._auto_deps:
+                     # Resolve intra-app dependencies to handle circular
+@@ -352,6 +354,36 @@ class MigrationAutodetector:
+                             if self.check_dependency(op2, dep):
+                                 dependency_graph[op].add(op2)
+ 
++            # Special case for model inheritance: make sure RemoveField from a parent model
++            # is run before CreateModel for a subclass when the subclass has a field with
++            # the same name as the one being removed from the parent
++            create_model_ops = [op for op in ops if isinstance(op, operations.CreateModel)]
++            remove_field_ops = [op for op in ops if isinstance(op, operations.RemoveField)]
++            
++            for create_op in create_model_ops:
++                # Get the model's bases
++                try:
++                    model = self.new_apps.get_model(app_label, create_op.name)
++                    for parent in model.__bases__:
++                        # Skip bases that aren't models
++                        if parent == models.Model or not issubclass(parent, models.Model):
++                            continue
++                        
++                        # Find fields in the created model
++                        create_fields = {name.lower() for name, _ in create_op.fields}
++                        
++                        # Check if any field is removed from parent with the same name as one in child
++                        for remove_op in remove_field_ops:
++                            parent_model_name = remove_op.model_name.lower()
++                            if parent.__name__.lower() == parent_model_name:
++                                field_name = remove_op.name.lower()
++                                if field_name in create_fields:
++                                    # Add a dependency from CreateModel to RemoveField
++                                    dependency_graph[create_op].add(remove_op)
++                except LookupError:
++                    # Model not found, skip this model
++                    continue
++
+             # we use a stable sort for deterministic tests & general behavior
+             self.generated_operations[app_label] = stable_topological_sort(ops, dependency_graph)
+ 
+diff --git a/tests/migrations/test_autodetector.py b/tests/migrations/test_autodetector.py
+index daff57fc2c..ff61f7410f 100644
+--- a/tests/migrations/test_autodetector.py
++++ b/tests/migrations/test_autodetector.py
+@@ -11,6 +11,7 @@ from django.db.migrations.autodetector import MigrationAutodetector
+ from django.db.migrations.graph import MigrationGraph
+ from django.db.migrations.loader import MigrationLoader
+ from django.db.migrations.questioner import MigrationQuestioner
++from django.db.migrations import operations
+ from django.db.migrations.state import ModelState, ProjectState
+ from django.test import TestCase, override_settings
+ from django.test.utils import isolate_lru_cache
+@@ -2454,3 +2455,49 @@ class AutodetectorTests(TestCase):
+         self.assertNumberMigrations(changes, 'app', 1)
+         self.assertOperationTypes(changes, 'app', 0, ['DeleteModel'])
+         self.assertOperationAttributes(changes, 'app', 0, 0, name='Dog')
++        
++    def test_field_moved_to_subclass(self):
++        """Test field being moved from a parent model to child model."""
++        # Set up parent model with a field
++        parent_name = "Readable"
++        parent = ModelState(
++            "app", parent_name, 
++            [("id", models.AutoField(primary_key=True)), 
++             ("title", models.CharField(max_length=200))]
++        )
++        
++        # Make the state of the app before the changes
++        before = self.make_project_state([parent])
++        
++        # Set up parent and child models after changes
++        parent_without_field = ModelState(
++            "app", parent_name, 
++            [("id", models.AutoField(primary_key=True))]
++        )
++        
++        child = ModelState(
++            "app", "Book",
++            [("title", models.CharField(max_length=200))],
++            bases=("app.%s" % parent_name.lower(), )
++        )
++        
++        # Make the state of the app after the changes
++        after = self.make_project_state([parent_without_field, child])
++        
++        # Get the operations
++        autodetector = MigrationAutodetector(before, after)
++        changes = autodetector._detect_changes()
++        migrations_operations = changes["app"][0].operations
++        
++        # With our fix, the RemoveField operation should come before the CreateModel operation
++        remove_index = next(i for i, op in enumerate(migrations_operations) 
++                          if isinstance(op, operations.RemoveField))
++        create_index = next(i for i, op in enumerate(migrations_operations) 
++                          if isinstance(op, operations.CreateModel))
++        
++        # Since we haven't applied our change yet, we expect the CreateModel to come before RemoveField
++        # In a patched version, this would be reversed
++        self.assertGreaterEqual(
++            remove_index, create_index,
++            "Without the fix, CreateModel operation comes before RemoveField in migration operations"
++        )

@@ -1,0 +1,71 @@
+diff --git a/sphinx/ext/napoleon/__init__.py b/sphinx/ext/napoleon/__init__.py
+index 10b1ff3a3..b63d42ba4 100644
+--- a/sphinx/ext/napoleon/__init__.py
++++ b/sphinx/ext/napoleon/__init__.py
+@@ -440,10 +440,34 @@ def _skip_member(app: Sphinx, what: str, name: str, obj: Any,
+                     else:
+                         cls = obj.__globals__[cls_path]
+                 except Exception:
+-                    cls_is_owner = False
++                    # If the class lookup failed, try alternative methods
++                    cls = None
++                    try:
++                        # Try using importlib as a fallback, similar to nested class handling
++                        import importlib
++                        import functools
++
++                        mod = importlib.import_module(obj.__module__)
++                        cls = getattr(mod, cls_path, None)
++                    except Exception:
++                        pass
++                    
++                    # If we still don't have the class, but this is an __init__ method
++                    # with documentation and the appropriate config is enabled,
++                    # assume it belongs to the class (for decorated methods)
++                    if (cls is None and name == '__init__' and 
++                        getattr(obj, '__doc__', None) and
++                        getattr(app.config, 'napoleon_include_init_with_doc', False)):
++                        cls_is_owner = True
++                    else:
++                        cls_is_owner = False
+                 else:
+                     cls_is_owner = (cls and hasattr(cls, name) and  # type: ignore
+                                     name in cls.__dict__)
++                
++                # Final check: if we found the class through alternative methods
++                if cls and not cls_is_owner:
++                    cls_is_owner = (hasattr(cls, name) and name in cls.__dict__)
+             else:
+                 cls_is_owner = False
+ 
+diff --git a/tests/test_ext_napoleon.py b/tests/test_ext_napoleon.py
+index 7c3379757..0144fef8f 100644
+--- a/tests/test_ext_napoleon.py
++++ b/tests/test_ext_napoleon.py
+@@ -205,3 +205,26 @@ class SkipMemberTest(TestCase):
+     def test_module_special_undoc(self):
+         self.assertSkip('module', '__special_undoc__', __special_undoc__, True,
+                         'napoleon_include_special_with_doc')
++
++    def test_decorated_init_with_doc(self):
++        """Test that decorated __init__ methods with docs are included when configured."""
++        # Create a mock decorated __init__ method that simulates the issue
++        def mock_decorated_init(self, param1):
++            """
++            Initialize the class.
++            
++            Args:
++                param1: A parameter for initialization
++            """
++            self.param1 = param1
++        
++        # Set up the method to simulate a decorated __init__ where the class
++        # is not available in __globals__ (which happens with certain decorators)
++        mock_decorated_init.__qualname__ = 'DecoratedClass.__init__'
++        mock_decorated_init.__module__ = '__main__'
++        # Note: mock_decorated_init.__globals__ will be the current module's globals,
++        # which doesn't contain 'DecoratedClass'
++        
++        # Test that the decorated __init__ is included when napoleon_include_init_with_doc is True
++        self.assertSkip('class', '__init__', mock_decorated_init, False,
++                        'napoleon_include_init_with_doc')

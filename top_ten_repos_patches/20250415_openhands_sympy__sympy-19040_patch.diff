@@ -1,0 +1,228 @@
+diff --git a/sympy/polys/factortools.py b/sympy/polys/factortools.py
+index c6a5f9f063..a1d5eb818a 100644
+--- a/sympy/polys/factortools.py
++++ b/sympy/polys/factortools.py
+@@ -1147,20 +1147,78 @@ def dmp_ext_factor(f, u, K):
+         return lc, []
+ 
+     f, F = dmp_sqf_part(f, u, K), f
+-    s, g, r = dmp_sqf_norm(f, u, K)
+-
+-    factors = dmp_factor_list_include(r, u, K.dom)
+-
+-    if len(factors) == 1:
+-        factors = [f]
+-    else:
+-        H = dmp_raise([K.one, s*K.unit], u, 0, K)
+-
+-        for i, (factor, _) in enumerate(factors):
+-            h = dmp_convert(factor, u, K.dom, K)
+-            h, _, g = dmp_inner_gcd(h, g, u, K)
+-            h = dmp_compose(h, H, u, K)
+-            factors[i] = h
++    
++    # Initialize with the current polynomial as a fallback
++    factors = [f]
++    
++    # Try a simpler approach: convert back to the base domain and factor
++    try:
++        # First factor in the base domain (QQ or ZZ)
++        K_dom = K.dom  # This is typically QQ for algebraic number fields
++        f_dom = dmp_convert(f, u, K, K_dom)
++        
++        # Get factors in the base domain
++        dom_factors = dmp_factor_list_include(f_dom, u, K_dom)
++        
++        if len(dom_factors) > 1:
++            # Replace our previous factors with these
++            factors = []
++            for df, _ in dom_factors:
++                factor = dmp_convert(df, u, K_dom, K)
++                factors.append(factor)
++        
++        # We have base domain factors, now continue with algebraic factorization
++        s, g, r = dmp_sqf_norm(f, u, K)
++        ext_factors = dmp_factor_list_include(r, u, K.dom)
++        
++        if len(ext_factors) > 1:
++            H = dmp_raise([K.one, s*K.unit], u, 0, K)
++            
++            # Add factors from algebraic extension
++            ext_poly_factors = []
++            for ef, _ in ext_factors:
++                h = dmp_convert(ef, u, K.dom, K)
++                h, _, g = dmp_inner_gcd(h, g, u, K)
++                h = dmp_compose(h, H, u, K)
++                ext_poly_factors.append(h)
++                
++            # Combine extension factors with base domain factors
++            # Only add the extension factors that aren't already covered
++            for efactor in ext_poly_factors:
++                # Check if this factor is already covered by our base domain factors
++                is_new = True
++                for factor in factors[:]:
++                    # Try to divide to see if one is a multiple of the other
++                    try:
++                        q = dmp_quo(factor, efactor, u, K)
++                        if not dmp_one_p(q, u, K) and not dmp_zero_p(q, u):
++                            # Replace factor with its parts
++                            factors.remove(factor)
++                            factors.append(efactor)
++                            factors.append(q)
++                            is_new = False
++                            break
++                    except:
++                        pass
++                if is_new:
++                    factors.append(efactor)
++    except Exception:
++        # On any error, fall back to the original method
++        s, g, r = dmp_sqf_norm(f, u, K)
++        
++        factors_ext = dmp_factor_list_include(r, u, K.dom)
++        
++        if len(factors_ext) == 1:
++            factors = [f]
++        else:
++            H = dmp_raise([K.one, s*K.unit], u, 0, K)
++            
++            factors = []
++            for factor, _ in factors_ext:
++                h = dmp_convert(factor, u, K.dom, K)
++                h, _, g = dmp_inner_gcd(h, g, u, K)
++                h = dmp_compose(h, H, u, K)
++                factors.append(h)
+ 
+     return lc, dmp_trial_division(F, factors, u, K)
+ 
+diff --git a/sympy/polys/polytools.py b/sympy/polys/polytools.py
+index 68b69d1a24..a2c16ff876 100644
+--- a/sympy/polys/polytools.py
++++ b/sympy/polys/polytools.py
+@@ -6346,6 +6346,45 @@ def _try_factor(expr):
+                 partials[p] = fac
+         return f.xreplace(partials)
+ 
++    # Special case for multivariate polynomials with algebraic extension
++    # This ensures we don't lose factors like (y-1) when using extension=I
++    from sympy import I
++    extension = args.get('extension', None)
++    gaussian = args.get('gaussian', None)
++    
++    # If we have an extension or gaussian mode for a multivariate polynomial
++    if (extension or gaussian) and len(gens) > 1 or (not gens and f.free_symbols and len(f.free_symbols) > 1):
++        # First factor without the extension
++        args_no_ext = dict(args)
++        args_no_ext.pop('extension', None)
++        args_no_ext.pop('gaussian', None)
++        
++        try:
++            # Get the factorization without extension
++            factors_no_ext = factor(f, *gens, **args_no_ext)
++            
++            # If it's already fully factorized, we're done
++            if isinstance(factors_no_ext, Mul):
++                # For each factor in the product, try to factor it further with the extension
++                factors = []
++                for arg in factors_no_ext.args:
++                    try:
++                        # Try to factor this term with the extension
++                        factor_ext = factor(arg, *gens, **args)
++                        factors.append(factor_ext)
++                    except:
++                        # If that fails, keep the original factor
++                        factors.append(arg)
++                        
++                return Mul(*factors)
++            # If it's just a single term or not factorizable without extension
++            else:
++                # Continue with normal factorization
++                pass
++        except:
++            # If the no-extension factorization fails, continue with the original approach
++            pass
++
+     try:
+         return _generic_factor(f, gens, args, method='factor')
+     except PolynomialError as msg:
+diff --git a/test_issue_18895.py b/test_issue_18895.py
+new file mode 100644
+index 0000000000..1454cd4aa8
+--- /dev/null
++++ b/test_issue_18895.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python
++
++from sympy import symbols, expand, factor, I, sqrt
++
++def test_factor_with_extension():
++    """
++    Test that factor with extension=True does not drop factors.
++    Issue #18895
++    """
++    # Create variables
++    x, y = symbols('x y')
++    
++    # Test Case 1: Basic example from the issue
++    z = expand((x-1)*(y-1))
++    print("Test Case 1: Basic example")
++    print("Original expression:", z)
++    
++    # Test regular factorization
++    regular_factorization = factor(z)
++    print("Regular factorization:", regular_factorization)
++    
++    # Test factorization with extension=True
++    extension_factorization = factor(z, extension=[I])
++    print("Factorization with extension=[I]:", extension_factorization)
++    
++    # Verify factors are preserved
++    if '(y - 1)' not in str(extension_factorization):
++        print("FAILURE: The (y - 1) factor was lost")
++    else:
++        print("SUCCESS: All factors are preserved")
++    
++    # Test Case 2: A more complex case
++    print("\nTest Case 2: Complex example with I")
++    z2 = expand((x**2 - 2*x + 2)*(y-1))
++    print("Original expression:", z2)
++    
++    # Test factorization with extension=True
++    extension_factorization2 = factor(z2, extension=[I])
++    print("Factorization with extension=[I]:", extension_factorization2)
++    
++    # Verify factors are preserved
++    if '(y - 1)' not in str(extension_factorization2):
++        print("FAILURE: The (y - 1) factor was lost")
++    else:
++        print("SUCCESS: All factors are preserved")
++    
++    # Test Case 3: Complex expression with different extension
++    print("\nTest Case 3: Example with sqrt(2)")
++    z3 = expand((x**2 - 2)*(y-1))
++    print("Original expression:", z3)
++    
++    # Test factorization with extension=True
++    extension_factorization3 = factor(z3, extension=sqrt(2))
++    print("Factorization with extension=sqrt(2):", extension_factorization3)
++    
++    # Verify factors are preserved
++    if '(y - 1)' not in str(extension_factorization3):
++        print("FAILURE: The (y - 1) factor was lost")
++    else:
++        print("SUCCESS: All factors are preserved")
++        
++    # Test Case 4: Using gaussian=True instead of extension=[I]
++    print("\nTest Case 4: Using gaussian=True")
++    gaussian_factorization = factor(z, gaussian=True)
++    print("Factorization with gaussian=True:", gaussian_factorization)
++    
++    # Verify factors are preserved
++    if '(y - 1)' not in str(gaussian_factorization):
++        print("FAILURE: The (y - 1) factor was lost")
++    else:
++        print("SUCCESS: All factors are preserved")
++
++if __name__ == "__main__":
++    test_factor_with_extension()
+\ No newline at end of file

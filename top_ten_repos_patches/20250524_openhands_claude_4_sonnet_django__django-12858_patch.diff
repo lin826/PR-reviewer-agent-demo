@@ -1,0 +1,727 @@
+diff --git a/debug_fix.py b/debug_fix.py
+new file mode 100644
+index 0000000000..c369affecd
+--- /dev/null
++++ b/debug_fix.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python
++"""
++Debug script to understand why the fix isn't working in the test case.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Test models exactly like in the failing test
++class Parent(models.Model):
++    class Meta:
++        app_label = '__main__'
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, models.CASCADE, null=True)
++
++    class Meta:
++        app_label = '__main__'
++        ordering = ('parent__isnull',)
++
++def debug_validation():
++    """Debug the validation process step by step."""
++    print("Debugging validation process...")
++    
++    # Check the parent field
++    parent_field = Child._meta.get_field('parent')
++    print(f"Parent field type: {type(parent_field)}")
++    print(f"Parent field.get_lookup('isnull'): {parent_field.get_lookup('isnull')}")
++    print(f"Parent field.get_transform('isnull'): {parent_field.get_transform('isnull')}")
++    
++    # Run the validation
++    errors = Child.check()
++    e015_errors = [error for error in errors if error.id == 'models.E015']
++    
++    if e015_errors:
++        print(f"\n❌ Validation failed with {len(e015_errors)} E015 errors:")
++        for error in e015_errors:
++            print(f"  - {error.msg}")
++    else:
++        print("\n✅ Validation passed!")
++    
++    # Let's manually trace through the _check_ordering method
++    print("\nManually tracing _check_ordering logic...")
++    
++    # This mimics the logic in _check_ordering
++    field = 'parent__isnull'
++    parts = field.split('__')
++    print(f"Field: {field}")
++    print(f"Parts: {parts}")
++    
++    _cls = Child
++    fld = None
++    
++    for i, part in enumerate(parts):
++        print(f"\nProcessing part {i}: '{part}'")
++        try:
++            if part == 'pk':
++                fld = _cls._meta.pk
++                print(f"  Found pk field: {fld}")
++            else:
++                fld = _cls._meta.get_field(part)
++                print(f"  Found field: {fld}")
++            
++            if fld.is_relation:
++                _cls = fld.get_path_info()[-1].to_opts.model
++                print(f"  Field is relation, new _cls: {_cls}")
++            else:
++                _cls = None
++                print(f"  Field is not relation, _cls set to None")
++                
++        except Exception as e:
++            print(f"  Exception: {e}")
++            print(f"  fld: {fld}")
++            if fld is not None:
++                transform_result = fld.get_transform(part)
++                lookup_result = fld.get_lookup(part)
++                print(f"  fld.get_transform('{part}'): {transform_result}")
++                print(f"  fld.get_lookup('{part}'): {lookup_result}")
++                
++                # This is the condition from our fix
++                condition = fld is None or (fld.get_transform(part) is None and fld.get_lookup(part) is None)
++                print(f"  Condition (should be False to pass): {condition}")
++            break
++
++if __name__ == '__main__':
++    debug_validation()
+\ No newline at end of file
+diff --git a/debug_transforms.py b/debug_transforms.py
+new file mode 100644
+index 0000000000..5f45c50627
+--- /dev/null
++++ b/debug_transforms.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python
++"""
++Debug script to understand how transforms and lookups work.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models.functions import Lower
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Test models
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    parent = models.ForeignKey('self', models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def debug_field_lookups_and_transforms():
++    """Debug what lookups and transforms are available on fields."""
++    print("Debugging field lookups and transforms...")
++    
++    # Get the name field from Product
++    name_field = Product._meta.get_field('name')
++    parent_field = Product._meta.get_field('parent')
++    
++    print(f"\nname field type: {type(name_field)}")
++    print(f"parent field type: {type(parent_field)}")
++    
++    # Test various lookups and transforms
++    test_cases = [
++        ('isnull', 'lookup'),
++        ('exact', 'lookup'),
++        ('lower', 'transform'),
++        ('upper', 'transform'),
++        ('nonexistent', 'both'),
++    ]
++    
++    for test_name, test_type in test_cases:
++        print(f"\nTesting '{test_name}' ({test_type}):")
++        
++        # Test on CharField (name field)
++        if test_type in ['lookup', 'both']:
++            lookup_result = name_field.get_lookup(test_name)
++            print(f"  CharField.get_lookup('{test_name}'): {lookup_result}")
++        
++        if test_type in ['transform', 'both']:
++            transform_result = name_field.get_transform(test_name)
++            print(f"  CharField.get_transform('{test_name}'): {transform_result}")
++        
++        # Test on ForeignKey (parent field)
++        if test_type in ['lookup', 'both']:
++            lookup_result = parent_field.get_lookup(test_name)
++            print(f"  ForeignKey.get_lookup('{test_name}'): {lookup_result}")
++        
++        if test_type in ['transform', 'both']:
++            transform_result = parent_field.get_transform(test_name)
++            print(f"  ForeignKey.get_transform('{test_name}'): {transform_result}")
++
++if __name__ == '__main__':
++    debug_field_lookups_and_transforms()
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 6c9e9d3707..124db6eed0 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1747,7 +1747,7 @@ class Model(metaclass=ModelBase):
+                     else:
+                         _cls = None
+                 except (FieldDoesNotExist, AttributeError):
+-                    if fld is None or fld.get_transform(part) is None:
++                    if fld is None or (fld.get_transform(part) is None and fld.get_lookup(part) is None):
+                         errors.append(
+                             checks.Error(
+                                 "'ordering' refers to the nonexistent field, "
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c7f236b6a1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the models.E015 issue with ordering using lookups.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.checks import run_checks
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Define the models as described in the issue
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    parent = models.ForeignKey('self', models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Supply(models.Model):
++    name = models.CharField(max_length=100)
++    product = models.ForeignKey(Product, models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Stock(models.Model):
++    name = models.CharField(max_length=100)
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++        # ordering = ['supply__product__parent__isnull']  # This should work but currently fails
++
++class StockWithOrdering(models.Model):
++    name = models.CharField(max_length=100)
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['supply__product__parent__isnull']  # This should work but currently fails
++
++def test_ordering_with_isnull_lookup():
++    """Test that ordering with __isnull lookup works."""
++    print("Testing ordering with __isnull lookup...")
++    
++    # Run system checks specifically on StockWithOrdering
++    errors = StockWithOrdering.check()
++    
++    # Filter for models.E015 errors
++    e015_errors = [error for error in errors if error.id == 'models.E015']
++    
++    if e015_errors:
++        print("❌ ISSUE REPRODUCED: Found models.E015 errors:")
++        for error in e015_errors:
++            print(f"  - {error.msg}")
++        return False
++    else:
++        print("✅ No models.E015 errors found - issue is fixed!")
++        return True
++
++def test_actual_query():
++    """Test that the actual query works (it should work even with the validation error)."""
++    print("\nTesting actual query functionality...")
++    
++    try:
++        # Create tables
++        from django.core.management import execute_from_command_line
++        from django.db import connection
++        
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(Product)
++            schema_editor.create_model(Supply)
++            schema_editor.create_model(Stock)
++        
++        # Create some test data
++        parent_product = Product.objects.create(name="Parent Product")
++        child_product = Product.objects.create(name="Child Product", parent=parent_product)
++        orphan_product = Product.objects.create(name="Orphan Product", parent=None)
++        
++        supply1 = Supply.objects.create(name="Supply 1", product=child_product)
++        supply2 = Supply.objects.create(name="Supply 2", product=orphan_product)
++        
++        stock1 = Stock.objects.create(name="Stock 1", supply=supply1)
++        stock2 = Stock.objects.create(name="Stock 2", supply=supply2)
++        
++        # Test the ordering query (without using the Meta ordering)
++        # We need to test the query directly since the Meta ordering is causing validation issues
++        result = list(Stock.objects.all().order_by('supply__product__parent__isnull').values_list('pk', flat=True))
++        print(f"✅ Query works! Results: {result}")
++        
++        result_desc = list(Stock.objects.all().order_by('-supply__product__parent__isnull').values_list('pk', flat=True))
++        print(f"✅ Descending query works! Results: {result_desc}")
++        
++        return True
++        
++    except Exception as e:
++        print(f"❌ Query failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("REPRODUCING ISSUE: models.E015 with ordering using lookups")
++    print("=" * 60)
++    
++    validation_passed = test_ordering_with_isnull_lookup()
++    query_passed = test_actual_query()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"  Validation check: {'PASSED' if validation_passed else 'FAILED'}")
++    print(f"  Query execution:  {'PASSED' if query_passed else 'FAILED'}")
++    
++    if not validation_passed and query_passed:
++        print("\n🐛 ISSUE CONFIRMED: Validation fails but query works!")
++        print("   This confirms the bug described in the issue.")
++    elif validation_passed and query_passed:
++        print("\n✅ ISSUE FIXED: Both validation and query work!")
++    else:
++        print("\n❓ UNEXPECTED RESULT")
++    
++    print("=" * 60)
+\ No newline at end of file
+diff --git a/test_exact_case.py b/test_exact_case.py
+new file mode 100644
+index 0000000000..b0b080cbe4
+--- /dev/null
++++ b/test_exact_case.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python
++"""
++Test script that exactly mimics the failing test case.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test.utils import isolate_apps
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_ordering_allows_builtin_lookups():
++    class Parent(models.Model):
++        class Meta:
++            app_label = '__main__'
++
++    class Child(models.Model):
++        parent = models.ForeignKey(Parent, models.CASCADE, null=True)
++
++        class Meta:
++            app_label = '__main__'
++            ordering = ('parent__isnull',)
++
++    errors = Child.check()
++    e015_errors = [error for error in errors if error.id == 'models.E015']
++    
++    print(f"Number of E015 errors: {len(e015_errors)}")
++    for error in e015_errors:
++        print(f"  - {error.msg}")
++    
++    return len(e015_errors) == 0
++
++if __name__ == '__main__':
++    success = test_ordering_allows_builtin_lookups()
++    print(f"Test {'PASSED' if success else 'FAILED'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..75f7082ca1
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the models.E015 fix with various lookups and transforms.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models.functions import Lower
++from django.test.utils import register_lookup
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Test models
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    parent = models.ForeignKey('self', models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Supply(models.Model):
++    name = models.CharField(max_length=100)
++    product = models.ForeignKey(Product, models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Test models with different ordering configurations
++class StockWithIsnull(models.Model):
++    name = models.CharField(max_length=100)
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['supply__product__parent__isnull']
++
++class StockWithExact(models.Model):
++    name = models.CharField(max_length=100)
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['supply__product__name__exact']
++
++class StockWithLower(models.Model):
++    name = models.CharField(max_length=100)
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['supply__product__name__lower']
++
++class StockWithInvalid(models.Model):
++    name = models.CharField(max_length=100)
++    supply = models.ForeignKey(Supply, models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++        ordering = ['supply__product__nonexistent']
++
++def test_model_validation(model_class, expected_to_pass=True, use_lower_transform=False):
++    """Test validation for a specific model."""
++    model_name = model_class.__name__
++    print(f"\nTesting {model_name}...")
++    
++    if use_lower_transform:
++        # Register Lower transform temporarily
++        with register_lookup(models.CharField, Lower):
++            errors = model_class.check()
++    else:
++        errors = model_class.check()
++    
++    e015_errors = [error for error in errors if error.id == 'models.E015']
++    
++    if expected_to_pass:
++        if e015_errors:
++            print(f"❌ {model_name}: Expected to pass but got E015 errors:")
++            for error in e015_errors:
++                print(f"    - {error.msg}")
++            return False
++        else:
++            print(f"✅ {model_name}: Validation passed as expected")
++            return True
++    else:
++        if e015_errors:
++            print(f"✅ {model_name}: Validation failed as expected:")
++            for error in e015_errors:
++                print(f"    - {error.msg}")
++            return True
++        else:
++            print(f"❌ {model_name}: Expected to fail but validation passed")
++            return False
++
++def main():
++    print("=" * 70)
++    print("COMPREHENSIVE TEST: models.E015 fix with various lookups and transforms")
++    print("=" * 70)
++    
++    # Test cases: (model_class, expected_to_pass, description, use_lower_transform)
++    test_cases = [
++        (StockWithIsnull, True, "ordering with __isnull lookup", False),
++        (StockWithExact, True, "ordering with __exact lookup", False),
++        (StockWithLower, True, "ordering with __lower transform", True),
++        (StockWithInvalid, False, "ordering with nonexistent field", False),
++    ]
++    
++    results = []
++    for model_class, expected_to_pass, description, use_lower_transform in test_cases:
++        print(f"\n📋 Testing {description}...")
++        result = test_model_validation(model_class, expected_to_pass, use_lower_transform)
++        results.append((description, result))
++    
++    print("\n" + "=" * 70)
++    print("SUMMARY:")
++    print("=" * 70)
++    
++    all_passed = True
++    for description, result in results:
++        status = "✅ PASS" if result else "❌ FAIL"
++        print(f"  {status}: {description}")
++        if not result:
++            all_passed = False
++    
++    print("\n" + "=" * 70)
++    if all_passed:
++        print("🎉 ALL TESTS PASSED! The fix works correctly.")
++    else:
++        print("❌ SOME TESTS FAILED! The fix needs more work.")
++    print("=" * 70)
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_isnull_ordering.py b/test_isnull_ordering.py
+new file mode 100644
+index 0000000000..3ad024fa8c
+--- /dev/null
++++ b/test_isnull_ordering.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python
++"""
++Test script to check if ordering by __isnull actually works in Django.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Simple test models
++class Parent(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Child(models.Model):
++    name = models.CharField(max_length=100)
++    parent = models.ForeignKey(Parent, models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_isnull_ordering():
++    """Test if ordering by __isnull works."""
++    print("Testing ordering by __isnull...")
++    
++    try:
++        # Create tables
++        from django.db import connection
++        
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(Parent)
++            schema_editor.create_model(Child)
++        
++        # Create test data
++        parent1 = Parent.objects.create(name="Parent 1")
++        parent2 = Parent.objects.create(name="Parent 2")
++        
++        child1 = Child.objects.create(name="Child 1", parent=parent1)
++        child2 = Child.objects.create(name="Child 2", parent=None)
++        child3 = Child.objects.create(name="Child 3", parent=parent2)
++        child4 = Child.objects.create(name="Child 4", parent=None)
++        
++        print("Created test data:")
++        for child in Child.objects.all():
++            print(f"  {child.name}: parent={child.parent}")
++        
++        # Test ordering by __isnull
++        print("\nTesting order_by('parent__isnull'):")
++        try:
++            result = list(Child.objects.order_by('parent__isnull').values_list('name', 'parent__name'))
++            print(f"✅ Success! Results: {result}")
++        except Exception as e:
++            print(f"❌ Failed: {e}")
++        
++        print("\nTesting order_by('-parent__isnull'):")
++        try:
++            result = list(Child.objects.order_by('-parent__isnull').values_list('name', 'parent__name'))
++            print(f"✅ Success! Results: {result}")
++        except Exception as e:
++            print(f"❌ Failed: {e}")
++            
++        # Test if we can filter by __isnull (this should definitely work)
++        print("\nTesting filter(parent__isnull=True):")
++        try:
++            result = list(Child.objects.filter(parent__isnull=True).values_list('name', flat=True))
++            print(f"✅ Success! Results: {result}")
++        except Exception as e:
++            print(f"❌ Failed: {e}")
++            
++        return True
++        
++    except Exception as e:
++        print(f"❌ Test setup failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    test_isnull_ordering()
+\ No newline at end of file
+diff --git a/tests/invalid_models_tests/test_models.py b/tests/invalid_models_tests/test_models.py
+index 6bfdf2e736..e85514af58 100644
+--- a/tests/invalid_models_tests/test_models.py
++++ b/tests/invalid_models_tests/test_models.py
+@@ -893,6 +893,18 @@ class OtherModelTests(SimpleTestCase):
+         with register_lookup(models.CharField, Lower):
+             self.assertEqual(Model.check(), [])
+ 
++    def test_ordering_allows_builtin_lookups(self):
++        class Parent(models.Model):
++            pass
++
++        class Child(models.Model):
++            parent = models.ForeignKey(Parent, models.CASCADE, null=True)
++
++            class Meta:
++                ordering = ('parent__isnull',)
++
++        self.assertEqual(Child.check(), [])
++
+     def test_ordering_pointing_to_related_model_pk(self):
+         class Parent(models.Model):
+             pass

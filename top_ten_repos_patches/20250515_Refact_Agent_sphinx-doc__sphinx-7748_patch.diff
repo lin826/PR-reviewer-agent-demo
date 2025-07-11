@@ -1,0 +1,109 @@
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index f8e4be999..13c5662b9 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -1045,30 +1045,53 @@ class DocstringSignatureMixin:
+         docstrings = self.get_doc()
+         self._new_docstrings = docstrings[:]
+         result = None
++        self._sig_from_docstring_all = []  # Store all signatures found
++        
+         for i, doclines in enumerate(docstrings):
+             # no lines in docstring, no match
+             if not doclines:
+                 continue
+-            # match first line of docstring against signature RE
+-            match = py_ext_sig_re.match(doclines[0])
+-            if not match:
+-                continue
+-            exmod, path, base, args, retann = match.groups()
+-            # the base name must match ours
+-            valid_names = [self.objpath[-1]]  # type: ignore
+-            if isinstance(self, ClassDocumenter):
+-                valid_names.append('__init__')
+-                if hasattr(self.object, '__mro__'):
+-                    valid_names.extend(cls.__name__ for cls in self.object.__mro__)
+-            if base not in valid_names:
+-                continue
+-            # re-prepare docstring to ignore more leading indentation
+-            tab_width = self.directive.state.document.settings.tab_width  # type: ignore
+-            self._new_docstrings[i] = prepare_docstring('\n'.join(doclines[1:]),
++                
++            # Process consecutive signature lines at the beginning of the docstring
++            matches = []
++            sig_lines = 0
++            
++            for line in doclines:
++                match = py_ext_sig_re.match(line)
++                if not match:
++                    # Stop at the first non-matching line
++                    break
++                    
++                exmod, path, base, args, retann = match.groups()
++                # the base name must match ours
++                valid_names = [self.objpath[-1]]  # type: ignore
++                if isinstance(self, ClassDocumenter):
++                    valid_names.append('__init__')
++                    if hasattr(self.object, '__mro__'):
++                        valid_names.extend(cls.__name__ for cls in self.object.__mro__)
++                if base not in valid_names:
++                    # Stop if the base name doesn't match
++                    break
++                    
++                # Add this signature to our matches
++                matches.append((args, retann))
++                sig_lines += 1
++            
++            # If we found any matches, process them
++            if matches:
++                # Store all matches for later use
++                self._sig_from_docstring_all = matches
++                
++                # re-prepare docstring to ignore the signature lines
++                tab_width = self.directive.state.document.settings.tab_width  # type: ignore
++                self._new_docstrings[i] = prepare_docstring('\n'.join(doclines[sig_lines:]),
+                                                         tabsize=tab_width)
+-            result = args, retann
+-            # don't look any further
+-            break
++                
++                # Return the first match for backward compatibility
++                result = matches[0]
++                # We found our signatures, don't look in other docstring sections
++                break
++                
+         return result
+ 
+     def get_doc(self, encoding: str = None, ignore: int = None) -> List[List[str]]:
+@@ -1088,7 +1111,30 @@ class DocstringSignatureMixin:
+             result = self._find_signature()
+             if result is not None:
+                 self.args, self.retann = result
+-        return super().format_signature(**kwargs)  # type: ignore
++                
++        # Get the base signature
++        sig = super().format_signature(**kwargs)  # type: ignore
++        
++        # If we have multiple signatures from docstring, format them all
++        if hasattr(self, '_sig_from_docstring_all') and len(self._sig_from_docstring_all) > 1:
++            sigs = [sig]
++            
++            # Add all additional signatures after the first one
++            for args, retann in self._sig_from_docstring_all[1:]:
++                # We need different handling for the string 'None' vs None vs other return annotations
++                if retann == 'None':
++                    # This means None was explicitly specified as return type
++                    sigs.append(f"({args}) -> None")
++                elif retann:
++                    # This is for any non-None, non-'None' return annotation
++                    sigs.append(f"({args}) -> {retann}")
++                else:
++                    # This is for when retann is None (not specified)
++                    sigs.append(f"({args})")
++                    
++            return "\n".join(sigs)
++        
++        return sig
+ 
+ 
+ class DocstringStripSignatureMixin(DocstringSignatureMixin):

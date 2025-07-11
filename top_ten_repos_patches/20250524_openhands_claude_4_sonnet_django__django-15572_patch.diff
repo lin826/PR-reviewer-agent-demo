@@ -1,0 +1,869 @@
+diff --git a/django/template/autoreload.py b/django/template/autoreload.py
+index 84c8554165..f3fd704031 100644
+--- a/django/template/autoreload.py
++++ b/django/template/autoreload.py
+@@ -17,7 +17,7 @@ def get_template_directories():
+         if not isinstance(backend, DjangoTemplates):
+             continue
+ 
+-        items.update(cwd / to_path(dir) for dir in backend.engine.dirs)
++        items.update(cwd / to_path(dir) for dir in backend.engine.dirs if dir)
+ 
+         for loader in backend.engine.template_loaders:
+             if not hasattr(loader, "get_dirs"):
+@@ -25,7 +25,7 @@ def get_template_directories():
+             items.update(
+                 cwd / to_path(directory)
+                 for directory in loader.get_dirs()
+-                if not is_django_path(directory)
++                if directory and not is_django_path(directory)
+             )
+     return items
+ 
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..142c9779ae
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python3
++"""
++Test script to verify edge cases for the empty DIRS fix.
++"""
++
++import os
++import sys
++from pathlib import Path
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++
++def test_edge_cases():
++    """Test various edge cases for DIRS values."""
++    
++    test_cases = [
++        {
++            'name': 'Empty string',
++            'dirs': [''],
++            'should_include_cwd': False,
++        },
++        {
++            'name': 'Multiple empty strings',
++            'dirs': ['', '', ''],
++            'should_include_cwd': False,
++        },
++        {
++            'name': 'Mixed empty and valid',
++            'dirs': ['', '/tmp', ''],
++            'should_include_cwd': False,
++        },
++        {
++            'name': 'None value (if possible)',
++            'dirs': [],  # We'll test None separately since it might cause issues
++            'should_include_cwd': False,
++        },
++        {
++            'name': 'Valid directories only',
++            'dirs': ['/tmp', '/var'],
++            'should_include_cwd': False,
++        },
++        {
++            'name': 'Empty list',
++            'dirs': [],
++            'should_include_cwd': False,
++        },
++    ]
++    
++    for i, test_case in enumerate(test_cases):
++        print(f"\nTest {i+1}: {test_case['name']}")
++        print(f"DIRS: {test_case['dirs']}")
++        
++        # Configure Django with the test case
++        if settings.configured:
++            # Reset Django
++            from django.apps import apps
++            apps.clear_cache()
++            from django.template import engines
++            engines._engines = {}
++        
++        settings.configure(
++            DEBUG=True,
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            TEMPLATES=[
++                {
++                    'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                    'DIRS': test_case['dirs'],
++                    'APP_DIRS': True,
++                    'OPTIONS': {
++                        'context_processors': [],
++                    },
++                },
++            ],
++            SECRET_KEY='test-secret-key',
++            USE_TZ=True,
++        )
++        
++        django.setup()
++        
++        from django.template import autoreload
++        
++        # Get template directories
++        template_dirs = autoreload.get_template_directories()
++        print(f"Template directories: {template_dirs}")
++        
++        # Check if current working directory is in the template directories
++        cwd = Path.cwd()
++        cwd_in_template_dirs = cwd in template_dirs
++        print(f"CWD in template dirs: {cwd_in_template_dirs}")
++        
++        # Verify expectation
++        if cwd_in_template_dirs == test_case['should_include_cwd']:
++            print("✅ PASS")
++        else:
++            print("❌ FAIL")
++            
++        # Test template_changed with a non-Python file
++        test_file = cwd / "test_file.txt"
++        result = autoreload.template_changed(None, test_file)
++        print(f"template_changed() result: {result}")
++        
++        expected_result = True if test_case['should_include_cwd'] else None
++        if result == expected_result:
++            print("✅ template_changed() behaves correctly")
++        else:
++            print(f"❌ template_changed() returned {result}, expected {expected_result}")
++        
++        # Reset for next test
++        settings._wrapped = None
++
++def test_none_values():
++    """Test behavior with None values in DIRS (if they can occur)."""
++    print("\n" + "="*50)
++    print("Testing None values handling...")
++    
++    # This test checks if our fix handles None values gracefully
++    # In practice, Django settings validation should prevent None values,
++    # but our fix should handle them gracefully anyway
++    
++    try:
++        from django.template.autoreload import get_template_directories
++        from django.template import engines
++        from django.template.backends.django import DjangoTemplates
++        from django.utils._os import to_path
++        from pathlib import Path
++        
++        # Simulate a backend with None in dirs (this shouldn't happen in practice)
++        # We'll test our filtering logic directly
++        
++        test_dirs = ['', None, '/tmp', '', None, '/var']
++        filtered_dirs = [dir for dir in test_dirs if dir]
++        
++        print(f"Original dirs: {test_dirs}")
++        print(f"Filtered dirs: {filtered_dirs}")
++        
++        # Our fix should handle this gracefully
++        cwd = Path.cwd()
++        try:
++            processed_dirs = [cwd / to_path(dir) for dir in filtered_dirs]
++            print(f"Processed dirs: {processed_dirs}")
++            print("✅ None values handled correctly")
++        except Exception as e:
++            print(f"❌ Error processing dirs: {e}")
++            
++    except Exception as e:
++        print(f"Test setup error: {e}")
++
++if __name__ == '__main__':
++    print("Django Empty DIRS Edge Cases Test")
++    print("=" * 50)
++    
++    test_edge_cases()
++    test_none_values()
++    
++    print("\n" + "="*50)
++    print("Edge cases testing completed!")
+\ No newline at end of file
+diff --git a/test_empty_dirs_issue.py b/test_empty_dirs_issue.py
+new file mode 100644
+index 0000000000..7b01dd5264
+--- /dev/null
++++ b/test_empty_dirs_issue.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the issue with empty strings in TEMPLATES DIRS
++causing autoreload to break.
++"""
++
++import os
++import sys
++from pathlib import Path
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal Django settings module
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [''],  # This is the problematic empty string
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [],
++                },
++            },
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Now test the issue
++from django.template import autoreload
++
++def test_empty_dirs_issue():
++    """Test that empty strings in TEMPLATES DIRS cause issues."""
++    
++    print("Testing get_template_directories() with empty string in DIRS...")
++    
++    # Get template directories
++    template_dirs = autoreload.get_template_directories()
++    print(f"Template directories: {template_dirs}")
++    
++    # Check if current working directory is in the template directories
++    cwd = Path.cwd()
++    print(f"Current working directory: {cwd}")
++    
++    cwd_in_template_dirs = cwd in template_dirs
++    print(f"Is CWD in template directories? {cwd_in_template_dirs}")
++    
++    if cwd_in_template_dirs:
++        print("❌ ISSUE REPRODUCED: Current working directory is in template directories!")
++        print("This will cause template_changed() to always return True for any file.")
++        
++        # Test template_changed function with a non-Python file
++        test_file = Path(__file__).with_suffix('.txt')  # Change to .txt to avoid .py filter
++        print(f"\nTesting template_changed() with file: {test_file}")
++        
++        result = autoreload.template_changed(None, test_file)
++        print(f"template_changed() result: {result}")
++        
++        if result is True:
++            print("❌ CONFIRMED: template_changed() returns True for non-template file!")
++            print("This breaks autoreload functionality.")
++        else:
++            print("✅ template_changed() correctly returned None/False")
++            
++        # Also test with a Python file to show the .py filter works
++        py_file = Path(__file__)
++        print(f"\nTesting template_changed() with Python file: {py_file}")
++        py_result = autoreload.template_changed(None, py_file)
++        print(f"template_changed() result for .py file: {py_result}")
++        print("(Should be None due to .py file filter)")
++    else:
++        print("✅ No issue detected - CWD not in template directories")
++    
++    return cwd_in_template_dirs
++
++def test_with_filtered_dirs():
++    """Test with properly filtered DIRS (empty strings removed)."""
++    
++    print("\n" + "="*60)
++    print("Testing with filtered DIRS (empty strings removed)...")
++    
++    # Reconfigure settings with filtered DIRS
++    from django.conf import settings
++    
++    # Create new settings with filtered DIRS
++    new_templates = []
++    for template_config in settings.TEMPLATES:
++        new_config = template_config.copy()
++        if 'DIRS' in new_config:
++            # Filter out empty strings
++            new_config['DIRS'] = [d for d in new_config['DIRS'] if d]
++        new_templates.append(new_config)
++    
++    # Update settings
++    settings.TEMPLATES = new_templates
++    
++    # Clear any cached template engines
++    from django.template import engines
++    engines._engines = {}
++    
++    # Test again
++    template_dirs = autoreload.get_template_directories()
++    print(f"Template directories (filtered): {template_dirs}")
++    
++    cwd = Path.cwd()
++    cwd_in_template_dirs = cwd in template_dirs
++    print(f"Is CWD in template directories? {cwd_in_template_dirs}")
++    
++    if not cwd_in_template_dirs:
++        print("✅ FIXED: Current working directory is NOT in template directories!")
++        
++        # Test template_changed function with a non-Python file
++        test_file = Path(__file__).with_suffix('.txt')
++        result = autoreload.template_changed(None, test_file)
++        print(f"template_changed() result: {result}")
++        
++        if result is None:
++            print("✅ CONFIRMED: template_changed() correctly returns None for non-template file!")
++        else:
++            print("❌ template_changed() still returns True")
++    else:
++        print("❌ Issue still present even with filtered DIRS")
++
++if __name__ == '__main__':
++    print("Django Empty DIRS Issue Reproduction Script")
++    print("=" * 50)
++    
++    issue_present = test_empty_dirs_issue()
++    test_with_filtered_dirs()
++    
++    print("\n" + "="*60)
++    if issue_present:
++        print("SUMMARY: Issue reproduced successfully!")
++        print("Empty strings in TEMPLATES DIRS cause autoreload to break.")
++    else:
++        print("SUMMARY: Issue not reproduced.")
+\ No newline at end of file
+diff --git a/test_empty_dirs_regression.py b/test_empty_dirs_regression.py
+new file mode 100644
+index 0000000000..ad753010b5
+--- /dev/null
++++ b/test_empty_dirs_regression.py
+@@ -0,0 +1,153 @@
++#!/usr/bin/env python3
++"""
++Regression test for the empty DIRS issue.
++This test can be added to the Django test suite.
++"""
++
++import os
++import sys
++from pathlib import Path
++from unittest import mock
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.test import SimpleTestCase, override_settings
++from django.template import autoreload
++
++class EmptyDirsRegressionTest(SimpleTestCase):
++    """
++    Regression test for issue where empty strings in TEMPLATES DIRS
++    cause autoreload to break.
++    
++    See: https://code.djangoproject.com/ticket/33285
++    """
++    
++    @override_settings(
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [''],  # Empty string should be filtered out
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [],
++                },
++            },
++        ]
++    )
++    def test_empty_string_in_dirs_filtered_out(self):
++        """
++        Test that empty strings in TEMPLATES DIRS are filtered out
++        and don't cause the current working directory to be included
++        in template directories.
++        """
++        template_dirs = autoreload.get_template_directories()
++        cwd = Path.cwd()
++        
++        # CWD should NOT be in template directories when DIRS contains empty string
++        self.assertNotIn(cwd, template_dirs)
++        
++        # template_changed should return None for non-template files
++        test_file = cwd / "test_file.txt"
++        result = autoreload.template_changed(None, test_file)
++        self.assertIsNone(result)
++    
++    @override_settings(
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': ['', '', ''],  # Multiple empty strings
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [],
++                },
++            },
++        ]
++    )
++    def test_multiple_empty_strings_filtered_out(self):
++        """Test that multiple empty strings are all filtered out."""
++        template_dirs = autoreload.get_template_directories()
++        cwd = Path.cwd()
++        
++        # CWD should NOT be in template directories
++        self.assertNotIn(cwd, template_dirs)
++        
++        # Should result in empty set since all dirs are empty
++        self.assertEqual(len(template_dirs), 0)
++    
++    @override_settings(
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': ['', '/tmp', ''],  # Mixed empty and valid
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [],
++                },
++            },
++        ]
++    )
++    def test_mixed_empty_and_valid_dirs(self):
++        """Test that empty strings are filtered out but valid dirs remain."""
++        template_dirs = autoreload.get_template_directories()
++        cwd = Path.cwd()
++        
++        # CWD should NOT be in template directories
++        self.assertNotIn(cwd, template_dirs)
++        
++        # Should contain the valid directory
++        expected_dir = cwd / Path('/tmp')
++        self.assertIn(expected_dir, template_dirs)
++    
++    @override_settings(
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [],  # Empty list
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [],
++                },
++            },
++        ]
++    )
++    def test_empty_dirs_list(self):
++        """Test that empty DIRS list works correctly."""
++        template_dirs = autoreload.get_template_directories()
++        cwd = Path.cwd()
++        
++        # CWD should NOT be in template directories
++        self.assertNotIn(cwd, template_dirs)
++
++if __name__ == '__main__':
++    # Configure Django for standalone test
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            SECRET_KEY='test-secret-key',
++            USE_TZ=True,
++        )
++    
++    django.setup()
++    
++    # Run the tests
++    import unittest
++    
++    suite = unittest.TestLoader().loadTestsFromTestCase(EmptyDirsRegressionTest)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    
++    if result.wasSuccessful():
++        print("\n✅ All regression tests passed!")
++    else:
++        print("\n❌ Some regression tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 0000000000..e067262737
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,127 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for empty strings in TEMPLATES DIRS.
++"""
++
++import os
++import sys
++from pathlib import Path
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++
++def test_with_empty_dirs():
++    """Test the current behavior with empty DIRS."""
++    print("Testing with empty string in TEMPLATES DIRS...")
++    
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            TEMPLATES=[
++                {
++                    'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                    'DIRS': [''],  # Problematic empty string
++                    'APP_DIRS': True,
++                    'OPTIONS': {
++                        'context_processors': [],
++                    },
++                },
++            ],
++            SECRET_KEY='test-secret-key',
++            USE_TZ=True,
++        )
++    
++    django.setup()
++    
++    from django.template import autoreload
++    
++    # Get template directories
++    template_dirs = autoreload.get_template_directories()
++    print(f"Template directories: {template_dirs}")
++    
++    # Check if current working directory is in the template directories
++    cwd = Path.cwd()
++    cwd_in_template_dirs = cwd in template_dirs
++    print(f"Current working directory in template dirs: {cwd_in_template_dirs}")
++    
++    # Test template_changed function with a non-Python file
++    test_file = cwd / "some_file.txt"
++    result = autoreload.template_changed(None, test_file)
++    print(f"template_changed() result for {test_file.name}: {result}")
++    
++    return cwd_in_template_dirs, result
++
++def test_filtered_behavior():
++    """Test what happens when we filter out empty strings."""
++    print("\nTesting behavior when empty strings are filtered out...")
++    
++    # Simulate the fix by filtering empty strings
++    from django.template import autoreload
++    from django.template import engines
++    from django.template.backends.django import DjangoTemplates
++    from django.utils._os import to_path
++    
++    def get_template_directories_fixed():
++        """Fixed version that filters out empty strings."""
++        cwd = Path.cwd()
++        items = set()
++        for backend in engines.all():
++            if not isinstance(backend, DjangoTemplates):
++                continue
++
++            # Filter out empty strings before processing
++            valid_dirs = [dir for dir in backend.engine.dirs if dir]
++            items.update(cwd / to_path(dir) for dir in valid_dirs)
++
++            for loader in backend.engine.template_loaders:
++                if not hasattr(loader, "get_dirs"):
++                    continue
++                items.update(
++                    cwd / to_path(directory)
++                    for directory in loader.get_dirs()
++                    if directory and not autoreload.is_django_path(directory)
++                )
++        return items
++    
++    # Test the fixed version
++    template_dirs = get_template_directories_fixed()
++    print(f"Template directories (fixed): {template_dirs}")
++    
++    cwd = Path.cwd()
++    cwd_in_template_dirs = cwd in template_dirs
++    print(f"Current working directory in template dirs: {cwd_in_template_dirs}")
++    
++    return cwd_in_template_dirs
++
++if __name__ == '__main__':
++    print("Django Empty DIRS Fix Verification Script")
++    print("=" * 50)
++    
++    # Test current behavior
++    cwd_in_dirs, template_changed_result = test_with_empty_dirs()
++    
++    # Test fixed behavior
++    fixed_cwd_in_dirs = test_filtered_behavior()
++    
++    print("\n" + "="*50)
++    print("RESULTS:")
++    print(f"Current behavior - CWD in template dirs: {cwd_in_dirs}")
++    print(f"Current behavior - template_changed() returns: {template_changed_result}")
++    print(f"Fixed behavior - CWD in template dirs: {fixed_cwd_in_dirs}")
++    
++    if cwd_in_dirs and not fixed_cwd_in_dirs:
++        print("✅ Fix would resolve the issue!")
++    elif cwd_in_dirs and fixed_cwd_in_dirs:
++        print("❌ Fix doesn't resolve the issue")
++    else:
++        print("ℹ️  Issue not present in current test setup")
+\ No newline at end of file
+diff --git a/test_simple_edge_cases.py b/test_simple_edge_cases.py
+new file mode 100644
+index 0000000000..4cc5381b7c
+--- /dev/null
++++ b/test_simple_edge_cases.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python3
++"""
++Simple test script to verify the fix handles edge cases.
++"""
++
++import os
++import sys
++from pathlib import Path
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++def test_filtering_logic():
++    """Test the filtering logic directly."""
++    print("Testing filtering logic directly...")
++    
++    from django.utils._os import to_path
++    
++    # Test cases for directory filtering
++    test_cases = [
++        {
++            'name': 'Empty string',
++            'input': [''],
++            'expected_after_filter': [],
++        },
++        {
++            'name': 'Multiple empty strings',
++            'input': ['', '', ''],
++            'expected_after_filter': [],
++        },
++        {
++            'name': 'Mixed empty and valid',
++            'input': ['', '/tmp', ''],
++            'expected_after_filter': ['/tmp'],
++        },
++        {
++            'name': 'Valid directories only',
++            'input': ['/tmp', '/var'],
++            'expected_after_filter': ['/tmp', '/var'],
++        },
++        {
++            'name': 'Empty list',
++            'input': [],
++            'expected_after_filter': [],
++        },
++    ]
++    
++    for test_case in test_cases:
++        print(f"\nTest: {test_case['name']}")
++        print(f"Input: {test_case['input']}")
++        
++        # Apply our filtering logic
++        filtered = [dir for dir in test_case['input'] if dir]
++        print(f"Filtered: {filtered}")
++        print(f"Expected: {test_case['expected_after_filter']}")
++        
++        if filtered == test_case['expected_after_filter']:
++            print("✅ PASS")
++        else:
++            print("❌ FAIL")
++            
++        # Test that to_path works on filtered results
++        try:
++            paths = [to_path(dir) for dir in filtered]
++            print(f"Converted to paths: {paths}")
++            print("✅ to_path() works on filtered results")
++        except Exception as e:
++            print(f"❌ to_path() failed: {e}")
++
++def test_pathlib_behavior():
++    """Test pathlib behavior with empty strings."""
++    print("\n" + "="*50)
++    print("Testing pathlib behavior with empty strings...")
++    
++    cwd = Path.cwd()
++    
++    # Test what happens with empty strings
++    empty_path = Path("")
++    print(f"Path('') = {empty_path}")
++    print(f"Path('').resolve() = {empty_path.resolve()}")
++    print(f"cwd / Path('') = {cwd / empty_path}")
++    print(f"(cwd / Path('')).resolve() = {(cwd / empty_path).resolve()}")
++    
++    # Verify our understanding
++    if (cwd / empty_path).resolve() == cwd:
++        print("✅ Confirmed: cwd / Path('') resolves to cwd")
++    else:
++        print("❌ Unexpected behavior")
++
++def test_with_actual_django():
++    """Test with actual Django setup."""
++    print("\n" + "="*50)
++    print("Testing with actual Django setup...")
++    
++    # Set up Django
++    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++    
++    import django
++    from django.conf import settings
++    
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            TEMPLATES=[
++                {
++                    'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                    'DIRS': ['', '/tmp', ''],  # Mixed empty and valid
++                    'APP_DIRS': True,
++                    'OPTIONS': {
++                        'context_processors': [],
++                    },
++                },
++            ],
++            SECRET_KEY='test-secret-key',
++            USE_TZ=True,
++        )
++    
++    django.setup()
++    
++    from django.template import autoreload
++    
++    # Test the fixed function
++    template_dirs = autoreload.get_template_directories()
++    print(f"Template directories: {template_dirs}")
++    
++    cwd = Path.cwd()
++    cwd_in_dirs = cwd in template_dirs
++    print(f"CWD in template dirs: {cwd_in_dirs}")
++    
++    if not cwd_in_dirs:
++        print("✅ Fix working: CWD not in template directories")
++    else:
++        print("❌ Fix not working: CWD still in template directories")
++    
++    # Test template_changed
++    test_file = cwd / "test.txt"
++    result = autoreload.template_changed(None, test_file)
++    print(f"template_changed() result: {result}")
++    
++    if result is None:
++        print("✅ template_changed() correctly returns None")
++    else:
++        print("❌ template_changed() incorrectly returns True")
++
++if __name__ == '__main__':
++    print("Django Empty DIRS Fix - Edge Cases Test")
++    print("=" * 50)
++    
++    test_filtering_logic()
++    test_pathlib_behavior()
++    test_with_actual_django()
++    
++    print("\n" + "="*50)
++    print("All edge case tests completed!")
+\ No newline at end of file
+diff --git a/tests/template_tests/test_autoreloader.py b/tests/template_tests/test_autoreloader.py
+index cc2c3f58a5..6729eaf93e 100644
+--- a/tests/template_tests/test_autoreloader.py
++++ b/tests/template_tests/test_autoreloader.py
+@@ -103,6 +103,53 @@ class TemplateReloadTests(SimpleTestCase):
+             },
+         )
+ 
++    @override_settings(
++        TEMPLATES=[
++            {
++                "DIRS": [""],  # Empty string should be filtered out
++                "BACKEND": "django.template.backends.django.DjangoTemplates",
++            }
++        ]
++    )
++    def test_empty_string_in_dirs_ignored(self):
++        """
++        Empty strings in TEMPLATES DIRS should be filtered out to prevent
++        the current working directory from being included in template
++        directories, which would break autoreload functionality.
++        
++        Regression test for #33285.
++        """
++        template_dirs = autoreload.get_template_directories()
++        cwd = Path.cwd()
++        
++        # CWD should NOT be in template directories when DIRS contains empty string
++        self.assertNotIn(cwd, template_dirs)
++        
++        # Should result in empty set since the only dir is empty
++        self.assertEqual(len(template_dirs), 0)
++
++    @override_settings(
++        TEMPLATES=[
++            {
++                "DIRS": ["", "/tmp", ""],  # Mixed empty and valid
++                "BACKEND": "django.template.backends.django.DjangoTemplates",
++            }
++        ]
++    )
++    def test_mixed_empty_and_valid_dirs(self):
++        """
++        Empty strings should be filtered out while valid directories are preserved.
++        """
++        template_dirs = autoreload.get_template_directories()
++        cwd = Path.cwd()
++        
++        # CWD should NOT be in template directories
++        self.assertNotIn(cwd, template_dirs)
++        
++        # Should contain the valid directory
++        expected_dir = cwd / Path("/tmp")
++        self.assertIn(expected_dir, template_dirs)
++
+ 
+ @require_jinja2
+ @override_settings(INSTALLED_APPS=["template_tests"])

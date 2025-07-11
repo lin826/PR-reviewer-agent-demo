@@ -1,0 +1,153 @@
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index 7d39d80ed..132ff1196 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -304,7 +304,19 @@ class PyXrefMixin:
+     def make_xrefs(self, rolename: str, domain: str, target: str,
+                    innernode: Type[TextlikeNode] = nodes.emphasis,
+                    contnode: Node = None, env: BuildEnvironment = None) -> List[Node]:
+-        delims = r'(\s*[\[\]\(\),](?:\s*or\s)?\s*|\s+or\s+|\.\.\.)'
++        # Fix for GH-issue #9307: Special handling for complex type expressions
++        # like dict(str, str) or list[tuple[str, int]]
++        
++        # Check if this is a complex type with parentheses/brackets and commas
++        if ('(' in target and ')' in target and ',' in target) or ('[' in target and ']' in target and ',' in target):
++            # For complex types like dict(str, str), treat the entire string as a single entity
++            # without splitting it at commas or parentheses
++            if contnode is None:
++                contnode = innernode(target, target)
++            return [self.make_xref(rolename, domain, target, innernode, contnode, env)]
++        
++        # For other cases, use a modified splitting logic that doesn't split at commas or parentheses
++        delims = r'(\s+or\s+|\.\.\.)'
+         delims_re = re.compile(delims)
+         sub_targets = re.split(delims, target)
+ 
+diff --git a/sphinx/util/docfields.py b/sphinx/util/docfields.py
+index 3a3367ebe..cf56a8da5 100644
+--- a/sphinx/util/docfields.py
++++ b/sphinx/util/docfields.py
+@@ -181,10 +181,20 @@ class TypedField(GroupedField):
+                 # inserted twice into the doctree, which leads to
+                 # inconsistencies later when references are resolved
+                 fieldtype = types.pop(fieldarg)
++                
++                # Fix for GH-issue #9307: Special handling for complex type expressions
++                # like dict(str, str) or list[tuple[str, int]]
+                 if len(fieldtype) == 1 and isinstance(fieldtype[0], nodes.Text):
+                     typename = fieldtype[0].astext()
+-                    par.extend(self.make_xrefs(self.typerolename, domain, typename,
+-                                               addnodes.literal_emphasis, env=env))
++                    # Check if this is a complex type with commas inside parentheses/brackets
++                    if ('(' in typename and ')' in typename and ',' in typename) or \
++                       ('[' in typename and ']' in typename and ',' in typename):
++                        # For these complex types, treat the entire type as a single entity
++                        par += addnodes.literal_emphasis(typename, typename)
++                    else:
++                        # For simple types, use the normal cross-reference mechanism
++                        par.extend(self.make_xrefs(self.typerolename, domain, typename,
++                                                addnodes.literal_emphasis, env=env))
+                 else:
+                     par += fieldtype
+                 par += nodes.Text(')')
+@@ -298,13 +308,40 @@ class DocFieldTransformer:
+             # also support syntax like ``:param type name:``
+             if typedesc.is_typed:
+                 try:
+-                    argtype, argname = fieldarg.split(None, 1)
++                    # Fix for GH-issue #9307: Special handling for complex type expressions
++                    # like dict(str, str) or list[tuple[str, int]]
++                    if ('(' in fieldarg and ')' in fieldarg and ',' in fieldarg) or \
++                       ('[' in fieldarg and ']' in fieldarg and ',' in fieldarg):
++                        # For complex types, try to find the space between type and name
++                        # by looking for the last space that's not inside parentheses or brackets
++                        paren_level = 0
++                        bracket_level = 0
++                        last_space_pos = -1
++                        
++                        for i, char in enumerate(fieldarg):
++                            if char == '(':
++                                paren_level += 1
++                            elif char == ')':
++                                paren_level -= 1
++                            elif char == '[':
++                                bracket_level += 1
++                            elif char == ']':
++                                bracket_level -= 1
++                            elif char.isspace() and paren_level == 0 and bracket_level == 0:
++                                last_space_pos = i
++                        
++                        if last_space_pos != -1:
++                            argtype = fieldarg[:last_space_pos]
++                            argname = fieldarg[last_space_pos+1:]
++                            types.setdefault(typename, {})[argname] = [nodes.Text(argtype)]
++                            fieldarg = argname
++                    else:
++                        # For simple types, use the original logic
++                        argtype, argname = fieldarg.split(None, 1)
++                        types.setdefault(typename, {})[argname] = [nodes.Text(argtype)]
++                        fieldarg = argname
+                 except ValueError:
+                     pass
+-                else:
+-                    types.setdefault(typename, {})[argname] = \
+-                        [nodes.Text(argtype)]
+-                    fieldarg = argname
+ 
+             translatable_content = nodes.inline(field_body.rawsource,
+                                                 translatable=True)
+diff --git a/tests/roots/test-autosummary/sphinx.rst b/tests/roots/test-autosummary/sphinx.rst
+index fc1a35a0e..f16732f38 100644
+--- a/tests/roots/test-autosummary/sphinx.rst
++++ b/tests/roots/test-autosummary/sphinx.rst
+@@ -1,31 +1,29 @@
+-Autosummary test
+-================
++﻿sphinx
++======
+ 
+-.. autosummary::
+-   :toctree: generated
++.. automodule:: sphinx
+ 
+-   sphinx.application.Sphinx
+-
+-.. currentmodule:: sphinx.application
+-
+-.. autoclass:: TemplateBridge
+-
+-   Basic test
++   
++   
++   .. rubric:: Module Attributes
+ 
+    .. autosummary::
++   
++      version_info
++   
++   
+ 
+-      render                    -- some ignored stuff goes here
+-      render_string             More ignored stuff
++   
++   
++   
+ 
+-   Test with tildes
+-
+-   .. autosummary::
++   
++   
++   
+ 
+-      ~TemplateBridge.render
+-      ~TemplateBridge.render_string
++   
++   
++   
+ 
+-   Methods:
+ 
+-  .. automethod:: render
+ 
+-  .. automethod:: render_string

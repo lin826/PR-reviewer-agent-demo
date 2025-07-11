@@ -1,0 +1,354 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 88c9ca9f28..fcea1597ef 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -542,11 +542,7 @@ class Field(RegisterLookupMixin):
+         return NotImplemented
+ 
+     def __hash__(self):
+-        return hash((
+-            self.creation_counter,
+-            self.model._meta.app_label if hasattr(self, 'model') else None,
+-            self.model._meta.model_name if hasattr(self, 'model') else None,
+-        ))
++        return hash(self.creation_counter)
+ 
+     def __deepcopy__(self, memodict):
+         # We don't have to deepcopy very much here, since most things are not
+diff --git a/test_django_tests.py b/test_django_tests.py
+new file mode 100644
+index 0000000000..bdf49c34e8
+--- /dev/null
++++ b/test_django_tests.py
+@@ -0,0 +1,35 @@
++"""
++Run the relevant Django tests to ensure our fix maintains test compatibility.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.model_fields',
++        ],
++    )
++    django.setup()
++
++# Get the test runner
++TestRunner = get_runner(settings)
++test_runner = TestRunner()
++
++# Run the tests specifically for abstract_inherited_fields
++failures = test_runner.run_tests(['tests.model_fields.tests.BasicFieldTests.test_abstract_inherited_fields'])
++
++# Exit with appropriate status code
++sys.exit(bool(failures))
+\ No newline at end of file
+diff --git a/test_field_equality.py b/test_field_equality.py
+new file mode 100644
+index 0000000000..765dceb5c3
+--- /dev/null
++++ b/test_field_equality.py
+@@ -0,0 +1,55 @@
++"""
++Test script to verify field equality behavior is maintained.
++"""
++from django.conf import settings
++from django.db import models
++import django
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure()
++
++# Create a model class with meta information
++class MockMeta1:
++    app_label = 'app1'
++    model_name = 'model1'
++
++class MockMeta2:
++    app_label = 'app2'
++    model_name = 'model2'
++
++class MockModel1:
++    _meta = MockMeta1()
++
++class MockModel2:
++    _meta = MockMeta2()
++
++# Create two fields with the same creation counter
++# We'll simulate this by manually setting the creation_counter
++field1 = models.CharField(max_length=200)
++field1.creation_counter = 100
++field1.model = MockModel1
++
++field2 = models.CharField(max_length=200)
++field2.creation_counter = 100  # Same creation counter
++field2.model = MockModel2  # Different model
++
++# Check hash values
++print(f"Hash of field1: {hash(field1)}")
++print(f"Hash of field2: {hash(field2)}")
++print(f"Do fields have same hash? {hash(field1) == hash(field2)}")
++
++# Check equality
++print(f"Are fields equal? {field1 == field2}")
++
++# This should pass because the fields have different models even with same creation_counter
++try:
++    assert field1 != field2, "Fields from different models should not be equal!"
++    print("TEST PASSED: Fields from different models are not equal")
++except AssertionError as e:
++    print(f"TEST FAILED: {e}")
++
++# Store in dictionary to ensure no collisions
++d = {field1: "field1", field2: "field2"}
++print(f"Dictionary has {len(d)} items (should be 2)")
++print(f"Dictionary retrievals work correctly? {d[field1] == 'field1' and d[field2] == 'field2'}")
+\ No newline at end of file
+diff --git a/test_field_hash.py b/test_field_hash.py
+new file mode 100644
+index 0000000000..13f6ad267e
+--- /dev/null
++++ b/test_field_hash.py
+@@ -0,0 +1,34 @@
++from django.db import models
++from django.conf import settings
++import django
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth', 'test_app'],
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    )
++    django.setup()
++
++def test_field_hash_immutability():
++    """Test that Field.__hash__() is immutable when a field is assigned to a model class."""
++    f = models.CharField(max_length=200)
++    d = {f: 1}
++    print(f"Initial hash of field: {hash(f)}")
++    
++    # Store field in a model class
++    class Book(models.Model):
++        title = f
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    print(f"Hash of field after assignment to model: {hash(f)}")
++    print(f"Is field in dictionary: {f in d}")
++    
++    # This should not raise an AssertionError
++    assert f in d, "Field hash changed after being assigned to a model!"
++    print("Test passed: Field hash is immutable")
++
++if __name__ == "__main__":
++    test_field_hash_immutability()
+\ No newline at end of file
+diff --git a/test_field_hash_reproducer.py b/test_field_hash_reproducer.py
+new file mode 100644
+index 0000000000..c5ee39fae8
+--- /dev/null
++++ b/test_field_hash_reproducer.py
+@@ -0,0 +1,59 @@
++"""
++Test script to verify Field.__hash__() immutability.
++
++This test reproduces the issue described where a field's hash changes
++after being assigned to a model, breaking dictionary lookups that use
++the field as a key.
++"""
++from django.conf import settings
++from django.db import models
++import django
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure()
++    
++# Create a simple field
++f = models.CharField(max_length=200)
++initial_hash = hash(f)
++print(f"Initial hash of field: {initial_hash}")
++
++# Store the field in a dictionary
++d = {f: 1}
++
++# Create a model class with meta information
++class MockMeta:
++    app_label = 'test_app'
++    model_name = 'mock_model'
++
++class MockModel:
++    _meta = MockMeta()
++
++# This simulates what happens when a field is assigned to a model
++# Setting the model attribute changes the hash
++f.model = MockModel
++
++# Check if the hash has changed
++new_hash = hash(f)
++print(f"Hash after setting model: {new_hash}")
++print(f"Has hash changed? {initial_hash != new_hash}")
++
++# Check if we can retrieve the value from the dictionary
++try:
++    value = d[f]
++    print(f"Successfully retrieved value from dictionary: {value}")
++    in_dict = True
++except KeyError:
++    print("KeyError: Field not found in dictionary")
++    in_dict = False
++
++print(f"Field in dictionary (using 'in'): {f in d}")
++print(f"Field lookup works: {in_dict}")
++
++# This should not raise an AssertionError if the hash is immutable
++try:
++    assert f in d, "Field hash changed after being assigned to a model!"
++    assert in_dict, "Cannot retrieve field value from dictionary after model assignment!"
++    print("TEST PASSED: Field hash is immutable")
++except AssertionError as e:
++    print(f"TEST FAILED: {e}")
+\ No newline at end of file
+diff --git a/test_field_hash_simple.py b/test_field_hash_simple.py
+new file mode 100644
+index 0000000000..dfe7ef9653
+--- /dev/null
++++ b/test_field_hash_simple.py
+@@ -0,0 +1,58 @@
++"""
++Test script to verify Field.__hash__() immutability.
++"""
++from django.conf import settings
++from django.db import models
++from django.db.models.options import Options
++from django.db.models.fields import Field
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEFAULT_TABLESPACE='',
++    )
++
++class MockMeta:
++    """Mock meta class to simulate a model's _meta attribute"""
++    app_label = 'test_app'
++    model_name = 'mock_model'
++
++class MockModel:
++    """Mock model to use in the test"""
++    _meta = MockMeta()
++    
++# Create a simple field
++f = models.CharField(max_length=200)
++initial_hash = hash(f)
++print(f"Initial hash of field: {initial_hash}")
++
++# Store the field in a dictionary
++d = {f: 1}
++
++# This simulates what happens when a field is assigned to a model
++# We'll directly set the model attribute which affects the hash
++f.model = MockModel
++
++# Check if the hash has changed
++new_hash = hash(f)
++print(f"Hash after contribute_to_class: {new_hash}")
++print(f"Has hash changed? {initial_hash != new_hash}")
++
++# Check if we can retrieve the value from the dictionary
++try:
++    value = d[f]
++    print(f"Retrieved value from dictionary: {value}")
++    in_dict = True
++except KeyError:
++    print("KeyError: Field not found in dictionary")
++    in_dict = False
++
++print(f"Is field in dictionary? {f in d}")
++print(f"Can we get the value from dictionary? {in_dict}")
++
++# This should not raise an AssertionError if the hash is immutable
++try:
++    assert f in d, "Field hash changed after being assigned to a model!"
++    print("TEST PASSED: Field hash is immutable")
++except AssertionError as e:
++    print(f"TEST FAILED: {e}")
+\ No newline at end of file
+diff --git a/test_issue_example.py b/test_issue_example.py
+new file mode 100644
+index 0000000000..251611bfc1
+--- /dev/null
++++ b/test_issue_example.py
+@@ -0,0 +1,34 @@
++"""
++Test script using the exact example from the issue description.
++"""
++from django.conf import settings
++from django.db import models
++import django
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    )
++    django.setup()
++
++# Create a field and store it in a dictionary
++f = models.CharField(max_length=200)
++d = {f: 1}
++print(f"Initial hash of field: {hash(f)}")
++
++# Define a model class and assign the field to it
++class Book(models.Model):
++    title = f
++    class Meta:
++        app_label = 'test_app'
++
++print(f"Hash after assigning to model: {hash(f)}")
++
++# Check if the field is still in the dictionary
++try:
++    assert f in d, "Field hash changed after being assigned to a model!"
++    print("TEST PASSED: Field is still in dictionary")
++except AssertionError as e:
++    print(f"TEST FAILED: {e}")
+\ No newline at end of file
+diff --git a/tests/model_fields/tests.py b/tests/model_fields/tests.py
+index 5208b40dc9..0af46977bf 100644
+--- a/tests/model_fields/tests.py
++++ b/tests/model_fields/tests.py
+@@ -128,9 +128,12 @@ class BasicFieldTests(SimpleTestCase):
+         self.assertLess(abstract_model_field, inherit2_model_field)
+         self.assertLess(inherit1_model_field, inherit2_model_field)
+ 
+-        self.assertNotEqual(hash(abstract_model_field), hash(inherit1_model_field))
+-        self.assertNotEqual(hash(abstract_model_field), hash(inherit2_model_field))
+-        self.assertNotEqual(hash(inherit1_model_field), hash(inherit2_model_field))
++        # Hash values are based only on creation_counter, so they can be equal
++        # Even though the fields are from different models
++        # This is necessary to ensure hash immutability for the lifetime of the field
++        self.assertEqual(hash(abstract_model_field), hash(inherit1_model_field))
++        self.assertEqual(hash(abstract_model_field), hash(inherit2_model_field))
++        self.assertEqual(hash(inherit1_model_field), hash(inherit2_model_field))
+ 
+ 
+ class ChoicesTests(SimpleTestCase):

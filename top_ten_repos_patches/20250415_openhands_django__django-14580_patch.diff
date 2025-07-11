@@ -1,0 +1,202 @@
+diff --git a/db.sqlite3 b/db.sqlite3
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/django/db/migrations/writer.py b/django/db/migrations/writer.py
+index 4918261fb0..6eebe5bdbd 100644
+--- a/django/db/migrations/writer.py
++++ b/django/db/migrations/writer.py
+@@ -163,8 +163,17 @@ class MigrationWriter:
+                 self.needs_manual_porting = True
+ 
+         # django.db.migrations is always used, but models import may not be.
+-        # If models import exists, merge it with migrations import.
+-        if "from django.db import models" in imports:
++        # Check if any operation is using models.Model in bases
++        uses_models_model = False
++        
++        # Look for 'models.Model' in the generated operations content
++        for operation_string in operations:
++            if 'models.Model' in operation_string:
++                uses_models_model = True
++                break
++        
++        # If models import exists or models.Model is referenced in bases, merge it with migrations import
++        if "from django.db import models" in imports or uses_models_model:
+             imports.discard("from django.db import models")
+             imports.add("from django.db import migrations, models")
+         else:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100755
+index 0000000000..7c4eaafed8
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python
++"""
++This script reproduces the issue with missing models import in migration files.
++The issue occurs when a model inherits from a mixin and from a model that
++inherits from models.Model.
++"""
++import os
++import sys
++import tempfile
++import shutil
++import django
++from django.conf import settings
++from django.core.management import call_command
++
++def create_test_project():
++    # Create a temporary directory to hold our Django project
++    temp_dir = tempfile.mkdtemp()
++    print(f"Creating test Django project in {temp_dir}")
++    
++    # Create a Django project
++    os.makedirs(os.path.join(temp_dir, 'testproject', 'testapp', 'migrations'), exist_ok=True)
++    
++    # Create the main Django settings file
++    with open(os.path.join(temp_dir, 'testproject', 'settings.py'), 'w') as f:
++        f.write("""
++import os
++
++SECRET_KEY = 'fake-key'
++INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++    'testproject.testapp',
++]
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': 'db.sqlite3',
++    }
++}
++MIDDLEWARE = []
++""")
++    
++    # Create __init__.py files
++    open(os.path.join(temp_dir, 'testproject', '__init__.py'), 'w').close()
++    open(os.path.join(temp_dir, 'testproject', 'testapp', '__init__.py'), 'w').close()
++    open(os.path.join(temp_dir, 'testproject', 'testapp', 'migrations', '__init__.py'), 'w').close()
++    
++    # Create models.py file with the problematic models setup
++    with open(os.path.join(temp_dir, 'testproject', 'testapp', 'models.py'), 'w') as f:
++        f.write("""
++from django.db import models
++
++class MyField(models.TextField):
++    pass
++
++class MyBaseModel(models.Model):
++    class Meta:
++        abstract = True
++
++class MyMixin:
++    pass
++
++class MyModel(MyMixin, MyBaseModel):
++    name = MyField(primary_key=True)
++""")
++    
++    return temp_dir
++
++def run_makemigrations_and_check_output(project_dir):
++    # Configure Django settings
++    sys.path.insert(0, project_dir)
++    os.environ['DJANGO_SETTINGS_MODULE'] = 'testproject.settings'
++    django.setup()
++    
++    # Run makemigrations
++    migrations_dir = os.path.join(project_dir, 'testproject', 'testapp', 'migrations')
++    call_command('makemigrations', 'testapp', verbosity=2)
++    
++    # Find the created migration file
++    migration_files = [f for f in os.listdir(migrations_dir) if f.startswith('0001') and f.endswith('.py')]
++    if not migration_files:
++        print("No migration file was generated!")
++        return False
++    
++    migration_path = os.path.join(migrations_dir, migration_files[0])
++    print(f"Generated migration file: {migration_path}")
++    
++    # Check if the migration file has the issue
++    with open(migration_path, 'r') as f:
++        migration_content = f.read()
++    
++    print("\nGenerated Migration Content:")
++    print("==========================")
++    print(migration_content)
++    print("==========================\n")
++    
++    has_models_import = "from django.db import migrations, models" in migration_content
++    has_models_reference = "models.Model" in migration_content
++    
++    print(f"Has 'models' import: {has_models_import}")
++    print(f"Has 'models.Model' reference: {has_models_reference}")
++    
++    if has_models_reference and not has_models_import:
++        print("ISSUE REPRODUCED: Migration references 'models.Model' but doesn't import 'models'")
++        return True
++    else:
++        print("Issue not reproduced: Migration seems correct")
++        
++        # Try to validate the migration by importing it
++        print("\nValidating migration by importing it...")
++        try:
++            import_path = f"testproject.testapp.migrations.{migration_files[0][:-3]}"
++            __import__(import_path)
++            print("Migration imported successfully!")
++            return False
++        except Exception as e:
++            print(f"Error importing migration: {e}")
++            return True
++
++if __name__ == "__main__":
++    try:
++        project_dir = create_test_project()
++        issue_reproduced = run_makemigrations_and_check_output(project_dir)
++        if issue_reproduced:
++            print("SUCCESS: The issue has been reproduced.")
++            sys.exit(1)  # Exit with error status to indicate the issue exists
++        else:
++            print("The issue could not be reproduced.")
++            sys.exit(0)
++    finally:
++        # Clean up
++        if 'project_dir' in locals():
++            shutil.rmtree(project_dir)
+\ No newline at end of file
+diff --git a/tests/migrations/test_writer.py b/tests/migrations/test_writer.py
+index a590ff4398..0c0e150a27 100644
+--- a/tests/migrations/test_writer.py
++++ b/tests/migrations/test_writer.py
+@@ -808,3 +808,30 @@ class WriterTests(SimpleTestCase):
+     def test_register_non_serializer(self):
+         with self.assertRaisesMessage(ValueError, "'TestModel1' must inherit from 'BaseSerializer'."):
+             MigrationWriter.register_serializer(complex, TestModel1)
++            
++    def test_models_import_for_model_base_references(self):
++        """
++        When a model base has models.Model in its bases, the models import
++        should be included.
++        """
++        class AbstractBaseModel(models.Model):
++            class Meta:
++                abstract = True
++                
++        class MyMixin:
++            pass
++            
++        migration = type("Migration", (migrations.Migration,), {
++            "operations": [
++                migrations.CreateModel(
++                    name='MyModel',
++                    fields=[
++                        ('id', models.AutoField(primary_key=True)),
++                    ],
++                    bases=(MyMixin, AbstractBaseModel),
++                ),
++            ]
++        })
++        writer = MigrationWriter(migration)
++        output = writer.as_string()
++        self.assertIn("from django.db import migrations, models\n", output)

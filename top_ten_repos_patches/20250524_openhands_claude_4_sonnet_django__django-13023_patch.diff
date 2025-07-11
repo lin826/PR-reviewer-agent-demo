@@ -1,0 +1,347 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..f3e01e1ba2
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for DecimalField.to_python() fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.exceptions import ValidationError
++from decimal import Decimal
++
++def test_comprehensive():
++    """Comprehensive test for DecimalField.to_python()."""
++    print("Comprehensive test for DecimalField.to_python()...")
++    
++    field = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    # Test cases that should work (return Decimal)
++    valid_cases = [
++        (None, None),
++        ('123.45', Decimal('123.45')),
++        ('123', Decimal('123')),
++        ('0', Decimal('0')),
++        ('-123.45', Decimal('-123.45')),
++        ('0.01', Decimal('0.01')),
++        (123, Decimal('123')),
++        (123.45, Decimal('123.4500000')),  # Float precision
++        (Decimal('123.45'), Decimal('123.45')),
++    ]
++    
++    print("\n✅ Testing valid inputs:")
++    for input_val, expected in valid_cases:
++        try:
++            result = field.to_python(input_val)
++            if result == expected:
++                print(f"  {input_val!r} -> {result!r} ✅")
++            else:
++                print(f"  {input_val!r} -> {result!r} ❌ (expected {expected!r})")
++        except Exception as e:
++            print(f"  {input_val!r} -> ERROR: {type(e).__name__}: {e} ❌")
++    
++    # Test cases that should raise ValidationError
++    invalid_cases = [
++        'abc',
++        'not_a_number',
++        '',
++        '12.34.56',
++        {'key': 'value'},
++        [1, 2, 3],
++        (1, 2, 3),
++        set([1, 2, 3]),
++        object(),
++        lambda x: x,
++    ]
++    
++    print("\n✅ Testing invalid inputs (should raise ValidationError):")
++    for input_val in invalid_cases:
++        try:
++            result = field.to_python(input_val)
++            print(f"  {input_val!r} -> {result!r} ❌ (should have raised ValidationError)")
++        except ValidationError as e:
++            print(f"  {input_val!r} -> ValidationError: {e} ✅")
++        except Exception as e:
++            print(f"  {input_val!r} -> {type(e).__name__}: {e} ❌ (should be ValidationError)")
++    
++    # Test edge cases
++    print("\n✅ Testing edge cases:")
++    edge_cases = [
++        '   123.45   ',  # Whitespace - should this work?
++        'inf',
++        '-inf',
++        'nan',
++    ]
++    
++    for input_val in edge_cases:
++        try:
++            result = field.to_python(input_val)
++            print(f"  {input_val!r} -> {result!r}")
++        except ValidationError as e:
++            print(f"  {input_val!r} -> ValidationError: {e}")
++        except Exception as e:
++            print(f"  {input_val!r} -> {type(e).__name__}: {e}")
++
++if __name__ == '__main__':
++    test_comprehensive()
+\ No newline at end of file
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 0fd69059ee..28374272f4 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -1501,7 +1501,7 @@ class DecimalField(Field):
+             return self.context.create_decimal_from_float(value)
+         try:
+             return decimal.Decimal(value)
+-        except decimal.InvalidOperation:
++        except (decimal.InvalidOperation, TypeError, ValueError):
+             raise exceptions.ValidationError(
+                 self.error_messages['invalid'],
+                 code='invalid',
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..1ea513c15a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the DecimalField.to_python() TypeError issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.exceptions import ValidationError
++from decimal import Decimal
++
++def test_decimalfield_with_dict():
++    """Test DecimalField.to_python() with dictionary input."""
++    print("Testing DecimalField.to_python() with dictionary input...")
++    
++    # Create a DecimalField instance
++    field = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    # Test with valid inputs first
++    print("Testing valid inputs:")
++    try:
++        result = field.to_python('123.45')
++        print(f"  String '123.45' -> {result} (type: {type(result)})")
++    except Exception as e:
++        print(f"  String '123.45' -> ERROR: {type(e).__name__}: {e}")
++    
++    try:
++        result = field.to_python(123.45)
++        print(f"  Float 123.45 -> {result} (type: {type(result)})")
++    except Exception as e:
++        print(f"  Float 123.45 -> ERROR: {type(e).__name__}: {e}")
++    
++    try:
++        result = field.to_python(Decimal('123.45'))
++        print(f"  Decimal('123.45') -> {result} (type: {type(result)})")
++    except Exception as e:
++        print(f"  Decimal('123.45') -> ERROR: {type(e).__name__}: {e}")
++    
++    # Test with invalid string
++    print("\nTesting invalid string input:")
++    try:
++        result = field.to_python('abc')
++        print(f"  String 'abc' -> {result} (type: {type(result)})")
++    except Exception as e:
++        print(f"  String 'abc' -> ERROR: {type(e).__name__}: {e}")
++    
++    # Test with dictionary (this should raise ValidationError, not TypeError)
++    print("\nTesting dictionary input (the problematic case):")
++    test_dict = {'key': 'value'}
++    try:
++        result = field.to_python(test_dict)
++        print(f"  Dict {test_dict} -> {result} (type: {type(result)})")
++    except Exception as e:
++        print(f"  Dict {test_dict} -> ERROR: {type(e).__name__}: {e}")
++        if isinstance(e, TypeError):
++            print("  ❌ ISSUE CONFIRMED: TypeError raised instead of ValidationError")
++        elif isinstance(e, ValidationError):
++            print("  ✅ GOOD: ValidationError raised as expected")
++        else:
++            print(f"  ❓ UNEXPECTED: {type(e).__name__} raised")
++    
++    # Test with list
++    print("\nTesting list input:")
++    test_list = [1, 2, 3]
++    try:
++        result = field.to_python(test_list)
++        print(f"  List {test_list} -> {result} (type: {type(result)})")
++    except Exception as e:
++        print(f"  List {test_list} -> ERROR: {type(e).__name__}: {e}")
++        if isinstance(e, TypeError):
++            print("  ❌ ISSUE: TypeError raised instead of ValidationError")
++        elif isinstance(e, ValidationError):
++            print("  ✅ GOOD: ValidationError raised as expected")
++        else:
++            print(f"  ❓ UNEXPECTED: {type(e).__name__} raised")
++
++    # Test with object
++    print("\nTesting object input:")
++    class TestObject:
++        def __str__(self):
++            return "test_object"
++    
++    test_obj = TestObject()
++    try:
++        result = field.to_python(test_obj)
++        print(f"  Object {test_obj} -> {result} (type: {type(result)})")
++    except Exception as e:
++        print(f"  Object {test_obj} -> ERROR: {type(e).__name__}: {e}")
++        if isinstance(e, TypeError):
++            print("  ❌ ISSUE: TypeError raised instead of ValidationError")
++        elif isinstance(e, ValidationError):
++            print("  ✅ GOOD: ValidationError raised as expected")
++        else:
++            print(f"  ❓ UNEXPECTED: {type(e).__name__} raised")
++
++if __name__ == '__main__':
++    test_decimalfield_with_dict()
+\ No newline at end of file
+diff --git a/test_decimalfield_dict_fix.py b/test_decimalfield_dict_fix.py
+new file mode 100644
+index 0000000000..f95484fcb5
+--- /dev/null
++++ b/test_decimalfield_dict_fix.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++"""
++Test case for the DecimalField.to_python() dict fix.
++This test can be added to the existing test suite.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.exceptions import ValidationError
++from django.test import TestCase
++
++class DecimalFieldToPythonTests(TestCase):
++    """Test DecimalField.to_python() with various invalid input types."""
++    
++    def setUp(self):
++        self.field = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    def test_to_python_with_dict_raises_validation_error(self):
++        """Test that to_python() raises ValidationError for dict input."""
++        with self.assertRaises(ValidationError) as cm:
++            self.field.to_python({'key': 'value'})
++        
++        self.assertEqual(cm.exception.code, 'invalid')
++        self.assertIn('value must be a decimal number', str(cm.exception))
++    
++    def test_to_python_with_list_raises_validation_error(self):
++        """Test that to_python() raises ValidationError for list input."""
++        with self.assertRaises(ValidationError) as cm:
++            self.field.to_python([1, 2, 3])
++        
++        self.assertEqual(cm.exception.code, 'invalid')
++        self.assertIn('value must be a decimal number', str(cm.exception))
++    
++    def test_to_python_with_tuple_raises_validation_error(self):
++        """Test that to_python() raises ValidationError for tuple input."""
++        with self.assertRaises(ValidationError) as cm:
++            self.field.to_python((1, 2, 3))
++        
++        self.assertEqual(cm.exception.code, 'invalid')
++        self.assertIn('value must be a decimal number', str(cm.exception))
++    
++    def test_to_python_with_set_raises_validation_error(self):
++        """Test that to_python() raises ValidationError for set input."""
++        with self.assertRaises(ValidationError) as cm:
++            self.field.to_python({1, 2, 3})
++        
++        self.assertEqual(cm.exception.code, 'invalid')
++        self.assertIn('value must be a decimal number', str(cm.exception))
++    
++    def test_to_python_with_object_raises_validation_error(self):
++        """Test that to_python() raises ValidationError for arbitrary object input."""
++        class TestObject:
++            def __str__(self):
++                return "test_object"
++        
++        with self.assertRaises(ValidationError) as cm:
++            self.field.to_python(TestObject())
++        
++        self.assertEqual(cm.exception.code, 'invalid')
++        self.assertIn('value must be a decimal number', str(cm.exception))
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

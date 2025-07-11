@@ -1,0 +1,550 @@
+diff --git a/sympy/physics/units/unitsystem.py b/sympy/physics/units/unitsystem.py
+index 3daf84c108..94f9573990 100644
+--- a/sympy/physics/units/unitsystem.py
++++ b/sympy/physics/units/unitsystem.py
+@@ -9,6 +9,9 @@
+ from sympy.core.mul import Mul
+ from sympy.core.power import Pow
+ from sympy.core.singleton import S
++from sympy.functions.elementary.exponential import ExpBase, log
++from sympy.functions.elementary.trigonometric import TrigonometricFunction, InverseTrigonometricFunction
++from sympy.functions.elementary.hyperbolic import HyperbolicFunction, InverseHyperbolicFunction
+ from sympy.physics.units.dimensions import _QuantityMapper
+ from sympy.physics.units.quantities import Quantity
+ 
+@@ -192,8 +195,45 @@ def _collect_factor_and_dimension(self, expr):
+         elif isinstance(expr, Function):
+             fds = [self._collect_factor_and_dimension(
+                 arg) for arg in expr.args]
+-            return (expr.func(*(f[0] for f in fds)),
+-                    *(d[1] for d in fds))
++            
++            # Handle mathematical functions that should return dimensionless results
++            if (isinstance(expr, (ExpBase, log)) or 
++                isinstance(expr, HyperbolicFunction) or 
++                isinstance(expr, InverseHyperbolicFunction)):
++                # These functions require dimensionless arguments and return dimensionless results
++                for i, (factor, dim) in enumerate(fds):
++                    if not self.get_dimension_system().is_dimensionless(dim):
++                        raise ValueError(
++                            'Dimension of "{}" is {}, '
++                            'but it should be Dimension(1)'.format(
++                                expr.args[i], dim))
++                return (expr.func(*(f[0] for f in fds)), Dimension(1))
++            
++            elif isinstance(expr, TrigonometricFunction):
++                # Trigonometric functions accept dimensionless or angle dimensions
++                angle_dim = Dimension('angle')
++                for i, (factor, dim) in enumerate(fds):
++                    if not (self.get_dimension_system().is_dimensionless(dim) or dim == angle_dim):
++                        raise ValueError(
++                            'Dimension of "{}" is {}, '
++                            'but it should be Dimension(1) or have angle dimensions'.format(
++                                expr.args[i], dim))
++                return (expr.func(*(f[0] for f in fds)), Dimension(1))
++            
++            elif isinstance(expr, InverseTrigonometricFunction):
++                # Inverse trigonometric functions require dimensionless arguments and return dimensionless results
++                for i, (factor, dim) in enumerate(fds):
++                    if not self.get_dimension_system().is_dimensionless(dim):
++                        raise ValueError(
++                            'Dimension of "{}" is {}, '
++                            'but it should be Dimension(1)'.format(
++                                expr.args[i], dim))
++                return (expr.func(*(f[0] for f in fds)), Dimension(1))
++            
++            else:
++                # For other functions, keep the original behavior
++                return (expr.func(*(f[0] for f in fds)),
++                        *(d[1] for d in fds))
+         elif isinstance(expr, Dimension):
+             return S.One, expr
+         else:
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..2b9e09ba5b
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for all mathematical functions after the fix.
++"""
++
++from sympy import (exp, log, sin, cos, tan, asin, acos, atan, atan2,
++                   sinh, cosh, tanh, asinh, acosh, atanh)
++from sympy.physics import units
++from sympy.physics.units.systems.si import SI
++
++def test_all_mathematical_functions():
++    """Test all mathematical functions with dimensionless arguments."""
++    print("=== Testing All Mathematical Functions ===")
++    
++    # Create a dimensionless expression
++    expr = units.second / (units.ohm * units.farad)
++    
++    # Test exponential and logarithmic functions
++    exp_log_functions = [
++        ("exp", exp(expr)),
++        ("log", log(2)),  # Use a simple positive dimensionless number
++    ]
++    
++    # Test trigonometric functions
++    trig_functions = [
++        ("sin", sin(expr)),
++        ("cos", cos(expr)),
++        ("tan", tan(expr)),
++    ]
++    
++    # Test inverse trigonometric functions
++    inv_trig_functions = [
++        ("asin", asin(expr/10)),  # asin needs |arg| <= 1
++        ("acos", acos(expr/10)),  # acos needs |arg| <= 1
++        ("atan", atan(expr)),
++        ("atan2", atan2(expr, expr)),
++    ]
++    
++    # Test hyperbolic functions
++    hyp_functions = [
++        ("sinh", sinh(expr)),
++        ("cosh", cosh(expr)),
++        ("tanh", tanh(expr)),
++    ]
++    
++    # Test inverse hyperbolic functions
++    inv_hyp_functions = [
++        ("asinh", asinh(expr)),
++        ("acosh", acosh(2)),  # acosh needs arg >= 1
++        ("atanh", atanh(expr/10)),  # atanh needs |arg| < 1
++    ]
++    
++    all_functions = (exp_log_functions + trig_functions + inv_trig_functions + 
++                    hyp_functions + inv_hyp_functions)
++    
++    results = []
++    for name, test_expr in all_functions:
++        try:
++            result = SI._collect_factor_and_dimension(test_expr)
++            print(f"✅ {name}: {result}")
++            assert result[1] == units.Dimension(1), f"{name} should return dimensionless"
++            results.append(True)
++        except Exception as e:
++            print(f"❌ {name}: {e}")
++            results.append(False)
++    
++    return all(results)
++
++def test_angle_dimensions():
++    """Test trigonometric functions with angle dimensions."""
++    print("\n=== Testing Trigonometric Functions with Angle Dimensions ===")
++    
++    # Create a quantity with angle dimensions
++    angle_qty = units.Quantity('theta')
++    from sympy.physics.units.definitions.dimension_definitions import angle
++    SI.set_quantity_dimension(angle_qty, angle)
++    angle_qty.set_global_relative_scale_factor(1, units.radian)
++    
++    trig_functions = [
++        ("sin(angle)", sin(angle_qty)),
++        ("cos(angle)", cos(angle_qty)),
++        ("tan(angle)", tan(angle_qty)),
++    ]
++    
++    results = []
++    for name, test_expr in trig_functions:
++        try:
++            result = SI._collect_factor_and_dimension(test_expr)
++            print(f"✅ {name}: {result}")
++            assert result[1] == units.Dimension(1), f"{name} should return dimensionless"
++            results.append(True)
++        except Exception as e:
++            print(f"❌ {name}: {e}")
++            results.append(False)
++    
++    return all(results)
++
++def test_dimensional_arguments_fail():
++    """Test that all mathematical functions properly reject dimensional arguments."""
++    print("\n=== Testing Dimensional Arguments (Should All Fail) ===")
++    
++    # Test with different dimensional quantities
++    length_qty = units.meter
++    time_qty = units.second
++    
++    functions_to_test = [
++        ("exp(meter)", exp(length_qty)),
++        ("log(second)", log(time_qty)),
++        ("sin(meter)", sin(length_qty)),
++        ("cos(second)", cos(time_qty)),
++        ("tan(meter)", tan(length_qty)),
++        ("asin(second)", asin(time_qty)),
++        ("acos(meter)", acos(length_qty)),
++        ("atan(second)", atan(time_qty)),
++        ("atan2(meter, second)", atan2(length_qty, time_qty)),
++        ("sinh(meter)", sinh(length_qty)),
++        ("cosh(second)", cosh(time_qty)),
++        ("tanh(meter)", tanh(length_qty)),
++        ("asinh(second)", asinh(time_qty)),
++        ("acosh(meter)", acosh(length_qty)),
++        ("atanh(second)", atanh(time_qty)),
++    ]
++    
++    results = []
++    for name, test_expr in functions_to_test:
++        try:
++            result = SI._collect_factor_and_dimension(test_expr)
++            print(f"❌ {name}: UNEXPECTED SUCCESS {result}")
++            results.append(False)
++        except ValueError as e:
++            print(f"✅ {name}: EXPECTED ERROR")
++            results.append(True)
++        except Exception as e:
++            print(f"❓ {name}: UNEXPECTED ERROR TYPE {e}")
++            results.append(False)
++    
++    return all(results)
++
++if __name__ == "__main__":
++    print("Comprehensive test for mathematical functions fix")
++    print("=" * 60)
++    
++    # Run all tests
++    test1 = test_all_mathematical_functions()
++    test2 = test_angle_dimensions()
++    test3 = test_dimensional_arguments_fail()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"All mathematical functions work: {test1}")
++    print(f"Angle dimensions work: {test2}")
++    print(f"Dimensional arguments fail correctly: {test3}")
++    
++    if all([test1, test2, test3]):
++        print("\n🎉 ALL COMPREHENSIVE TESTS PASSED!")
++    else:
++        print("\n❌ Some comprehensive tests FAILED!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1b0ddf2b43
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the mathematical function fix.
++"""
++
++from sympy import exp, log, sin, cos, tan, sinh, cosh, tanh, sqrt, Symbol
++from sympy.physics import units
++from sympy.physics.units.systems.si import SI
++
++def test_hyperbolic_functions():
++    """Test hyperbolic functions."""
++    print("=== Testing Hyperbolic Functions ===")
++    
++    # Dimensionless argument - should work
++    expr = units.second / (units.ohm * units.farad)
++    
++    test_cases = [
++        ("sinh", sinh(expr)),
++        ("cosh", cosh(expr)),
++        ("tanh", tanh(expr)),
++    ]
++    
++    for name, test_expr in test_cases:
++        try:
++            result = SI._collect_factor_and_dimension(test_expr)
++            print(f"✅ {name}: {result}")
++            assert result[1] == units.Dimension(1), f"{name} should return dimensionless"
++        except Exception as e:
++            print(f"❌ {name}: {e}")
++            return False
++    
++    return True
++
++def test_angle_dimensions():
++    """Test trigonometric functions with angle dimensions."""
++    print("\n=== Testing Angle Dimensions ===")
++    
++    # Create a quantity with angle dimensions
++    angle_qty = units.Quantity('theta')
++    from sympy.physics.units.definitions.dimension_definitions import angle
++    SI.set_quantity_dimension(angle_qty, angle)
++    angle_qty.set_global_relative_scale_factor(1, units.radian)
++    
++    test_cases = [
++        ("sin(angle)", sin(angle_qty)),
++        ("cos(angle)", cos(angle_qty)),
++        ("tan(angle)", tan(angle_qty)),
++    ]
++    
++    for name, test_expr in test_cases:
++        try:
++            result = SI._collect_factor_and_dimension(test_expr)
++            print(f"✅ {name}: {result}")
++            assert result[1] == units.Dimension(1), f"{name} should return dimensionless"
++        except Exception as e:
++            print(f"❌ {name}: {e}")
++            return False
++    
++    return True
++
++def test_non_mathematical_functions():
++    """Test that non-mathematical functions still work as before."""
++    print("\n=== Testing Non-Mathematical Functions ===")
++    
++    # Test sqrt (which is actually a Pow, not a Function)
++    length_expr = units.meter
++    sqrt_expr = sqrt(length_expr)
++    
++    try:
++        result = SI._collect_factor_and_dimension(sqrt_expr)
++        print(f"✅ sqrt(meter): {result}")
++        # sqrt should preserve dimensions: sqrt(length) = length^(1/2)
++    except Exception as e:
++        print(f"❌ sqrt(meter): {e}")
++        return False
++    
++    # Test a custom function (should keep original behavior)
++    from sympy.core.function import Function
++    
++    class CustomFunction(Function):
++        pass
++    
++    x = Symbol('x')
++    custom_expr = CustomFunction(length_expr)
++    
++    try:
++        result = SI._collect_factor_and_dimension(custom_expr)
++        print(f"✅ CustomFunction(meter): {result}")
++        # Custom function should return the dimension of its argument
++        assert result[1] == units.length, "Custom function should preserve argument dimensions"
++    except Exception as e:
++        print(f"❌ CustomFunction(meter): {e}")
++        return False
++    
++    return True
++
++def test_multiple_arguments():
++    """Test functions with multiple arguments."""
++    print("\n=== Testing Multiple Arguments ===")
++    
++    # Create dimensionless expressions
++    expr1 = units.second / (units.ohm * units.farad)
++    expr2 = units.meter / units.meter  # Also dimensionless
++    
++    # Test log with base (if it exists)
++    try:
++        # Note: sympy log doesn't typically take a base as a second argument in this way
++        # but let's test a function that might have multiple args
++        from sympy import atan2
++        
++        # atan2 should accept dimensionless arguments
++        atan2_expr = atan2(expr1, expr2)
++        result = SI._collect_factor_and_dimension(atan2_expr)
++        print(f"✅ atan2(dimensionless, dimensionless): {result}")
++        assert result[1] == units.Dimension(1), "atan2 should return dimensionless"
++    except Exception as e:
++        print(f"❌ atan2: {e}")
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    print("Testing edge cases for mathematical function fix")
++    print("=" * 50)
++    
++    results = [
++        test_hyperbolic_functions(),
++        test_angle_dimensions(),
++        test_non_mathematical_functions(),
++        test_multiple_arguments(),
++    ]
++    
++    print("\n" + "=" * 50)
++    if all(results):
++        print("✅ All edge case tests PASSED!")
++    else:
++        print("❌ Some edge case tests FAILED!")
+\ No newline at end of file
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 0000000000..bc13a2fec5
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++"""
++Test the exact issue from the issue description.
++"""
++
++from sympy import exp
++from sympy.physics import units
++from sympy.physics.units.systems.si import SI
++
++# Exact code from the issue description
++expr = units.second / (units.ohm * units.farad)
++dim = SI._collect_factor_and_dimension(expr)[1]
++
++assert SI.get_dimension_system().is_dimensionless(dim)
++
++buggy_expr = 100 + exp(expr)
++result = SI._collect_factor_and_dimension(buggy_expr)
++
++print("✅ SUCCESS! The exact issue from the description has been fixed!")
++print(f"Result: {result}")
++print(f"Expression: {buggy_expr}")
++
++# This should NOT raise:
++# ValueError: Dimension of "exp(second/(farad*ohm))" is Dimension(time/(capacitance*impedance)), but it should be Dimension(1)
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..d47734e59a
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the SI._collect_factor_and_dimension() issue.
++
++The issue is that exp() and other mathematical functions don't properly
++detect that their arguments should be dimensionless.
++"""
++
++from sympy import exp, log, sin, cos, Symbol
++from sympy.physics import units
++from sympy.physics.units.systems.si import SI
++
++def test_original_issue():
++    """Test the original issue from the bug report."""
++    print("=== Testing Original Issue ===")
++    
++    # This should work - the expression is dimensionless
++    expr = units.second / (units.ohm * units.farad)
++    dim = SI._collect_factor_and_dimension(expr)[1]
++    print(f"Expression: {expr}")
++    print(f"Dimension: {dim}")
++    print(f"Is dimensionless: {SI.get_dimension_system().is_dimensionless(dim)}")
++    
++    assert SI.get_dimension_system().is_dimensionless(dim), "Expression should be dimensionless"
++    
++    # This should fail with the current implementation
++    buggy_expr = 100 + exp(expr)
++    print(f"Buggy expression: {buggy_expr}")
++    
++    try:
++        result = SI._collect_factor_and_dimension(buggy_expr)
++        print(f"SUCCESS: {result}")
++        return True
++    except ValueError as e:
++        print(f"ERROR: {e}")
++        return False
++
++def test_existing_working_cases():
++    """Test cases that should already work."""
++    print("\n=== Testing Existing Working Cases ===")
++    
++    # Test case from existing tests: exp(u**2/v**2) where both have energy dimensions
++    u = units.Quantity('u')
++    v = units.Quantity('v')
++    SI.set_quantity_dimension(u, units.energy)
++    SI.set_quantity_dimension(v, units.energy)
++    u.set_global_relative_scale_factor(1, units.joule)
++    v.set_global_relative_scale_factor(1, units.joule)
++    
++    expr = 1 + exp(u**2/v**2)
++    print(f"Expression: {expr}")
++    
++    try:
++        result = SI._collect_factor_and_dimension(expr)
++        print(f"SUCCESS: {result}")
++        # Should be (1 + E, Dimension(1))
++        assert result[1] == units.Dimension(1), f"Expected Dimension(1), got {result[1]}"
++        return True
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++
++def test_other_mathematical_functions():
++    """Test other mathematical functions that should require dimensionless arguments."""
++    print("\n=== Testing Other Mathematical Functions ===")
++    
++    # Create a dimensionless expression
++    expr = units.second / (units.ohm * units.farad)
++    
++    test_cases = [
++        ("log", log(expr)),
++        ("sin", sin(expr)),
++        ("cos", cos(expr)),
++    ]
++    
++    results = []
++    for name, test_expr in test_cases:
++        print(f"\nTesting {name}({expr}):")
++        try:
++            result = SI._collect_factor_and_dimension(test_expr)
++            print(f"SUCCESS: {result}")
++            results.append(True)
++        except Exception as e:
++            print(f"ERROR: {e}")
++            results.append(False)
++    
++    return all(results)
++
++def test_dimensional_arguments_should_fail():
++    """Test that functions with dimensional arguments should fail."""
++    print("\n=== Testing Functions with Dimensional Arguments (Should Fail) ===")
++    
++    # Create expressions with dimensions
++    length_expr = units.meter
++    time_expr = units.second
++    
++    test_cases = [
++        ("exp(meter)", exp(length_expr)),
++        ("log(second)", log(time_expr)),
++        ("sin(meter)", sin(length_expr)),
++    ]
++    
++    results = []
++    for name, test_expr in test_cases:
++        print(f"\nTesting {name}:")
++        try:
++            result = SI._collect_factor_and_dimension(test_expr)
++            print(f"UNEXPECTED SUCCESS: {result} (should have failed)")
++            results.append(False)
++        except Exception as e:
++            print(f"EXPECTED ERROR: {e}")
++            results.append(True)
++    
++    return all(results)
++
++if __name__ == "__main__":
++    print("Testing SI._collect_factor_and_dimension() issue reproduction")
++    print("=" * 60)
++    
++    # Test the original issue
++    original_works = test_original_issue()
++    
++    # Test existing working cases
++    existing_works = test_existing_working_cases()
++    
++    # Test other mathematical functions
++    other_funcs_work = test_other_mathematical_functions()
++    
++    # Test that dimensional arguments should fail
++    dimensional_fails = test_dimensional_arguments_should_fail()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"Original issue works: {original_works}")
++    print(f"Existing cases work: {existing_works}")
++    print(f"Other functions work: {other_funcs_work}")
++    print(f"Dimensional args fail correctly: {dimensional_fails}")
++    
++    if original_works:
++        print("\n✅ Issue has been FIXED!")
++    else:
++        print("\n❌ Issue still EXISTS!")
+\ No newline at end of file

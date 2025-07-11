@@ -1,0 +1,361 @@
+diff --git a/sympy/solvers/inequalities.py b/sympy/solvers/inequalities.py
+index 9127d217f1..e2aea7c2b2 100644
+--- a/sympy/solvers/inequalities.py
++++ b/sympy/solvers/inequalities.py
+@@ -8,6 +8,7 @@
+ from sympy.core.relational import Relational, Eq, Ge, Lt
+ from sympy.sets import Interval
+ from sympy.sets.sets import FiniteSet, Union, EmptySet, Intersection
++from sympy.sets.conditionset import ConditionSet
+ from sympy.core.singleton import S
+ from sympy.core.function import expand_mul
+ 
+@@ -526,6 +527,12 @@ def solve_univariate_inequality(expr, gen, relational=True, domain=S.Reals, cont
+                     # in which case we raise ValueError
+                     raise ValueError
+             except (ValueError, NotImplementedError):
++                # If we can't solve analytically and relational=False,
++                # return a ConditionSet instead of raising NotImplementedError
++                if not relational:
++                    # Use the original expression with the original variable
++                    original_expr = expr.xreplace({gen: _gen}) if gen != _gen else expr
++                    return ConditionSet(_gen, original_expr, _domain)
+                 # replace gen with generic x since it's
+                 # univariate anyway
+                 raise NotImplementedError(filldedent('''
+diff --git a/sympy/solvers/tests/test_inequalities.py b/sympy/solvers/tests/test_inequalities.py
+index 4c8a31a517..4117a802ea 100644
+--- a/sympy/solvers/tests/test_inequalities.py
++++ b/sympy/solvers/tests/test_inequalities.py
+@@ -4,6 +4,7 @@
+                    Or, S, sin, cos, tan, sqrt, Symbol, Union, Integral, Sum,
+                    Function, Poly, PurePoly, pi, root, log, exp, Dummy, Abs,
+                    Piecewise, Rational)
++from sympy.sets.conditionset import ConditionSet
+ from sympy.solvers.inequalities import (reduce_inequalities,
+                                         solve_poly_inequality as psolve,
+                                         reduce_rational_inequalities,
+@@ -299,7 +300,11 @@ def test_solve_univariate_inequality():
+         Or(And(-oo < x, x < 1), And(S.One < x, x < 2))
+ 
+     n = Dummy('n')
+-    raises(NotImplementedError, lambda: isolve(Abs(x) <= n, x, relational=False))
++    # With relational=False, should return ConditionSet instead of raising NotImplementedError
++    result = isolve(Abs(x) <= n, x, relational=False)
++    assert isinstance(result, ConditionSet)
++    assert result.sym == x
++    assert result.base_set == S.Reals
+     c1 = Dummy("c1", positive=True)
+     raises(NotImplementedError, lambda: isolve(n/c1 < 0, c1))
+     n = Dummy('n', negative=True)
+diff --git a/test_detailed_verification.py b/test_detailed_verification.py
+new file mode 100644
+index 0000000000..601af8c0a7
+--- /dev/null
++++ b/test_detailed_verification.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python3
++"""
++Detailed verification of the fix
++"""
++
++from sympy import *
++
++def test_condition_set_content():
++    """Test that the ConditionSet contains the right content"""
++    print("=== Testing ConditionSet Content ===")
++    n = Symbol('n')
++    eq = Eq(n*cos(n) - 3*sin(n), 0)
++    result = eq.as_set()
++    
++    print(f"Original equation: {eq}")
++    print(f"Result: {result}")
++    print(f"Result type: {type(result)}")
++    
++    # Check the components of the ConditionSet
++    print(f"Variable: {result.sym}")
++    print(f"Condition: {result.condition}")
++    print(f"Base set: {result.base_set}")
++    
++    # Test membership
++    print("\n=== Testing Membership ===")
++    # Test a known solution (approximately)
++    test_val = 0  # sin(0) = 0, cos(0) = 1, so 0*1 - 3*0 = 0
++    print(f"Testing if {test_val} is in the set:")
++    membership = test_val in result
++    print(f"Result: {membership}")
++
++def test_backward_compatibility():
++    """Test that the fix doesn't break existing functionality"""
++    print("\n=== Testing Backward Compatibility ===")
++    
++    # Test that polynomial equations still work
++    x = Symbol('x')
++    poly_eq = Eq(x**2 - 4, 0)
++    poly_result = poly_eq.as_set()
++    print(f"Polynomial equation: {poly_eq}")
++    print(f"Polynomial result: {poly_result}")
++    print(f"Polynomial result type: {type(poly_result)}")
++    
++    # Test that inequalities still work
++    ineq = x > 2
++    ineq_result = ineq.as_set()
++    print(f"Inequality: {ineq}")
++    print(f"Inequality result: {ineq_result}")
++    print(f"Inequality result type: {type(ineq_result)}")
++
++def test_relational_true_still_raises():
++    """Test that solve_univariate_inequality with relational=True still raises NotImplementedError"""
++    print("\n=== Testing relational=True Still Raises ===")
++    from sympy.solvers.inequalities import solve_univariate_inequality
++    
++    n = Symbol('n')
++    eq = Eq(n*cos(n) - 3*sin(n), 0)
++    
++    try:
++        # This should still raise NotImplementedError
++        result = solve_univariate_inequality(eq, n, relational=True)
++        print(f"ERROR: Expected NotImplementedError but got: {result}")
++        return False
++    except NotImplementedError as e:
++        print(f"Good: relational=True still raises NotImplementedError: {e}")
++        return True
++    except Exception as e:
++        print(f"ERROR: Unexpected exception: {type(e).__name__}: {e}")
++        return False
++
++def test_relational_false_returns_conditionset():
++    """Test that solve_univariate_inequality with relational=False returns ConditionSet"""
++    print("\n=== Testing relational=False Returns ConditionSet ===")
++    from sympy.solvers.inequalities import solve_univariate_inequality
++    
++    n = Symbol('n')
++    eq = Eq(n*cos(n) - 3*sin(n), 0)
++    
++    try:
++        result = solve_univariate_inequality(eq, n, relational=False)
++        print(f"Result: {result}")
++        print(f"Result type: {type(result)}")
++        return isinstance(result, ConditionSet)
++    except Exception as e:
++        print(f"ERROR: Unexpected exception: {type(e).__name__}: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Detailed verification of the fix")
++    print("=" * 60)
++    
++    test_condition_set_content()
++    test_backward_compatibility()
++    success1 = test_relational_true_still_raises()
++    success2 = test_relational_false_returns_conditionset()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"relational=True still raises: {success1}")
++    print(f"relational=False returns ConditionSet: {success2}")
++    print(f"Overall success: {success1 and success2}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..10b52d3b9d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the fix
++"""
++
++from sympy import *
++
++def test_different_domains():
++    """Test with different domains"""
++    print("=== Testing Different Domains ===")
++    x = Symbol('x')
++    eq = Eq(x*cos(x), 0)
++    
++    # Test with different domains
++    from sympy.solvers.inequalities import solve_univariate_inequality
++    
++    # Test with Reals (default)
++    result1 = solve_univariate_inequality(eq, x, relational=False, domain=S.Reals)
++    print(f"Domain S.Reals: {result1}")
++    
++    # Test with Interval
++    result2 = solve_univariate_inequality(eq, x, relational=False, domain=Interval(0, 10))
++    print(f"Domain Interval(0, 10): {result2}")
++
++def test_different_equation_types():
++    """Test with different types of equations"""
++    print("\n=== Testing Different Equation Types ===")
++    x = Symbol('x')
++    
++    # Test equality
++    eq1 = Eq(x*sin(x), 1)
++    result1 = eq1.as_set()
++    print(f"Equality: {eq1} -> {result1}")
++    
++    # Test inequality (should still work as before)
++    ineq1 = x*sin(x) > 1
++    result2 = ineq1.as_set()
++    print(f"Inequality: {ineq1} -> {result2}")
++
++def test_multivariate_still_fails():
++    """Test that multivariate expressions still raise appropriate errors"""
++    print("\n=== Testing Multivariate Still Fails ===")
++    x, y = symbols('x y')
++    eq = Eq(x*y + sin(x), 0)
++    
++    try:
++        result = eq.as_set()
++        print(f"ERROR: Expected NotImplementedError but got: {result}")
++        return False
++    except NotImplementedError as e:
++        print(f"Good: Multivariate still raises NotImplementedError: {e}")
++        return True
++    except Exception as e:
++        print(f"ERROR: Unexpected exception: {type(e).__name__}: {e}")
++        return False
++
++def test_complex_symbols():
++    """Test with complex symbols"""
++    print("\n=== Testing Complex Symbols ===")
++    z = Symbol('z', complex=True)
++    eq = Eq(z*exp(z), 1)
++    
++    try:
++        result = eq.as_set()
++        print(f"Complex symbol result: {result}")
++        return True
++    except Exception as e:
++        print(f"Complex symbol error: {type(e).__name__}: {e}")
++        return False
++
++def test_membership_works():
++    """Test that membership testing works correctly"""
++    print("\n=== Testing Membership ===")
++    x = Symbol('x')
++    eq = Eq(x*cos(x), 0)
++    result = eq.as_set()
++    
++    print(f"ConditionSet: {result}")
++    
++    # Test known solutions
++    test_values = [0, pi, -pi, 2*pi]
++    for val in test_values:
++        try:
++            is_member = val in result
++            print(f"{val} in set: {is_member}")
++        except Exception as e:
++            print(f"Error testing {val}: {e}")
++
++if __name__ == "__main__":
++    print("Testing edge cases for the fix")
++    print("=" * 50)
++    
++    test_different_domains()
++    test_different_equation_types()
++    success1 = test_multivariate_still_fails()
++    success2 = test_complex_symbols()
++    test_membership_works()
++    
++    print("\n" + "=" * 50)
++    print("SUMMARY:")
++    print(f"Multivariate still fails appropriately: {success1}")
++    print(f"Complex symbols handled: {success2}")
+\ No newline at end of file
+diff --git a/test_issue_reproduction.py b/test_issue_reproduction.py
+new file mode 100644
+index 0000000000..2e03e88ea8
+--- /dev/null
++++ b/test_issue_reproduction.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the issue where solveset raises NotImplementedError
++instead of returning ConditionSet for transcendental equations.
++"""
++
++from sympy import *
++
++def test_original_issue():
++    """Test the original issue from the bug report"""
++    print("=== Testing Original Issue ===")
++    n = Symbol('n')
++    eq = Eq(n*cos(n) - 3*sin(n), 0)
++    print(f"Equation: {eq}")
++    
++    try:
++        result = eq.as_set()
++        print(f"Result: {result}")
++        print(f"Result type: {type(result)}")
++        return True
++    except Exception as e:
++        print(f"Error type: {type(e).__name__}")
++        print(f"Error message: {str(e)}")
++        return False
++
++def test_expected_behavior():
++    """Test what the expected behavior should be"""
++    print("\n=== Testing Expected Behavior ===")
++    n = Symbol('n')
++    eq = Eq(n*cos(n) - 3*sin(n), 0)
++    expected = ConditionSet(n, eq, S.Reals)
++    print(f"Expected result: {expected}")
++    print(f"Expected type: {type(expected)}")
++
++def test_simple_case():
++    """Test a simple case that should work"""
++    print("\n=== Testing Simple Case (should work) ===")
++    x = Symbol('x')
++    eq = Eq(x**2 - 4, 0)
++    print(f"Simple equation: {eq}")
++    
++    try:
++        result = eq.as_set()
++        print(f"Result: {result}")
++        print(f"Result type: {type(result)}")
++        return True
++    except Exception as e:
++        print(f"Error type: {type(e).__name__}")
++        print(f"Error message: {str(e)}")
++        return False
++
++def test_other_transcendental():
++    """Test other transcendental equations"""
++    print("\n=== Testing Other Transcendental Equations ===")
++    x = Symbol('x')
++    
++    # Test sin(x) = x
++    eq1 = Eq(sin(x), x)
++    print(f"Equation 1: {eq1}")
++    try:
++        result1 = eq1.as_set()
++        print(f"Result 1: {result1}")
++    except Exception as e:
++        print(f"Error 1: {type(e).__name__}: {str(e)}")
++    
++    # Test exp(x) = x
++    eq2 = Eq(exp(x), x)
++    print(f"Equation 2: {eq2}")
++    try:
++        result2 = eq2.as_set()
++        print(f"Result 2: {result2}")
++    except Exception as e:
++        print(f"Error 2: {type(e).__name__}: {str(e)}")
++
++if __name__ == "__main__":
++    print("Testing the issue where solveset raises NotImplementedError instead of returning ConditionSet")
++    print("=" * 80)
++    
++    success1 = test_original_issue()
++    test_expected_behavior()
++    success2 = test_simple_case()
++    test_other_transcendental()
++    
++    print("\n" + "=" * 80)
++    print("SUMMARY:")
++    print(f"Original issue reproduced: {not success1}")
++    print(f"Simple case works: {success2}")
+\ No newline at end of file

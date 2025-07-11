@@ -1,0 +1,98 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index ce18098fd2..1e77a11d15 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1124,7 +1124,9 @@ class Query(BaseExpression):
+
+     def check_filterable(self, expression):
+         """Raise an error if expression cannot be used in a WHERE clause."""
+-        if not getattr(expression, 'filterable', True):
++        # Ignore the 'filterable' attribute for model instances to prevent clash with model fields of same name
++        from django.db.models import Model
++        if not isinstance(expression, Model) and not getattr(expression, 'filterable', True):
+             raise NotSupportedError(
+                 expression.__class__.__name__ + ' is disallowed in the filter '
+                 'clause.'
+diff --git a/test_filterable_model.py b/test_filterable_model.py
+new file mode 100644
+index 0000000000..144b7cc172
+--- /dev/null
++++ b/test_filterable_model.py
+@@ -0,0 +1,76 @@
++import os
++import django
++import sys
++from django.conf import settings
++
++# Set up minimal Django settings
++if not settings.configured:
++    settings.configure(
++        SECRET_KEY='test_key',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Q
++
++# Create the test models
++class ProductMetaDataType(models.Model):
++    label = models.CharField(max_length=255)
++    filterable = models.BooleanField(default=False)
++
++    class Meta:
++        app_label = "test_app"
++
++    def __str__(self):
++        return self.label
++
++class ProductMetaData(models.Model):
++    value = models.TextField()
++    metadata_type = models.ForeignKey(ProductMetaDataType, on_delete=models.CASCADE)
++
++    class Meta:
++        app_label = "test_app"
++
++def test_filter_with_filterable_field():
++    # This will reproduce the error
++    try:
++        # Create a ProductMetaDataType with filterable=False
++        metadata_type = ProductMetaDataType(label="Brand", filterable=False)
++
++        # Try to filter ProductMetaData with this object
++        # This would fail before the fix with:
++        # django.db.utils.NotSupportedError: ProductMetaDataType is disallowed in the filter clause.
++        from django.db.models.sql.query import Query
++
++        # Create a Query object manually
++        query = Query(ProductMetaData)
++
++        # Build a filter expression
++        lookup = 'metadata_type'
++        value = metadata_type
++        filter_expr = (lookup, value)
++
++        # This will trigger check_filterable() for the metadata_type
++        try:
++            clause, _ = query.build_filter(filter_expr)
++            print("Test passed: Successfully created a filter with a model that has filterable=False attribute")
++            return True
++        except Exception as e:
++            print(f"Test failed with specific error: {e}")
++            return False
++    except Exception as e:
++        print(f"Test setup failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    test_filter_with_filterable_field()
+\ No newline at end of file

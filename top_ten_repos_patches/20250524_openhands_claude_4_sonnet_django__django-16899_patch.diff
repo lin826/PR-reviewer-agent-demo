@@ -1,0 +1,348 @@
+diff --git a/check_error_message.py b/check_error_message.py
+new file mode 100644
+index 0000000000..21870df018
+--- /dev/null
++++ b/check_error_message.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python
++"""
++Check the actual error message produced by our fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'admin_checks',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from tests.admin_checks.models import Song
++from django.contrib import admin
++from django.contrib.admin.sites import AdminSite
++
++class SongAdmin(admin.ModelAdmin):
++    readonly_fields = ('title', 'nonexistent')
++
++errors = SongAdmin(Song, AdminSite()).check()
++readonly_errors = [e for e in errors if e.id == 'admin.E035']
++
++if readonly_errors:
++    print('Actual error message:')
++    print(repr(readonly_errors[0].msg))
++    print('\nFormatted:')
++    print(readonly_errors[0].msg)
++else:
++    print('No readonly_fields errors found')
++    print('All errors:')
++    for error in errors:
++        print(f"  {error.id}: {error.msg}")
+\ No newline at end of file
+diff --git a/django/contrib/admin/checks.py b/django/contrib/admin/checks.py
+index c395b0bde2..2c90dedc31 100644
+--- a/django/contrib/admin/checks.py
++++ b/django/contrib/admin/checks.py
+@@ -771,10 +771,11 @@ class BaseModelAdminChecks:
+             except FieldDoesNotExist:
+                 return [
+                     checks.Error(
+-                        "The value of '%s' is not a callable, an attribute of "
+-                        "'%s', or an attribute of '%s'."
++                        "The value of '%s' refers to '%s', which is not a callable, "
++                        "an attribute of '%s', or an attribute of '%s'."
+                         % (
+                             label,
++                            field_name,
+                             obj.__class__.__name__,
+                             obj.model._meta.label,
+                         ),
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..298eb2f190
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the readonly_fields error message issue.
++This script demonstrates that readonly_fields error messages don't include the field name,
++while other similar error messages do.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.contrib.admin.sites import AdminSite
++from django.core import checks
++
++# Define test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField()
++    
++    class Meta:
++        app_label = '__main__'
++
++# Test ModelAdmin with invalid readonly_fields
++class TestModelAdmin(admin.ModelAdmin):
++    readonly_fields = ('name', 'nonexistent_field')  # 'nonexistent_field' doesn't exist
++    list_display = ('name', 'description')
++    list_editable = ('nonexistent_list_field',)  # For comparison
++
++def test_readonly_fields_error():
++    """Test the current readonly_fields error message format."""
++    print("=== Testing readonly_fields error message ===")
++    
++    admin_obj = TestModelAdmin(TestModel, AdminSite())
++    errors = admin_obj.check()
++    
++    readonly_errors = [e for e in errors if e.id == 'admin.E035']
++    list_editable_errors = [e for e in errors if e.id == 'admin.E121']
++    
++    print(f"Found {len(readonly_errors)} readonly_fields errors:")
++    for error in readonly_errors:
++        print(f"  - {error.msg}")
++    
++    print(f"\nFound {len(list_editable_errors)} list_editable errors:")
++    for error in list_editable_errors:
++        print(f"  - {error.msg}")
++    
++    print("\n=== Analysis ===")
++    if readonly_errors:
++        readonly_msg = readonly_errors[0].msg
++        print(f"readonly_fields error: {readonly_msg}")
++        if 'nonexistent_field' in readonly_msg:
++            print("✓ readonly_fields error includes field name")
++        else:
++            print("✗ readonly_fields error does NOT include field name")
++    
++    if list_editable_errors:
++        list_editable_msg = list_editable_errors[0].msg
++        print(f"list_editable error: {list_editable_msg}")
++        if 'nonexistent_list_field' in list_editable_msg:
++            print("✓ list_editable error includes field name")
++        else:
++            print("✗ list_editable error does NOT include field name")
++
++if __name__ == '__main__':
++    test_readonly_fields_error()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..43c2d7cb45
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script to verify the readonly_fields fix works in various scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.contrib.admin.sites import AdminSite
++from django.core import checks
++
++# Define test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    description = models.TextField()
++    
++    class Meta:
++        app_label = '__main__'
++
++class RelatedModel(models.Model):
++    test_model = models.ForeignKey(TestModel, on_delete=models.CASCADE)
++    title = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_case_1_single_invalid_field():
++    """Test with a single invalid readonly field."""
++    print("=== Test Case 1: Single invalid readonly field ===")
++    
++    class TestAdmin(admin.ModelAdmin):
++        readonly_fields = ('invalid_field',)
++    
++    admin_obj = TestAdmin(TestModel, AdminSite())
++    errors = [e for e in admin_obj.check() if e.id == 'admin.E035']
++    
++    assert len(errors) == 1, f"Expected 1 error, got {len(errors)}"
++    error_msg = errors[0].msg
++    print(f"Error message: {error_msg}")
++    
++    assert 'invalid_field' in error_msg, "Field name should be in error message"
++    assert "readonly_fields[0]" in error_msg, "Index should be in error message"
++    print("✓ Test passed")
++
++def test_case_2_multiple_invalid_fields():
++    """Test with multiple invalid readonly fields."""
++    print("\n=== Test Case 2: Multiple invalid readonly fields ===")
++    
++    class TestAdmin(admin.ModelAdmin):
++        readonly_fields = ('name', 'invalid1', 'description', 'invalid2')
++    
++    admin_obj = TestAdmin(TestModel, AdminSite())
++    errors = [e for e in admin_obj.check() if e.id == 'admin.E035']
++    
++    assert len(errors) == 2, f"Expected 2 errors, got {len(errors)}"
++    
++    # Check first error
++    error1_msg = errors[0].msg
++    print(f"Error 1: {error1_msg}")
++    assert 'invalid1' in error1_msg, "First invalid field name should be in error message"
++    assert "readonly_fields[1]" in error1_msg, "Correct index should be in error message"
++    
++    # Check second error
++    error2_msg = errors[1].msg
++    print(f"Error 2: {error2_msg}")
++    assert 'invalid2' in error2_msg, "Second invalid field name should be in error message"
++    assert "readonly_fields[3]" in error2_msg, "Correct index should be in error message"
++    print("✓ Test passed")
++
++def test_case_3_inline_admin():
++    """Test with inline admin."""
++    print("\n=== Test Case 3: Inline admin with invalid readonly field ===")
++    
++    class RelatedInline(admin.TabularInline):
++        model = RelatedModel
++        readonly_fields = ('nonexistent_inline_field',)
++    
++    admin_obj = RelatedInline(TestModel, AdminSite())
++    errors = [e for e in admin_obj.check() if e.id == 'admin.E035']
++    
++    assert len(errors) == 1, f"Expected 1 error, got {len(errors)}"
++    error_msg = errors[0].msg
++    print(f"Error message: {error_msg}")
++    
++    assert 'nonexistent_inline_field' in error_msg, "Field name should be in error message"
++    assert "readonly_fields[0]" in error_msg, "Index should be in error message"
++    print("✓ Test passed")
++
++def test_case_4_valid_fields():
++    """Test that valid readonly fields don't produce errors."""
++    print("\n=== Test Case 4: Valid readonly fields ===")
++    
++    class TestAdmin(admin.ModelAdmin):
++        readonly_fields = ('name', 'description')
++    
++    admin_obj = TestAdmin(TestModel, AdminSite())
++    errors = [e for e in admin_obj.check() if e.id == 'admin.E035']
++    
++    assert len(errors) == 0, f"Expected 0 errors, got {len(errors)}"
++    print("✓ Test passed - no errors for valid fields")
++
++def test_case_5_callable_fields():
++    """Test that callable readonly fields don't produce errors."""
++    print("\n=== Test Case 5: Callable readonly fields ===")
++    
++    def my_callable(obj):
++        return "test"
++    
++    class TestAdmin(admin.ModelAdmin):
++        readonly_fields = ('name', my_callable, lambda x: "lambda")
++        
++        @admin.display
++        def admin_method(self, obj):
++            return "admin method"
++    
++    admin_obj = TestAdmin(TestModel, AdminSite())
++    errors = [e for e in admin_obj.check() if e.id == 'admin.E035']
++    
++    assert len(errors) == 0, f"Expected 0 errors, got {len(errors)}"
++    print("✓ Test passed - no errors for callable fields")
++
++def run_all_tests():
++    """Run all test cases."""
++    print("Running comprehensive tests for readonly_fields fix...\n")
++    
++    test_case_1_single_invalid_field()
++    test_case_2_multiple_invalid_fields()
++    test_case_3_inline_admin()
++    test_case_4_valid_fields()
++    test_case_5_callable_fields()
++    
++    print("\n🎉 All tests passed! The fix is working correctly.")
++
++if __name__ == '__main__':
++    run_all_tests()
+\ No newline at end of file

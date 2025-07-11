@@ -1,0 +1,468 @@
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 000000000..ee606a37b
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,114 @@
++import numpy as np
++from sklearn.model_selection import StratifiedKFold
++
++def test_final_verification():
++    """Final comprehensive test to verify the fix"""
++    
++    print("=== FINAL VERIFICATION OF STRATIFIEDKFOLD FIX ===\n")
++    
++    # Test 1: Original issue reproduction
++    print("1. Testing original issue scenario:")
++    samples_per_class = 10
++    X = np.linspace(0, samples_per_class*2-1, samples_per_class * 2)
++    y = np.concatenate((np.ones(samples_per_class), np.zeros(samples_per_class)), axis=0)
++    
++    # Test with different random states
++    skf1 = StratifiedKFold(n_splits=10, shuffle=True, random_state=1)
++    skf2 = StratifiedKFold(n_splits=10, shuffle=True, random_state=2)
++    
++    folds1 = list(skf1.split(X, y))
++    folds2 = list(skf2.split(X, y))
++    
++    pairs1 = {tuple(sorted(test)) for _, test in folds1}
++    pairs2 = {tuple(sorted(test)) for _, test in folds2}
++    
++    print(f"   Random state 1 pairs: {sorted(pairs1)}")
++    print(f"   Random state 2 pairs: {sorted(pairs2)}")
++    print(f"   Different pairs: {pairs1 != pairs2}")
++    
++    # Check if the old bug pattern exists
++    old_bug_pattern = {(i, i+10) for i in range(10)}
++    has_old_bug = pairs1 == old_bug_pattern and pairs2 == old_bug_pattern
++    print(f"   Old bug pattern eliminated: {not has_old_bug}")
++    print()
++    
++    # Test 2: Stratification preservation
++    print("2. Testing stratification preservation:")
++    X = np.arange(100)
++    y = np.repeat([0, 1, 2], [30, 35, 35])  # Slightly unbalanced
++    
++    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
++    
++    all_stratified = True
++    for i, (train, test) in enumerate(skf.split(X, y)):
++        unique, counts = np.unique(y[test], return_counts=True)
++        class_dist = dict(zip(unique, counts))
++        print(f"   Fold {i}: {class_dist}")
++        
++        # Check approximate stratification (allowing for rounding)
++        expected_ratios = np.array([30, 35, 35]) / 100
++        actual_ratios = np.array(list(class_dist.values())) / len(test)
++        if not np.allclose(expected_ratios, actual_ratios, atol=0.1):
++            all_stratified = False
++    
++    print(f"   Stratification preserved: {all_stratified}")
++    print()
++    
++    # Test 3: shuffle=False consistency
++    print("3. Testing shuffle=False consistency:")
++    skf_no_shuffle_1 = StratifiedKFold(n_splits=5, shuffle=False, random_state=1)
++    skf_no_shuffle_2 = StratifiedKFold(n_splits=5, shuffle=False, random_state=999)
++    
++    folds_ns1 = list(skf_no_shuffle_1.split(X, y))
++    folds_ns2 = list(skf_no_shuffle_2.split(X, y))
++    
++    consistent = all(np.array_equal(test1, test2) for (_, test1), (_, test2) in zip(folds_ns1, folds_ns2))
++    print(f"   shuffle=False gives consistent results: {consistent}")
++    print()
++    
++    # Test 4: Reproducibility with same random_state
++    print("4. Testing reproducibility with same random_state:")
++    skf_repro_1 = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
++    skf_repro_2 = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
++    
++    folds_r1 = list(skf_repro_1.split(X, y))
++    folds_r2 = list(skf_repro_2.split(X, y))
++    
++    reproducible = all(np.array_equal(test1, test2) for (_, test1), (_, test2) in zip(folds_r1, folds_r2))
++    print(f"   Same random_state gives reproducible results: {reproducible}")
++    print()
++    
++    # Test 5: Different behavior with different random_states
++    print("5. Testing different behavior with different random_states:")
++    skf_diff_1 = StratifiedKFold(n_splits=5, shuffle=True, random_state=1)
++    skf_diff_2 = StratifiedKFold(n_splits=5, shuffle=True, random_state=2)
++    
++    folds_d1 = list(skf_diff_1.split(X, y))
++    folds_d2 = list(skf_diff_2.split(X, y))
++    
++    different = any(not np.array_equal(test1, test2) for (_, test1), (_, test2) in zip(folds_d1, folds_d2))
++    print(f"   Different random_states give different results: {different}")
++    print()
++    
++    # Summary
++    print("=== SUMMARY ===")
++    all_tests_passed = (
++        pairs1 != pairs2 and  # Different pairs for different random states
++        not has_old_bug and   # Old bug pattern eliminated
++        all_stratified and    # Stratification preserved
++        consistent and        # shuffle=False is consistent
++        reproducible and      # Same random_state is reproducible
++        different             # Different random_states give different results
++    )
++    
++    print(f"All tests passed: {all_tests_passed}")
++    
++    if all_tests_passed:
++        print("✅ FIX VERIFIED: StratifiedKFold shuffle issue has been resolved!")
++    else:
++        print("❌ ISSUES DETECTED: Some tests failed!")
++    
++    return all_tests_passed
++
++if __name__ == "__main__":
++    test_final_verification()
+\ No newline at end of file
+diff --git a/sklearn/model_selection/_split.py b/sklearn/model_selection/_split.py
+index 24394f869..310e236ce 100644
+--- a/sklearn/model_selection/_split.py
++++ b/sklearn/model_selection/_split.py
+@@ -620,7 +620,7 @@ class StratifiedKFold(_BaseKFold):
+         super().__init__(n_splits, shuffle, random_state)
+ 
+     def _make_test_folds(self, X, y=None):
+-        rng = self.random_state
++        rng = check_random_state(self.random_state)
+         y = np.asarray(y)
+         type_of_target_y = type_of_target(y)
+         allowed_target_types = ('binary', 'multiclass')
+@@ -645,6 +645,16 @@ class StratifiedKFold(_BaseKFold):
+                            " be less than n_splits=%d."
+                            % (min_groups, self.n_splits)), Warning)
+ 
++        # Shuffle the data within each class if shuffle=True
++        if self.shuffle:
++            # Create a mapping from original indices to shuffled indices for each class
++            shuffled_indices = np.arange(n_samples)
++            for cls_idx, cls in enumerate(unique_y):
++                cls_mask = y == cls
++                cls_indices = np.where(cls_mask)[0]
++                rng.shuffle(cls_indices)
++                shuffled_indices[cls_mask] = cls_indices
++
+         # pre-assign each sample to a test fold index using individual KFold
+         # splitting strategies for each class so as to respect the balance of
+         # classes
+@@ -652,22 +662,28 @@ class StratifiedKFold(_BaseKFold):
+         # will break when the data is not 100% stratifiable for all classes.
+         # So we pass np.zeroes(max(c, n_splits)) as data to the KFold
+         per_cls_cvs = [
+-            KFold(self.n_splits, shuffle=self.shuffle,
+-                  random_state=rng).split(np.zeros(max(count, self.n_splits)))
++            KFold(self.n_splits, shuffle=False,
++                  random_state=None).split(np.zeros(max(count, self.n_splits)))
+             for count in y_counts]
+ 
+         test_folds = np.zeros(n_samples, dtype=np.int)
+         for test_fold_indices, per_cls_splits in enumerate(zip(*per_cls_cvs)):
+             for cls, (_, test_split) in zip(unique_y, per_cls_splits):
+-                cls_test_folds = test_folds[y == cls]
++                if self.shuffle:
++                    # Use shuffled indices
++                    cls_indices = shuffled_indices[y == cls]
++                else:
++                    # Use original indices
++                    cls_indices = np.where(y == cls)[0]
++                
+                 # the test split can be too big because we used
+                 # KFold(...).split(X[:max(c, n_splits)]) when data is not 100%
+                 # stratifiable for all the classes
+                 # (we use a warning instead of raising an exception)
+                 # If this is the case, let's trim it:
+-                test_split = test_split[test_split < len(cls_test_folds)]
+-                cls_test_folds[test_split] = test_fold_indices
+-                test_folds[y == cls] = cls_test_folds
++                test_split = test_split[test_split < len(cls_indices)]
++                selected_indices = cls_indices[test_split]
++                test_folds[selected_indices] = test_fold_indices
+ 
+         return test_folds
+ 
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..fb6e7434c
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,68 @@
++import numpy as np
++from sklearn.model_selection import StratifiedKFold
++
++def test_edge_cases():
++    """Test edge cases to ensure we haven't broken anything"""
++    
++    print("=== Test 1: Unbalanced classes ===")
++    X = np.arange(15)
++    y = np.array([0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2])  # 5, 3, 7 samples per class
++    
++    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
++    folds = list(skf.split(X, y))
++    
++    print("Unbalanced classes test:")
++    for i, (train, test) in enumerate(folds):
++        print(f"Fold {i}: test = {test}, y_test = {y[test]}")
++    
++    # Check stratification is preserved
++    for i, (train, test) in enumerate(folds):
++        unique, counts = np.unique(y[test], return_counts=True)
++        print(f"Fold {i} class distribution: {dict(zip(unique, counts))}")
++    print()
++    
++    print("=== Test 2: Binary classification ===")
++    X = np.arange(10)
++    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
++    
++    skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
++    folds = list(skf.split(X, y))
++    
++    print("Binary classification test:")
++    for i, (train, test) in enumerate(folds):
++        print(f"Fold {i}: test = {test}, y_test = {y[test]}")
++    print()
++    
++    print("=== Test 3: shuffle=False should be unchanged ===")
++    X = np.arange(10)
++    y = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
++    
++    skf1 = StratifiedKFold(n_splits=5, shuffle=False, random_state=42)
++    skf2 = StratifiedKFold(n_splits=5, shuffle=False, random_state=123)
++    
++    folds1 = list(skf1.split(X, y))
++    folds2 = list(skf2.split(X, y))
++    
++    print("shuffle=False should give same results regardless of random_state:")
++    same_results = all(np.array_equal(test1, test2) for (_, test1), (_, test2) in zip(folds1, folds2))
++    print("Same results:", same_results)
++    for i, ((train1, test1), (train2, test2)) in enumerate(zip(folds1, folds2)):
++        print(f"Fold {i}: test1 = {test1}, test2 = {test2}")
++    print()
++    
++    print("=== Test 4: Multiclass with many classes ===")
++    X = np.arange(20)
++    y = np.array([0, 1, 2, 3, 4] * 4)  # 5 classes, 4 samples each
++    
++    skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
++    folds = list(skf.split(X, y))
++    
++    print("Multiclass test:")
++    for i, (train, test) in enumerate(folds):
++        unique, counts = np.unique(y[test], return_counts=True)
++        print(f"Fold {i}: test = {test}")
++        print(f"  Class distribution: {dict(zip(unique, counts))}")
++    print()
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_issue_reproduction.py b/test_issue_reproduction.py
+new file mode 100644
+index 000000000..de9ebf6ec
+--- /dev/null
++++ b/test_issue_reproduction.py
+@@ -0,0 +1,32 @@
++import numpy as np
++from sklearn.model_selection import StratifiedKFold
++
++RANDOM_SEED = 1
++
++samples_per_class = 10
++X = np.linspace(0, samples_per_class*2-1, samples_per_class * 2)
++y = np.concatenate((np.ones(samples_per_class), np.zeros(samples_per_class)), axis=0)
++
++print(X, '\n', y, '\n')
++
++print('\nshuffle = False\n')
++
++k_fold = StratifiedKFold(n_splits=10, shuffle=False, random_state=RANDOM_SEED)
++result = 0
++for fold_n, (train_idx, test_idx) in enumerate(k_fold.split(X, y)):
++    print(train_idx, '\n', test_idx)
++
++print('\nshuffle = True, Random seed =', RANDOM_SEED, '\n')
++
++k_fold = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_SEED)
++result = 0
++for fold_n, (train_idx, test_idx) in enumerate(k_fold.split(X, y)):
++    print(train_idx, '\n', test_idx)
++
++RANDOM_SEED += 1
++print('\nshuffle = True, Random seed =', RANDOM_SEED, '\n')
++  
++k_fold = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_SEED)
++result = 0
++for fold_n, (train_idx, test_idx) in enumerate(k_fold.split(X, y)):
++    print(train_idx, '\n', test_idx)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 000000000..925053e5e
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,66 @@
++import numpy as np
++from sklearn.model_selection import StratifiedKFold
++
++def test_original_issue():
++    """Test the exact scenario from the original issue"""
++    
++    RANDOM_SEED = 1
++    
++    samples_per_class = 10
++    X = np.linspace(0, samples_per_class*2-1, samples_per_class * 2)
++    y = np.concatenate((np.ones(samples_per_class), np.zeros(samples_per_class)), axis=0)
++    
++    print("Data:")
++    print("X:", X)
++    print("y:", y)
++    print()
++    
++    # Test with n_splits=10 as in original issue
++    print("=== shuffle=True, Random seed = 1, n_splits=10 ===")
++    k_fold = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_SEED)
++    folds_rs1 = []
++    for fold_n, (train_idx, test_idx) in enumerate(k_fold.split(X, y)):
++        print(f"Fold {fold_n}: test = {test_idx}")
++        folds_rs1.append(test_idx)
++    
++    print("\n=== shuffle=True, Random seed = 2, n_splits=10 ===")
++    RANDOM_SEED = 2
++    k_fold = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_SEED)
++    folds_rs2 = []
++    for fold_n, (train_idx, test_idx) in enumerate(k_fold.split(X, y)):
++        print(f"Fold {fold_n}: test = {test_idx}")
++        folds_rs2.append(test_idx)
++    
++    # Check if the same pairs appear
++    print("\n=== Analysis ===")
++    
++    def extract_pairs(folds):
++        pairs = set()
++        for test_idx in folds:
++            if len(test_idx) == 2:
++                pairs.add(tuple(sorted(test_idx)))
++        return pairs
++    
++    pairs_rs1 = extract_pairs(folds_rs1)
++    pairs_rs2 = extract_pairs(folds_rs2)
++    
++    print("Pairs with random_state=1:", sorted(pairs_rs1))
++    print("Pairs with random_state=2:", sorted(pairs_rs2))
++    
++    if pairs_rs1 == pairs_rs2:
++        print("❌ BUG CONFIRMED: Same pairs regardless of random_state!")
++        
++        # Check the specific pattern mentioned in the issue
++        print("\nChecking if sample i is always paired with sample i+10:")
++        expected_pairs = {(i, i+10) for i in range(10)}
++        if pairs_rs1 == expected_pairs:
++            print("✅ Confirmed: sample i is always paired with sample i+10")
++        else:
++            print("❌ Different pattern than expected")
++            print("Expected:", sorted(expected_pairs))
++            print("Actual:", sorted(pairs_rs1))
++    else:
++        print("✅ WORKING: Different pairs for different random_state")
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file
+diff --git a/test_stratified_kfold_detailed.py b/test_stratified_kfold_detailed.py
+new file mode 100644
+index 000000000..dafdc1e4b
+--- /dev/null
++++ b/test_stratified_kfold_detailed.py
+@@ -0,0 +1,88 @@
++import numpy as np
++from sklearn.model_selection import StratifiedKFold
++
++def test_stratified_kfold_shuffle():
++    """Test to demonstrate the StratifiedKFold shuffle issue"""
++    
++    # Create test data: 10 samples per class
++    samples_per_class = 10
++    X = np.linspace(0, samples_per_class*2-1, samples_per_class * 2)
++    y = np.concatenate((np.ones(samples_per_class), np.zeros(samples_per_class)), axis=0)
++    
++    print("Data:")
++    print("X:", X)
++    print("y:", y)
++    print()
++    
++    # Test 1: shuffle=False
++    print("=== Test 1: shuffle=False ===")
++    skf = StratifiedKFold(n_splits=5, shuffle=False, random_state=42)
++    folds_no_shuffle = list(skf.split(X, y))
++    
++    for i, (train, test) in enumerate(folds_no_shuffle):
++        print(f"Fold {i}: test indices = {test}")
++    print()
++    
++    # Test 2: shuffle=True, random_state=42
++    print("=== Test 2: shuffle=True, random_state=42 ===")
++    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
++    folds_shuffle_42 = list(skf.split(X, y))
++    
++    for i, (train, test) in enumerate(folds_shuffle_42):
++        print(f"Fold {i}: test indices = {test}")
++    print()
++    
++    # Test 3: shuffle=True, random_state=123
++    print("=== Test 3: shuffle=True, random_state=123 ===")
++    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=123)
++    folds_shuffle_123 = list(skf.split(X, y))
++    
++    for i, (train, test) in enumerate(folds_shuffle_123):
++        print(f"Fold {i}: test indices = {test}")
++    print()
++    
++    # Analysis: Check if the same pairs are always together
++    print("=== Analysis ===")
++    
++    def get_class_pairs(folds, y):
++        """Extract which samples from class 1 (0-9) are paired with which from class 0 (10-19)"""
++        pairs = {}
++        for _, test in folds:
++            class1_samples = [idx for idx in test if y[idx] == 1]  # class 1 samples (0-9)
++            class0_samples = [idx for idx in test if y[idx] == 0]  # class 0 samples (10-19)
++            
++            for c1_sample in class1_samples:
++                for c0_sample in class0_samples:
++                    if c1_sample not in pairs:
++                        pairs[c1_sample] = []
++                    pairs[c1_sample].append(c0_sample)
++        return pairs
++    
++    pairs_no_shuffle = get_class_pairs(folds_no_shuffle, y)
++    pairs_shuffle_42 = get_class_pairs(folds_shuffle_42, y)
++    pairs_shuffle_123 = get_class_pairs(folds_shuffle_123, y)
++    
++    print("Class pairings (no shuffle):")
++    for c1, c0_list in sorted(pairs_no_shuffle.items()):
++        print(f"  Sample {c1} (class 1) paired with {c0_list} (class 0)")
++    
++    print("\nClass pairings (shuffle=True, rs=42):")
++    for c1, c0_list in sorted(pairs_shuffle_42.items()):
++        print(f"  Sample {c1} (class 1) paired with {c0_list} (class 0)")
++    
++    print("\nClass pairings (shuffle=True, rs=123):")
++    for c1, c0_list in sorted(pairs_shuffle_123.items()):
++        print(f"  Sample {c1} (class 1) paired with {c0_list} (class 0)")
++    
++    # Check if the pairing pattern is the same
++    print("\nAre pairing patterns identical across different random states?")
++    same_42_123 = pairs_shuffle_42 == pairs_shuffle_123
++    print("Shuffle(42) vs shuffle(123):", same_42_123)
++    
++    if same_42_123:
++        print("❌ BUG CONFIRMED: Same pairing pattern regardless of random_state!")
++    else:
++        print("✅ WORKING: Different pairing patterns for different random_state")
++
++if __name__ == "__main__":
++    test_stratified_kfold_shuffle()
+\ No newline at end of file

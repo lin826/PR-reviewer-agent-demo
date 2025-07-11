@@ -1,0 +1,155 @@
+diff --git a/django/db/migrations/writer.py b/django/db/migrations/writer.py
+index a59f0c8dcb..f75537464e 100644
+--- a/django/db/migrations/writer.py
++++ b/django/db/migrations/writer.py
+@@ -173,9 +173,24 @@ class MigrationWriter:
+         else:
+             imports.add("from django.db import migrations")
+ 
+-        # Sort imports by the package / module to be imported (the part after
+-        # "from" in "from ... import ..." or after "import" in "import ...").
+-        sorted_imports = sorted(imports, key=lambda i: i.split()[1])
++        # Group imports by type ("import" vs "from ... import")
++        # following Django coding style: all "import" statements first,
++        # followed by "from ... import" statements
++        import_statements = []
++        from_import_statements = []
++        
++        for import_line in imports:
++            if import_line.startswith('import '):
++                import_statements.append(import_line)
++            else:
++                from_import_statements.append(import_line)
++                
++        # Sort each group by the package/module name
++        sorted_import_statements = sorted(import_statements, key=lambda i: i.split()[1])
++        sorted_from_statements = sorted(from_import_statements, key=lambda i: i.split()[1])
++        
++        # Join them with all "import" statements first, followed by all "from ... import" statements
++        sorted_imports = sorted_import_statements + sorted_from_statements
+         items["imports"] = "\n".join(sorted_imports) + "\n" if imports else ""
+         if migration_imports:
+             items["imports"] += (
+diff --git a/test_migration_imports.py b/test_migration_imports.py
+new file mode 100755
+index 0000000000..1421ade07a
+--- /dev/null
++++ b/test_migration_imports.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python
++"""
++This script tests the import ordering in generated migration files.
++The current issue is that Django's migration writer is sorting imports by module name,
++ignoring the precedence of 'import module' vs 'from module import objects'.
++"""
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++# Use the current Django project
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++
++import django
++from django.apps import apps
++from django.conf import settings
++from django.db import migrations, models
++from django.db.migrations.writer import MigrationWriter
++
++# Configure Django settings to avoid requiring a full project
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++def create_test_migration():
++    """Create a simple test migration and check its import ordering."""
++    # Create a simple migration with mixed imports
++    # We need to add imports that will result in the problematic ordering
++    import datetime
++    import time
++    
++    # Create the MigrationWriter to test
++    class TestMigrationWriter(MigrationWriter):
++        def as_string(self):
++            content = super().as_string()
++            # Check the original sorting behavior
++            print("Original content:", content)
++            return content
++    
++    migration = type(
++        "Migration",
++        (migrations.Migration,),
++        {
++            "operations": [
++                migrations.AddField(
++                    "testmodel",
++                    "testfield",
++                    models.DateTimeField(default=datetime.datetime.now),
++                ),
++                migrations.AlterField(
++                    "testmodel",
++                    "otherfield",
++                    models.IntegerField(default=time.time),
++                ),
++            ],
++            "dependencies": [],
++        },
++    )
++    
++    # Generate migration file content
++    writer = TestMigrationWriter(migration)
++    content = writer.as_string()
++    
++    # Check the import ordering
++    import_lines = [
++        line for line in content.split("\n")
++        if line.startswith("import ") or line.startswith("from ")
++    ]
++    
++    print("Current import ordering:")
++    for line in import_lines:
++        print(f"  {line}")
++    
++    # Check if imports follow Django style guide
++    import_modules = [line for line in import_lines if line.startswith("import ")]
++    from_modules = [line for line in import_lines if line.startswith("from ")]
++    
++    if not import_lines:
++        print("\nNo imports found in the migration!")
++        return False
++    
++    imports_properly_ordered = True
++    
++    # If there are both import and from-import statements,
++    # check if all import statements come before all from-import statements
++    if import_modules and from_modules:
++        last_import_index = max(import_lines.index(line) for line in import_modules)
++        first_from_index = min(import_lines.index(line) for line in from_modules)
++        
++        if last_import_index > first_from_index:
++            imports_properly_ordered = False
++            print("\nImports are NOT properly ordered!")
++            print("Expected: All 'import' statements before all 'from ... import' statements")
++            
++            # Show how imports should be ordered according to Django style
++            correct_imports = sorted(import_modules) + sorted(from_modules)
++            print("\nCorrect ordering would be:")
++            for line in correct_imports:
++                print(f"  {line}")
++    
++    if imports_properly_ordered:
++        print("\nImports are properly ordered according to Django style guide.")
++        
++    return imports_properly_ordered
++
++if __name__ == "__main__":
++    print("Testing migration import ordering...")
++    result = create_test_migration()
++    sys.exit(0 if result else 1)
+\ No newline at end of file

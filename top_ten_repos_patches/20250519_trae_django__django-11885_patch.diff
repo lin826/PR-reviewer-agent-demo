@@ -1,0 +1,67 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index ae82d26340..8763046b9b 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -280,6 +280,42 @@ class Collector:
+                 return
+         self.data = {model: self.data[model] for model in sorted_models}
+ 
++    def _group_fast_deletes_by_model(self):
++        """
++        Group fast delete QuerySets by their model.
++        
++        For QuerySets that reference the same model but filter on different fields,
++        this will group them together to be deleted in a single SQL query.
++        """
++        grouped_fast_deletes = {}
++        for qs in self.fast_deletes:
++            model = qs.model
++            if model not in grouped_fast_deletes:
++                grouped_fast_deletes[model] = []
++            grouped_fast_deletes[model].append(qs)
++            
++        return grouped_fast_deletes
++        
++    def _combine_model_querysets(self, model, querysets):
++        """
++        Combine multiple QuerySets for the same model into a single QuerySet.
++        
++        This combines the WHERE conditions of multiple QuerySets using OR to 
++        create a single QuerySet that will delete all objects matched by any 
++        of the original QuerySets.
++        """
++        if len(querysets) == 1:
++            return querysets[0]
++            
++        # Start with an empty QuerySet of the same model
++        combined_qs = model._default_manager.using(self.using).none()
++        
++        # Combine all QuerySets with OR operations
++        for qs in querysets:
++            combined_qs = combined_qs | qs
++            
++        return combined_qs
++
+     def delete(self):
+         # sort instance collections
+         for model, instances in self.data.items():
+@@ -309,10 +345,14 @@ class Collector:
+                         sender=model, instance=obj, using=self.using
+                     )
+ 
+-            # fast deletes
+-            for qs in self.fast_deletes:
+-                count = qs._raw_delete(using=self.using)
+-                deleted_counter[qs.model._meta.label] += count
++            # Group fast deletes by model to reduce the number of queries
++            grouped_fast_deletes = self._group_fast_deletes_by_model()
++            
++            # Process the grouped fast deletes
++            for model, querysets in grouped_fast_deletes.items():
++                combined_qs = self._combine_model_querysets(model, querysets)
++                count = combined_qs._raw_delete(using=self.using)
++                deleted_counter[model._meta.label] += count
+ 
+             # update fields
+             for model, instances_for_fieldvalues in self.field_updates.items():
+

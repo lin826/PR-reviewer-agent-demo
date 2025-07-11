@@ -1,0 +1,1341 @@
+diff --git a/requests/adapters.py b/requests/adapters.py
+index fe22ff45..1aa3c8fa 100644
+--- a/requests/adapters.py
++++ b/requests/adapters.py
+@@ -191,8 +191,12 @@ class HTTPAdapter(BaseAdapter):
+             )
+         else:
+             proxy_headers = self.proxy_headers(proxy)
++            # Strip credentials from proxy URL to avoid conflicts with proxy_headers
++            # This ensures authentication is handled consistently via headers
++            from .utils import urldefragauth
++            proxy_url = urldefragauth(proxy)
+             manager = self.proxy_manager[proxy] = proxy_from_url(
+-                proxy,
++                proxy_url,
+                 proxy_headers=proxy_headers,
+                 num_pools=self._pool_connections,
+                 maxsize=self._pool_maxsize,
+diff --git a/test_connect_tunnel.py b/test_connect_tunnel.py
+new file mode 100644
+index 00000000..0926a872
+--- /dev/null
++++ b/test_connect_tunnel.py
+@@ -0,0 +1,149 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test script to investigate CONNECT tunnel behavior that might be affected by Python 3.8.12
++"""
++
++import sys
++import urllib3
++from urllib3.poolmanager import proxy_from_url
++from urllib3.util import parse_url
++import requests
++from requests.adapters import HTTPAdapter
++
++def test_https_proxy_behavior():
++    """Test how HTTPS requests through HTTP proxy work (CONNECT tunnel)"""
++    
++    print(f"Python version: {sys.version}")
++    print(f"urllib3 version: {urllib3.__version__}")
++    print("=" * 60)
++    
++    # Test HTTPS request through HTTP proxy (requires CONNECT tunnel)
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    target_url = "https://example.org/"
++    
++    print(f"Testing HTTPS request through HTTP proxy")
++    print(f"Proxy: {proxy_url}")
++    print(f"Target: {target_url}")
++    
++    # Test how requests would handle this
++    adapter = HTTPAdapter()
++    
++    # Get proxy headers
++    proxy_headers = adapter.proxy_headers(proxy_url)
++    print(f"Proxy headers: {proxy_headers}")
++    
++    # Parse the proxy URL
++    parsed_proxy = parse_url(proxy_url)
++    print(f"Parsed proxy: {parsed_proxy}")
++    
++    # Test proxy manager creation
++    try:
++        manager = proxy_from_url(proxy_url, proxy_headers=proxy_headers)
++        print(f"✓ Proxy manager created: {type(manager)}")
++        
++        # Check manager attributes
++        if hasattr(manager, 'proxy_headers'):
++            print(f"  Manager proxy_headers: {manager.proxy_headers}")
++        if hasattr(manager, 'proxy'):
++            print(f"  Manager proxy: {manager.proxy}")
++            
++    except Exception as e:
++        print(f"✗ Proxy manager creation failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_http_vs_https_proxy():
++    """Test difference between HTTP and HTTPS requests through proxy"""
++    
++    print("\n" + "=" * 60)
++    print("Testing HTTP vs HTTPS through proxy")
++    
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    
++    test_cases = [
++        ("http://example.org/", "HTTP request (no tunnel)"),
++        ("https://example.org/", "HTTPS request (CONNECT tunnel)"),
++    ]
++    
++    adapter = HTTPAdapter()
++    
++    for target_url, description in test_cases:
++        print(f"\n{description}")
++        print(f"Target: {target_url}")
++        
++        try:
++            # Get proxy headers
++            proxy_headers = adapter.proxy_headers(proxy_url)
++            print(f"  Proxy headers: {proxy_headers}")
++            
++            # Create proxy manager
++            manager = proxy_from_url(proxy_url, proxy_headers=proxy_headers)
++            print(f"  ✓ Manager created for {target_url}")
++            
++        except Exception as e:
++            print(f"  ✗ Failed for {target_url}: {e}")
++
++def test_proxy_auth_header_handling():
++    """Test how proxy auth headers are handled in different scenarios"""
++    
++    print("\n" + "=" * 60)
++    print("Testing proxy auth header handling")
++    
++    from requests.auth import _basic_auth_str
++    
++    # Test different proxy configurations
++    test_proxies = [
++        "http://user:pass@proxy.example.com:8080",
++        "http://user@proxy.example.com:8080",  # No password
++        "http://proxy.example.com:8080",       # No auth
++    ]
++    
++    adapter = HTTPAdapter()
++    
++    for proxy_url in test_proxies:
++        print(f"\nTesting proxy: {proxy_url}")
++        
++        try:
++            headers = adapter.proxy_headers(proxy_url)
++            print(f"  Generated headers: {headers}")
++            
++            # Test if the headers are valid
++            if 'Proxy-Authorization' in headers:
++                auth_header = headers['Proxy-Authorization']
++                if auth_header.startswith('Basic '):
++                    print(f"  ✓ Valid Basic auth header")
++                else:
++                    print(f"  ✗ Invalid auth header format: {auth_header}")
++            else:
++                print(f"  ✓ No auth header (expected for proxy without credentials)")
++                
++        except Exception as e:
++            print(f"  ✗ Error processing proxy: {e}")
++
++def test_urllib3_version_compatibility():
++    """Test urllib3 version-specific behavior"""
++    
++    print("\n" + "=" * 60)
++    print("Testing urllib3 version compatibility")
++    
++    print(f"urllib3 version: {urllib3.__version__}")
++    
++    # Check if there are any version-specific behaviors
++    try:
++        from urllib3.poolmanager import ProxyManager
++        print(f"✓ ProxyManager available: {ProxyManager}")
++        
++        # Check ProxyManager attributes
++        proxy_manager_attrs = [attr for attr in dir(ProxyManager) if not attr.startswith('_')]
++        print(f"  ProxyManager methods: {proxy_manager_attrs}")
++        
++    except Exception as e:
++        print(f"✗ ProxyManager import failed: {e}")
++
++if __name__ == '__main__':
++    test_https_proxy_behavior()
++    test_http_vs_https_proxy()
++    test_proxy_auth_header_handling()
++    test_urllib3_version_compatibility()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..b55e1e8d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test edge cases for the proxy authentication fix
++"""
++
++import requests
++from requests.adapters import HTTPAdapter
++
++def test_edge_cases():
++    """Test various edge cases"""
++    
++    print("Testing edge cases...")
++    
++    adapter = HTTPAdapter()
++    
++    test_cases = [
++        # Normal cases
++        ("http://user:pass@proxy.example.com:8080", "Normal credentials"),
++        ("http://proxy.example.com:8080", "No credentials"),
++        
++        # Edge cases
++        ("http://user:@proxy.example.com:8080", "Empty password"),
++        ("http://:pass@proxy.example.com:8080", "Empty username"),
++        ("http://:@proxy.example.com:8080", "Both empty"),
++        ("http://user:p%40ss@proxy.example.com:8080", "URL encoded password"),
++        ("http://user%40domain:pass@proxy.example.com:8080", "URL encoded username"),
++        
++        # Special characters
++        ("http://user:p@ss@proxy.example.com:8080", "Password with @"),
++        ("http://user:p:ss@proxy.example.com:8080", "Password with :"),
++        
++        # Different ports
++        ("http://user:pass@proxy.example.com", "No port"),
++        ("http://user:pass@proxy.example.com:3128", "Different port"),
++        
++        # HTTPS proxy
++        ("https://user:pass@proxy.example.com:8080", "HTTPS proxy"),
++    ]
++    
++    for proxy_url, description in test_cases:
++        print(f"\n{description}: {proxy_url}")
++        
++        try:
++            # Test proxy headers
++            headers = adapter.proxy_headers(proxy_url)
++            print(f"  Headers: {headers}")
++            
++            # Test proxy manager
++            manager = adapter.proxy_manager_for(proxy_url)
++            print(f"  Manager proxy: {manager.proxy}")
++            print(f"  Manager headers: {manager.proxy_headers}")
++            
++            # Verify credentials are stripped from URL
++            if '@' in proxy_url and '@' not in manager.proxy:
++                print(f"  ✓ Credentials stripped from URL")
++            elif '@' not in proxy_url:
++                print(f"  ✓ No credentials to strip")
++            else:
++                print(f"  ✗ Credentials not stripped from URL")
++            
++            # Verify headers consistency
++            if headers == manager.proxy_headers:
++                print(f"  ✓ Headers consistent")
++            else:
++                print(f"  ✗ Headers inconsistent")
++                
++        except Exception as e:
++            print(f"  ✗ Error: {e}")
++            import traceback
++            traceback.print_exc()
++
++def test_caching_behavior():
++    """Test that caching still works correctly"""
++    
++    print("\n" + "=" * 60)
++    print("Testing caching behavior...")
++    
++    adapter = HTTPAdapter()
++    
++    # Test that same proxy URL returns same manager
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    
++    manager1 = adapter.proxy_manager_for(proxy_url)
++    manager2 = adapter.proxy_manager_for(proxy_url)
++    
++    if id(manager1) == id(manager2):
++        print("✓ Caching works: same manager returned for same proxy")
++    else:
++        print("✗ Caching broken: different managers returned for same proxy")
++    
++    # Test that different credentials create different managers
++    proxy_url2 = "http://user2:pass2@proxy.example.com:8080"
++    manager3 = adapter.proxy_manager_for(proxy_url2)
++    
++    if id(manager1) != id(manager3):
++        print("✓ Different credentials create different managers")
++    else:
++        print("✗ Same manager used for different credentials")
++
++def test_session_integration():
++    """Test integration with session"""
++    
++    print("\n" + "=" * 60)
++    print("Testing session integration...")
++    
++    from requests.sessions import Session
++    from requests.models import PreparedRequest
++    
++    session = Session()
++    
++    # Test with credentials in URL
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    proxies = {'https': proxy_url}
++    
++    req = PreparedRequest()
++    req.prepare(method='GET', url='https://example.org/')
++    
++    # Test rebuild_proxies
++    new_proxies = session.rebuild_proxies(req, proxies)
++    
++    print(f"Original proxies: {proxies}")
++    print(f"Rebuilt proxies: {new_proxies}")
++    print(f"Request headers: {dict(req.headers)}")
++    
++    if 'Proxy-Authorization' in req.headers:
++        print("✓ Session correctly adds Proxy-Authorization header")
++    else:
++        print("✗ Session missing Proxy-Authorization header")
++
++if __name__ == '__main__':
++    test_edge_cases()
++    test_caching_behavior()
++    test_session_integration()
+\ No newline at end of file
+diff --git a/test_encoding_issue.py b/test_encoding_issue.py
+new file mode 100644
+index 00000000..9c707727
+--- /dev/null
++++ b/test_encoding_issue.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test script to check for encoding issues that might affect Python 3.8.12
++"""
++
++import sys
++import base64
++from requests.auth import _basic_auth_str
++from requests._internal_utils import to_native_string
++
++def test_encoding_variations():
++    """Test different encoding scenarios that might be affected by Python 3.8.12 changes"""
++    
++    print(f"Python version: {sys.version}")
++    print("=" * 60)
++    
++    # Test basic case
++    username = 'user'
++    password = 'pass'
++    
++    print(f"Testing with username='{username}', password='{password}'")
++    
++    # Test the _basic_auth_str function step by step
++    print("\nStep-by-step encoding:")
++    
++    # Step 1: Convert to bytes if needed
++    if isinstance(username, str):
++        username_bytes = username.encode('latin1')
++        print(f"1. Username encoded to latin1: {username_bytes}")
++    else:
++        username_bytes = username
++        print(f"1. Username already bytes: {username_bytes}")
++    
++    if isinstance(password, str):
++        password_bytes = password.encode('latin1')
++        print(f"2. Password encoded to latin1: {password_bytes}")
++    else:
++        password_bytes = password
++        print(f"2. Password already bytes: {password_bytes}")
++    
++    # Step 2: Join with colon
++    combined = b':'.join((username_bytes, password_bytes))
++    print(f"3. Combined bytes: {combined}")
++    
++    # Step 3: Base64 encode
++    b64_encoded = base64.b64encode(combined)
++    print(f"4. Base64 encoded: {b64_encoded}")
++    
++    # Step 4: Strip and convert to native string
++    b64_stripped = b64_encoded.strip()
++    print(f"5. Base64 stripped: {b64_stripped}")
++    
++    native_string = to_native_string(b64_stripped)
++    print(f"6. Native string: {native_string}")
++    
++    # Step 5: Add Basic prefix
++    auth_str = 'Basic ' + native_string
++    print(f"7. Final auth string: {auth_str}")
++    
++    # Compare with the actual function
++    actual_result = _basic_auth_str(username, password)
++    print(f"\nActual _basic_auth_str result: {actual_result}")
++    
++    if auth_str == actual_result:
++        print("✓ Manual encoding matches _basic_auth_str")
++    else:
++        print("✗ Manual encoding differs from _basic_auth_str")
++        print(f"  Expected: {auth_str}")
++        print(f"  Actual:   {actual_result}")
++
++def test_special_characters():
++    """Test with special characters that might cause encoding issues"""
++    
++    print("\n" + "=" * 60)
++    print("Testing special characters")
++    
++    test_cases = [
++        ('user', 'pass'),
++        ('user@domain', 'pass'),
++        ('user', 'p@ss'),
++        ('user', 'pässwörd'),  # Non-ASCII characters
++        ('üser', 'pass'),      # Non-ASCII username
++        ('user', ''),          # Empty password
++        ('', 'pass'),          # Empty username
++    ]
++    
++    for username, password in test_cases:
++        try:
++            result = _basic_auth_str(username, password)
++            print(f"✓ '{username}':'{password}' -> {result}")
++        except Exception as e:
++            print(f"✗ '{username}':'{password}' -> ERROR: {e}")
++
++def test_to_native_string():
++    """Test the to_native_string function specifically"""
++    
++    print("\n" + "=" * 60)
++    print("Testing to_native_string function")
++    
++    test_inputs = [
++        b'dXNlcjpwYXNz',  # Basic user:pass
++        'dXNlcjpwYXNz',   # String version
++        b'',              # Empty bytes
++        '',               # Empty string
++    ]
++    
++    for inp in test_inputs:
++        try:
++            result = to_native_string(inp)
++            print(f"✓ to_native_string({inp!r}) -> {result!r}")
++        except Exception as e:
++            print(f"✗ to_native_string({inp!r}) -> ERROR: {e}")
++
++if __name__ == '__main__':
++    test_encoding_variations()
++    test_special_characters()
++    test_to_native_string()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 00000000..7dd6eb94
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test the fix for proxy authentication bug
++"""
++
++import sys
++import requests
++from requests.adapters import HTTPAdapter
++
++def test_proxy_manager_with_fix():
++    """Test proxy manager creation with the fix"""
++    
++    print(f"Python version: {sys.version}")
++    print("=" * 60)
++    
++    adapter = HTTPAdapter()
++    
++    # Test with credentials in URL
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    
++    print(f"Testing proxy URL: {proxy_url}")
++    
++    # Get proxy headers
++    proxy_headers = adapter.proxy_headers(proxy_url)
++    print(f"Proxy headers: {proxy_headers}")
++    
++    # Get proxy manager
++    manager = adapter.proxy_manager_for(proxy_url)
++    print(f"Manager type: {type(manager)}")
++    print(f"Manager proxy: {manager.proxy}")
++    print(f"Manager proxy_headers: {manager.proxy_headers}")
++    
++    # Check if the fix worked
++    if manager.proxy_headers and 'Proxy-Authorization' in manager.proxy_headers:
++        print("✓ Fix successful: Proxy authentication is handled via headers")
++        print(f"  Auth header: {manager.proxy_headers['Proxy-Authorization']}")
++    else:
++        print("✗ Fix failed: No proxy authentication headers found")
++    
++    # Check if credentials were stripped from URL
++    if '@' not in manager.proxy:
++        print("✓ Credentials stripped from proxy URL")
++    else:
++        print("✗ Credentials still in proxy URL")
++
++def test_session_with_fix():
++    """Test session behavior with the fix"""
++    
++    print("\n" + "=" * 60)
++    print("Testing session behavior with fix...")
++    
++    from requests.sessions import Session
++    from requests.models import PreparedRequest
++    
++    session = Session()
++    
++    # Test with credentials in URL
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    proxies = {'https': proxy_url}
++    
++    # Create a prepared request
++    req = PreparedRequest()
++    req.prepare(method='GET', url='https://example.org/')
++    
++    print(f"Original proxy: {proxy_url}")
++    
++    # Call rebuild_proxies
++    new_proxies = session.rebuild_proxies(req, proxies)
++    
++    print(f"Rebuilt proxies: {new_proxies}")
++    print(f"Request headers: {dict(req.headers)}")
++    
++    # Check if Proxy-Authorization header is present
++    if 'Proxy-Authorization' in req.headers:
++        print(f"✓ Request has Proxy-Authorization: {req.headers['Proxy-Authorization']}")
++    else:
++        print("✗ Request missing Proxy-Authorization header")
++
++def test_multiple_proxy_configs():
++    """Test different proxy configurations"""
++    
++    print("\n" + "=" * 60)
++    print("Testing multiple proxy configurations...")
++    
++    adapter = HTTPAdapter()
++    
++    test_cases = [
++        ("http://user:pass@proxy.example.com:8080", "Credentials in URL"),
++        ("http://proxy.example.com:8080", "No credentials"),
++        ("http://user:@proxy.example.com:8080", "Username only"),
++        ("http://user:p%40ss@proxy.example.com:8080", "URL encoded password"),
++    ]
++    
++    for proxy_url, description in test_cases:
++        print(f"\n{description}: {proxy_url}")
++        
++        try:
++            # Get proxy headers
++            headers = adapter.proxy_headers(proxy_url)
++            print(f"  Headers: {headers}")
++            
++            # Get proxy manager
++            manager = adapter.proxy_manager_for(proxy_url)
++            print(f"  Manager proxy: {manager.proxy}")
++            print(f"  Manager headers: {manager.proxy_headers}")
++            
++            # Check consistency
++            if headers == manager.proxy_headers:
++                print(f"  ✓ Headers consistent")
++            else:
++                print(f"  ✗ Headers inconsistent")
++                print(f"    Expected: {headers}")
++                print(f"    Got: {manager.proxy_headers}")
++                
++        except Exception as e:
++            print(f"  ✗ Error: {e}")
++
++if __name__ == '__main__':
++    test_proxy_manager_with_fix()
++    test_session_with_fix()
++    test_multiple_proxy_configs()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 00000000..7bc64d5e
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test that demonstrates the fix for the original proxy authentication issue
++"""
++
++import sys
++import requests
++from requests.adapters import HTTPAdapter
++from unittest.mock import patch, MagicMock
++
++def test_original_issue_scenario():
++    """Test the exact scenario from the original issue"""
++    
++    print(f"Python version: {sys.version}")
++    print("=" * 60)
++    print("Testing original issue scenario...")
++    
++    # This is the scenario from the original issue
++    proxies = {
++        'https': 'http://user:pass@proxy.example.com:8080'
++    }
++    
++    print(f"Proxies configuration: {proxies}")
++    
++    # Test that the proxy manager is created correctly
++    adapter = HTTPAdapter()
++    proxy_url = proxies['https']
++    
++    print(f"\n1. Testing proxy manager creation...")
++    manager = adapter.proxy_manager_for(proxy_url)
++    print(f"   Manager proxy: {manager.proxy}")
++    print(f"   Manager headers: {manager.proxy_headers}")
++    
++    # Verify the fix
++    if manager.proxy_headers and 'Proxy-Authorization' in manager.proxy_headers:
++        print("   ✓ Proxy authentication headers are present")
++        auth_header = manager.proxy_headers['Proxy-Authorization']
++        print(f"   ✓ Auth header: {auth_header}")
++        
++        # Verify it's a valid Basic auth header
++        if auth_header.startswith('Basic '):
++            print("   ✓ Valid Basic authentication header")
++        else:
++            print("   ✗ Invalid authentication header format")
++    else:
++        print("   ✗ No proxy authentication headers found")
++    
++    # Verify credentials are stripped from URL
++    if '@' not in manager.proxy:
++        print("   ✓ Credentials stripped from proxy URL")
++    else:
++        print("   ✗ Credentials still in proxy URL")
++    
++    print(f"\n2. Testing session behavior...")
++    
++    # Test with session (as in original issue)
++    from requests.sessions import Session
++    from requests.models import PreparedRequest
++    
++    session = Session()
++    req = PreparedRequest()
++    req.prepare(method='GET', url='https://example.org/')
++    
++    # This is what happens internally when making a request
++    new_proxies = session.rebuild_proxies(req, proxies)
++    
++    print(f"   Rebuilt proxies: {new_proxies}")
++    print(f"   Request headers: {dict(req.headers)}")
++    
++    if 'Proxy-Authorization' in req.headers:
++        print("   ✓ Request has Proxy-Authorization header")
++        print(f"   ✓ Header value: {req.headers['Proxy-Authorization']}")
++    else:
++        print("   ✗ Request missing Proxy-Authorization header")
++
++def test_mock_request_with_fix():
++    """Test with a mock to simulate the actual request flow"""
++    
++    print(f"\n3. Testing with mock request...")
++    
++    # Mock urllib3 to capture what gets passed to it
++    with patch('urllib3.poolmanager.proxy_from_url') as mock_proxy_from_url:
++        mock_manager = MagicMock()
++        mock_manager.proxy = 'http://proxy.example.com:8080'
++        mock_manager.proxy_headers = {'Proxy-Authorization': 'Basic dXNlcjpwYXNz'}
++        mock_proxy_from_url.return_value = mock_manager
++        
++        # Create adapter and get proxy manager
++        adapter = HTTPAdapter()
++        proxy_url = 'http://user:pass@proxy.example.com:8080'
++        
++        manager = adapter.proxy_manager_for(proxy_url)
++        
++        # Check what was passed to urllib3
++        if mock_proxy_from_url.called:
++            call_args = mock_proxy_from_url.call_args
++            passed_url = call_args[0][0]  # First positional argument
++            passed_headers = call_args[1].get('proxy_headers', {})  # Keyword argument
++            
++            print(f"   URL passed to urllib3: {passed_url}")
++            print(f"   Headers passed to urllib3: {passed_headers}")
++            
++            # Verify the fix
++            if '@' not in passed_url:
++                print("   ✓ Credentials stripped from URL passed to urllib3")
++            else:
++                print("   ✗ Credentials still in URL passed to urllib3")
++            
++            if 'Proxy-Authorization' in passed_headers:
++                print("   ✓ Proxy-Authorization header passed to urllib3")
++            else:
++                print("   ✗ No Proxy-Authorization header passed to urllib3")
++        else:
++            print("   ✗ urllib3 proxy_from_url not called")
++
++def test_python_version_compatibility():
++    """Test that the fix should work across Python versions"""
++    
++    print(f"\n4. Testing Python version compatibility...")
++    
++    # Test the core components that might be affected by Python version changes
++    from requests.auth import _basic_auth_str
++    from requests.utils import get_auth_from_url, urldefragauth
++    
++    # Test auth string generation
++    auth_str = _basic_auth_str('user', 'pass')
++    expected = 'Basic dXNlcjpwYXNz'
++    
++    if auth_str == expected:
++        print("   ✓ Basic auth string generation works correctly")
++    else:
++        print(f"   ✗ Basic auth string generation failed: {auth_str} != {expected}")
++    
++    # Test URL parsing
++    proxy_url = 'http://user:pass@proxy.example.com:8080'
++    username, password = get_auth_from_url(proxy_url)
++    
++    if username == 'user' and password == 'pass':
++        print("   ✓ URL auth extraction works correctly")
++    else:
++        print(f"   ✗ URL auth extraction failed: {username}, {password}")
++    
++    # Test URL cleaning
++    clean_url = urldefragauth(proxy_url)
++    expected_clean = 'http://proxy.example.com:8080'
++    
++    if clean_url == expected_clean:
++        print("   ✓ URL credential stripping works correctly")
++    else:
++        print(f"   ✗ URL credential stripping failed: {clean_url} != {expected_clean}")
++
++if __name__ == '__main__':
++    test_original_issue_scenario()
++    test_mock_request_with_fix()
++    test_python_version_compatibility()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print("The fix ensures that proxy authentication is handled consistently")
++    print("via headers, which should resolve the Python 3.8.12 compatibility issue.")
++    print("Credentials are stripped from proxy URLs and passed explicitly as headers")
++    print("to urllib3, avoiding potential conflicts in CONNECT tunnel authentication.")
++    print("=" * 60)
+\ No newline at end of file
+diff --git a/test_proxy_auth_bug.py b/test_proxy_auth_bug.py
+new file mode 100644
+index 00000000..117fa549
+--- /dev/null
++++ b/test_proxy_auth_bug.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test script to reproduce the proxy authentication bug in Python 3.8.12
++"""
++
++import sys
++import requests
++from requests.adapters import HTTPAdapter
++from requests.auth import _basic_auth_str
++import urllib3
++from unittest.mock import patch, MagicMock
++
++def test_proxy_headers_generation():
++    """Test that proxy headers are generated correctly"""
++    print(f"Python version: {sys.version}")
++    print(f"Requests version: {requests.__version__}")
++    print(f"urllib3 version: {urllib3.__version__}")
++    
++    # Test basic proxy header generation
++    adapter = HTTPAdapter()
++    headers = adapter.proxy_headers("http://user:pass@proxy.example.com:8080")
++    print(f"Generated proxy headers: {headers}")
++    
++    expected = {'Proxy-Authorization': 'Basic dXNlcjpwYXNz'}
++    assert headers == expected, f"Expected {expected}, got {headers}"
++    print("✓ Basic proxy header generation works")
++
++def test_basic_auth_str():
++    """Test the _basic_auth_str function directly"""
++    auth_str = _basic_auth_str('user', 'pass')
++    print(f"Generated auth string: {auth_str}")
++    
++    expected = 'Basic dXNlcjpwYXNz'
++    assert auth_str == expected, f"Expected {expected}, got {auth_str}"
++    print("✓ Basic auth string generation works")
++
++def test_proxy_auth_with_mock():
++    """Test proxy authentication with a mock server"""
++    
++    # Create a mock response that simulates a 407 error
++    mock_response = MagicMock()
++    mock_response.status_code = 407
++    mock_response.headers = {'Proxy-Authenticate': 'Basic realm="proxy"'}
++    mock_response.content = b'Proxy Authentication Required'
++    
++    # Test that we can handle the 407 response
++    print(f"Mock 407 response status: {mock_response.status_code}")
++    
++    # Now test with a successful response
++    mock_success = MagicMock()
++    mock_success.status_code = 200
++    mock_success.headers = {'Content-Type': 'text/html'}
++    mock_success.content = b'Success'
++    
++    print(f"Mock 200 response status: {mock_success.status_code}")
++    print("✓ Mock responses work correctly")
++
++def test_session_rebuild_proxies():
++    """Test the session's rebuild_proxies method"""
++    from requests.sessions import Session
++    from requests.models import PreparedRequest
++    
++    session = Session()
++    
++    # Create a prepared request
++    req = PreparedRequest()
++    req.prepare(method='GET', url='https://example.org/')
++    
++    # Test with proxy that has auth
++    proxies = {'https': 'http://user:pass@proxy.example.com:8080'}
++    
++    # Call rebuild_proxies
++    new_proxies = session.rebuild_proxies(req, proxies)
++    
++    print(f"Original proxies: {proxies}")
++    print(f"Rebuilt proxies: {new_proxies}")
++    print(f"Request headers after rebuild: {dict(req.headers)}")
++    
++    # Check if Proxy-Authorization header was added
++    if 'Proxy-Authorization' in req.headers:
++        print(f"✓ Proxy-Authorization header added: {req.headers['Proxy-Authorization']}")
++    else:
++        print("✗ Proxy-Authorization header NOT added")
++    
++    return req.headers.get('Proxy-Authorization')
++
++def main():
++    """Run all tests"""
++    print("=" * 60)
++    print("Testing proxy authentication functionality")
++    print("=" * 60)
++    
++    try:
++        test_basic_auth_str()
++        print()
++        
++        test_proxy_headers_generation()
++        print()
++        
++        test_proxy_auth_with_mock()
++        print()
++        
++        proxy_auth_header = test_session_rebuild_proxies()
++        print()
++        
++        if proxy_auth_header:
++            print("✓ All tests passed - proxy authentication should work")
++        else:
++            print("✗ Proxy authentication header not generated properly")
++            
++    except Exception as e:
++        print(f"✗ Test failed with error: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_proxy_header_flow.py b/test_proxy_header_flow.py
+new file mode 100644
+index 00000000..c2bc1a74
+--- /dev/null
++++ b/test_proxy_header_flow.py
+@@ -0,0 +1,155 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test script to trace how proxy headers flow through the system
++"""
++
++import sys
++import requests
++from requests.adapters import HTTPAdapter
++from requests.sessions import Session
++from requests.models import PreparedRequest
++from unittest.mock import patch, MagicMock
++
++def test_proxy_header_flow():
++    """Test the complete flow of proxy headers"""
++    
++    print(f"Python version: {sys.version}")
++    print("=" * 60)
++    
++    # Create a session and adapter
++    session = Session()
++    adapter = HTTPAdapter()
++    
++    # Test proxy configuration
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    proxies = {'https': proxy_url}
++    
++    print(f"Testing proxy: {proxy_url}")
++    
++    # Step 1: Test proxy_headers method
++    proxy_headers = adapter.proxy_headers(proxy_url)
++    print(f"1. proxy_headers() result: {proxy_headers}")
++    
++    # Step 2: Test proxy_manager_for method
++    try:
++        proxy_manager = adapter.proxy_manager_for(proxy_url)
++        print(f"2. proxy_manager_for() result: {type(proxy_manager)}")
++        if hasattr(proxy_manager, 'proxy_headers'):
++            print(f"   Manager proxy_headers: {proxy_manager.proxy_headers}")
++    except Exception as e:
++        print(f"2. proxy_manager_for() failed: {e}")
++    
++    # Step 3: Test session.rebuild_proxies
++    req = PreparedRequest()
++    req.prepare(method='GET', url='https://example.org/')
++    
++    print(f"3. Before rebuild_proxies - request headers: {dict(req.headers)}")
++    
++    new_proxies = session.rebuild_proxies(req, proxies)
++    print(f"   After rebuild_proxies - request headers: {dict(req.headers)}")
++    print(f"   Rebuilt proxies: {new_proxies}")
++    
++    # Step 4: Check if Proxy-Authorization is in the request headers
++    if 'Proxy-Authorization' in req.headers:
++        print(f"✓ Proxy-Authorization header found: {req.headers['Proxy-Authorization']}")
++    else:
++        print("✗ Proxy-Authorization header NOT found in request")
++
++def test_mock_request():
++    """Test with a mock request to see what headers are sent"""
++    
++    print("\n" + "=" * 60)
++    print("Testing with mock request")
++    
++    # Mock the urllib3 connection
++    with patch('requests.adapters.HTTPAdapter.send') as mock_send:
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.headers = {}
++        mock_response.content = b'Success'
++        mock_send.return_value = mock_response
++        
++        # Make a request through proxy
++        proxies = {'https': 'http://user:pass@proxy.example.com:8080'}
++        
++        try:
++            response = requests.get('https://example.org/', proxies=proxies)
++            print(f"✓ Request succeeded: {response.status_code}")
++            
++            # Check what was passed to the mock
++            if mock_send.called:
++                call_args = mock_send.call_args
++                request = call_args[0][0]  # First positional argument
++                print(f"  Request headers: {dict(request.headers)}")
++                
++                if 'Proxy-Authorization' in request.headers:
++                    print(f"  ✓ Proxy-Authorization header: {request.headers['Proxy-Authorization']}")
++                else:
++                    print(f"  ✗ No Proxy-Authorization header found")
++            
++        except Exception as e:
++            print(f"✗ Request failed: {e}")
++
++def test_direct_urllib3():
++    """Test urllib3 directly to see how it handles proxy headers"""
++    
++    print("\n" + "=" * 60)
++    print("Testing urllib3 directly")
++    
++    import urllib3
++    from urllib3.poolmanager import proxy_from_url
++    
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    proxy_headers = {'Proxy-Authorization': 'Basic dXNlcjpwYXNz'}
++    
++    try:
++        # Create proxy manager
++        manager = proxy_from_url(proxy_url, proxy_headers=proxy_headers)
++        print(f"✓ Proxy manager created: {type(manager)}")
++        
++        # Check manager configuration
++        print(f"  Manager proxy: {manager.proxy}")
++        print(f"  Manager proxy_headers: {manager.proxy_headers}")
++        
++        # Try to inspect the manager's internal state
++        if hasattr(manager, 'proxy_config'):
++            print(f"  Manager proxy_config: {manager.proxy_config}")
++            
++    except Exception as e:
++        print(f"✗ urllib3 test failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_header_case_sensitivity():
++    """Test if header case sensitivity is an issue"""
++    
++    print("\n" + "=" * 60)
++    print("Testing header case sensitivity")
++    
++    from requests.structures import CaseInsensitiveDict
++    
++    # Test different header cases
++    test_headers = [
++        'Proxy-Authorization',
++        'proxy-authorization',
++        'PROXY-AUTHORIZATION',
++        'Proxy-authorization',
++    ]
++    
++    for header_name in test_headers:
++        headers = CaseInsensitiveDict()
++        headers[header_name] = 'Basic dXNlcjpwYXNz'
++        
++        # Check if it's accessible with standard case
++        if 'Proxy-Authorization' in headers:
++            print(f"✓ {header_name} -> accessible as Proxy-Authorization")
++        else:
++            print(f"✗ {header_name} -> NOT accessible as Proxy-Authorization")
++
++if __name__ == '__main__':
++    test_proxy_header_flow()
++    test_mock_request()
++    test_direct_urllib3()
++    test_header_case_sensitivity()
+\ No newline at end of file
+diff --git a/test_python_version_issue.py b/test_python_version_issue.py
+new file mode 100644
+index 00000000..f1fbf6f9
+--- /dev/null
++++ b/test_python_version_issue.py
+@@ -0,0 +1,149 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test to investigate potential Python version-specific issues
++"""
++
++import sys
++import requests
++from requests.adapters import HTTPAdapter
++from unittest.mock import patch, MagicMock
++
++def test_proxy_manager_caching():
++    """Test if proxy manager caching is causing issues"""
++    
++    print(f"Python version: {sys.version}")
++    print("=" * 60)
++    
++    adapter = HTTPAdapter()
++    
++    # Test with same proxy URL but different credentials
++    proxy_url1 = "http://user1:pass1@proxy.example.com:8080"
++    proxy_url2 = "http://user2:pass2@proxy.example.com:8080"
++    proxy_url3 = "http://proxy.example.com:8080"  # No credentials in URL
++    
++    print("Testing proxy manager caching...")
++    
++    # Get managers for different proxy configurations
++    manager1 = adapter.proxy_manager_for(proxy_url1)
++    manager2 = adapter.proxy_manager_for(proxy_url2)
++    manager3 = adapter.proxy_manager_for(proxy_url3)
++    
++    print(f"Manager 1 (user1): {id(manager1)} - headers: {manager1.proxy_headers}")
++    print(f"Manager 2 (user2): {id(manager2)} - headers: {manager2.proxy_headers}")
++    print(f"Manager 3 (no auth): {id(manager3)} - headers: {manager3.proxy_headers}")
++    
++    # Check if they're different instances (they should be)
++    if id(manager1) != id(manager2):
++        print("✓ Different credentials create different managers")
++    else:
++        print("✗ Same manager used for different credentials - POTENTIAL BUG!")
++    
++    # Test getting the same manager again
++    manager1_again = adapter.proxy_manager_for(proxy_url1)
++    if id(manager1) == id(manager1_again):
++        print("✓ Same proxy URL returns cached manager")
++    else:
++        print("✗ Same proxy URL creates new manager - caching not working")
++
++def test_proxy_headers_consistency():
++    """Test if proxy headers are consistent across calls"""
++    
++    print("\n" + "=" * 60)
++    print("Testing proxy headers consistency...")
++    
++    adapter = HTTPAdapter()
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    
++    # Get headers multiple times
++    headers1 = adapter.proxy_headers(proxy_url)
++    headers2 = adapter.proxy_headers(proxy_url)
++    headers3 = adapter.proxy_headers(proxy_url)
++    
++    print(f"Headers 1: {headers1}")
++    print(f"Headers 2: {headers2}")
++    print(f"Headers 3: {headers3}")
++    
++    if headers1 == headers2 == headers3:
++        print("✓ Proxy headers are consistent")
++    else:
++        print("✗ Proxy headers are inconsistent - POTENTIAL BUG!")
++
++def test_session_proxy_handling():
++    """Test how session handles proxy authentication"""
++    
++    print("\n" + "=" * 60)
++    print("Testing session proxy handling...")
++    
++    from requests.sessions import Session
++    from requests.models import PreparedRequest
++    
++    session = Session()
++    
++    # Test different proxy configurations
++    test_cases = [
++        ("http://user:pass@proxy.example.com:8080", "Credentials in URL"),
++        ("http://proxy.example.com:8080", "No credentials in URL"),
++    ]
++    
++    for proxy_url, description in test_cases:
++        print(f"\nTesting: {description}")
++        print(f"Proxy URL: {proxy_url}")
++        
++        # Create a prepared request
++        req = PreparedRequest()
++        req.prepare(method='GET', url='https://example.org/')
++        
++        proxies = {'https': proxy_url}
++        
++        # Call rebuild_proxies
++        new_proxies = session.rebuild_proxies(req, proxies)
++        
++        print(f"  Original proxies: {proxies}")
++        print(f"  Rebuilt proxies: {new_proxies}")
++        print(f"  Request headers: {dict(req.headers)}")
++        
++        # Check if Proxy-Authorization header is present
++        if 'Proxy-Authorization' in req.headers:
++            print(f"  ✓ Proxy-Authorization: {req.headers['Proxy-Authorization']}")
++        else:
++            print(f"  ✗ No Proxy-Authorization header")
++
++def test_urllib3_proxy_behavior():
++    """Test urllib3 proxy behavior directly"""
++    
++    print("\n" + "=" * 60)
++    print("Testing urllib3 proxy behavior...")
++    
++    import urllib3
++    from urllib3.poolmanager import proxy_from_url
++    
++    # Test creating proxy managers with different configurations
++    test_cases = [
++        ("http://user:pass@proxy.example.com:8080", {}),
++        ("http://proxy.example.com:8080", {'Proxy-Authorization': 'Basic dXNlcjpwYXNz'}),
++    ]
++    
++    for proxy_url, proxy_headers in test_cases:
++        print(f"\nTesting proxy: {proxy_url}")
++        print(f"Headers: {proxy_headers}")
++        
++        try:
++            manager = proxy_from_url(proxy_url, proxy_headers=proxy_headers)
++            print(f"  ✓ Manager created: {type(manager)}")
++            print(f"  Manager proxy: {manager.proxy}")
++            print(f"  Manager proxy_headers: {manager.proxy_headers}")
++            
++            # Check if the manager has the expected configuration
++            if hasattr(manager, 'proxy_config'):
++                print(f"  Manager proxy_config: {manager.proxy_config}")
++                
++        except Exception as e:
++            print(f"  ✗ Failed to create manager: {e}")
++
++if __name__ == '__main__':
++    test_proxy_manager_caching()
++    test_proxy_headers_consistency()
++    test_session_proxy_handling()
++    test_urllib3_proxy_behavior()
+\ No newline at end of file
+diff --git a/test_urllib3_proxy.py b/test_urllib3_proxy.py
+new file mode 100644
+index 00000000..b47ecff3
+--- /dev/null
++++ b/test_urllib3_proxy.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test script to check urllib3 proxy behavior that might be affected by Python 3.8.12
++"""
++
++import sys
++import urllib3
++from urllib3.poolmanager import proxy_from_url
++from requests.adapters import HTTPAdapter
++from requests.auth import _basic_auth_str
++
++def test_urllib3_proxy_creation():
++    """Test how urllib3 creates proxy connections"""
++    
++    print(f"Python version: {sys.version}")
++    print(f"urllib3 version: {urllib3.__version__}")
++    print("=" * 60)
++    
++    # Test proxy URL with authentication
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    
++    print(f"Testing proxy URL: {proxy_url}")
++    
++    # Test proxy_from_url function
++    try:
++        proxy_headers = {'Proxy-Authorization': 'Basic dXNlcjpwYXNz'}
++        proxy_manager = proxy_from_url(proxy_url, proxy_headers=proxy_headers)
++        print(f"✓ proxy_from_url succeeded: {type(proxy_manager)}")
++        print(f"  Proxy headers: {proxy_headers}")
++        
++        # Check if the proxy manager has the right configuration
++        if hasattr(proxy_manager, 'proxy'):
++            print(f"  Proxy manager proxy: {proxy_manager.proxy}")
++        if hasattr(proxy_manager, 'proxy_headers'):
++            print(f"  Proxy manager headers: {proxy_manager.proxy_headers}")
++            
++    except Exception as e:
++        print(f"✗ proxy_from_url failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_adapter_proxy_manager():
++    """Test how HTTPAdapter creates proxy managers"""
++    
++    print("\n" + "=" * 60)
++    print("Testing HTTPAdapter proxy manager creation")
++    
++    adapter = HTTPAdapter()
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    
++    try:
++        # This calls the proxy_manager_for method
++        manager = adapter.proxy_manager_for(proxy_url)
++        print(f"✓ proxy_manager_for succeeded: {type(manager)}")
++        
++        if hasattr(manager, 'proxy'):
++            print(f"  Manager proxy: {manager.proxy}")
++        if hasattr(manager, 'proxy_headers'):
++            print(f"  Manager proxy_headers: {manager.proxy_headers}")
++            
++    except Exception as e:
++        print(f"✗ proxy_manager_for failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_proxy_headers_method():
++    """Test the proxy_headers method specifically"""
++    
++    print("\n" + "=" * 60)
++    print("Testing HTTPAdapter.proxy_headers method")
++    
++    adapter = HTTPAdapter()
++    proxy_url = "http://user:pass@proxy.example.com:8080"
++    
++    try:
++        headers = adapter.proxy_headers(proxy_url)
++        print(f"✓ proxy_headers succeeded: {headers}")
++        
++        expected = {'Proxy-Authorization': 'Basic dXNlcjpwYXNz'}
++        if headers == expected:
++            print("✓ Headers match expected values")
++        else:
++            print(f"✗ Headers don't match. Expected: {expected}")
++            
++    except Exception as e:
++        print(f"✗ proxy_headers failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_urllib3_direct():
++    """Test urllib3 directly without requests wrapper"""
++    
++    print("\n" + "=" * 60)
++    print("Testing urllib3 directly")
++    
++    try:
++        # Create a proxy manager directly
++        proxy_url = "http://proxy.example.com:8080"
++        proxy_headers = {'Proxy-Authorization': 'Basic dXNlcjpwYXNz'}
++        
++        manager = proxy_from_url(proxy_url, proxy_headers=proxy_headers)
++        print(f"✓ Direct urllib3 proxy_from_url succeeded: {type(manager)}")
++        
++        # Try to inspect the manager
++        print(f"  Manager attributes: {[attr for attr in dir(manager) if not attr.startswith('_')]}")
++        
++    except Exception as e:
++        print(f"✗ Direct urllib3 test failed: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_header_encoding():
++    """Test if there are any header encoding issues"""
++    
++    print("\n" + "=" * 60)
++    print("Testing header encoding")
++    
++    # Test different types of credentials
++    test_cases = [
++        ('user', 'pass'),
++        ('user@domain.com', 'complex!pass'),
++        ('üser', 'pässwörd'),  # Unicode characters
++    ]
++    
++    for username, password in test_cases:
++        try:
++            auth_str = _basic_auth_str(username, password)
++            headers = {'Proxy-Authorization': auth_str}
++            print(f"✓ '{username}':'{password}' -> {auth_str}")
++            
++            # Test if the header can be used with urllib3
++            proxy_url = "http://proxy.example.com:8080"
++            manager = proxy_from_url(proxy_url, proxy_headers=headers)
++            print(f"  ✓ urllib3 accepts the header")
++            
++        except Exception as e:
++            print(f"✗ '{username}':'{password}' -> ERROR: {e}")
++
++if __name__ == '__main__':
++    test_urllib3_proxy_creation()
++    test_adapter_proxy_manager()
++    test_proxy_headers_method()
++    test_urllib3_direct()
++    test_header_encoding()
+\ No newline at end of file

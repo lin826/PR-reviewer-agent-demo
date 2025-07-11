@@ -1,0 +1,373 @@
+diff --git a/django/template/defaultfilters.py b/django/template/defaultfilters.py
+index 1c844580c6..8f5322ea71 100644
+--- a/django/template/defaultfilters.py
++++ b/django/template/defaultfilters.py
+@@ -21,6 +21,7 @@ from django.utils.text import (
+ )
+ from django.utils.timesince import timesince, timeuntil
+ from django.utils.translation import gettext, ngettext
++from django.utils.functional import Promise
+ 
+ from .base import Variable, VariableDoesNotExist
+ from .library import Library
+@@ -678,6 +679,11 @@ def add(value, arg):
+         return int(value) + int(arg)
+     except (ValueError, TypeError):
+         try:
++            # Handle lazy strings by converting them to strings first
++            if isinstance(value, Promise):
++                value = str(value)
++            if isinstance(arg, Promise):
++                arg = str(arg)
+             return value + arg
+         except Exception:
+             return ''
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4186e77d11
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,127 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the issue with add filter and lazy strings.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_I18N=True,
++        TEMPLATES=[{
++            'BACKEND': 'django.template.backends.django.DjangoTemplates',
++            'DIRS': [],
++            'APP_DIRS': True,
++            'OPTIONS': {
++                'context_processors': [],
++            },
++        }],
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django.template import Template, Context
++from django.utils.translation import gettext_lazy
++
++def test_add_filter_with_lazy_string():
++    """Test the add filter with lazy strings."""
++    print("Testing add filter with lazy strings...")
++    
++    # Create a lazy string
++    lazy_string = gettext_lazy("Hello")
++    regular_string = " World"
++    
++    print(f"Lazy string: {lazy_string} (type: {type(lazy_string)})")
++    print(f"Regular string: {regular_string} (type: {type(regular_string)})")
++    
++    # Test direct concatenation (this should work)
++    try:
++        direct_concat = str(lazy_string) + regular_string
++        print(f"Direct concatenation (with str()): {direct_concat}")
++    except Exception as e:
++        print(f"Direct concatenation (with str()) failed: {e}")
++    
++    # Test direct concatenation without str() (this should fail)
++    try:
++        direct_concat_fail = lazy_string + regular_string
++        print(f"Direct concatenation (without str()): {direct_concat_fail}")
++    except Exception as e:
++        print(f"Direct concatenation (without str()) failed: {e}")
++    
++    # Test the reverse order - regular string + lazy string
++    try:
++        reverse_concat = regular_string + lazy_string
++        print(f"Reverse concatenation: {reverse_concat}")
++    except Exception as e:
++        print(f"Reverse concatenation failed: {e}")
++    
++    # Test with add filter in template
++    template_str = '{{ lazy_str|add:regular_str }}'
++    template = Template(template_str)
++    context = Context({
++        'lazy_str': lazy_string,
++        'regular_str': regular_string
++    })
++    
++    try:
++        result = template.render(context)
++        print(f"Template result: '{result}'")
++        if result == '':
++            print("ERROR: Template returned empty string!")
++        else:
++            print("SUCCESS: Template concatenation worked!")
++    except Exception as e:
++        print(f"Template rendering failed: {e}")
++    
++    # Test reverse order in template
++    template_str2 = '{{ regular_str|add:lazy_str }}'
++    template2 = Template(template_str2)
++    context2 = Context({
++        'lazy_str': lazy_string,
++        'regular_str': regular_string
++    })
++    
++    try:
++        result2 = template2.render(context2)
++        print(f"Template result (reverse): '{result2}'")
++        if result2 == '':
++            print("ERROR: Template (reverse) returned empty string!")
++        else:
++            print("SUCCESS: Template (reverse) concatenation worked!")
++    except Exception as e:
++        print(f"Template (reverse) rendering failed: {e}")
++    
++    # Test with add filter function directly
++    from django.template.defaultfilters import add
++    try:
++        filter_result = add(lazy_string, regular_string)
++        print(f"Filter function result: '{filter_result}'")
++        if filter_result == '':
++            print("ERROR: Filter function returned empty string!")
++        else:
++            print("SUCCESS: Filter function worked!")
++    except Exception as e:
++        print(f"Filter function failed: {e}")
++    
++    # Test reverse order with filter function
++    try:
++        filter_result2 = add(regular_string, lazy_string)
++        print(f"Filter function result (reverse): '{filter_result2}'")
++        if filter_result2 == '':
++            print("ERROR: Filter function (reverse) returned empty string!")
++        else:
++            print("SUCCESS: Filter function (reverse) worked!")
++    except Exception as e:
++        print(f"Filter function (reverse) failed: {e}")
++
++if __name__ == '__main__':
++    test_add_filter_with_lazy_string()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..a5e3d6a32b
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the add filter fix with lazy strings.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_I18N=True,
++        TEMPLATES=[{
++            'BACKEND': 'django.template.backends.django.DjangoTemplates',
++            'DIRS': [],
++            'APP_DIRS': True,
++            'OPTIONS': {
++                'context_processors': [],
++            },
++        }],
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django.template import Template, Context
++from django.utils.translation import gettext_lazy
++from django.template.defaultfilters import add
++
++def test_comprehensive():
++    """Comprehensive test for add filter with various scenarios."""
++    print("=== Comprehensive Add Filter Test ===")
++    
++    # Test cases
++    test_cases = [
++        # (value, arg, expected_result, description)
++        ("5", "3", 8, "Integer strings"),
++        (5, 3, 8, "Integers"),
++        ("hello", " world", "hello world", "Regular strings"),
++        (gettext_lazy("Hello"), " World", "Hello World", "Lazy string + regular string"),
++        (" World", gettext_lazy("Hello"), " WorldHello", "Regular string + lazy string"),
++        (gettext_lazy("Hello"), gettext_lazy(" World"), "Hello World", "Lazy string + lazy string"),
++        ([1, 2], [3, 4], [1, 2, 3, 4], "Lists"),
++        ((1, 2), (3, 4), (1, 2, 3, 4), "Tuples"),
++        ("invalid", "not_int", "invalidnot_int", "Non-numeric strings"),
++    ]
++    
++    passed = 0
++    failed = 0
++    
++    for i, (value, arg, expected, description) in enumerate(test_cases, 1):
++        try:
++            result = add(value, arg)
++            if result == expected:
++                print(f"✓ Test {i}: {description} - PASSED")
++                passed += 1
++            else:
++                print(f"✗ Test {i}: {description} - FAILED")
++                print(f"  Expected: {expected} (type: {type(expected)})")
++                print(f"  Got: {result} (type: {type(result)})")
++                failed += 1
++        except Exception as e:
++            print(f"✗ Test {i}: {description} - ERROR: {e}")
++            failed += 1
++    
++    print(f"\n=== Results ===")
++    print(f"Passed: {passed}")
++    print(f"Failed: {failed}")
++    print(f"Total: {passed + failed}")
++    
++    # Test template rendering
++    print(f"\n=== Template Tests ===")
++    template_tests = [
++        ('{{ "hello"|add:" world" }}', "hello world", "Regular strings in template"),
++        ('{{ lazy_str|add:" world" }}', "Hello world", "Lazy string + regular in template"),
++        ('{{ " world"|add:lazy_str }}', " worldHello", "Regular + lazy string in template"),
++        ('{{ lazy_str1|add:lazy_str2 }}', "HelloWorld", "Lazy + lazy in template"),
++    ]
++    
++    template_passed = 0
++    template_failed = 0
++    
++    for i, (template_str, expected, description) in enumerate(template_tests, 1):
++        try:
++            template = Template(template_str)
++            context = Context({
++                'lazy_str': gettext_lazy("Hello"),
++                'lazy_str1': gettext_lazy("Hello"),
++                'lazy_str2': gettext_lazy("World"),
++            })
++            result = template.render(context)
++            
++            if result == expected:
++                print(f"✓ Template {i}: {description} - PASSED")
++                template_passed += 1
++            else:
++                print(f"✗ Template {i}: {description} - FAILED")
++                print(f"  Expected: '{expected}'")
++                print(f"  Got: '{result}'")
++                template_failed += 1
++        except Exception as e:
++            print(f"✗ Template {i}: {description} - ERROR: {e}")
++            template_failed += 1
++    
++    print(f"\n=== Template Results ===")
++    print(f"Passed: {template_passed}")
++    print(f"Failed: {template_failed}")
++    print(f"Total: {template_passed + template_failed}")
++    
++    return failed == 0 and template_failed == 0
++
++if __name__ == '__main__':
++    success = test_comprehensive()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_lazy_string_add.py b/test_lazy_string_add.py
+new file mode 100644
+index 0000000000..988b1e7ead
+--- /dev/null
++++ b/test_lazy_string_add.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python
++"""
++Test case that could be added to the Django test suite to prevent regression
++of the lazy string concatenation issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        USE_I18N=True,
++        TEMPLATES=[{
++            'BACKEND': 'django.template.backends.django.DjangoTemplates',
++            'DIRS': [],
++            'APP_DIRS': True,
++            'OPTIONS': {
++                'context_processors': [],
++            },
++        }],
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django.test import SimpleTestCase
++from django.template.defaultfilters import add
++from django.utils.translation import gettext_lazy
++from django.template import Template, Context
++
++class AddLazyStringTests(SimpleTestCase):
++    """
++    Tests for add filter with lazy strings (regression test for issue where
++    add filter was unable to concatenate strings with lazy strings).
++    """
++
++    def test_add_lazy_string_to_regular_string(self):
++        """Test adding a lazy string to a regular string."""
++        lazy_str = gettext_lazy("Hello")
++        regular_str = " World"
++        result = add(lazy_str, regular_str)
++        self.assertEqual(result, "Hello World")
++
++    def test_add_regular_string_to_lazy_string(self):
++        """Test adding a regular string to a lazy string."""
++        regular_str = "Hello"
++        lazy_str = gettext_lazy(" World")
++        result = add(regular_str, lazy_str)
++        self.assertEqual(result, "Hello World")
++
++    def test_add_lazy_string_to_lazy_string(self):
++        """Test adding a lazy string to another lazy string."""
++        lazy_str1 = gettext_lazy("Hello")
++        lazy_str2 = gettext_lazy(" World")
++        result = add(lazy_str1, lazy_str2)
++        self.assertEqual(result, "Hello World")
++
++    def test_add_lazy_string_template_rendering(self):
++        """Test lazy string concatenation in template rendering."""
++        template = Template('{{ lazy_str|add:" World" }}')
++        context = Context({'lazy_str': gettext_lazy("Hello")})
++        result = template.render(context)
++        self.assertEqual(result, "Hello World")
++
++    def test_add_regular_to_lazy_template_rendering(self):
++        """Test regular string + lazy string concatenation in template rendering."""
++        template = Template('{{ "Hello"|add:lazy_str }}')
++        context = Context({'lazy_str': gettext_lazy(" World")})
++        result = template.render(context)
++        self.assertEqual(result, "Hello World")
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

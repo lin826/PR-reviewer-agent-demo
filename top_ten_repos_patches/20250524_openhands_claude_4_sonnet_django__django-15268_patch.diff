@@ -1,0 +1,565 @@
+diff --git a/debug_optimization.py b/debug_optimization.py
+new file mode 100644
+index 0000000000..a773c7fa5b
+--- /dev/null
++++ b/debug_optimization.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++"""
++Debug script to understand how the optimizer works.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import migrations
++
++def test_reduce_method():
++    """Test the reduce method directly."""
++    
++    print("Testing reduce method directly...")
++    
++    # Create operations
++    op1 = migrations.AlterUniqueTogether(name='mymodel', unique_together=set())
++    op2 = migrations.AlterIndexTogether(name='mymodel', index_together=set())
++    op3 = migrations.AlterUniqueTogether(name='mymodel', unique_together={("col",)})
++    op4 = migrations.AlterIndexTogether(name='mymodel', index_together={("col",)})
++    
++    print(f"op1: {op1}")
++    print(f"op2: {op2}")
++    print(f"op3: {op3}")
++    print(f"op4: {op4}")
++    
++    # Test op1.reduce(op3) - should optimize
++    print(f"\nop1.reduce(op3): {op1.reduce(op3, 'testapp')}")
++    
++    # Test op1.reduce(op2) - should not optimize (different types)
++    print(f"op1.reduce(op2): {op1.reduce(op2, 'testapp')}")
++    
++    # Test op2.reduce(op4) - should optimize
++    print(f"op2.reduce(op4): {op2.reduce(op4, 'testapp')}")
++    
++    # Test op3.reduce(op1) - should not optimize (wrong order)
++    print(f"op3.reduce(op1): {op3.reduce(op1, 'testapp')}")
++
++if __name__ == '__main__':
++    test_reduce_method()
+\ No newline at end of file
+diff --git a/debug_test2.py b/debug_test2.py
+new file mode 100644
+index 0000000000..bcef6f1719
+--- /dev/null
++++ b/debug_test2.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++
++import os
++import sys
++import django
++from django.conf import settings
++
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++
++def debug_test2():
++    """Debug test 2: Reverse order (set then clear)."""
++    print("Debug Test 2: Reverse order (set then clear)")
++    
++    operations = [
++        migrations.AlterUniqueTogether(name='mymodel', unique_together={("col",)}),
++        migrations.AlterIndexTogether(name='mymodel', index_together={("col",)}),
++        migrations.AlterUniqueTogether(name='mymodel', unique_together=set()),
++        migrations.AlterIndexTogether(name='mymodel', index_together=set()),
++    ]
++    
++    print("Original operations:")
++    for i, op in enumerate(operations):
++        print(f"  {i+1}. {op} (option_value: {op.option_value})")
++    
++    optimizer = MigrationOptimizer()
++    optimized = optimizer.optimize(operations, app_label='testapp')
++    
++    print(f"\nOptimized operations:")
++    for i, op in enumerate(optimized):
++        print(f"  {i+1}. {op} (option_value: {op.option_value})")
++    
++    print(f"\nExpected: Final operations should be clearing operations (empty sets)")
++    print(f"Actual: op1.option_value = {optimized[0].option_value}, op2.option_value = {optimized[1].option_value}")
++
++if __name__ == '__main__':
++    debug_test2()
+\ No newline at end of file
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index c120f5d32d..ddcd2cb942 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -480,6 +480,25 @@ class AlterTogetherOptionOperation(ModelOptionOperation):
+     def option_value(self):
+         return getattr(self, self.option_name)
+ 
++    def reduce(self, operation, app_label):
++        if (isinstance(operation, self.__class__) and
++                self.name_lower == operation.name_lower):
++            # If the current operation clears constraints (sets to empty)
++            # and the other operation sets actual constraints, optimize by
++            # eliminating the clearing operation.
++            if (not self.option_value and operation.option_value):
++                return [operation]
++            # For any other case with same operation type and model,
++            # keep the latter operation (standard behavior).
++            else:
++                return [operation]
++        # Allow optimization across different AlterTogetherOptionOperation types
++        # on the same model, since they operate on different constraints.
++        elif (isinstance(operation, AlterTogetherOptionOperation) and
++              self.name_lower == operation.name_lower):
++            return True
++        return super().reduce(operation, app_label)
++
+     def deconstruct(self):
+         kwargs = {
+             'name': self.name,
+diff --git a/test_comprehensive_optimization.py b/test_comprehensive_optimization.py
+new file mode 100644
+index 0000000000..76e9ce80d8
+--- /dev/null
++++ b/test_comprehensive_optimization.py
+@@ -0,0 +1,236 @@
++#!/usr/bin/env python3
++
++"""
++Comprehensive test script for AlterFooTogether optimization.
++
++This script tests various scenarios to ensure the optimization works correctly
++and doesn't break edge cases.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++
++def test_basic_optimization():
++    """Test the basic optimization case from the issue."""
++    print("Test 1: Basic optimization (clear then set)")
++    
++    operations = [
++        migrations.AlterUniqueTogether(name='mymodel', unique_together=set()),
++        migrations.AlterIndexTogether(name='mymodel', index_together=set()),
++        migrations.AlterUniqueTogether(name='mymodel', unique_together={("col",)}),
++        migrations.AlterIndexTogether(name='mymodel', index_together={("col",)}),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    optimized = optimizer.optimize(operations, app_label='testapp')
++    
++    expected_count = 2
++    if len(optimized) == expected_count:
++        print(f"✅ PASS: {len(operations)} operations optimized to {len(optimized)}")
++        return True
++    else:
++        print(f"❌ FAIL: Expected {expected_count}, got {len(optimized)}")
++        return False
++
++def test_reverse_order():
++    """Test that optimization doesn't happen in reverse order."""
++    print("\nTest 2: Reverse order (set then clear) - should NOT optimize")
++    
++    operations = [
++        migrations.AlterUniqueTogether(name='mymodel', unique_together={("col",)}),
++        migrations.AlterIndexTogether(name='mymodel', index_together={("col",)}),
++        migrations.AlterUniqueTogether(name='mymodel', unique_together=set()),
++        migrations.AlterIndexTogether(name='mymodel', index_together=set()),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    optimized = optimizer.optimize(operations, app_label='testapp')
++    
++    # Should optimize to just the clearing operations (last ones win)
++    expected_count = 2
++    if len(optimized) == expected_count:
++        print(f"✅ PASS: {len(operations)} operations optimized to {len(optimized)}")
++        # Check that the final operations are the clearing ones
++        if (not optimized[0].option_value and not optimized[1].option_value):
++            print("✅ PASS: Final operations are clearing operations")
++            return True
++        else:
++            print("❌ FAIL: Final operations should be clearing operations")
++            return False
++    else:
++        print(f"❌ FAIL: Expected {expected_count}, got {len(optimized)}")
++        return False
++
++def test_different_models():
++    """Test that optimization doesn't happen across different models."""
++    print("\nTest 3: Different models - should NOT optimize")
++    
++    operations = [
++        migrations.AlterUniqueTogether(name='model1', unique_together=set()),
++        migrations.AlterIndexTogether(name='model2', index_together=set()),
++        migrations.AlterUniqueTogether(name='model1', unique_together={("col",)}),
++        migrations.AlterIndexTogether(name='model2', index_together={("col",)}),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    optimized = optimizer.optimize(operations, app_label='testapp')
++    
++    # Should optimize to 2 operations (one for each model)
++    expected_count = 2
++    if len(optimized) == expected_count:
++        print(f"✅ PASS: {len(operations)} operations optimized to {len(optimized)}")
++        return True
++    else:
++        print(f"❌ FAIL: Expected {expected_count}, got {len(optimized)}")
++        return False
++
++def test_mixed_operations():
++    """Test optimization with other operations in between."""
++    print("\nTest 4: Mixed operations - should still optimize")
++    
++    operations = [
++        migrations.AlterUniqueTogether(name='mymodel', unique_together=set()),
++        migrations.AlterIndexTogether(name='mymodel', index_together=set()),
++        migrations.AlterModelTable(name='othermodel', table='new_table'),  # Unrelated operation
++        migrations.AlterUniqueTogether(name='mymodel', unique_together={("col",)}),
++        migrations.AlterIndexTogether(name='mymodel', index_together={("col",)}),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    optimized = optimizer.optimize(operations, app_label='testapp')
++    
++    # Should optimize to 3 operations (2 for mymodel + 1 for othermodel)
++    expected_count = 3
++    if len(optimized) == expected_count:
++        print(f"✅ PASS: {len(operations)} operations optimized to {len(optimized)}")
++        return True
++    else:
++        print(f"❌ FAIL: Expected {expected_count}, got {len(optimized)}")
++        return False
++
++def test_only_unique_together():
++    """Test optimization with only unique_together operations."""
++    print("\nTest 5: Only unique_together operations")
++    
++    operations = [
++        migrations.AlterUniqueTogether(name='mymodel', unique_together=set()),
++        migrations.AlterUniqueTogether(name='mymodel', unique_together={("col",)}),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    optimized = optimizer.optimize(operations, app_label='testapp')
++    
++    # Should optimize to 1 operation
++    expected_count = 1
++    if len(optimized) == expected_count:
++        print(f"✅ PASS: {len(operations)} operations optimized to {len(optimized)}")
++        return True
++    else:
++        print(f"❌ FAIL: Expected {expected_count}, got {len(optimized)}")
++        return False
++
++def test_only_index_together():
++    """Test optimization with only index_together operations."""
++    print("\nTest 6: Only index_together operations")
++    
++    operations = [
++        migrations.AlterIndexTogether(name='mymodel', index_together=set()),
++        migrations.AlterIndexTogether(name='mymodel', index_together={("col",)}),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    optimized = optimizer.optimize(operations, app_label='testapp')
++    
++    # Should optimize to 1 operation
++    expected_count = 1
++    if len(optimized) == expected_count:
++        print(f"✅ PASS: {len(operations)} operations optimized to {len(optimized)}")
++        return True
++    else:
++        print(f"❌ FAIL: Expected {expected_count}, got {len(optimized)}")
++        return False
++
++def test_multiple_cycles():
++    """Test multiple clear/set cycles."""
++    print("\nTest 7: Multiple clear/set cycles")
++    
++    operations = [
++        migrations.AlterUniqueTogether(name='mymodel', unique_together=set()),
++        migrations.AlterIndexTogether(name='mymodel', index_together=set()),
++        migrations.AlterUniqueTogether(name='mymodel', unique_together={("col1",)}),
++        migrations.AlterIndexTogether(name='mymodel', index_together={("col1",)}),
++        migrations.AlterUniqueTogether(name='mymodel', unique_together=set()),
++        migrations.AlterIndexTogether(name='mymodel', index_together=set()),
++        migrations.AlterUniqueTogether(name='mymodel', unique_together={("col2",)}),
++        migrations.AlterIndexTogether(name='mymodel', index_together={("col2",)}),
++    ]
++    
++    optimizer = MigrationOptimizer()
++    optimized = optimizer.optimize(operations, app_label='testapp')
++    
++    # Should optimize to 2 operations (final state)
++    expected_count = 2
++    if len(optimized) == expected_count:
++        print(f"✅ PASS: {len(operations)} operations optimized to {len(optimized)}")
++        return True
++    else:
++        print(f"❌ FAIL: Expected {expected_count}, got {len(optimized)}")
++        return False
++
++if __name__ == '__main__':
++    print("Comprehensive AlterFooTogether Optimization Tests")
++    print("=" * 60)
++    
++    tests = [
++        test_basic_optimization,
++        test_reverse_order,
++        test_different_models,
++        test_mixed_operations,
++        test_only_unique_together,
++        test_only_index_together,
++        test_multiple_cycles,
++    ]
++    
++    passed = 0
++    total = len(tests)
++    
++    for test in tests:
++        if test():
++            passed += 1
++    
++    print("\n" + "=" * 60)
++    print(f"Results: {passed}/{total} tests passed")
++    
++    if passed == total:
++        print("🎉 All tests passed!")
++        sys.exit(0)
++    else:
++        print("💥 Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_optimization_issue.py b/test_optimization_issue.py
+new file mode 100644
+index 0000000000..4906b14833
+--- /dev/null
++++ b/test_optimization_issue.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python3
++
++"""
++Test script to reproduce the AlterFooTogether optimization issue.
++
++This script demonstrates the current behavior where multiple AlterFooTogether 
++operations are not optimized when they follow the pattern:
++1. Clear constraints (set to empty)
++2. Set new constraints
++
++The expected optimization should eliminate the clearing operations when 
++they are immediately followed by setting operations.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import migrations
++from django.db.migrations.optimizer import MigrationOptimizer
++
++def test_alter_foo_together_optimization():
++    """Test the optimization of AlterFooTogether operations."""
++    
++    print("Testing AlterFooTogether optimization...")
++    
++    # Create the operations as described in the issue
++    operations = [
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together=set(),
++        ),
++        migrations.AlterIndexTogether(
++            name='mymodel',
++            index_together=set(),
++        ),
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together={("col",)},
++        ),
++        migrations.AlterIndexTogether(
++            name='mymodel',
++            index_together={("col",)},
++        ),
++    ]
++    
++    print(f"Original operations ({len(operations)}):")
++    for i, op in enumerate(operations):
++        print(f"  {i+1}. {op}")
++    
++    # Run the optimizer
++    optimizer = MigrationOptimizer()
++    optimized_operations = optimizer.optimize(operations, app_label='testapp')
++    
++    print(f"\nOptimized operations ({len(optimized_operations)}):")
++    for i, op in enumerate(optimized_operations):
++        print(f"  {i+1}. {op}")
++    
++    # Check if optimization worked as expected
++    expected_operations = [
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together={("col",)},
++        ),
++        migrations.AlterIndexTogether(
++            name='mymodel',
++            index_together={("col",)},
++        ),
++    ]
++    
++    print(f"\nExpected operations ({len(expected_operations)}):")
++    for i, op in enumerate(expected_operations):
++        print(f"  {i+1}. {op}")
++    
++    # Compare results
++    if len(optimized_operations) == len(expected_operations):
++        print("\n✅ SUCCESS: Optimization worked! Operations were reduced from 4 to 2.")
++        return True
++    else:
++        print(f"\n❌ FAILURE: Expected {len(expected_operations)} operations, got {len(optimized_operations)}")
++        return False
++
++def test_same_type_optimization():
++    """Test that same-type optimization still works."""
++    
++    print("\n" + "="*60)
++    print("Testing same-type AlterFooTogether optimization...")
++    
++    # Test consecutive operations of the same type
++    operations = [
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together={("col1",)},
++        ),
++        migrations.AlterUniqueTogether(
++            name='mymodel',
++            unique_together={("col2",)},
++        ),
++    ]
++    
++    print(f"Original operations ({len(operations)}):")
++    for i, op in enumerate(operations):
++        print(f"  {i+1}. {op}")
++    
++    # Run the optimizer
++    optimizer = MigrationOptimizer()
++    optimized_operations = optimizer.optimize(operations, app_label='testapp')
++    
++    print(f"\nOptimized operations ({len(optimized_operations)}):")
++    for i, op in enumerate(optimized_operations):
++        print(f"  {i+1}. {op}")
++    
++    # Should be reduced to just the second operation
++    if len(optimized_operations) == 1:
++        print("\n✅ SUCCESS: Same-type optimization works correctly.")
++        return True
++    else:
++        print(f"\n❌ FAILURE: Expected 1 operation, got {len(optimized_operations)}")
++        return False
++
++if __name__ == '__main__':
++    print("Django AlterFooTogether Optimization Test")
++    print("="*60)
++    
++    success1 = test_alter_foo_together_optimization()
++    success2 = test_same_type_optimization()
++    
++    print("\n" + "="*60)
++    if success1 and success2:
++        print("🎉 All tests passed!")
++        sys.exit(0)
++    else:
++        print("💥 Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file

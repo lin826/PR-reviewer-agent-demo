@@ -1,0 +1,479 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 3a462f1c4c..3ff84a8a3d 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -232,9 +232,25 @@ class Collector:
+         """
+         Get a QuerySet of objects related to `objs` via the relation `related`.
+         """
+-        return related.related_model._base_manager.using(self.using).filter(
+-            **{"%s__in" % related.field.name: objs}
+-        )
++        # Only select the required fields for deletion:
++        # - Primary key is always needed for deletion
++        # - Foreign keys are needed for cascading
++        related_model = related.related_model
++        
++        # Get the primary key and any foreign keys
++        fields = [related_model._meta.pk.name]
++        
++        # Add any foreign keys that might be needed for further cascading
++        for field in related_model._meta.fields:
++            if field.is_relation and field.many_to_one:
++                fields.append(field.attname)
++        
++        # Create a queryset that only fetches the required fields
++        qs = related_model._base_manager.using(self.using)
++        qs = qs.filter(**{"%s__in" % related.field.name: objs})
++        qs = qs.only(*fields)
++        
++        return qs
+ 
+     def instances_with_model(self):
+         for model, instances in self.data.items():
+diff --git a/test_app/__init__.py b/test_app/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/test_app/models.py b/test_app/models.py
+new file mode 100644
+index 0000000000..7e6014d638
+--- /dev/null
++++ b/test_app/models.py
+@@ -0,0 +1,14 @@
++
++from django.db import models
++
++class GrandParent(models.Model):
++    name = models.CharField(max_length=100)
++
++class Parent(models.Model):
++    name = models.CharField(max_length=100)
++    grandparent = models.ForeignKey(GrandParent, on_delete=models.CASCADE, related_name='parents')
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE, related_name='children')
++    text_data = models.TextField()  # This will contain problematic text
++    
+\ No newline at end of file
+diff --git a/test_delete_actual_db.py b/test_delete_actual_db.py
+new file mode 100644
+index 0000000000..083a9d6da2
+--- /dev/null
++++ b/test_delete_actual_db.py
+@@ -0,0 +1,102 @@
++import os
++import django
++from django.db import models, connection
++
++# Use SQLite instead of in-memory for this test
++DB_PATH = "/tmp/test_delete.db"
++
++# Create test settings
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "test_settings")
++with open("/workspace/django__django__3.0/test_settings.py", "w") as f:
++    f.write(f"""
++DATABASES = {{
++    'default': {{
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': '{DB_PATH}',
++    }}
++}}
++INSTALLED_APPS = [
++    'test_app',
++]
++SECRET_KEY = 'dummy'
++USE_TZ = True
++DEBUG = True
++""")
++
++# Create a test app
++if not os.path.exists("/workspace/django__django__3.0/test_app"):
++    os.mkdir("/workspace/django__django__3.0/test_app")
++
++with open("/workspace/django__django__3.0/test_app/__init__.py", "w") as f:
++    f.write("")
++
++with open("/workspace/django__django__3.0/test_app/models.py", "w") as f:
++    f.write("""
++from django.db import models
++
++class Parent(models.Model):
++    name = models.CharField(max_length=100)
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE)
++    text_data = models.TextField()  # This will contain problematic text
++""")
++
++# Set up Django
++django.setup()
++
++# Import our test models
++from test_app.models import Parent, Child
++from django.db import connection
++
++def run_test():
++    # Create tables
++    connection.cursor().execute("DROP TABLE IF EXISTS test_app_parent")
++    connection.cursor().execute("DROP TABLE IF EXISTS test_app_child")
++    
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Parent)
++        schema_editor.create_model(Child)
++    
++    # Create test data with a problematic Unicode character
++    parent = Parent.objects.create(name="Test Parent")
++    
++    # Add invalid UTF-8 byte sequence
++    # In a real MySQL situation, a high Unicode code point might be stored incorrectly
++    # We're simulating that problem with a replacement character
++    problematic_text = b'This is some text with invalid UTF-8 byte sequence \xed\xed\xed'.decode('utf-8', errors='replace')
++    child = Child.objects.create(parent=parent, text_data=problematic_text)
++    
++    # Enable SQL logging
++    from django.db import connection
++    connection.force_debug_cursor = True
++    from django.db import reset_queries
++    reset_queries()
++    
++    print("Original query:")
++    # Record the baseline - what was being fetched before our fix
++    original_child = list(Child.objects.filter(parent=parent))
++    print(f"SQL for full fetch: {connection.queries[-1]['sql']}\n")
++    reset_queries()
++    
++    # Import the Collector and try to delete
++    from django.db.models.deletion import Collector
++    collector = Collector(using='default')
++    collector.collect([parent])
++    
++    print("SQL after optimizing for deletion:")
++    for query in connection.queries:
++        print(query['sql'])
++    
++    # Execute the delete
++    collector.delete()
++    
++    # Verify the delete worked
++    assert not Child.objects.filter(parent=parent).exists()
++    assert not Parent.objects.filter(id=parent.id).exists()
++    
++    print("\nTest completed successfully!")
++
++if __name__ == "__main__":
++    run_test()
+\ No newline at end of file
+diff --git a/test_delete_unicode_issue.py b/test_delete_unicode_issue.py
+new file mode 100644
+index 0000000000..785ed78005
+--- /dev/null
++++ b/test_delete_unicode_issue.py
+@@ -0,0 +1,131 @@
++import os
++import sys
++import django
++from django.db import models, connection
++
++# Set up Django
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "test_settings")
++
++# Create test settings
++with open("/workspace/django__django__3.0/test_settings.py", "w") as f:
++    f.write("""
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++INSTALLED_APPS = [
++    'test_app',
++]
++SECRET_KEY = 'dummy'
++USE_TZ = True
++DEBUG = True
++    """)
++
++# Create a test app
++if not os.path.exists("/workspace/django__django__3.0/test_app"):
++    os.mkdir("/workspace/django__django__3.0/test_app")
++
++with open("/workspace/django__django__3.0/test_app/__init__.py", "w") as f:
++    f.write("")
++
++with open("/workspace/django__django__3.0/test_app/models.py", "w") as f:
++    f.write("""
++from django.db import models
++
++class Parent(models.Model):
++    name = models.CharField(max_length=100)
++
++class AnotherModel(models.Model):
++    name = models.CharField(max_length=100)
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE)
++    another = models.ForeignKey(AnotherModel, on_delete=models.CASCADE, null=True)
++    text_data = models.TextField()  # This will contain problematic text
++    """)
++
++django.setup()
++
++# Import our test models
++from test_app.models import Parent, Child, AnotherModel
++
++# Create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Parent)
++    schema_editor.create_model(AnotherModel)
++    schema_editor.create_model(Child)
++
++# Create test data with a problematic Unicode character
++parent = Parent.objects.create(name="Test Parent")
++another = AnotherModel.objects.create(name="Another Model")
++
++# Add invalid UTF-8 byte sequence
++problematic_text = b'This is some text with invalid UTF-8 byte sequence \xed\xed\xed'.decode('utf-8', errors='replace')
++child = Child.objects.create(parent=parent, another=another, text_data=problematic_text)
++
++# Import the deletion module to check fields fetched
++from django.db.models.deletion import Collector
++from django.db import connection
++from django.db import reset_queries
++
++# Create a query logger
++def log_query(execute, sql, params, many, context):
++    print(f"SQL: {sql}")
++    print(f"Params: {params}")
++    return execute(sql, params, many, context)
++
++class DebugQueryWrapper:
++    def __init__(self):
++        self.executed_queries = []
++    
++    def __call__(self, execute, sql, params, many, context):
++        result = execute(sql, params, many, context)
++        self.executed_queries.append((sql, params))
++        return result
++
++# Create a custom collector to log queries
++class LoggingCollector(Collector):
++    def related_objects(self, related, objs):
++        print(f"\nFetching related objects for {related.related_model.__name__}")
++        
++        # Get the SQL directly from the connection
++        from django.db import connections
++        old_debug = connections['default'].force_debug_cursor  
++        connections['default'].force_debug_cursor = True
++        
++        # Clear any previous queries
++        from django.db import reset_queries
++        reset_queries()
++        
++        result = super().related_objects(related, objs)
++        
++        # Get the executed query
++        from django.db import connection
++        if connection.queries:
++            print(f"SQL executed: {connection.queries[-1]['sql']}")
++        
++        # Reset debug
++        connections['default'].force_debug_cursor = old_debug
++        
++        return result
++
++# Enable global SQL debugging
++from django.db import connection
++connection.force_debug_cursor = True
++reset_queries()
++
++# Delete with default collector
++collector = LoggingCollector(using='default')
++collector.collect([parent])
++
++# Print all queries that were executed
++print("\nAll executed SQL queries:")
++for i, query in enumerate(connection.queries, 1):
++    print(f"{i}. {query['sql']}")
++
++collector.delete()
++
++print("\nTest completed successfully")
+\ No newline at end of file
+diff --git a/test_deletion_simple.py b/test_deletion_simple.py
+new file mode 100644
+index 0000000000..613812350e
+--- /dev/null
++++ b/test_deletion_simple.py
+@@ -0,0 +1,149 @@
++import os
++import django
++
++# Set up Django
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "test_settings")
++
++# Create test settings
++with open("/workspace/django__django__3.0/test_settings.py", "w") as f:
++    f.write("""
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': '/tmp/test.db',
++    }
++}
++INSTALLED_APPS = [
++    'test_app',
++]
++SECRET_KEY = 'dummy'
++    """)
++
++# Create a test app
++if not os.path.exists("/workspace/django__django__3.0/test_app"):
++    os.mkdir("/workspace/django__django__3.0/test_app")
++
++with open("/workspace/django__django__3.0/test_app/__init__.py", "w") as f:
++    f.write("")
++
++with open("/workspace/django__django__3.0/test_app/models.py", "w") as f:
++    f.write("""
++from django.db import models
++
++class GrandParent(models.Model):
++    name = models.CharField(max_length=100)
++
++class Parent(models.Model):
++    name = models.CharField(max_length=100)
++    grandparent = models.ForeignKey(GrandParent, on_delete=models.CASCADE, related_name='parents')
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE, related_name='children')
++    text_data = models.TextField()  # This will contain problematic text
++    """)
++
++django.setup()
++
++from django.db import connection
++from test_app.models import GrandParent, Parent, Child
++from django.db.models.deletion import Collector
++import os
++
++# Remove existing database if it exists
++if os.path.exists('/tmp/test.db'):
++    os.remove('/tmp/test.db')
++
++# Create the schema
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(GrandParent)
++    schema_editor.create_model(Parent)
++    schema_editor.create_model(Child)
++
++# Test data
++grandparent = GrandParent.objects.create(name="Test GrandParent")
++parent = Parent.objects.create(name="Test Parent", grandparent=grandparent)
++problematic_text = b'This is some text with invalid UTF-8 byte sequence \xed\xed\xed'.decode('utf-8', errors='replace')
++child = Child.objects.create(parent=parent, text_data=problematic_text)
++
++# Enable debug
++connection.force_debug_cursor = True
++
++# Log query before deletion
++from django.db import reset_queries
++reset_queries()
++list(Child.objects.filter(parent=parent))
++print(f"Default Child query includes all fields: {connection.queries[-1]['sql']}")
++
++# Now let's try to delete the grandparent, which should cascade to Parent and Child
++reset_queries()
++print("\nDeleting GrandParent (should trigger cascades to Parent and Child):")
++collector = Collector(using='default')
++collector.collect([grandparent])
++
++# Print all queries
++print("\nQueries during collection:")
++for i, query in enumerate(connection.queries):
++    print(f"{i+1}: {query['sql']}")
++
++# Check if we have queries
++if not connection.queries:
++    print("No queries were logged during collection!")
++    exit(1)
++
++# Get columns from the SQL
++import re
++
++# Get the queries for the Child table (related objects)
++default_query = connection.queries[0]['sql']  # The first query is our default Child query
++child_queries = [q['sql'] for q in connection.queries[1:] if 'test_app_child' in q['sql']]
++parent_queries = [q['sql'] for q in connection.queries[1:] if 'test_app_parent' in q['sql']]
++
++if child_queries:
++    print("\nFound Child queries during collection:")
++    for i, query in enumerate(child_queries):
++        print(f"Child query {i+1}: {query}")
++    
++    # Compare with the default query
++    child_query = child_queries[0]
++    default_cols = re.search(r'SELECT\s+(.+?)\s+FROM', default_query, re.DOTALL)
++    collector_cols = re.search(r'SELECT\s+(.+?)\s+FROM', child_query, re.DOTALL)
++    
++if parent_queries:
++    print("\nFound Parent queries during collection:")
++    for i, query in enumerate(parent_queries):
++        print(f"Parent query {i+1}: {query}")
++
++# Check for the Parent query results 
++if parent_queries:
++    parent_query = parent_queries[0]
++    default_parent_cols = default_query.count(',') + 1
++    collector_parent_cols = parent_query.count('"test_app_parent".')
++    
++    print(f"\nParent query analysis:")
++    print(f"Columns in default query: {default_parent_cols}")
++    print(f"Columns in collection: {collector_parent_cols}")
++    
++    # Check what fields were fetched
++    parent_fields = re.findall(r'"test_app_parent"."([^"]+)"', parent_query)
++    print(f"Parent fields fetched: {', '.join(parent_fields)}")
++    
++    if 'text_data' not in ' '.join(parent_fields):
++        print("\nFIX IS WORKING! Only necessary fields are being selected.")
++    else:
++        print("\nFix is not working correctly. Text fields are still being fetched.")
++
++# Now execute the delete and make sure cascading works
++print("\nExecuting deletion...")
++reset_queries()
++result = collector.delete()
++print(f"Deletion result: {result}")
++
++# Verify all objects were deleted
++counts = (
++    GrandParent.objects.count(),
++    Parent.objects.count(),
++    Child.objects.count()
++)
++print(f"\nRemaining objects (should all be 0): GrandParent={counts[0]}, Parent={counts[1]}, Child={counts[2]}")
++if all(c == 0 for c in counts):
++    print("CASCADING DELETION SUCCESSFUL - all related objects were properly deleted.")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..acc8f2c1bd
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,12 @@
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': '/tmp/test.db',
++    }
++}
++INSTALLED_APPS = [
++    'test_app',
++]
++SECRET_KEY = 'dummy'
++    
+\ No newline at end of file

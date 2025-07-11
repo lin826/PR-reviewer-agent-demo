@@ -1,0 +1,142 @@
+diff --git a/django/core/serializers/base.py b/django/core/serializers/base.py
+index da85cb4b92..f79c41a1bc 100644
+--- a/django/core/serializers/base.py
++++ b/django/core/serializers/base.py
+@@ -269,10 +269,11 @@ class DeserializedObject:
+     (and not touch the many-to-many stuff.)
+     """
+ 
+-    def __init__(self, obj, m2m_data=None, deferred_fields=None):
++    def __init__(self, obj, m2m_data=None, deferred_fields=None, using=None):
+         self.object = obj
+         self.m2m_data = m2m_data
+         self.deferred_fields = deferred_fields
++        self.using = using
+ 
+     def __repr__(self):
+         return "<%s: %s(pk=%s)>" % (
+@@ -285,6 +286,9 @@ class DeserializedObject:
+         # Call save on the Model baseclass directly. This bypasses any
+         # model-defined save. The save is also forced to be raw.
+         # raw=True is passed to any pre/post_save signals.
++        # Use the database specified during deserialization if not overridden
++        if using is None:
++            using = self.using
+         models.Model.save_base(self.object, using=using, raw=True, **kwargs)
+         if self.m2m_data and save_m2m:
+             for accessor_name, object_list in self.m2m_data.items():
+@@ -295,6 +299,10 @@ class DeserializedObject:
+         self.m2m_data = None
+ 
+     def save_deferred_fields(self, using=None):
++        # Use the database specified during deserialization if not overridden
++        if using is None:
++            using = self.using
++            
+         self.m2m_data = {}
+         for field, field_value in self.deferred_fields.items():
+             opts = self.object._meta
+@@ -319,7 +327,7 @@ class DeserializedObject:
+                         e, label, self.object.pk, field_value
+                     )
+                 setattr(self.object, field.attname, value)
+-        self.save()
++        self.save(using=using)
+ 
+ 
+ def build_instance(Model, data, db):
+@@ -336,13 +344,57 @@ def build_instance(Model, data, db):
+         and hasattr(default_manager, "get_by_natural_key")
+         and hasattr(Model, "natural_key")
+     ):
+-        natural_key = Model(**data).natural_key()
++        # Process any foreign keys that are represented as natural keys
++        # before trying to get the natural key of the model
++        fk_fields = {}
++        for field in Model._meta.fields:
++            if field.remote_field and field.name in data and isinstance(data[field.name], list):
++                try:
++                    # Try to resolve the natural key to an actual FK value
++                    fk_model = field.remote_field.model
++                    if hasattr(fk_model._default_manager, "get_by_natural_key"):
++                        fk_obj = fk_model._default_manager.db_manager(db).get_by_natural_key(*data[field.name])
++                        if fk_obj:
++                            # Store the original natural key
++                            fk_fields[field.name] = data[field.name]
++                            # Replace with the actual FK value
++                            data[field.attname] = fk_obj.pk
++                            # Remove the natural key to avoid confusion
++                            del data[field.name]
++                except Exception:
++                    # If we can't resolve the FK, just leave it as is
++                    pass
++        
++        # Now try to get the natural key of the model
+         try:
+-            data[Model._meta.pk.attname] = Model._meta.pk.to_python(
+-                default_manager.db_manager(db).get_by_natural_key(*natural_key).pk
+-            )
+-        except Model.DoesNotExist:
++            # Create a temporary instance with the data we have
++            temp_instance = Model(**data)
++            
++            # Try to get the natural key, but catch any exceptions
++            # that might occur if foreign keys are missing
++            try:
++                natural_key = temp_instance.natural_key()
++                try:
++                    data[Model._meta.pk.attname] = Model._meta.pk.to_python(
++                        default_manager.db_manager(db).get_by_natural_key(*natural_key).pk
++                    )
++                except Model.DoesNotExist:
++                    # No existing row – object will be inserted later.
++                    pass
++            except Exception:
++                # Natural key couldn't be evaluated (forward refs, etc.)
++                # Don't block deserialisation – just carry on without the optimisation.
++                pass
++        except Exception:
++            # If we can't even create the instance, just continue without
++            # trying to get its natural key
+             pass
++        
++        # Restore any natural keys we temporarily replaced
++        for field_name, natural_key in fk_fields.items():
++            data[field_name] = natural_key
++            # Keep the FK value too, as it might be useful
++    
+     return Model(**data)
+ 
+ 
+diff --git a/django/core/serializers/python.py b/django/core/serializers/python.py
+index a3918bf9d2..9eb9394e8a 100644
+--- a/django/core/serializers/python.py
++++ b/django/core/serializers/python.py
+@@ -155,9 +155,15 @@ def Deserializer(
+                         field, field_value, using, handle_forward_references
+                     )
+                 except Exception as e:
+-                    raise base.DeserializationError.WithData(
+-                        e, d["model"], d.get("pk"), field_value
+-                    )
++                    if handle_forward_references:
++                        # If we're handling forward references and the FK lookup fails,
++                        # just defer this field instead of failing
++                        deferred_fields[field] = field_value
++                        continue
++                    else:
++                        raise base.DeserializationError.WithData(
++                            e, d["model"], d.get("pk"), field_value
++                        )
+                 if value == base.DEFER_FIELD:
+                     deferred_fields[field] = field_value
+                 else:
+@@ -172,7 +178,7 @@ def Deserializer(
+                     )
+ 
+         obj = base.build_instance(Model, data, using)
+-        yield base.DeserializedObject(obj, m2m_data, deferred_fields)
++        yield base.DeserializedObject(obj, m2m_data, deferred_fields, using=using)
+ 
+ 
+ def _get_model(model_identifier):

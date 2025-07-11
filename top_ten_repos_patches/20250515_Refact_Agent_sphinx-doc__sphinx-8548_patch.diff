@@ -1,0 +1,163 @@
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index ddfd2b365..ead56e0c7 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -597,12 +597,41 @@ class Documenter:
+         if self.analyzer:
+             attr_docs = self.analyzer.find_attr_docs()
+             if self.objpath:
+-                key = ('.'.join(self.objpath[:-1]), self.objpath[-1])
+-                if key in attr_docs:
++                attr_name = self.objpath[-1]
++                # 1. try the direct owner (current class / module)
++                key = ('.'.join(self.objpath[:-1]), attr_name)
++                doc = attr_docs.get(key)
++
++                # 2. if not found, walk MRO and look in base classes
++                if doc is None and self.objpath and len(self.objpath) >= 2:
++                    owner = self.parent or getattr(self.object, "__objclass__", None)
++                    if owner and inspect.isclass(owner):
++                        for base in owner.__mro__[1:]:  # Skip the class itself
++                            # Try with __qualname__ first
++                            if hasattr(base, '__qualname__'):
++                                base_key = (base.__qualname__, attr_name)
++                                if base_key in attr_docs:
++                                    doc = attr_docs[base_key]
++                                    break
++                            
++                            # Try with __name__ as fallback
++                            base_key = (base.__name__, attr_name)
++                            if base_key in attr_docs:
++                                doc = attr_docs[base_key]
++                                break
++                            
++                            # Try with module.name format
++                            if hasattr(base, '__module__'):
++                                base_key = (base.__module__ + '.' + base.__name__, attr_name)
++                                if base_key in attr_docs:
++                                    doc = attr_docs[base_key]
++                                    break
++
++                if doc:
+                     no_docstring = True
+                     # make a copy of docstring for attributes to avoid cache
+                     # the change of autodoc-process-docstring event.
+-                    docstrings = [list(attr_docs[key])]
++                    docstrings = [list(doc)]
+ 
+                     for i, line in enumerate(self.process_doc(docstrings)):
+                         self.add_line(line, sourcename, i)
+@@ -746,7 +775,11 @@ class Documenter:
+                         keep = has_doc or self.options.undoc_members
+                 else:
+                     keep = False
+-            elif (namespace, membername) in attr_docs:
++            elif ((namespace, membername) in attr_docs or
++                  # or documented in ANY base class
++                  (inspect.isclass(self.object) and
++                   any((getattr(cls, '__qualname__', cls.__name__), membername) in attr_docs
++                       for cls in self.object.__mro__[1:]))):
+                 if want_all and isprivate:
+                     if self.options.private_members is None:
+                         keep = False
+@@ -831,6 +864,28 @@ class Documenter:
+             documenter = classes[-1](self.directive, full_mname, self.indent)
+             memberdocumenters.append((documenter, isattr))
+ 
++        # Handle inherited attributes if :inherited-members: is set
++        if self.options.inherited_members and inspect.isclass(self.object):
++            # Get all attributes from the class's __dict__ and its base classes
++            for base in self.object.__mro__[1:]:  # Skip the class itself
++                for name, value in base.__dict__.items():
++                    # Skip private attributes, special methods, and callables
++                    if (name.startswith('_') and not name.startswith('__')) or \
++                       (name.startswith('__') and name.endswith('__')) or \
++                       callable(value):
++                        continue
++                    
++                    # Check if this attribute is already documented
++                    if any(d[0].name.split('::')[-1] == name for d in memberdocumenters):
++                        continue
++                    
++                    # Create an AttributeDocumenter for this inherited attribute
++                    from sphinx.ext.autodoc import AttributeDocumenter
++                    full_name = self.modname + '::' + '.'.join(self.objpath + [name])
++                    documenter = AttributeDocumenter(self.directive, full_name, self.indent)
++                    if documenter.import_object():
++                        memberdocumenters.append((documenter, True))
++
+         member_order = self.options.member_order or self.config.autodoc_member_order
+         memberdocumenters = self.sort_members(memberdocumenters, member_order)
+ 
+@@ -2196,6 +2251,11 @@ class UninitializedInstanceAttributeMixin(DataDocumenterMixinBase):
+             return super().import_object(raiseerror=True)  # type: ignore
+         except ImportError as exc:
+             try:
++                if self.modname is None or self.objpath is None or len(self.objpath) <= 1:
++                    if raiseerror:
++                        raise
++                    return False
++                    
+                 ret = import_object(self.modname, self.objpath[:-1], 'class',
+                                     attrgetter=self.get_attr,  # type: ignore
+                                     warningiserror=self.config.autodoc_warningiserror)
+@@ -2204,7 +2264,7 @@ class UninitializedInstanceAttributeMixin(DataDocumenterMixinBase):
+                     self.object = UNINITIALIZED_ATTR
+                     self.parent = parent
+                     return True
+-            except ImportError:
++            except (ImportError, TypeError):
+                 pass
+ 
+             if raiseerror:
+@@ -2273,6 +2333,9 @@ class AttributeDocumenter(GenericAliasMixin, NewTypeMixin, SlotsMixin,  # type:
+     def isinstanceattribute(self) -> bool:
+         """Check the subject is an instance attribute."""
+         # uninitialized instance variable (PEP-526)
++        if self.modname is None or self.objpath is None or len(self.objpath) <= 1:
++            return False
++            
+         with mock(self.config.autodoc_mock_imports):
+             try:
+                 ret = import_object(self.modname, self.objpath[:-1], 'class',
+@@ -2284,7 +2347,7 @@ class AttributeDocumenter(GenericAliasMixin, NewTypeMixin, SlotsMixin,  # type:
+                 if self.objpath[-1] in annotations:
+                     self.object = UNINITIALIZED_ATTR
+                     return True
+-            except ImportError:
++            except (ImportError, TypeError, AttributeError):
+                 pass
+ 
+         return False
+diff --git a/sphinx/ext/autodoc/importer.py b/sphinx/ext/autodoc/importer.py
+index d6e73d36a..565473314 100644
+--- a/sphinx/ext/autodoc/importer.py
++++ b/sphinx/ext/autodoc/importer.py
+@@ -60,6 +60,9 @@ def import_module(modname: str, warningiserror: bool = False) -> Any:
+     """
+     Call importlib.import_module(modname), convert exceptions to ImportError
+     """
++    if modname is None:
++        raise ImportError("No module name specified", "")
++        
+     try:
+         with warnings.catch_warnings():
+             warnings.filterwarnings("ignore", category=ImportWarning)
+@@ -82,7 +85,7 @@ def import_object(modname: str, objpath: List[str], objtype: str = '',
+     try:
+         module = None
+         exc_on_importing = None
+-        objpath = list(objpath)
++        objpath = list(objpath) if objpath is not None else []
+         while module is None:
+             try:
+                 module = import_module(modname, warningiserror=warningiserror)
+@@ -90,7 +93,7 @@ def import_object(modname: str, objpath: List[str], objtype: str = '',
+             except ImportError as exc:
+                 logger.debug('[autodoc] import %s => failed', modname)
+                 exc_on_importing = exc
+-                if '.' in modname:
++                if modname and '.' in modname:
+                     # retry with parent module
+                     modname, name = modname.rsplit('.', 1)
+                     objpath.insert(0, name)

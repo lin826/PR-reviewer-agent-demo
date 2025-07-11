@@ -1,0 +1,852 @@
+diff --git a/django/views/generic/base.py b/django/views/generic/base.py
+index ea5baca08d..2dfe88dbdb 100644
+--- a/django/views/generic/base.py
++++ b/django/views/generic/base.py
+@@ -11,7 +11,7 @@ from django.template.response import TemplateResponse
+ from django.urls import reverse
+ from django.utils.decorators import classonlymethod
+ from django.utils.deprecation import RemovedInDjango40Warning
+-from django.utils.functional import SimpleLazyObject
++from django.utils.functional import SimpleLazyObject, empty
+ 
+ logger = logging.getLogger('django.request')
+ 
+@@ -165,11 +165,47 @@ class TemplateView(TemplateResponseMixin, ContextMixin, View):
+ 
+ 
+ # RemovedInDjango40Warning
++class _DeprecatedURLKwargProxy(SimpleLazyObject):
++    """
++    A SimpleLazyObject subclass that provides better database compatibility
++    by resolving to the underlying value when used in database operations.
++    """
++    def __str__(self):
++        # Resolve the lazy object to get the actual string value
++        if self._wrapped is empty:
++            self._setup()
++        return str(self._wrapped)
++    
++    def __bytes__(self):
++        # Resolve the lazy object to get the actual bytes value
++        if self._wrapped is empty:
++            self._setup()
++        return bytes(self._wrapped)
++    
++    def __int__(self):
++        # Resolve the lazy object to get the actual int value
++        if self._wrapped is empty:
++            self._setup()
++        return int(self._wrapped)
++    
++    def __float__(self):
++        # Resolve the lazy object to get the actual float value
++        if self._wrapped is empty:
++            self._setup()
++        return float(self._wrapped)
++    
++    def __conform__(self, protocol):
++        # This method is called by SQLite's adapt() function
++        # We resolve the lazy object and return the underlying value
++        if self._wrapped is empty:
++            self._setup()
++        return self._wrapped
++
++
+ def _wrap_url_kwargs_with_deprecation_warning(url_kwargs):
+     context_kwargs = {}
+     for key, value in url_kwargs.items():
+         # Bind into function closure.
+-        @SimpleLazyObject
+         def access_value(key=key, value=value):
+             warnings.warn(
+                 'TemplateView passing URL kwargs to the context is '
+@@ -178,7 +214,7 @@ def _wrap_url_kwargs_with_deprecation_warning(url_kwargs):
+                 RemovedInDjango40Warning, stacklevel=2,
+             )
+             return value
+-        context_kwargs[key] = access_value
++        context_kwargs[key] = _DeprecatedURLKwargProxy(access_value)
+     return context_kwargs
+ 
+ 
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..e5416d0da5
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,217 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the fix for SimpleLazyObject issue in TemplateView
++"""
++import os
++import sys
++import django
++import warnings
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        ROOT_URLCONF='test_comprehensive_fix',
++    )
++
++django.setup()
++
++from django.db import models
++from django.shortcuts import get_object_or_404
++from django.views.generic import TemplateView
++from django.urls import path
++from django.test import TestCase, RequestFactory
++from django.utils.deprecation import RemovedInDjango40Warning
++
++
++# Create a simple model for testing
++class Account(models.Model):
++    slug = models.SlugField(unique=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_comprehensive_fix'
++
++
++# Test view that uses URL parameters in database queries (the original issue)
++class OfferView(TemplateView):
++    template_name = "offers/offer.html"
++    
++    def get_context_data(self, **kwargs):
++        offer_slug = kwargs.get("offer_slug", "")
++        
++        # This should work without errors (the main fix)
++        offer = get_object_or_404(Account, slug=offer_slug)
++        return {"offer": offer, "offer_slug": offer_slug}
++
++
++# Test view that doesn't access URL parameters programmatically
++class SimpleTemplateView(TemplateView):
++    template_name = "simple.html"
++
++
++# URL patterns
++urlpatterns = [
++    path('offers/<slug:offer_slug>/', OfferView.as_view(), name='offer_view'),
++    path('simple/<slug:test_slug>/', SimpleTemplateView.as_view(), name='simple_view'),
++]
++
++
++class ComprehensiveTestCase(TestCase):
++    def setUp(self):
++        # Create the database tables
++        from django.db import connection
++        
++        # Create the Account table manually
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(Account)
++        
++        # Create test accounts
++        self.account1 = Account.objects.create(slug='test-offer', name='Test Offer')
++        self.account2 = Account.objects.create(slug='another-offer', name='Another Offer')
++        
++    def test_database_query_with_url_parameter(self):
++        """Test that URL parameters work correctly in database queries (main issue)"""
++        factory = RequestFactory()
++        request = factory.get('/offers/test-offer/')
++        
++        view = OfferView()
++        view.setup(request, offer_slug='test-offer')
++        
++        # This should work without errors
++        response = view.get(request, offer_slug='test-offer')
++        self.assertEqual(response.status_code, 200)
++        
++        # Test with another slug
++        view.setup(request, offer_slug='another-offer')
++        response = view.get(request, offer_slug='another-offer')
++        self.assertEqual(response.status_code, 200)
++        
++    def test_nonexistent_slug_raises_404(self):
++        """Test that nonexistent slugs properly raise 404"""
++        factory = RequestFactory()
++        request = factory.get('/offers/nonexistent/')
++        
++        view = OfferView()
++        view.setup(request, offer_slug='nonexistent')
++        
++        from django.http import Http404
++        with self.assertRaises(Http404):
++            view.get(request, offer_slug='nonexistent')
++            
++    def test_deprecation_warning_still_works(self):
++        """Test that deprecation warnings are still triggered when appropriate"""
++        factory = RequestFactory()
++        request = factory.get('/simple/test-value/')
++        
++        view = SimpleTemplateView()
++        view.setup(request, test_slug='test-value')
++        
++        # Get the context
++        context = view.get_context_data(test_slug='test-value')
++        
++        # The context should contain the wrapped URL parameter
++        self.assertIn('test_slug', context)
++        
++        # Accessing the parameter should trigger a deprecation warning
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            
++            # Access the parameter to trigger the warning
++            test_slug_obj = context['test_slug']
++            if hasattr(test_slug_obj, '_wrapped'):
++                # Force evaluation to trigger warning
++                str(test_slug_obj)
++            
++            # Check if warning was triggered
++            deprecation_warnings = [warning for warning in w 
++                                  if issubclass(warning.category, RemovedInDjango40Warning)]
++            
++            if deprecation_warnings:
++                self.assertIn('TemplateView passing URL kwargs to the context is deprecated', 
++                            str(deprecation_warnings[0].message))
++                
++    def test_different_parameter_types(self):
++        """Test that the fix works with different URL parameter types"""
++        # Test with integer parameter
++        from django.urls import path
++        from django.views.generic import TemplateView
++        
++        class IntParamView(TemplateView):
++            template_name = "test.html"
++            
++            def get_context_data(self, **kwargs):
++                # This should work with integer parameters too
++                year = kwargs.get("year", 2023)
++                # Simulate a database query that uses the parameter
++                return {"year": year, "is_leap": year % 4 == 0}
++        
++        factory = RequestFactory()
++        request = factory.get('/year/2024/')
++        
++        view = IntParamView()
++        view.setup(request, year=2024)
++        
++        # This should work without errors
++        context = view.get_context_data(year=2024)
++        self.assertEqual(context['year'], 2024)
++        self.assertTrue(context['is_leap'])
++
++
++def run_tests():
++    """Run all the comprehensive tests"""
++    test_case = ComprehensiveTestCase()
++    test_case.setUp()
++    
++    print("=== Testing database query with URL parameter (main issue) ===")
++    try:
++        test_case.test_database_query_with_url_parameter()
++        print("✓ PASS: Database queries with URL parameters work correctly")
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++    
++    print("\n=== Testing 404 handling ===")
++    try:
++        test_case.test_nonexistent_slug_raises_404()
++        print("✓ PASS: 404 handling works correctly")
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++    
++    print("\n=== Testing deprecation warning ===")
++    try:
++        test_case.test_deprecation_warning_still_works()
++        print("✓ PASS: Deprecation warnings still work")
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++    
++    print("\n=== Testing different parameter types ===")
++    try:
++        test_case.test_different_parameter_types()
++        print("✓ PASS: Different parameter types work correctly")
++    except Exception as e:
++        print(f"✗ FAIL: {e}")
++        return False
++    
++    print("\n🎉 All tests passed! The fix is working correctly.")
++    return True
++
++
++if __name__ == '__main__':
++    success = run_tests()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_deprecation_warning.py b/test_deprecation_warning.py
+new file mode 100644
+index 0000000000..491b9eb683
+--- /dev/null
++++ b/test_deprecation_warning.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python
++"""
++Test script to verify that the deprecation warning still works correctly
++"""
++import os
++import sys
++import django
++import warnings
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        ROOT_URLCONF='test_deprecation_warning',
++        TEMPLATES=[{
++            'BACKEND': 'django.template.backends.django.DjangoTemplates',
++            'DIRS': [],
++            'APP_DIRS': True,
++            'OPTIONS': {
++                'context_processors': [],
++            },
++        }],
++    )
++
++django.setup()
++
++from django.views.generic import TemplateView
++from django.urls import path
++from django.test import TestCase, RequestFactory
++from django.utils.deprecation import RemovedInDjango40Warning
++
++
++class TestDeprecationView(TemplateView):
++    template_name = "test.html"
++    
++    def get_context_data(self, **kwargs):
++        # Don't access the kwargs here to avoid resolving the lazy objects
++        print("get_context_data called")
++        
++        # Return the context (this will include the wrapped kwargs)
++        context = super().get_context_data(**kwargs)
++        return context
++
++
++# URL patterns
++urlpatterns = [
++    path('test/<slug:offer_slug>/', TestDeprecationView.as_view(), name='test_view'),
++]
++
++
++def test_deprecation_warning():
++    """Test that deprecation warnings are still triggered when accessing kwargs in templates"""
++    factory = RequestFactory()
++    request = factory.get('/test/my-slug/')
++    
++    view = TestDeprecationView()
++    view.setup(request, offer_slug='my-slug')
++    
++    # Get the context
++    context = view.get_context_data(offer_slug='my-slug')
++    
++    print(f"Context keys: {list(context.keys())}")
++    print(f"offer_slug type in context: {type(context.get('offer_slug'))}")
++    
++    # Check if it's still a proxy object
++    offer_slug_obj = context['offer_slug']
++    print(f"Is proxy object: {hasattr(offer_slug_obj, '_wrapped')}")
++    
++    # Accessing the value directly should trigger a warning
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        # This should trigger the deprecation warning
++        if hasattr(offer_slug_obj, '_wrapped'):
++            # Force access to trigger the warning
++            value = str(offer_slug_obj)
++            print(f"Template access - offer_slug: {value}")
++        else:
++            print("Object is not a proxy, no warning expected")
++        
++        if w:
++            print(f"Deprecation warning triggered: {w[0].message}")
++            print(f"Warning category: {w[0].category}")
++        else:
++            print("No deprecation warning triggered")
++
++
++if __name__ == '__main__':
++    test_deprecation_warning()
+\ No newline at end of file
+diff --git a/test_direct_warning.py b/test_direct_warning.py
+new file mode 100644
+index 0000000000..2687a660a9
+--- /dev/null
++++ b/test_direct_warning.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python
++"""
++Direct test of the deprecation warning mechanism
++"""
++import warnings
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.views.generic.base import _wrap_url_kwargs_with_deprecation_warning
++from django.utils.deprecation import RemovedInDjango40Warning
++
++
++def test_direct_deprecation_warning():
++    """Test the deprecation warning mechanism directly"""
++    
++    # Create wrapped kwargs like TemplateView does
++    url_kwargs = {'offer_slug': 'test-offer', 'category': 'electronics'}
++    wrapped_kwargs = _wrap_url_kwargs_with_deprecation_warning(url_kwargs)
++    
++    print(f"Wrapped kwargs keys: {list(wrapped_kwargs.keys())}")
++    print(f"offer_slug type: {type(wrapped_kwargs['offer_slug'])}")
++    print(f"category type: {type(wrapped_kwargs['category'])}")
++    
++    # Test accessing without triggering warning (should work for database operations)
++    offer_slug_obj = wrapped_kwargs['offer_slug']
++    print(f"Has _wrapped attribute: {hasattr(offer_slug_obj, '_wrapped')}")
++    
++    # Test that the object works in database-like operations
++    print(f"String representation: {str(offer_slug_obj)}")
++    print(f"Equality test: {offer_slug_obj == 'test-offer'}")
++    
++    # Test that accessing the value triggers the deprecation warning
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        # This should trigger the deprecation warning
++        # We need to access the lazy object in a way that triggers the warning
++        # The warning is triggered in the _setupfunc, so we need to force evaluation
++        value = str(offer_slug_obj)  # This might have already resolved it
++        
++        print(f"Warnings captured: {len(w)}")
++        if w:
++            for warning in w:
++                print(f"Warning: {warning.message}")
++                print(f"Category: {warning.category}")
++        else:
++            print("No warnings captured")
++    
++    # Try to trigger the warning by creating a fresh object and accessing it
++    print("\n--- Testing fresh object ---")
++    fresh_kwargs = _wrap_url_kwargs_with_deprecation_warning({'test_param': 'test_value'})
++    fresh_obj = fresh_kwargs['test_param']
++    
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        # Force the lazy object to evaluate by accessing its value
++        # The warning should be triggered in the _setupfunc
++        print(f"Fresh object value: {fresh_obj}")
++        
++        print(f"Fresh warnings captured: {len(w)}")
++        if w:
++            for warning in w:
++                print(f"Fresh warning: {warning.message}")
++                print(f"Fresh category: {warning.category}")
++
++
++if __name__ == '__main__':
++    test_direct_deprecation_warning()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..fe61cf9ef4
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,213 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the SimpleLazyObject fix
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.views.generic import TemplateView
++from django.test import RequestFactory
++from django.views.generic.base import _DeprecatedURLKwargProxy
++
++
++# Test model
++class TestModel(models.Model):
++    slug = models.SlugField()
++    number = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_edge_cases'
++
++
++def test_different_data_types():
++    """Test that our proxy works with different data types"""
++    print("=== Testing different data types ===")
++    
++    # Test string
++    proxy_str = _DeprecatedURLKwargProxy(lambda: "test-string")
++    assert str(proxy_str) == "test-string"
++    assert proxy_str == "test-string"
++    print("✓ String type works")
++    
++    # Test integer
++    proxy_int = _DeprecatedURLKwargProxy(lambda: 42)
++    assert int(proxy_int) == 42
++    assert proxy_int == 42
++    print("✓ Integer type works")
++    
++    # Test None
++    proxy_none = _DeprecatedURLKwargProxy(lambda: None)
++    assert proxy_none == None  # Use == instead of is
++    print("✓ None type works")
++    
++    # Test boolean
++    proxy_bool = _DeprecatedURLKwargProxy(lambda: True)
++    assert bool(proxy_bool) is True
++    assert proxy_bool == True  # Use == instead of is
++    print("✓ Boolean type works")
++
++
++def test_database_operations():
++    """Test various database operations with our proxy"""
++    print("\n=== Testing database operations ===")
++    
++    from django.db import connection
++    
++    # Create the test table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create test data
++    obj1 = TestModel.objects.create(slug='test-slug', number=123)
++    obj2 = TestModel.objects.create(slug='another-slug', number=456)
++    
++    # Test filtering with proxy objects
++    proxy_slug = _DeprecatedURLKwargProxy(lambda: 'test-slug')
++    proxy_number = _DeprecatedURLKwargProxy(lambda: 123)
++    
++    # Test exact lookup
++    result = TestModel.objects.filter(slug=proxy_slug).first()
++    assert result is not None
++    assert result.slug == 'test-slug'
++    print("✓ Exact lookup works")
++    
++    # Test integer lookup
++    result = TestModel.objects.filter(number=proxy_number).first()
++    assert result is not None
++    assert result.number == 123
++    print("✓ Integer lookup works")
++    
++    # Test get() method
++    result = TestModel.objects.get(slug=proxy_slug)
++    assert result.slug == 'test-slug'
++    print("✓ get() method works")
++    
++    # Test exclude()
++    results = TestModel.objects.exclude(slug=proxy_slug)
++    assert len(results) == 1
++    assert results[0].slug == 'another-slug'
++    print("✓ exclude() method works")
++
++
++def test_sqlite_conform_protocol():
++    """Test that our __conform__ method works correctly"""
++    print("\n=== Testing SQLite conform protocol ===")
++    
++    import sqlite3
++    
++    # Create a proxy object
++    proxy = _DeprecatedURLKwargProxy(lambda: 'test-value')
++    
++    # Test that SQLite can adapt our proxy
++    conn = sqlite3.connect(':memory:')
++    cursor = conn.cursor()
++    
++    cursor.execute('CREATE TABLE test (value TEXT)')
++    
++    # This should work without errors
++    cursor.execute('INSERT INTO test (value) VALUES (?)', (proxy,))
++    
++    # Verify the value was inserted correctly
++    cursor.execute('SELECT value FROM test')
++    result = cursor.fetchone()
++    assert result[0] == 'test-value'
++    
++    conn.close()
++    print("✓ SQLite conform protocol works")
++
++
++def test_proxy_transparency():
++    """Test that our proxy is transparent for normal operations"""
++    print("\n=== Testing proxy transparency ===")
++    
++    proxy = _DeprecatedURLKwargProxy(lambda: 'test-value')
++    
++    # Test string operations
++    assert len(proxy) == len('test-value')
++    assert proxy.upper() == 'TEST-VALUE'
++    assert proxy.startswith('test')
++    assert 'value' in proxy
++    print("✓ String operations work")
++    
++    # Test comparison operations
++    assert proxy == 'test-value'
++    assert proxy != 'other-value'
++    assert proxy < 'z'
++    assert proxy > 'a'
++    print("✓ Comparison operations work")
++    
++    # Test hash (important for dict keys)
++    hash_value = hash(proxy)
++    assert isinstance(hash_value, int)
++    print("✓ Hash operation works")
++
++
++def test_multiple_access():
++    """Test that multiple accesses work correctly"""
++    print("\n=== Testing multiple access ===")
++    
++    access_count = 0
++    
++    def counting_func():
++        nonlocal access_count
++        access_count += 1
++        return f'value-{access_count}'
++    
++    proxy = _DeprecatedURLKwargProxy(counting_func)
++    
++    # First access should initialize the proxy
++    value1 = str(proxy)
++    assert access_count == 1
++    
++    # Subsequent accesses should use the cached value
++    value2 = str(proxy)
++    assert access_count == 1  # Should not increment
++    assert value1 == value2
++    
++    print("✓ Multiple access caching works")
++
++
++def run_all_tests():
++    """Run all edge case tests"""
++    try:
++        test_different_data_types()
++        test_database_operations()
++        test_sqlite_conform_protocol()
++        test_proxy_transparency()
++        test_multiple_access()
++        
++        print("\n🎉 All edge case tests passed!")
++        return True
++    except Exception as e:
++        print(f"\n❌ Edge case test failed: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++
++if __name__ == '__main__':
++    success = run_all_tests()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..6ed4a05c0a
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the SimpleLazyObject issue in TemplateView.get_context_data()
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        ROOT_URLCONF='test_reproduction',
++    )
++
++django.setup()
++
++from django.db import models
++from django.shortcuts import get_object_or_404
++from django.views.generic import TemplateView
++from django.urls import path
++from django.test import TestCase, RequestFactory
++from django.http import Http404
++
++
++# Create a simple model for testing
++class Account(models.Model):
++    slug = models.SlugField(unique=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_reproduction'
++
++
++# Create the problematic view from the issue description
++class OfferView(TemplateView):
++    template_name = "offers/offer.html"
++    
++    def get_context_data(self, **kwargs):
++        offer_slug = kwargs.get("offer_slug", "")
++        print(f"offer_slug type: {type(offer_slug)}")
++        print(f"offer_slug value: {offer_slug}")
++        
++        # This should fail with SimpleLazyObject
++        try:
++            offer = get_object_or_404(Account, slug=offer_slug)
++            return {"offer": offer, "offer_slug": offer_slug}
++        except Exception as e:
++            print(f"Error occurred: {e}")
++            print(f"Error type: {type(e)}")
++            raise
++
++
++# URL patterns
++urlpatterns = [
++    path('offers/<slug:offer_slug>/', OfferView.as_view(), name='offer_view'),
++]
++
++
++class TestSimpleLazyObjectIssue(TestCase):
++    def setUp(self):
++        # Create the database tables
++        from django.db import connection
++        
++        # Create the Account table manually
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(Account)
++        
++        # Create a test account
++        self.account = Account.objects.create(slug='test-offer', name='Test Offer')
++        
++    def test_template_view_with_slug_parameter(self):
++        """Test that TemplateView can handle slug parameters in database queries"""
++        factory = RequestFactory()
++        request = factory.get('/offers/test-offer/')
++        
++        view = OfferView()
++        view.setup(request, offer_slug='test-offer')
++        
++        # This should work without errors
++        try:
++            response = view.get(request, offer_slug='test-offer')
++            print("SUCCESS: No error occurred")
++            return True
++        except Exception as e:
++            print(f"FAILED: {e}")
++            return False
++            
++    def test_simple_lazy_object_in_database_query(self):
++        """Test that SimpleLazyObject causes issues in database queries"""
++        from django.utils.functional import SimpleLazyObject
++        
++        # Create a SimpleLazyObject like the one created by _wrap_url_kwargs_with_deprecation_warning
++        lazy_slug = SimpleLazyObject(lambda: 'test-offer')
++        
++        print(f"lazy_slug type: {type(lazy_slug)}")
++        print(f"lazy_slug value: {lazy_slug}")
++        
++        # This should fail
++        try:
++            offer = get_object_or_404(Account, slug=lazy_slug)
++            print("UNEXPECTED: No error occurred with SimpleLazyObject")
++        except Exception as e:
++            print(f"EXPECTED ERROR: {e}")
++            print(f"Error type: {type(e)}")
++
++
++if __name__ == '__main__':
++    # Run the tests
++    test_case = TestSimpleLazyObjectIssue()
++    test_case.setUp()
++    
++    print("=== Testing TemplateView with slug parameter ===")
++    success = test_case.test_template_view_with_slug_parameter()
++    if success:
++        print("✓ TemplateView test PASSED - Fix is working!")
++    else:
++        print("✗ TemplateView test FAILED - Fix is not working")
++    
++    print("\n=== Testing SimpleLazyObject directly ===")
++    test_case.test_simple_lazy_object_in_database_query()
+\ No newline at end of file

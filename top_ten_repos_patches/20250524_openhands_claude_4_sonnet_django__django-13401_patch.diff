@@ -1,0 +1,800 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 28374272f4..07c878dc20 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -516,17 +516,25 @@ class Field(RegisterLookupMixin):
+     def __eq__(self, other):
+         # Needed for @total_ordering
+         if isinstance(other, Field):
+-            return self.creation_counter == other.creation_counter
++            return (
++                self.creation_counter == other.creation_counter and
++                self.model == other.model
++            )
+         return NotImplemented
+ 
+     def __lt__(self, other):
+         # This is needed because bisect does not take a comparison function.
+         if isinstance(other, Field):
+-            return self.creation_counter < other.creation_counter
++            if self.creation_counter != other.creation_counter:
++                return self.creation_counter < other.creation_counter
++            # If creation_counters are equal, compare by model to ensure consistent ordering
++            self_model_name = '' if self.model is None else f"{self.model.__module__}.{self.model.__name__}"
++            other_model_name = '' if other.model is None else f"{other.model.__module__}.{other.model.__name__}"
++            return self_model_name < other_model_name
+         return NotImplemented
+ 
+     def __hash__(self):
+-        return hash(self.creation_counter)
++        return hash((self.creation_counter, self.model))
+ 
+     def __deepcopy__(self, memodict):
+         # We don't have to deepcopy very much here, since most things are not
+diff --git a/test_exact_issue_example.py b/test_exact_issue_example.py
+new file mode 100644
+index 0000000000..662646ee0e
+--- /dev/null
++++ b/test_exact_issue_example.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python
++"""
++Test the exact example from the issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++
++# Exact example from the issue description
++class A(models.Model):
++    class Meta:
++        abstract = True
++        app_label = 'test'
++    myfield = models.IntegerField()
++
++class B(A):
++    class Meta:
++        app_label = 'test'
++
++class C(A):
++    class Meta:
++        app_label = 'test'
++
++# Test the exact statements from the issue
++print("Testing exact issue example...")
++
++# Original issue: len({B._meta.get_field('myfield'), C._meta.get_field('myfield')}) == 1
++result = len({B._meta.get_field('myfield'), C._meta.get_field('myfield')})
++print(f"len({{B._meta.get_field('myfield'), C._meta.get_field('myfield')}}): {result}")
++print(f"Expected: 2 (was 1 before fix)")
++
++# Original issue: B._meta.get_field('myfield') == C._meta.get_field('myfield')
++equality = B._meta.get_field('myfield') == C._meta.get_field('myfield')
++print(f"B._meta.get_field('myfield') == C._meta.get_field('myfield'): {equality}")
++print(f"Expected: False (was True before fix)")
++
++if result == 2 and equality == False:
++    print("\n✅ SUCCESS: Issue has been fixed!")
++    sys.exit(0)
++else:
++    print("\n❌ FAILURE: Issue still exists!")
++    sys.exit(1)
+\ No newline at end of file
+diff --git a/test_field_equality_comprehensive.py b/test_field_equality_comprehensive.py
+new file mode 100644
+index 0000000000..0713655feb
+--- /dev/null
++++ b/test_field_equality_comprehensive.py
+@@ -0,0 +1,296 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script for field equality fix.
++
++Tests various edge cases and scenarios to ensure the fix works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++
++def test_basic_abstract_inheritance():
++    """Test the basic case from the issue description."""
++    print("=== Test 1: Basic Abstract Inheritance ===")
++    
++    class A(models.Model):
++        class Meta:
++            abstract = True
++            app_label = 'test'
++        myfield = models.IntegerField()
++    
++    class B(A):
++        class Meta:
++            app_label = 'test'
++    
++    class C(A):
++        class Meta:
++            app_label = 'test'
++    
++    field_b = B._meta.get_field('myfield')
++    field_c = C._meta.get_field('myfield')
++    
++    # Test the original issue
++    assert field_b != field_c, "Fields should not be equal"
++    assert len({field_b, field_c}) == 2, "Set should contain both fields"
++    assert hash(field_b) != hash(field_c), "Fields should have different hashes"
++    
++    print("✅ Basic abstract inheritance test passed")
++
++def test_same_model_fields():
++    """Test that fields from the same model still work correctly."""
++    print("=== Test 2: Same Model Fields ===")
++    
++    class TestModel(models.Model):
++        class Meta:
++            app_label = 'test'
++        field1 = models.IntegerField()
++        field2 = models.CharField(max_length=100)
++    
++    field1 = TestModel._meta.get_field('field1')
++    field2 = TestModel._meta.get_field('field2')
++    
++    # These should be different because they have different creation_counters
++    assert field1 != field2, "Different fields should not be equal"
++    assert hash(field1) != hash(field2), "Different fields should have different hashes"
++    assert field1 < field2, "field1 should be less than field2 (created first)"
++    
++    print("✅ Same model fields test passed")
++
++def test_same_field_same_model():
++    """Test that the same field from the same model is equal to itself."""
++    print("=== Test 3: Same Field Same Model ===")
++    
++    class TestModel(models.Model):
++        class Meta:
++            app_label = 'test'
++        myfield = models.IntegerField()
++    
++    field1 = TestModel._meta.get_field('myfield')
++    field2 = TestModel._meta.get_field('myfield')
++    
++    # These should be equal (same field, same model)
++    assert field1 == field2, "Same field from same model should be equal"
++    assert hash(field1) == hash(field2), "Same field should have same hash"
++    assert not (field1 < field2), "Same field should not be less than itself"
++    assert not (field2 < field1), "Same field should not be less than itself"
++    
++    print("✅ Same field same model test passed")
++
++def test_multiple_inheritance_levels():
++    """Test multiple levels of inheritance."""
++    print("=== Test 4: Multiple Inheritance Levels ===")
++    
++    class AbstractBase(models.Model):
++        class Meta:
++            abstract = True
++            app_label = 'test'
++        base_field = models.IntegerField()
++    
++    class AbstractMiddle(AbstractBase):
++        class Meta:
++            abstract = True
++            app_label = 'test'
++        middle_field = models.CharField(max_length=100)
++    
++    class ConcreteA(AbstractMiddle):
++        class Meta:
++            app_label = 'test'
++        concrete_field = models.BooleanField()
++    
++    class ConcreteB(AbstractMiddle):
++        class Meta:
++            app_label = 'test'
++        concrete_field = models.DateField()
++    
++    # Test base fields
++    base_a = ConcreteA._meta.get_field('base_field')
++    base_b = ConcreteB._meta.get_field('base_field')
++    assert base_a != base_b, "Base fields from different models should not be equal"
++    
++    # Test middle fields
++    middle_a = ConcreteA._meta.get_field('middle_field')
++    middle_b = ConcreteB._meta.get_field('middle_field')
++    assert middle_a != middle_b, "Middle fields from different models should not be equal"
++    
++    # Test concrete fields (different types, same name)
++    concrete_a = ConcreteA._meta.get_field('concrete_field')
++    concrete_b = ConcreteB._meta.get_field('concrete_field')
++    assert concrete_a != concrete_b, "Concrete fields from different models should not be equal"
++    
++    print("✅ Multiple inheritance levels test passed")
++
++def test_field_ordering_consistency():
++    """Test that field ordering is consistent and predictable."""
++    print("=== Test 5: Field Ordering Consistency ===")
++    
++    class AbstractBase(models.Model):
++        class Meta:
++            abstract = True
++            app_label = 'test'
++        field1 = models.IntegerField()
++        field2 = models.CharField(max_length=100)
++    
++    class ModelA(AbstractBase):
++        class Meta:
++            app_label = 'test'
++        field3 = models.BooleanField()
++    
++    class ModelB(AbstractBase):
++        class Meta:
++            app_label = 'test'
++        field4 = models.DateField()
++    
++    # Get all fields
++    fields = [
++        ModelA._meta.get_field('field1'),
++        ModelA._meta.get_field('field2'),
++        ModelA._meta.get_field('field3'),
++        ModelB._meta.get_field('field1'),
++        ModelB._meta.get_field('field2'),
++        ModelB._meta.get_field('field4'),
++    ]
++    
++    # Sort multiple times to ensure consistency
++    sorted1 = sorted(fields)
++    sorted2 = sorted(fields)
++    sorted3 = sorted(fields)
++    
++    assert sorted1 == sorted2 == sorted3, "Sorting should be consistent"
++    
++    # Check that fields are primarily ordered by creation_counter
++    creation_counters = [f.creation_counter for f in sorted1]
++    assert creation_counters == sorted(creation_counters), "Fields should be ordered by creation_counter"
++    
++    print("✅ Field ordering consistency test passed")
++
++def test_set_operations():
++    """Test various set operations with fields."""
++    print("=== Test 6: Set Operations ===")
++    
++    class AbstractBase(models.Model):
++        class Meta:
++            abstract = True
++            app_label = 'test'
++        shared_field = models.IntegerField()
++    
++    class ModelA(AbstractBase):
++        class Meta:
++            app_label = 'test'
++        unique_field = models.CharField(max_length=100)
++    
++    class ModelB(AbstractBase):
++        class Meta:
++            app_label = 'test'
++        unique_field = models.BooleanField()
++    
++    # Get fields
++    shared_a = ModelA._meta.get_field('shared_field')
++    shared_b = ModelB._meta.get_field('shared_field')
++    unique_a = ModelA._meta.get_field('unique_field')
++    unique_b = ModelB._meta.get_field('unique_field')
++    
++    # Test set operations
++    set1 = {shared_a, unique_a}
++    set2 = {shared_b, unique_b}
++    
++    # Union should contain all 4 fields
++    union = set1 | set2
++    assert len(union) == 4, f"Union should contain 4 fields, got {len(union)}"
++    
++    # Intersection should be empty (no shared fields between models)
++    intersection = set1 & set2
++    assert len(intersection) == 0, f"Intersection should be empty, got {len(intersection)}"
++    
++    # Difference should contain original fields
++    diff1 = set1 - set2
++    assert diff1 == set1, "Difference should equal original set1"
++    
++    diff2 = set2 - set1
++    assert diff2 == set2, "Difference should equal original set2"
++    
++    print("✅ Set operations test passed")
++
++def test_hash_consistency():
++    """Test that hash values are consistent across multiple calls."""
++    print("=== Test 7: Hash Consistency ===")
++    
++    class TestModel(models.Model):
++        class Meta:
++            app_label = 'test'
++        test_field = models.IntegerField()
++    
++    field = TestModel._meta.get_field('test_field')
++    
++    # Hash should be consistent across multiple calls
++    hash1 = hash(field)
++    hash2 = hash(field)
++    hash3 = hash(field)
++    
++    assert hash1 == hash2 == hash3, "Hash should be consistent across calls"
++    
++    print("✅ Hash consistency test passed")
++
++def run_all_tests():
++    """Run all tests and report results."""
++    print("Running comprehensive field equality tests...\n")
++    
++    tests = [
++        test_basic_abstract_inheritance,
++        test_same_model_fields,
++        test_same_field_same_model,
++        test_multiple_inheritance_levels,
++        test_field_ordering_consistency,
++        test_set_operations,
++        test_hash_consistency,
++    ]
++    
++    passed = 0
++    failed = 0
++    
++    for test in tests:
++        try:
++            test()
++            passed += 1
++        except Exception as e:
++            print(f"❌ {test.__name__} failed: {e}")
++            failed += 1
++    
++    print(f"\n=== RESULTS ===")
++    print(f"✅ Passed: {passed}")
++    print(f"❌ Failed: {failed}")
++    print(f"Total: {len(tests)}")
++    
++    if failed == 0:
++        print("\n🎉 All tests passed! The fix works correctly.")
++        return True
++    else:
++        print(f"\n💥 {failed} test(s) failed. The fix needs more work.")
++        return False
++
++if __name__ == '__main__':
++    print("Django version:", django.VERSION)
++    success = run_all_tests()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_field_equality_issue.py b/test_field_equality_issue.py
+new file mode 100644
+index 0000000000..665b8e5c74
+--- /dev/null
++++ b/test_field_equality_issue.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the field equality issue with abstract models.
++
++This script demonstrates the problem described in the issue:
++- Fields inherited from abstract models in different concrete models are considered equal
++- This causes unexpected deduplication when using sets
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++
++def test_abstract_field_equality_issue():
++    """Test the field equality issue with abstract models."""
++    
++    print("=== Testing Abstract Model Field Equality Issue ===")
++    
++    # Define the models as described in the issue
++    class A(models.Model):
++        class Meta:
++            abstract = True
++            app_label = 'test'
++        myfield = models.IntegerField()
++    
++    class B(A):
++        class Meta:
++            app_label = 'test'
++    
++    class C(A):
++        class Meta:
++            app_label = 'test'
++    
++    # Get the fields from both models
++    field_b = B._meta.get_field('myfield')
++    field_c = C._meta.get_field('myfield')
++    
++    print(f"Field B: {field_b}")
++    print(f"Field C: {field_c}")
++    print(f"Field B model: {field_b.model}")
++    print(f"Field C model: {field_c.model}")
++    print(f"Field B creation_counter: {field_b.creation_counter}")
++    print(f"Field C creation_counter: {field_c.creation_counter}")
++    
++    # Test equality
++    print(f"\nEquality test:")
++    print(f"field_b == field_c: {field_b == field_c}")
++    print(f"Expected: False (they should be different because they belong to different models)")
++    
++    # Test set behavior
++    print(f"\nSet behavior test:")
++    field_set = {field_b, field_c}
++    print(f"len({{field_b, field_c}}): {len(field_set)}")
++    print(f"Expected: 2 (both fields should be in the set)")
++    
++    # Test hash values
++    print(f"\nHash test:")
++    print(f"hash(field_b): {hash(field_b)}")
++    print(f"hash(field_c): {hash(field_c)}")
++    print(f"hash(field_b) == hash(field_c): {hash(field_b) == hash(field_c)}")
++    print(f"Expected: False (they should have different hashes)")
++    
++    # Test ordering
++    print(f"\nOrdering test:")
++    print(f"field_b < field_c: {field_b < field_c}")
++    print(f"field_c < field_b: {field_c < field_b}")
++    
++    # Summary
++    print(f"\n=== ISSUE SUMMARY ===")
++    issues_found = []
++    
++    if field_b == field_c:
++        issues_found.append("Fields are equal when they shouldn't be")
++    
++    if len(field_set) == 1:
++        issues_found.append("Set deduplication removes one field")
++        
++    if hash(field_b) == hash(field_c):
++        issues_found.append("Fields have same hash when they shouldn't")
++    
++    if issues_found:
++        print("ISSUES FOUND:")
++        for issue in issues_found:
++            print(f"  - {issue}")
++        return False
++    else:
++        print("NO ISSUES FOUND - Fields behave correctly!")
++        return True
++
++def test_same_model_fields():
++    """Test that fields from the same model still work correctly."""
++    
++    print("\n=== Testing Same Model Field Behavior ===")
++    
++    class TestModel(models.Model):
++        class Meta:
++            app_label = 'test'
++        field1 = models.IntegerField()
++        field2 = models.CharField(max_length=100)
++    
++    field1 = TestModel._meta.get_field('field1')
++    field2 = TestModel._meta.get_field('field2')
++    
++    print(f"Field1: {field1}")
++    print(f"Field2: {field2}")
++    print(f"field1 == field2: {field1 == field2}")
++    print(f"field1 < field2: {field1 < field2}")
++    print(f"hash(field1) == hash(field2): {hash(field1) == hash(field2)}")
++    
++    # These should be different because they have different creation_counters
++    print("Expected: Fields should be different (different creation_counters)")
++
++def test_field_ordering_preservation():
++    """Test that field ordering is preserved after the fix."""
++    
++    print("\n=== Testing Field Ordering Preservation ===")
++    
++    class AbstractBase(models.Model):
++        class Meta:
++            abstract = True
++            app_label = 'test'
++        field1 = models.IntegerField()
++        field2 = models.CharField(max_length=100)
++    
++    class Model1(AbstractBase):
++        class Meta:
++            app_label = 'test'
++        field3 = models.BooleanField()
++    
++    class Model2(AbstractBase):
++        class Meta:
++            app_label = 'test'
++        field4 = models.DateField()
++    
++    # Get all fields and test ordering
++    fields = [
++        Model1._meta.get_field('field1'),
++        Model1._meta.get_field('field2'), 
++        Model1._meta.get_field('field3'),
++        Model2._meta.get_field('field1'),
++        Model2._meta.get_field('field2'),
++        Model2._meta.get_field('field4'),
++    ]
++    
++    print("Fields and their creation_counters:")
++    for field in fields:
++        print(f"  {field.model.__name__}.{field.name}: {field.creation_counter}")
++    
++    # Sort fields and check if ordering is preserved
++    sorted_fields = sorted(fields)
++    print("\nSorted fields:")
++    for field in sorted_fields:
++        print(f"  {field.model.__name__}.{field.name}: {field.creation_counter}")
++
++if __name__ == '__main__':
++    print("Django version:", django.VERSION)
++    
++    # Run tests
++    success = test_abstract_field_equality_issue()
++    test_same_model_fields()
++    test_field_ordering_preservation()
++    
++    if not success:
++        print("\n❌ REPRODUCTION SUCCESSFUL - Issue confirmed!")
++        sys.exit(1)
++    else:
++        print("\n✅ Issue not reproduced - Fields behave correctly!")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_field_equality_regression.py b/test_field_equality_regression.py
+new file mode 100644
+index 0000000000..6aba26b620
+--- /dev/null
++++ b/test_field_equality_regression.py
+@@ -0,0 +1,188 @@
++"""
++Regression test for field equality issue with abstract models.
++
++This test can be added to Django's test suite to prevent regression of the issue
++where fields inherited from abstract models were incorrectly considered equal
++across different concrete models.
++
++Issue: https://code.djangoproject.com/ticket/XXXXX
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import SimpleTestCase
++from django.test.utils import isolate_apps
++
++
++class FieldEqualityRegressionTest(SimpleTestCase):
++    """
++    Test that fields inherited from abstract models are not equal across
++    different concrete models.
++    """
++
++    def test_abstract_model_field_equality_across_models(self):
++        """
++        Fields inherited from abstract models should not be equal when they
++        belong to different concrete models, even if they have the same
++        creation_counter.
++        """
++        class AbstractBase(models.Model):
++            myfield = models.IntegerField()
++
++            class Meta:
++                abstract = True
++                app_label = 'test'
++
++        class ConcreteA(AbstractBase):
++            class Meta:
++                app_label = 'test'
++
++        class ConcreteB(AbstractBase):
++            class Meta:
++                app_label = 'test'
++
++        field_a = ConcreteA._meta.get_field('myfield')
++        field_b = ConcreteB._meta.get_field('myfield')
++
++        # Fields should have the same creation_counter (inherited from same abstract model)
++        self.assertEqual(field_a.creation_counter, field_b.creation_counter)
++
++        # But they should not be equal because they belong to different models
++        self.assertNotEqual(field_a, field_b)
++
++        # They should have different hash values
++        self.assertNotEqual(hash(field_a), hash(field_b))
++
++        # Set operations should work correctly (no deduplication)
++        field_set = {field_a, field_b}
++        self.assertEqual(len(field_set), 2)
++
++    def test_same_model_field_equality_preserved(self):
++        """
++        Fields from the same model should still be equal to themselves
++        and behave as before.
++        """
++        class TestModel(models.Model):
++            field1 = models.IntegerField()
++            field2 = models.CharField(max_length=100)
++            
++            class Meta:
++                app_label = 'test'
++
++        field1_a = TestModel._meta.get_field('field1')
++        field1_b = TestModel._meta.get_field('field1')  # Same field, same model
++        field2 = TestModel._meta.get_field('field2')
++
++        # Same field from same model should be equal
++        self.assertEqual(field1_a, field1_b)
++        self.assertEqual(hash(field1_a), hash(field1_b))
++
++        # Different fields from same model should not be equal
++        self.assertNotEqual(field1_a, field2)
++        self.assertNotEqual(hash(field1_a), hash(field2))
++
++    def test_field_ordering_with_same_creation_counter(self):
++        """
++        Fields with the same creation_counter should be ordered consistently
++        by model when creation_counters are equal.
++        """
++        class AbstractBase(models.Model):
++            shared_field = models.IntegerField()
++
++            class Meta:
++                abstract = True
++                app_label = 'test'
++
++        class ModelA(AbstractBase):
++            class Meta:
++                app_label = 'test'
++
++        class ModelB(AbstractBase):
++            class Meta:
++                app_label = 'test'
++
++        field_a = ModelA._meta.get_field('shared_field')
++        field_b = ModelB._meta.get_field('shared_field')
++
++        # Fields should have same creation_counter
++        self.assertEqual(field_a.creation_counter, field_b.creation_counter)
++
++        # Ordering should be consistent (one should always be less than the other)
++        fields = [field_a, field_b]
++        sorted_fields = sorted(fields)
++
++        # Sort multiple times to ensure consistency
++        self.assertEqual(sorted(fields), sorted_fields)
++        self.assertEqual(sorted(fields), sorted_fields)
++
++        # One field should be consistently less than the other
++        self.assertTrue((field_a < field_b) or (field_b < field_a))
++        self.assertFalse((field_a < field_b) and (field_b < field_a))
++
++    def test_multiple_inheritance_levels(self):
++        """
++        Test field equality with multiple levels of abstract inheritance.
++        """
++        class AbstractBase(models.Model):
++            base_field = models.IntegerField()
++
++            class Meta:
++                abstract = True
++                app_label = 'test'
++
++        class AbstractMiddle(AbstractBase):
++            middle_field = models.CharField(max_length=100)
++
++            class Meta:
++                abstract = True
++                app_label = 'test'
++
++        class ConcreteA(AbstractMiddle):
++            class Meta:
++                app_label = 'test'
++
++        class ConcreteB(AbstractMiddle):
++            class Meta:
++                app_label = 'test'
++
++        # Test base fields
++        base_a = ConcreteA._meta.get_field('base_field')
++        base_b = ConcreteB._meta.get_field('base_field')
++        self.assertNotEqual(base_a, base_b)
++
++        # Test middle fields
++        middle_a = ConcreteA._meta.get_field('middle_field')
++        middle_b = ConcreteB._meta.get_field('middle_field')
++        self.assertNotEqual(middle_a, middle_b)
++
++        # All fields should be distinguishable in a set
++        all_fields = {base_a, base_b, middle_a, middle_b}
++        self.assertEqual(len(all_fields), 4)
++
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

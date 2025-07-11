@@ -1,0 +1,94 @@
+diff --git a/sphinx/builders/linkcheck.py b/sphinx/builders/linkcheck.py
+index 1dc0337c3..32036c1ad 100644
+--- a/sphinx/builders/linkcheck.py
++++ b/sphinx/builders/linkcheck.py
+@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlparse
+ 
+ from docutils import nodes
+ from docutils.nodes import Node
+-from requests.exceptions import HTTPError
++from requests.exceptions import HTTPError, TooManyRedirects
+ 
+ from sphinx.application import Sphinx
+ from sphinx.builders import Builder
+@@ -172,9 +172,9 @@ class CheckExternalLinksBuilder(Builder):
+                                                  config=self.app.config, auth=auth_info,
+                                                  **kwargs)
+                         response.raise_for_status()
+-                    except HTTPError:
++                    except (HTTPError, TooManyRedirects):
+                         # retry with GET request if that fails, some servers
+-                        # don't like HEAD requests.
++                        # don't like HEAD requests or may have too many redirects
+                         response = requests.get(req_url, stream=True, config=self.app.config,
+                                                 auth=auth_info, **kwargs)
+                         response.raise_for_status()
+diff --git a/test_many_redirects.py b/test_many_redirects.py
+new file mode 100644
+index 000000000..b5d072ddf
+--- /dev/null
++++ b/test_many_redirects.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python
++
++"""
++This script reproduces the issue with the linkchecker falling back to GET requests
++when HEAD requests result in too many redirects.
++"""
++
++import logging
++import requests
++from requests.exceptions import TooManyRedirects, HTTPError
++
++# Set up logging
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger("test_linkchecker")
++
++# URL that causes too many redirects when accessing with HEAD
++test_url = "https://idr.openmicroscopy.org/webclient/?show=well-119093"  # From the issue description
++
++# Try HEAD request first
++def test_link(url):
++    try:
++        logger.info(f"Trying HEAD request for {url}")
++        
++        try:
++            # First try HEAD request
++            response = requests.head(url, allow_redirects=True, timeout=15)
++            response.raise_for_status()
++            logger.info("HEAD request successful!")
++            return True
++        except TooManyRedirects as e:
++            # This is the issue we're trying to fix
++            # The original code doesn't catch this specific exception
++            logger.info(f"HEAD request resulted in too many redirects: {str(e)}")
++            logger.info("Trying GET request instead...")
++            
++            # In the fixed version, we should try GET request here
++            response = requests.get(url, stream=True, timeout=15)
++            response.raise_for_status()
++            logger.info("GET request successful!")
++            return True
++        except HTTPError:
++            # Original code does handle this case
++            logger.info("HEAD request resulted in HTTP error, trying GET request...")
++            response = requests.get(url, stream=True, timeout=15)
++            response.raise_for_status()
++            logger.info("GET request successful!")
++            return True
++            
++    except Exception as e:
++        logger.error(f"Error checking link: {str(e)}")
++        return False
++
++if __name__ == "__main__":
++    logger.info("Testing link checker with TooManyRedirects fallback logic")
++    
++    # With the fix implemented
++    success = test_link(test_url)
++    
++    if success:
++        logger.info("Test PASSED: Link checked successfully with fallback to GET")
++    else:
++        logger.error("Test FAILED: Could not check link even with fallback to GET")
+\ No newline at end of file

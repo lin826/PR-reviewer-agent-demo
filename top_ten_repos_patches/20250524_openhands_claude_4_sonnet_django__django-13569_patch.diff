@@ -1,0 +1,789 @@
+diff --git a/debug_order_by.py b/debug_order_by.py
+new file mode 100644
+index 0000000000..9bb289435e
+--- /dev/null
++++ b/debug_order_by.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python
++"""
++Debug script to understand the structure of order_by expressions.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Count
++from django.db.models.functions import Random
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class Thing(models.Model):
++    name = models.CharField(max_length=100, default="test")
++    
++    class Meta:
++        app_label = '__main__'
++
++class Related(models.Model):
++    thing = models.ForeignKey(Thing, on_delete=models.CASCADE)
++    value = models.IntegerField(default=1)
++    
++    class Meta:
++        app_label = '__main__'
++
++def debug_order_by_expressions():
++    """Debug the structure of order_by expressions."""
++    
++    # Create tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Thing)
++        schema_editor.create_model(Related)
++    
++    # Create test data
++    t = Thing.objects.create(name="test_thing")
++    Related.objects.create(thing=t, value=1)
++    Related.objects.create(thing=t, value=2)
++    
++    print("=== Debugging order_by expressions ===\n")
++    
++    # Get the queryset
++    qs = Thing.objects.annotate(rc=Count('related')).order_by('?').values('id', 'rc')
++    
++    # Access the compiler to debug
++    from django.db.models.sql.compiler import SQLCompiler
++    
++    compiler = qs.query.get_compiler('default')
++    
++    # Get the order_by from the compiler
++    extra_select, order_by, group_by = compiler.pre_sql_setup()
++    
++    print("Order by expressions:")
++    for i, (expr, (sql, params, is_ref)) in enumerate(order_by):
++        print(f"  {i}: expr={expr}, type={type(expr)}")
++        print(f"      sql={sql}, params={params}, is_ref={is_ref}")
++        print(f"      isinstance(expr, Random)={isinstance(expr, Random)}")
++        
++        # Check source expressions
++        if hasattr(expr, 'get_source_expressions'):
++            source_exprs = expr.get_source_expressions()
++            print(f"      source_expressions={source_exprs}")
++            for j, source_expr in enumerate(source_exprs):
++                print(f"        {j}: {source_expr}, type={type(source_expr)}")
++                print(f"           isinstance(source_expr, Random)={isinstance(source_expr, Random)}")
++        
++        # Check get_group_by_cols
++        if hasattr(expr, 'get_group_by_cols'):
++            group_by_cols = expr.get_group_by_cols()
++            print(f"      get_group_by_cols()={group_by_cols}")
++            for j, col in enumerate(group_by_cols):
++                print(f"        {j}: {col}, type={type(col)}")
++                print(f"           isinstance(col, Random)={isinstance(col, Random)}")
++        
++        print()
++
++if __name__ == '__main__':
++    debug_order_by_expressions()
+\ No newline at end of file
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..6881c6aeda
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python
++"""
++Debug the test case.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.aggregation',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from tests.aggregation.models import Author, Book, Publisher
++from django.db.models import Count
++from decimal import Decimal
++import datetime
++
++def debug_test():
++    """Debug the test case."""
++    
++    # Create tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Author)
++        schema_editor.create_model(Publisher)
++        schema_editor.create_model(Book)
++    
++    print("=== Debugging Test Case ===\n")
++    
++    # Create test data
++    p1 = Publisher.objects.create(name='Test Publisher', num_awards=1)
++    author = Author.objects.create(name="Test Author", age=30)
++    
++    book1 = Book.objects.create(
++        name="Book 1", pages=100, rating=4.0, price=Decimal('10.00'),
++        contact=author, publisher=p1, pubdate=datetime.date(2020, 1, 1)
++    )
++    book2 = Book.objects.create(
++        name="Book 2", pages=200, rating=4.5, price=Decimal('15.00'),
++        contact=author, publisher=p1, pubdate=datetime.date(2020, 2, 1)
++    )
++    
++    print(f"Created author: {author}")
++    print(f"Created books: {book1}, {book2}")
++    
++    # Check the relationship
++    print(f"Author books: {list(author.book_set.all())}")
++    print(f"Book1 contact: {book1.contact}")
++    print(f"Book2 contact: {book2.contact}")
++    
++    # Test the query
++    qs = Author.objects.filter(name="Test Author").annotate(
++        book_count=Count('book_contact_set')
++    ).order_by('?').values('id', 'book_count')
++    
++    print(f"Query: {qs.query}")
++    result = list(qs)
++    print(f"Result: {result}")
++    
++    # Test without random ordering
++    qs2 = Author.objects.filter(name="Test Author").annotate(
++        book_count=Count('book_contact_set')
++    ).order_by('id').values('id', 'book_count')
++    
++    print(f"Query without random: {qs2.query}")
++    result2 = list(qs2)
++    print(f"Result without random: {result2}")
++
++if __name__ == '__main__':
++    debug_test()
+\ No newline at end of file
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 04e430a42e..88bbd77807 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -129,7 +129,12 @@ class SQLCompiler:
+             # Skip References to the select clause, as all expressions in the
+             # select clause are already part of the group by.
+             if not is_ref:
+-                expressions.extend(expr.get_group_by_cols())
++                # Get group by columns but exclude Random expressions
++                group_by_cols = expr.get_group_by_cols()
++                expressions.extend([
++                    col for col in group_by_cols
++                    if not isinstance(col, Random)
++                ])
+         having_group_by = self.having.get_group_by_cols() if self.having else ()
+         for expr in having_group_by:
+             expressions.append(expr)
+diff --git a/test_annotation_behavior.py b/test_annotation_behavior.py
+new file mode 100644
+index 0000000000..7b20420f94
+--- /dev/null
++++ b/test_annotation_behavior.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python
++"""
++Test Random annotation behavior (separate from ordering).
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Count
++from django.db.models.functions import Random
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class Thing(models.Model):
++    name = models.CharField(max_length=100, default="test")
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_annotation_behavior():
++    """Test Random annotation behavior."""
++    
++    # Create tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Thing)
++    
++    print("=== Testing Random Annotation Behavior ===\n")
++    
++    # Create test data
++    Thing.objects.create(name="thing1")
++    Thing.objects.create(name="thing2")
++    
++    print("Created 2 Things")
++    
++    # Test 1: Random annotation without aggregation
++    print("\n1. Random annotation without aggregation:")
++    qs1 = Thing.objects.annotate(rand_val=Random()).order_by('id').values('id', 'rand_val')
++    result1 = list(qs1)
++    print(f"   Query: {qs1.query}")
++    print(f"   Result count: {len(result1)}")
++    print(f"   Expected: 2 rows (one per Thing)")
++    
++    # Test 2: Random annotation with aggregation (the problematic case)
++    print("\n2. Random annotation with aggregation:")
++    qs2 = Thing.objects.annotate(
++        rand_val=Random(),
++        count_val=Count('id')
++    ).order_by('id').values('id', 'rand_val', 'count_val')
++    result2 = list(qs2)
++    print(f"   Query: {qs2.query}")
++    print(f"   Result count: {len(result2)}")
++    print(f"   Expected: 2 rows (one per Thing)")
++    
++    print("\n=== Analysis ===")
++    print("Test 1 shows that Random annotation without aggregation works correctly.")
++    print("Test 2 shows that Random annotation WITH aggregation creates multiple rows")
++    print("because each Random() call returns a different value, creating separate groups.")
++    print("\nThis is actually the CORRECT behavior for annotations!")
++    print("If you annotate with Random(), each row gets a different random value,")
++    print("so they can't be grouped together. This is different from ordering.")
++
++if __name__ == '__main__':
++    test_annotation_behavior()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..b60e2d21e1
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the Random ordering fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Count, Sum, Avg
++from django.db.models.functions import Random
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class Thing(models.Model):
++    name = models.CharField(max_length=100, default="test")
++    value = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Related(models.Model):
++    thing = models.ForeignKey(Thing, on_delete=models.CASCADE)
++    value = models.IntegerField(default=1)
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_edge_cases():
++    """Test various edge cases for the Random ordering fix."""
++    
++    # Create tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Thing)
++        schema_editor.create_model(Related)
++    
++    print("=== Testing Edge Cases ===\n")
++    
++    # Create test data
++    t1 = Thing.objects.create(name="thing1", value=10)
++    t2 = Thing.objects.create(name="thing2", value=20)
++    
++    Related.objects.create(thing=t1, value=1)
++    Related.objects.create(thing=t1, value=2)
++    Related.objects.create(thing=t2, value=3)
++    
++    print("Created 2 Things with 3 Related objects total")
++    
++    # Test 1: Multiple aggregations with random ordering
++    print("\n1. Multiple aggregations with random ordering:")
++    qs1 = Thing.objects.annotate(
++        rc=Count('related'),
++        avg_val=Avg('related__value')
++    ).order_by('?').values('id', 'rc', 'avg_val')
++    result1 = list(qs1)
++    print(f"   Query: {qs1.query}")
++    print(f"   Result: {result1}")
++    print(f"   Expected: 2 rows (one per Thing)")
++    
++    # Test 2: Random ordering with values() and aggregation
++    print("\n2. Random ordering with values() and aggregation:")
++    qs2 = Thing.objects.values('name').annotate(rc=Count('related')).order_by('?')
++    result2 = list(qs2)
++    print(f"   Query: {qs2.query}")
++    print(f"   Result: {result2}")
++    print(f"   Expected: 2 rows (one per Thing name)")
++    
++    # Test 3: Random ordering without aggregation (should still work)
++    print("\n3. Random ordering without aggregation:")
++    qs3 = Thing.objects.order_by('?').values('id', 'name')
++    result3 = list(qs3)
++    print(f"   Query: {qs3.query}")
++    print(f"   Result: {result3}")
++    print(f"   Expected: 2 rows (all Things)")
++    
++    # Test 4: Mixed ordering (field + random)
++    print("\n4. Mixed ordering (field + random):")
++    qs4 = Thing.objects.annotate(rc=Count('related')).order_by('name', '?').values('id', 'rc')
++    result4 = list(qs4)
++    print(f"   Query: {qs4.query}")
++    print(f"   Result: {result4}")
++    print(f"   Expected: 2 rows (one per Thing)")
++    
++    # Test 5: Random in annotation (not ordering)
++    print("\n5. Random in annotation (not ordering):")
++    qs5 = Thing.objects.annotate(
++        rc=Count('related'),
++        rand_val=Random()
++    ).order_by('id').values('id', 'rc', 'rand_val')
++    result5 = list(qs5)
++    print(f"   Query: {qs5.query}")
++    print(f"   Result count: {len(result5)}")
++    print(f"   Expected: 2 rows (one per Thing)")
++    
++    # Validate results
++    print("\n=== Validation ===")
++    
++    # Check that aggregations work correctly
++    if len(result1) == 2:
++        print("✅ Test 1 PASSED: Multiple aggregations work with random ordering")
++    else:
++        print(f"❌ Test 1 FAILED: Expected 2 rows, got {len(result1)}")
++    
++    if len(result2) == 2:
++        print("✅ Test 2 PASSED: values() + aggregation works with random ordering")
++    else:
++        print(f"❌ Test 2 FAILED: Expected 2 rows, got {len(result2)}")
++    
++    if len(result3) == 2:
++        print("✅ Test 3 PASSED: Random ordering without aggregation works")
++    else:
++        print(f"❌ Test 3 FAILED: Expected 2 rows, got {len(result3)}")
++    
++    if len(result4) == 2:
++        print("✅ Test 4 PASSED: Mixed ordering works with aggregation")
++    else:
++        print(f"❌ Test 4 FAILED: Expected 2 rows, got {len(result4)}")
++    
++    if len(result5) == 2:
++        print("✅ Test 5 PASSED: Random in annotation works")
++    else:
++        print(f"❌ Test 5 FAILED: Expected 2 rows, got {len(result5)}")
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_random_aggregation_bug.py b/test_random_aggregation_bug.py
+new file mode 100644
+index 0000000000..46f02c2258
+--- /dev/null
++++ b/test_random_aggregation_bug.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the order_by('?') aggregation bug.
++
++This script reproduces the issue where using order_by('?') with aggregation
++incorrectly adds RANDOM() to the GROUP BY clause, breaking the aggregation.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define test models
++class Thing(models.Model):
++    name = models.CharField(max_length=100, default="test")
++    
++    class Meta:
++        app_label = '__main__'
++
++class Related(models.Model):
++    thing = models.ForeignKey(Thing, on_delete=models.CASCADE)
++    value = models.IntegerField(default=1)
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_random_ordering_with_aggregation():
++    """Test that demonstrates the bug with order_by('?') and aggregation."""
++    
++    # Create tables
++    from django.db import connection
++    
++    # Create tables manually
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Thing)
++        schema_editor.create_model(Related)
++    
++    print("=== Testing order_by('?') with aggregation ===\n")
++    
++    # Create test data
++    t = Thing.objects.create(name="test_thing")
++    rs = [Related.objects.create(thing=t, value=i) for i in range(2)]
++    
++    print(f"Created 1 Thing with {len(rs)} Related objects")
++    
++    # Test 1: Normal aggregation (should work)
++    print("\n1. Normal aggregation (order_by('id')):")
++    qs1 = Thing.objects.annotate(rc=Count('related')).order_by('id').values('id', 'rc')
++    result1 = list(qs1)
++    print(f"   Query: {qs1.query}")
++    print(f"   Result: {result1}")
++    print("   Expected: [{'id': 1, 'rc': 2}] (one row with count=2)")
++    
++    # Test 2: Aggregation with field ordering (should break aggregation)
++    print("\n2. Aggregation with field ordering (order_by('related')):")
++    qs2 = Thing.objects.annotate(rc=Count('related')).order_by('related').values('id', 'rc')
++    result2 = list(qs2)
++    print(f"   Query: {qs2.query}")
++    print(f"   Result: {result2}")
++    print("   Expected: [{'id': 1, 'rc': 1}, {'id': 1, 'rc': 1}] (two rows with count=1 each)")
++    
++    # Test 3: Aggregation with random ordering (BUG - should NOT break aggregation)
++    print("\n3. Aggregation with random ordering (order_by('?')) - THE BUG:")
++    qs3 = Thing.objects.annotate(rc=Count('related')).order_by('?').values('id', 'rc')
++    result3 = list(qs3)
++    print(f"   Query: {qs3.query}")
++    print(f"   Result: {result3}")
++    print("   Expected: [{'id': 1, 'rc': 2}] (one row with count=2)")
++    print(f"   Actual: {result3}")
++    
++    # Check if the bug exists
++    if len(result3) == 2 and all(item['rc'] == 1 for item in result3):
++        print("\n❌ BUG CONFIRMED: Random ordering incorrectly breaks aggregation!")
++        print("   The RANDOM() function is being added to GROUP BY clause.")
++        return False
++    elif len(result3) == 1 and result3[0]['rc'] == 2:
++        print("\n✅ BUG FIXED: Random ordering does not break aggregation!")
++        return True
++    else:
++        print(f"\n❓ UNEXPECTED RESULT: {result3}")
++        return False
++
++def test_sql_analysis():
++    """Analyze the generated SQL to understand the issue."""
++    print("\n=== SQL Analysis ===")
++    
++    # Create test data if not exists
++    if not Thing.objects.exists():
++        t = Thing.objects.create(name="test_thing")
++        Related.objects.create(thing=t, value=1)
++        Related.objects.create(thing=t, value=2)
++    
++    # Get the problematic query
++    qs = Thing.objects.annotate(rc=Count('related')).order_by('?').values('id', 'rc')
++    sql_query = str(qs.query)
++    
++    print(f"Generated SQL: {sql_query}")
++    
++    # Check if RANDOM() appears in GROUP BY
++    if 'GROUP BY' in sql_query:
++        group_by_part = sql_query.split('GROUP BY')[1].split('ORDER BY')[0].strip()
++        print(f"GROUP BY clause: {group_by_part}")
++        
++        # Check for various random function names across different databases
++        random_functions = ['RANDOM()', 'RAND()', 'DBMS_RANDOM.VALUE']
++        has_random_in_group_by = any(func in group_by_part for func in random_functions)
++        
++        if has_random_in_group_by:
++            print("❌ PROBLEM: Random function is included in GROUP BY clause!")
++            return False
++        else:
++            print("✅ GOOD: Random function is not in GROUP BY clause")
++            return True
++    else:
++        print("❓ Could not find GROUP BY clause")
++        return None
++
++if __name__ == '__main__':
++    print("Django Random Ordering Aggregation Bug Test")
++    print("=" * 50)
++    
++    # Run tests
++    aggregation_test_passed = test_random_ordering_with_aggregation()
++    sql_test_passed = test_sql_analysis()
++    
++    print("\n" + "=" * 50)
++    print("SUMMARY:")
++    print(f"Aggregation test: {'PASSED' if aggregation_test_passed else 'FAILED'}")
++    print(f"SQL analysis test: {'PASSED' if sql_test_passed else 'FAILED'}")
++    
++    if not aggregation_test_passed:
++        print("\nThe bug exists: order_by('?') incorrectly breaks queryset aggregation")
++        sys.exit(1)
++    else:
++        print("\nNo bug detected: order_by('?') works correctly with aggregation")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_random_ordering_aggregation.py b/test_random_ordering_aggregation.py
+new file mode 100644
+index 0000000000..2cd0c7a300
+--- /dev/null
++++ b/test_random_ordering_aggregation.py
+@@ -0,0 +1,101 @@
++"""
++Test case for the Random ordering aggregation fix.
++
++This test should be added to the Django test suite to prevent regression
++of the bug where order_by('?') incorrectly breaks queryset aggregation.
++"""
++
++from django.db import models
++from django.db.models import Count
++from django.test import TestCase
++
++
++class Thing(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'aggregation'
++
++
++class Related(models.Model):
++    thing = models.ForeignKey(Thing, on_delete=models.CASCADE)
++    value = models.IntegerField()
++
++    class Meta:
++        app_label = 'aggregation'
++
++
++class RandomOrderingAggregationTests(TestCase):
++    """
++    Test that random ordering (order_by('?')) doesn't break aggregation.
++    
++    This addresses the issue where RANDOM() was incorrectly added to the
++    GROUP BY clause, causing aggregation to be broken.
++    """
++
++    @classmethod
++    def setUpTestData(cls):
++        # Create test data: one Thing with two Related objects
++        cls.thing = Thing.objects.create(name="test_thing")
++        Related.objects.create(thing=cls.thing, value=1)
++        Related.objects.create(thing=cls.thing, value=2)
++
++    def test_random_ordering_preserves_aggregation(self):
++        """
++        Test that order_by('?') doesn't break aggregation.
++        
++        The aggregation should return one row with count=2, not two rows
++        with count=1 each.
++        """
++        # Test with random ordering
++        qs = Thing.objects.annotate(rc=Count('related')).order_by('?').values('id', 'rc')
++        result = list(qs)
++        
++        # Should return one row with the correct count
++        self.assertEqual(len(result), 1)
++        self.assertEqual(result[0]['rc'], 2)
++
++    def test_random_ordering_sql_excludes_random_from_group_by(self):
++        """
++        Test that the generated SQL doesn't include RANDOM() in GROUP BY.
++        """
++        qs = Thing.objects.annotate(rc=Count('related')).order_by('?').values('id', 'rc')
++        sql = str(qs.query)
++        
++        # Should have ORDER BY with random function but not in GROUP BY
++        self.assertIn('ORDER BY', sql)
++        
++        # Extract GROUP BY clause
++        if 'GROUP BY' in sql:
++            group_by_part = sql.split('GROUP BY')[1].split('ORDER BY')[0].strip()
++            
++            # Random functions should not be in GROUP BY
++            random_functions = ['RANDOM()', 'RAND()', 'DBMS_RANDOM.VALUE']
++            for func in random_functions:
++                self.assertNotIn(func, group_by_part)
++
++    def test_field_ordering_breaks_aggregation_as_expected(self):
++        """
++        Test that ordering by a related field still breaks aggregation as expected.
++        
++        This is the expected behavior and should not be changed by the fix.
++        """
++        qs = Thing.objects.annotate(rc=Count('related')).order_by('related').values('id', 'rc')
++        result = list(qs)
++        
++        # Should return two rows with count=1 each (broken aggregation)
++        self.assertEqual(len(result), 2)
++        self.assertTrue(all(item['rc'] == 1 for item in result))
++
++    def test_normal_ordering_preserves_aggregation(self):
++        """
++        Test that normal ordering preserves aggregation.
++        
++        This is a control test to ensure normal behavior still works.
++        """
++        qs = Thing.objects.annotate(rc=Count('related')).order_by('id').values('id', 'rc')
++        result = list(qs)
++        
++        # Should return one row with the correct count
++        self.assertEqual(len(result), 1)
++        self.assertEqual(result[0]['rc'], 2)
+\ No newline at end of file
+diff --git a/tests/aggregation/tests.py b/tests/aggregation/tests.py
+index f8aeceb2d0..2babb792d5 100644
+--- a/tests/aggregation/tests.py
++++ b/tests/aggregation/tests.py
+@@ -1315,3 +1315,41 @@ class AggregateTestCase(TestCase):
+         # with self.assertNumQueries(1) as ctx:
+         #     self.assertSequenceEqual(books_qs, [book])
+         # self.assertEqual(ctx[0]['sql'].count('SELECT'), 2)
++
++    def test_random_ordering_preserves_aggregation(self):
++        """
++        Test that order_by('?') doesn't break aggregation.
++        
++        The aggregation should return one row with count=2, not two rows
++        with count=1 each. This addresses the issue where RANDOM() was
++        incorrectly added to the GROUP BY clause.
++        """
++        # Create test data: one author with two books
++        author = Author.objects.create(name="Random Test Author", age=30)
++        Book.objects.create(
++            name="Random Book 1", pages=100, rating=4.0, price=Decimal('10.00'),
++            contact=author, publisher=self.p1, pubdate=datetime.date(2020, 1, 1)
++        )
++        Book.objects.create(
++            name="Random Book 2", pages=200, rating=4.5, price=Decimal('15.00'),
++            contact=author, publisher=self.p1, pubdate=datetime.date(2020, 2, 1)
++        )
++        
++        # Test with random ordering - should preserve aggregation
++        qs = Author.objects.filter(pk=author.pk).annotate(
++            book_count=Count('book_contact_set')
++        ).order_by('?').values('id', 'book_count')
++        result = list(qs)
++        
++        # Should return one row with the correct count
++        self.assertEqual(len(result), 1)
++        self.assertEqual(result[0]['book_count'], 2)
++        
++        # Verify SQL doesn't include RANDOM() in GROUP BY
++        sql = str(qs.query)
++        if 'GROUP BY' in sql:
++            group_by_part = sql.split('GROUP BY')[1].split('ORDER BY')[0].strip()
++            # Random functions should not be in GROUP BY
++            random_functions = ['RANDOM()', 'RAND()', 'DBMS_RANDOM.VALUE']
++            for func in random_functions:
++                self.assertNotIn(func, group_by_part)

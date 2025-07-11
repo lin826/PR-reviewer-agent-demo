@@ -1,0 +1,204 @@
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index c957ffa564..4fcb52cf40 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -59,11 +59,55 @@ class Q(tree.Node):
+         return obj
+ 
+     def __or__(self, other):
++        """
++        Return a new Q object combining 'self' and 'other' with an OR operation.
++        If 'other' is an Expression (like Exists), special handling is needed.
++        """
++        from django.db.models.expressions import Expression
++        if isinstance(other, Expression):
++            obj = type(self)()
++            obj.connector = self.OR
++            obj.add(self, self.OR)
++            obj.add(other, self.OR)
++            return obj
+         return self._combine(other, self.OR)
+ 
++    def __ror__(self, other):
++        """
++        Return 'other | self' which is logically equivalent to 'self | other'.
++        This allows expressions like Exists(...) | Q(...) to work correctly.
++        """
++        obj = type(self)()
++        obj.connector = self.OR
++        obj.add(other, self.OR)
++        obj.add(self, self.OR)
++        return obj
++
+     def __and__(self, other):
++        """
++        Return a new Q object combining 'self' and 'other' with an AND operation.
++        If 'other' is an Expression (like Exists), special handling is needed.
++        """
++        from django.db.models.expressions import Expression
++        if isinstance(other, Expression):
++            obj = type(self)()
++            obj.connector = self.AND
++            obj.add(self, self.AND)
++            obj.add(other, self.AND)
++            return obj
+         return self._combine(other, self.AND)
+ 
++    def __rand__(self, other):
++        """
++        Return 'other & self' which is logically equivalent to 'self & other'.
++        This allows expressions like Exists(...) & Q(...) to work correctly.
++        """
++        obj = type(self)()
++        obj.connector = self.AND
++        obj.add(other, self.AND)
++        obj.add(self, self.AND)
++        return obj
++
+     def __invert__(self):
+         obj = type(self)()
+         obj.add(self, self.AND)
+diff --git a/test_exists_q.py b/test_exists_q.py
+new file mode 100644
+index 0000000000..c37ee0498e
+--- /dev/null
++++ b/test_exists_q.py
+@@ -0,0 +1,36 @@
++from django.db.models import Q
++from django.db.models.expressions import Exists
++from django.db.models.query import QuerySet
++
++# Create a mock queryset - we don't need an actual database connection
++# for this simple test
++mock_queryset = QuerySet()
++
++# Test the issue
++print("\nTesting Exists(...) & Q() - Should work:")
++try:
++    result = Exists(mock_queryset) & Q()
++    print(f"Success: {result}")
++except TypeError as e:
++    print(f"Failed: {e}")
++
++print("\nTesting Q() & Exists(...) - Should now work with our fix:")
++try:
++    result = Q() & Exists(mock_queryset)
++    print(f"Success: {result}")
++except TypeError as e:
++    print(f"Failed with TypeError: {e}")
++
++print("\nTesting Exists(...) | Q() - Should work:")
++try:
++    result = Exists(mock_queryset) | Q()
++    print(f"Success: {result}")
++except TypeError as e:
++    print(f"Failed: {e}")
++
++print("\nTesting Q() | Exists(...) - Should now work with our fix:")
++try:
++    result = Q() | Exists(mock_queryset)
++    print(f"Success: {result}")
++except TypeError as e:
++    print(f"Failed with TypeError: {e}")
+\ No newline at end of file
+diff --git a/test_q_exists_combinations.py b/test_q_exists_combinations.py
+new file mode 100644
+index 0000000000..1c40d439c9
+--- /dev/null
++++ b/test_q_exists_combinations.py
+@@ -0,0 +1,94 @@
++from django.conf import settings
++from django.test.utils import setup_test_environment
++
++# Configure Django settings
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++    ],
++)
++
++import django
++django.setup()
++setup_test_environment()
++
++from django.db import models
++from django.db.models import Q
++from django.db.models.expressions import Exists, F, Value
++
++# Test model
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    price = models.DecimalField(max_digits=10, decimal_places=2)
++
++    class Meta:
++        app_label = 'test_app'
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Product)
++
++# Insert some test data
++Product.objects.create(name='Product 1', price=10.00)
++Product.objects.create(name='Product 2', price=20.00)
++Product.objects.create(name='Product 3', price=30.00)
++
++# Test basic combinations
++print("Basic combinations:")
++print("------------------")
++
++print("Testing Exists(...) & Q():")
++result = Exists(Product.objects.filter(price__gt=15)) & Q(name__startswith='P')
++print(f"  Result: {result}")
++print(f"  SQL: {Product.objects.filter(result).query}")
++
++print("\nTesting Q() & Exists(...):")
++result = Q(name__startswith='P') & Exists(Product.objects.filter(price__gt=15))
++print(f"  Result: {result}")
++print(f"  SQL: {Product.objects.filter(result).query}")
++
++print("\nTesting Exists(...) | Q():")
++result = Exists(Product.objects.filter(price__gt=15)) | Q(name__startswith='P')
++print(f"  Result: {result}")
++print(f"  SQL: {Product.objects.filter(result).query}")
++
++print("\nTesting Q() | Exists(...):")
++result = Q(name__startswith='P') | Exists(Product.objects.filter(price__gt=15))
++print(f"  Result: {result}")
++print(f"  SQL: {Product.objects.filter(result).query}")
++
++# Test complex combinations
++print("\nComplex combinations:")
++print("-------------------")
++
++print("Testing (Q() & Q()) & Exists(...):")
++result = (Q(name__startswith='P') & Q(price__lt=25)) & Exists(Product.objects.filter(price__gt=15))
++print(f"  Result: {result}")
++print(f"  SQL: {Product.objects.filter(result).query}")
++
++print("\nTesting Exists(...) & (Q() & Q()):")
++result = Exists(Product.objects.filter(price__gt=15)) & (Q(name__startswith='P') & Q(price__lt=25))
++print(f"  Result: {result}")
++print(f"  SQL: {Product.objects.filter(result).query}")
++
++print("\nTesting Q() & (Exists(...) & Exists(...)):")
++result = Q(name__startswith='P') & (Exists(Product.objects.filter(price__gt=15)) & Exists(Product.objects.filter(price__lt=25)))
++print(f"  Result: {result}")
++print(f"  SQL: {Product.objects.filter(result).query}")
++
++print("\nTesting (Exists(...) & Exists(...)) & Q():")
++result = (Exists(Product.objects.filter(price__gt=15)) & Exists(Product.objects.filter(price__lt=25))) & Q(name__startswith='P')
++print(f"  Result: {result}")
++print(f"  SQL: {Product.objects.filter(result).query}")
++
++# Note: Our fix is specifically for Exists expressions - they're a special 
++# case where they need to be combined with Q objects in queries. Other 
++# expressions may behave differently, which is outside the scope of our fix.
+\ No newline at end of file

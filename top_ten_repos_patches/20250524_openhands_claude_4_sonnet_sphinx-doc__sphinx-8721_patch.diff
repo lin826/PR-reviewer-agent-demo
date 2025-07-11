@@ -1,0 +1,656 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..3cb6f9a29
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,221 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for viewcode epub issue.
++
++This script reproduces the issue where viewcode creates pages for epub 
++even when viewcode_enable_epub=False on `make html epub`.
++"""
++
++import os
++import shutil
++import tempfile
++from pathlib import Path
++
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def create_test_project(tmpdir):
++    """Create a minimal test project with viewcode extension."""
++    
++    # Create source directory
++    srcdir = tmpdir / "source"
++    srcdir.mkdir()
++    
++    # Create conf.py
++    conf_content = '''
++import os
++import sys
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.viewcode']
++viewcode_enable_epub = False
++'''
++    (srcdir / "conf.py").write_text(conf_content)
++    
++    # Create index.rst
++    index_content = '''
++Test Project
++============
++
++.. automodule:: testmodule
++   :members:
++'''
++    (srcdir / "index.rst").write_text(index_content)
++    
++    # Create a test module
++    module_content = '''
++"""Test module for viewcode testing."""
++
++def test_function():
++    """A test function."""
++    return "Hello, World!"
++
++class TestClass:
++    """A test class."""
++    
++    def test_method(self):
++        """A test method."""
++        return "Method called"
++'''
++    (srcdir / "testmodule.py").write_text(module_content)
++    
++    return srcdir
++
++
++def build_docs(srcdir, builder_name):
++    """Build documentation with the specified builder."""
++    outdir = srcdir.parent / f"build_{builder_name}"
++    doctreedir = srcdir.parent / f"doctrees_{builder_name}"
++    
++    # Clean up previous builds
++    if outdir.exists():
++        shutil.rmtree(outdir)
++    if doctreedir.exists():
++        shutil.rmtree(doctreedir)
++    
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir),
++            doctreedir=str(doctreedir),
++            buildername=builder_name,
++            verbosity=1
++        )
++        app.build()
++    
++    return outdir
++
++
++def check_viewcode_pages(outdir, builder_name):
++    """Check if viewcode pages were generated."""
++    modules_dir = outdir / "_modules"
++    
++    if modules_dir.exists():
++        print(f"✗ {builder_name}: _modules directory exists (should not exist for epub with viewcode_enable_epub=False)")
++        # List the contents
++        for item in modules_dir.rglob("*"):
++            if item.is_file():
++                print(f"  Found: {item.relative_to(outdir)}")
++        return True
++    else:
++        print(f"✓ {builder_name}: _modules directory does not exist (correct)")
++        return False
++
++
++def build_docs_sequential(srcdir):
++    """Build HTML then EPUB sequentially to simulate 'make html epub'."""
++    outdir_html = srcdir.parent / "build_html"
++    outdir_epub = srcdir.parent / "build_epub"
++    doctreedir = srcdir.parent / "doctrees"
++    
++    # Clean up previous builds
++    for outdir in [outdir_html, outdir_epub, doctreedir]:
++        if outdir.exists():
++            shutil.rmtree(outdir)
++    
++    # Build HTML first
++    print("Building HTML documentation...")
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir_html),
++            doctreedir=str(doctreedir),
++            buildername="html",
++            verbosity=1
++        )
++        app.build()
++    
++    # Build EPUB using the same environment (this simulates make html epub)
++    print("Building EPUB documentation...")
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir_epub),
++            doctreedir=str(doctreedir),
++            buildername="epub",
++            verbosity=1
++        )
++        app.build()
++    
++    return outdir_html, outdir_epub
++
++
++def main():
++    """Main function to reproduce the issue."""
++    print("Reproducing viewcode epub issue...")
++    print("=" * 50)
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        srcdir = create_test_project(tmpdir)
++        
++        print(f"Created test project in: {srcdir}")
++        print()
++        
++        # Test 1: Build separately
++        print("TEST 1: Building HTML and EPUB separately")
++        print("-" * 40)
++        
++        # Build HTML (should have viewcode pages)
++        print("Building HTML documentation...")
++        html_outdir = build_docs(srcdir, "html")
++        html_has_modules = check_viewcode_pages(html_outdir, "HTML")
++        print()
++        
++        # Build EPUB (should NOT have viewcode pages due to viewcode_enable_epub=False)
++        print("Building EPUB documentation...")
++        epub_outdir = build_docs(srcdir, "epub")
++        epub_has_modules_separate = check_viewcode_pages(epub_outdir, "EPUB")
++        print()
++        
++        # Test 2: Build sequentially (simulating make html epub)
++        print("TEST 2: Building HTML then EPUB sequentially (simulating 'make html epub')")
++        print("-" * 40)
++        
++        html_outdir2, epub_outdir2 = build_docs_sequential(srcdir)
++        html_has_modules2 = check_viewcode_pages(html_outdir2, "HTML (sequential)")
++        epub_has_modules_sequential = check_viewcode_pages(epub_outdir2, "EPUB (sequential)")
++        print()
++        
++        # Summary
++        print("Summary:")
++        print("=" * 50)
++        print("Separate builds:")
++        if html_has_modules:
++            print("  ✓ HTML build correctly includes viewcode pages")
++        else:
++            print("  ✗ HTML build missing viewcode pages (unexpected)")
++            
++        if epub_has_modules_separate:
++            print("  ✗ EPUB build incorrectly includes viewcode pages")
++        else:
++            print("  ✓ EPUB build correctly excludes viewcode pages")
++            
++        print("\nSequential builds (simulating 'make html epub'):")
++        if html_has_modules2:
++            print("  ✓ HTML build correctly includes viewcode pages")
++        else:
++            print("  ✗ HTML build missing viewcode pages (unexpected)")
++            
++        if epub_has_modules_sequential:
++            print("  ✗ EPUB build incorrectly includes viewcode pages (BUG!)")
++            print("    This is the issue we need to fix.")
++            return True  # Issue reproduced
++        else:
++            print("  ✓ EPUB build correctly excludes viewcode pages")
++            
++        return epub_has_modules_separate or epub_has_modules_sequential
++
++
++if __name__ == "__main__":
++    issue_reproduced = main()
++    if issue_reproduced:
++        print("\n🐛 Issue successfully reproduced!")
++        exit(1)
++    else:
++        print("\n✅ Issue not reproduced - behavior is correct.")
++        exit(0)
+\ No newline at end of file
+diff --git a/sphinx/ext/viewcode.py b/sphinx/ext/viewcode.py
+index a7d52a91c..060604e25 100644
+--- a/sphinx/ext/viewcode.py
++++ b/sphinx/ext/viewcode.py
+@@ -182,6 +182,8 @@ def collect_pages(app: Sphinx) -> Generator[Tuple[str, Dict[str, Any], str], Non
+     env = app.builder.env
+     if not hasattr(env, '_viewcode_modules'):
+         return
++    if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
++        return
+     highlighter = app.builder.highlighter  # type: ignore
+     urito = app.builder.get_relative_uri
+ 
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 000000000..df2c0360e
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,241 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the viewcode epub fix.
++
++This script tests various scenarios to ensure the fix works correctly.
++"""
++
++import os
++import shutil
++import tempfile
++from pathlib import Path
++
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def create_test_project(tmpdir, viewcode_enable_epub):
++    """Create a minimal test project with viewcode extension."""
++    
++    # Create source directory
++    srcdir = tmpdir / "source"
++    srcdir.mkdir()
++    
++    # Create conf.py
++    conf_content = f'''
++import os
++import sys
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.viewcode']
++viewcode_enable_epub = {viewcode_enable_epub}
++'''
++    (srcdir / "conf.py").write_text(conf_content)
++    
++    # Create index.rst
++    index_content = '''
++Test Project
++============
++
++.. automodule:: testmodule
++   :members:
++'''
++    (srcdir / "index.rst").write_text(index_content)
++    
++    # Create a test module
++    module_content = '''
++"""Test module for viewcode testing."""
++
++def test_function():
++    """A test function."""
++    return "Hello, World!"
++
++class TestClass:
++    """A test class."""
++    
++    def test_method(self):
++        """A test method."""
++        return "Method called"
++'''
++    (srcdir / "testmodule.py").write_text(module_content)
++    
++    return srcdir
++
++
++def build_docs_sequential(srcdir):
++    """Build HTML then EPUB sequentially."""
++    outdir_html = srcdir.parent / "build_html"
++    outdir_epub = srcdir.parent / "build_epub"
++    doctreedir = srcdir.parent / "doctrees"
++    
++    # Clean up previous builds
++    for outdir in [outdir_html, outdir_epub, doctreedir]:
++        if outdir.exists():
++            shutil.rmtree(outdir)
++    
++    # Build HTML first
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir_html),
++            doctreedir=str(doctreedir),
++            buildername="html",
++            verbosity=0  # Reduce verbosity for cleaner output
++        )
++        app.build()
++    
++    # Build EPUB
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir_epub),
++            doctreedir=str(doctreedir),
++            buildername="epub",
++            verbosity=0  # Reduce verbosity for cleaner output
++        )
++        app.build()
++    
++    return outdir_html, outdir_epub
++
++
++def build_docs_separate(srcdir):
++    """Build HTML and EPUB separately."""
++    outdir_html = srcdir.parent / "build_html_sep"
++    outdir_epub = srcdir.parent / "build_epub_sep"
++    
++    # Clean up previous builds
++    for outdir in [outdir_html, outdir_epub]:
++        if outdir.exists():
++            shutil.rmtree(outdir)
++    
++    # Build HTML
++    doctreedir_html = srcdir.parent / "doctrees_html"
++    if doctreedir_html.exists():
++        shutil.rmtree(doctreedir_html)
++    
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir_html),
++            doctreedir=str(doctreedir_html),
++            buildername="html",
++            verbosity=0
++        )
++        app.build()
++    
++    # Build EPUB
++    doctreedir_epub = srcdir.parent / "doctrees_epub"
++    if doctreedir_epub.exists():
++        shutil.rmtree(doctreedir_epub)
++    
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir_epub),
++            doctreedir=str(doctreedir_epub),
++            buildername="epub",
++            verbosity=0
++        )
++        app.build()
++    
++    return outdir_html, outdir_epub
++
++
++def check_viewcode_pages(outdir):
++    """Check if viewcode pages were generated."""
++    modules_dir = outdir / "_modules"
++    return modules_dir.exists()
++
++
++def test_scenario(scenario_name, viewcode_enable_epub, expected_html, expected_epub_seq, expected_epub_sep):
++    """Test a specific scenario."""
++    print(f"\n{scenario_name}")
++    print("=" * len(scenario_name))
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        srcdir = create_test_project(tmpdir, viewcode_enable_epub)
++        
++        # Test sequential builds
++        html_outdir, epub_outdir = build_docs_sequential(srcdir)
++        html_has_modules = check_viewcode_pages(html_outdir)
++        epub_has_modules_seq = check_viewcode_pages(epub_outdir)
++        
++        # Test separate builds
++        html_outdir_sep, epub_outdir_sep = build_docs_separate(srcdir)
++        html_has_modules_sep = check_viewcode_pages(html_outdir_sep)
++        epub_has_modules_sep = check_viewcode_pages(epub_outdir_sep)
++        
++        # Check results
++        results = []
++        
++        # HTML should always have viewcode pages
++        if html_has_modules == expected_html and html_has_modules_sep == expected_html:
++            results.append("✓ HTML builds correctly include viewcode pages")
++        else:
++            results.append(f"✗ HTML builds: expected {expected_html}, got seq={html_has_modules}, sep={html_has_modules_sep}")
++        
++        # EPUB sequential
++        if epub_has_modules_seq == expected_epub_seq:
++            results.append(f"✓ EPUB sequential build: {'includes' if expected_epub_seq else 'excludes'} viewcode pages (correct)")
++        else:
++            results.append(f"✗ EPUB sequential build: expected {expected_epub_seq}, got {epub_has_modules_seq}")
++        
++        # EPUB separate
++        if epub_has_modules_sep == expected_epub_sep:
++            results.append(f"✓ EPUB separate build: {'includes' if expected_epub_sep else 'excludes'} viewcode pages (correct)")
++        else:
++            results.append(f"✗ EPUB separate build: expected {expected_epub_sep}, got {epub_has_modules_sep}")
++        
++        for result in results:
++            print(result)
++        
++        # Return True if all tests passed
++        return all(result.startswith("✓") for result in results)
++
++
++def main():
++    """Test various scenarios."""
++    print("Comprehensive test for viewcode epub fix")
++    print("=" * 40)
++    
++    all_passed = True
++    
++    # Scenario 1: viewcode_enable_epub = False (default)
++    # HTML should have viewcode, EPUB should not
++    passed = test_scenario(
++        "Scenario 1: viewcode_enable_epub = False (default)",
++        viewcode_enable_epub=False,
++        expected_html=True,
++        expected_epub_seq=False,  # This is the bug we fixed
++        expected_epub_sep=False
++    )
++    all_passed = all_passed and passed
++    
++    # Scenario 2: viewcode_enable_epub = True
++    # Both HTML and EPUB should have viewcode
++    passed = test_scenario(
++        "Scenario 2: viewcode_enable_epub = True",
++        viewcode_enable_epub=True,
++        expected_html=True,
++        expected_epub_seq=True,
++        expected_epub_sep=True
++    )
++    all_passed = all_passed and passed
++    
++    print(f"\n{'='*40}")
++    if all_passed:
++        print("✅ All tests passed! The fix works correctly.")
++        return True
++    else:
++        print("❌ Some tests failed.")
++        return False
++
++
++if __name__ == "__main__":
++    success = main()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_viewcode_enabled.py b/test_viewcode_enabled.py
+new file mode 100644
+index 000000000..96c3c8b2a
+--- /dev/null
++++ b/test_viewcode_enabled.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python3
++"""
++Test script to verify viewcode works when viewcode_enable_epub=True.
++"""
++
++import os
++import shutil
++import tempfile
++from pathlib import Path
++
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def create_test_project_enabled(tmpdir):
++    """Create a minimal test project with viewcode extension and viewcode_enable_epub=True."""
++    
++    # Create source directory
++    srcdir = tmpdir / "source"
++    srcdir.mkdir()
++    
++    # Create conf.py with viewcode_enable_epub=True
++    conf_content = '''
++import os
++import sys
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.viewcode']
++viewcode_enable_epub = True
++'''
++    (srcdir / "conf.py").write_text(conf_content)
++    
++    # Create index.rst
++    index_content = '''
++Test Project
++============
++
++.. automodule:: testmodule
++   :members:
++'''
++    (srcdir / "index.rst").write_text(index_content)
++    
++    # Create a test module
++    module_content = '''
++"""Test module for viewcode testing."""
++
++def test_function():
++    """A test function."""
++    return "Hello, World!"
++
++class TestClass:
++    """A test class."""
++    
++    def test_method(self):
++        """A test method."""
++        return "Method called"
++'''
++    (srcdir / "testmodule.py").write_text(module_content)
++    
++    return srcdir
++
++
++def build_docs_sequential(srcdir):
++    """Build HTML then EPUB sequentially."""
++    outdir_html = srcdir.parent / "build_html"
++    outdir_epub = srcdir.parent / "build_epub"
++    doctreedir = srcdir.parent / "doctrees"
++    
++    # Clean up previous builds
++    for outdir in [outdir_html, outdir_epub, doctreedir]:
++        if outdir.exists():
++            shutil.rmtree(outdir)
++    
++    # Build HTML first
++    print("Building HTML documentation...")
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir_html),
++            doctreedir=str(doctreedir),
++            buildername="html",
++            verbosity=1
++        )
++        app.build()
++    
++    # Build EPUB
++    print("Building EPUB documentation...")
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(outdir_epub),
++            doctreedir=str(doctreedir),
++            buildername="epub",
++            verbosity=1
++        )
++        app.build()
++    
++    return outdir_html, outdir_epub
++
++
++def check_viewcode_pages(outdir, builder_name):
++    """Check if viewcode pages were generated."""
++    modules_dir = outdir / "_modules"
++    
++    if modules_dir.exists():
++        print(f"✓ {builder_name}: _modules directory exists")
++        # List the contents
++        for item in modules_dir.rglob("*"):
++            if item.is_file():
++                print(f"  Found: {item.relative_to(outdir)}")
++        return True
++    else:
++        print(f"✗ {builder_name}: _modules directory does not exist")
++        return False
++
++
++def main():
++    """Test viewcode with viewcode_enable_epub=True."""
++    print("Testing viewcode with viewcode_enable_epub=True...")
++    print("=" * 50)
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        srcdir = create_test_project_enabled(tmpdir)
++        
++        print(f"Created test project in: {srcdir}")
++        print()
++        
++        # Build sequentially (simulating make html epub)
++        html_outdir, epub_outdir = build_docs_sequential(srcdir)
++        html_has_modules = check_viewcode_pages(html_outdir, "HTML")
++        epub_has_modules = check_viewcode_pages(epub_outdir, "EPUB")
++        print()
++        
++        # Summary
++        print("Summary:")
++        print("=" * 50)
++        if html_has_modules:
++            print("✓ HTML build correctly includes viewcode pages")
++        else:
++            print("✗ HTML build missing viewcode pages (unexpected)")
++            
++        if epub_has_modules:
++            print("✓ EPUB build correctly includes viewcode pages (viewcode_enable_epub=True)")
++        else:
++            print("✗ EPUB build missing viewcode pages (unexpected with viewcode_enable_epub=True)")
++            
++        return html_has_modules and epub_has_modules
++
++
++if __name__ == "__main__":
++    success = main()
++    if success:
++        print("\n✅ Test passed: viewcode works correctly with viewcode_enable_epub=True")
++        exit(0)
++    else:
++        print("\n❌ Test failed: viewcode not working correctly with viewcode_enable_epub=True")
++        exit(1)
+\ No newline at end of file

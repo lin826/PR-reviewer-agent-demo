@@ -1,0 +1,437 @@
+diff --git a/django/db/models/sql/where.py b/django/db/models/sql/where.py
+index aaab1730b7..846396b94c 100644
+--- a/django/db/models/sql/where.py
++++ b/django/db/models/sql/where.py
+@@ -129,13 +129,15 @@ class WhereNode(tree.Node):
+             # Convert if the database doesn't support XOR:
+             #   a XOR b XOR c XOR ...
+             # to:
+-            #   (a OR b OR c OR ...) AND (a + b + c + ...) == 1
++            #   (a OR b OR c OR ...) AND (a + b + c + ...) % 2 == 1
++            from django.db.models.functions import Mod
++            
+             lhs = self.__class__(self.children, OR)
+             rhs_sum = reduce(
+                 operator.add,
+                 (Case(When(c, then=1), default=0) for c in self.children),
+             )
+-            rhs = Exact(1, rhs_sum)
++            rhs = Exact(1, Mod(rhs_sum, 2))
+             return self.__class__([lhs, rhs], AND, self.negated).as_sql(
+                 compiler, connection
+             )
+diff --git a/reproduce_xor_issue.py b/reproduce_xor_issue.py
+new file mode 100644
+index 0000000000..1b4a8032f0
+--- /dev/null
++++ b/reproduce_xor_issue.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python
++"""
++Reproduction script for XOR issue in Django.
++
++This script demonstrates the problem where Q(...) ^ Q(...) ^ Q(...) 
++with more than 2 arguments is wrongly interpreted as exactly-one 
++rather than parity on databases lacking native XOR support.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Q
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple test model
++class TestModel(models.Model):
++    id = models.AutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test data
++test_obj = TestModel.objects.create(id=37, name="test")
++
++def test_xor_behavior():
++    """Test XOR behavior with multiple arguments."""
++    print("Testing XOR behavior on database:", connection.vendor)
++    print("Supports logical XOR:", connection.features.supports_logical_xor)
++    print()
++    
++    # Test single condition (should be True)
++    result1 = TestModel.objects.filter(Q(id=37)).count()
++    print(f"Q(id=37): {result1} (expected: 1)")
++    
++    # Test two XOR conditions (should be False: True XOR True = False)
++    result2 = TestModel.objects.filter(Q(id=37) ^ Q(id=37)).count()
++    print(f"Q(id=37) ^ Q(id=37): {result2} (expected: 0)")
++    
++    # Test three XOR conditions (should be True: True XOR True XOR True = True)
++    result3 = TestModel.objects.filter(Q(id=37) ^ Q(id=37) ^ Q(id=37)).count()
++    print(f"Q(id=37) ^ Q(id=37) ^ Q(id=37): {result3} (expected: 1)")
++    
++    # Test four XOR conditions (should be False: even number of True values)
++    result4 = TestModel.objects.filter(Q(id=37) ^ Q(id=37) ^ Q(id=37) ^ Q(id=37)).count()
++    print(f"Q(id=37) ^ Q(id=37) ^ Q(id=37) ^ Q(id=37): {result4} (expected: 0)")
++    
++    # Test five XOR conditions (should be True: odd number of True values)
++    result5 = TestModel.objects.filter(Q(id=37) ^ Q(id=37) ^ Q(id=37) ^ Q(id=37) ^ Q(id=37)).count()
++    print(f"Q(id=37) ^ Q(id=37) ^ Q(id=37) ^ Q(id=37) ^ Q(id=37): {result5} (expected: 1)")
++    
++    print()
++    
++    # Test with mixed conditions
++    print("Testing with mixed True/False conditions:")
++    
++    # True XOR False = True
++    result_mixed1 = TestModel.objects.filter(Q(id=37) ^ Q(id=999)).count()
++    print(f"Q(id=37) ^ Q(id=999): {result_mixed1} (expected: 1)")
++    
++    # True XOR False XOR True = False (even number of True values)
++    result_mixed2 = TestModel.objects.filter(Q(id=37) ^ Q(id=999) ^ Q(id=37)).count()
++    print(f"Q(id=37) ^ Q(id=999) ^ Q(id=37): {result_mixed2} (expected: 0)")
++    
++    # True XOR False XOR False = True (odd number of True values)
++    result_mixed3 = TestModel.objects.filter(Q(id=37) ^ Q(id=999) ^ Q(id=998)).count()
++    print(f"Q(id=37) ^ Q(id=999) ^ Q(id=998): {result_mixed3} (expected: 1)")
++    
++    print()
++    
++    # Show the generated SQL for debugging
++    print("Generated SQL for Q(id=37) ^ Q(id=37) ^ Q(id=37):")
++    qs = TestModel.objects.filter(Q(id=37) ^ Q(id=37) ^ Q(id=37))
++    print(str(qs.query))
++    
++    return {
++        'single': result1,
++        'two_xor': result2,
++        'three_xor': result3,
++        'four_xor': result4,
++        'five_xor': result5,
++        'mixed1': result_mixed1,
++        'mixed2': result_mixed2,
++        'mixed3': result_mixed3,
++    }
++
++if __name__ == "__main__":
++    results = test_xor_behavior()
++    
++    # Check if results match expected parity behavior
++    expected = {
++        'single': 1,
++        'two_xor': 0,
++        'three_xor': 1,
++        'four_xor': 0,
++        'five_xor': 1,
++        'mixed1': 1,
++        'mixed2': 0,
++        'mixed3': 1,
++    }
++    
++    print("\nSummary:")
++    all_correct = True
++    for key, expected_val in expected.items():
++        actual_val = results[key]
++        status = "✓" if actual_val == expected_val else "✗"
++        print(f"{key}: {actual_val} (expected {expected_val}) {status}")
++        if actual_val != expected_val:
++            all_correct = False
++    
++    if all_correct:
++        print("\n✓ All tests passed! XOR behavior is correct.")
++        sys.exit(0)
++    else:
++        print("\n✗ Some tests failed! XOR behavior is incorrect.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..c938bdaec6
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python
++"""
++Test edge cases for XOR fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Q
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create test models
++class TestModel(models.Model):
++    id = models.AutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++    value = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test data
++obj1 = TestModel.objects.create(id=1, name="obj1", value=10)
++obj2 = TestModel.objects.create(id=2, name="obj2", value=20)
++obj3 = TestModel.objects.create(id=3, name="obj3", value=30)
++
++def test_edge_cases():
++    """Test edge cases for XOR behavior."""
++    print("Testing XOR edge cases on database:", connection.vendor)
++    print("Supports logical XOR:", connection.features.supports_logical_xor)
++    print()
++    
++    # Test with different field conditions
++    print("=== Testing with different field conditions ===")
++    
++    # Test: id=1 XOR value=20 XOR name="obj3"
++    # obj1: True XOR False XOR False = True
++    # obj2: False XOR True XOR False = True  
++    # obj3: False XOR False XOR True = True
++    # Expected: 3 results
++    result1 = TestModel.objects.filter(Q(id=1) ^ Q(value=20) ^ Q(name="obj3")).count()
++    print(f"Q(id=1) ^ Q(value=20) ^ Q(name='obj3'): {result1} (expected: 3)")
++    
++    # Test: id=1 XOR value=999 XOR name="obj3"
++    # obj1: True XOR False XOR False = True
++    # obj2: False XOR False XOR False = False
++    # obj3: False XOR False XOR True = True
++    # Expected: 2 results (obj1, obj3)
++    result2 = TestModel.objects.filter(Q(id=1) ^ Q(value=999) ^ Q(name="obj3")).count()
++    print(f"Q(id=1) ^ Q(value=999) ^ Q(name='obj3'): {result2} (expected: 2)")
++    
++    # Test: id=999 XOR value=999 XOR name="obj3" (should be True: 0 XOR 0 XOR 1 = 1)
++    result3 = TestModel.objects.filter(Q(id=999) ^ Q(value=999) ^ Q(name="obj3")).count()
++    print(f"Q(id=999) ^ Q(value=999) ^ Q(name='obj3'): {result3} (expected: 1)")
++    
++    print()
++    
++    # Test with complex conditions
++    print("=== Testing with complex conditions ===")
++    
++    # Test: (id__in=[1,2]) XOR (value__gt=15) XOR (name__startswith="obj")
++    # For obj1: True XOR False XOR True = False
++    # For obj2: True XOR True XOR True = True  
++    # For obj3: False XOR True XOR True = False
++    # Expected: 1 result (obj2)
++    result4 = TestModel.objects.filter(
++        Q(id__in=[1,2]) ^ Q(value__gt=15) ^ Q(name__startswith="obj")
++    ).count()
++    print(f"Q(id__in=[1,2]) ^ Q(value__gt=15) ^ Q(name__startswith='obj'): {result4} (expected: 1)")
++    
++    # Test with 6 conditions (even number, should follow parity)
++    print()
++    print("=== Testing with 6 conditions ===")
++    
++    # All True conditions: True^True^True^True^True^True = False (even number)
++    result5 = TestModel.objects.filter(
++        Q(id__gte=1) ^ Q(value__gte=0) ^ Q(name__contains="obj") ^ 
++        Q(id__lte=10) ^ Q(value__lte=100) ^ Q(name__isnull=False)
++    ).count()
++    print(f"6 True conditions: {result5} (expected: 0)")
++    
++    # 5 True, 1 False: True^True^True^True^True^False = True (odd number)
++    result6 = TestModel.objects.filter(
++        Q(id__gte=1) ^ Q(value__gte=0) ^ Q(name__contains="obj") ^ 
++        Q(id__lte=10) ^ Q(value__lte=100) ^ Q(name__contains="nonexistent")
++    ).count()
++    print(f"5 True, 1 False conditions: {result6} (expected: 3)")
++    
++    print()
++    
++    # Test with negated conditions
++    print("=== Testing with negated conditions ===")
++    
++    # Test: ~Q(id=999) XOR ~Q(value=999) XOR Q(name="obj1")
++    # For obj1: True XOR True XOR True = True
++    # For obj2: True XOR True XOR False = False
++    # For obj3: True XOR True XOR False = False
++    # Expected: 1 result (obj1)
++    result7 = TestModel.objects.filter(~Q(id=999) ^ ~Q(value=999) ^ Q(name="obj1")).count()
++    print(f"~Q(id=999) ^ ~Q(value=999) ^ Q(name='obj1'): {result7} (expected: 1)")
++    
++    return {
++        'different_fields': result1,
++        'mixed_true_false': result2,
++        'mostly_false': result3,
++        'complex_conditions': result4,
++        'six_true': result5,
++        'five_true_one_false': result6,
++        'negated_conditions': result7,
++    }
++
++if __name__ == "__main__":
++    results = test_edge_cases()
++    
++    # Check if results match expected parity behavior
++    expected = {
++        'different_fields': 3,
++        'mixed_true_false': 2,
++        'mostly_false': 1,
++        'complex_conditions': 1,
++        'six_true': 0,
++        'five_true_one_false': 3,
++        'negated_conditions': 1,
++    }
++    
++    print("\nSummary:")
++    all_correct = True
++    for key, expected_val in expected.items():
++        actual_val = results[key]
++        status = "✓" if actual_val == expected_val else "✗"
++        print(f"{key}: {actual_val} (expected {expected_val}) {status}")
++        if actual_val != expected_val:
++            all_correct = False
++    
++    if all_correct:
++        print("\n✓ All edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("\n✗ Some edge case tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_postgresql.py b/test_postgresql.py
+new file mode 100644
+index 0000000000..a874883061
+--- /dev/null
++++ b/test_postgresql.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python
++"""
++Test XOR behavior with PostgreSQL configuration.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Q
++
++# Configure Django settings for PostgreSQL
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test_db',
++                'USER': 'test_user',
++                'PASSWORD': 'test_pass',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Check if PostgreSQL supports XOR
++print("Database vendor:", connection.vendor)
++print("Supports logical XOR:", connection.features.supports_logical_xor)
++
++# Create a simple test model
++class TestModel(models.Model):
++    id = models.AutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the SQL generation without actually connecting to PostgreSQL
++from django.db.models.sql.where import WhereNode
++from django.db.models.expressions import Case, When
++from django.db.models.lookups import Exact
++
++# Create a mock query to test SQL generation
++def test_xor_sql_generation():
++    """Test XOR SQL generation for PostgreSQL."""
++    
++    # Create test conditions
++    from django.db.models.sql.query import Query
++    from django.db.models.sql.compiler import SQLCompiler
++    
++    # Create a simple where node with XOR
++    where_node = WhereNode()
++    where_node.connector = 'XOR'
++    
++    # Add some test conditions (we'll mock these)
++    from django.db.models.lookups import Exact
++    from django.db.models.fields import IntegerField
++    
++    # Create mock conditions
++    cond1 = Exact(37, 'id')
++    cond1.lhs = 'test_testmodel.id'
++    cond1.rhs = 37
++    
++    cond2 = Exact(37, 'id') 
++    cond2.lhs = 'test_testmodel.id'
++    cond2.rhs = 37
++    
++    cond3 = Exact(37, 'id')
++    cond3.lhs = 'test_testmodel.id'
++    cond3.rhs = 37
++    
++    where_node.children = [cond1, cond2, cond3]
++    
++    # Test that PostgreSQL doesn't support XOR natively
++    from django.db.backends.postgresql.features import DatabaseFeatures
++    features = DatabaseFeatures(None)
++    print(f"PostgreSQL supports_logical_xor: {features.supports_logical_xor}")
++
++if __name__ == "__main__":
++    test_xor_sql_generation()
+\ No newline at end of file

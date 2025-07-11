@@ -1,0 +1,680 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index b192df4fbf..5ddc05e8ba 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -72,6 +72,35 @@ from django.db.models.utils import resolve_callables
+ from django.utils.functional import cached_property
+ 
+ 
++def filter_sliced_queryset(queryset, **filter_kwargs):
++    """
++    Apply filters to a queryset that may be sliced.
++    
++    If the queryset is sliced, temporarily remove the slice, apply the filter,
++    then reapply the slice. This allows filtering sliced querysets which is
++    needed for prefetch_related with sliced querysets.
++    """
++    if not queryset.query.is_sliced:
++        # Not sliced, apply filter normally
++        return queryset.filter(**filter_kwargs)
++    
++    # Save slice parameters
++    low_mark = queryset.query.low_mark
++    high_mark = queryset.query.high_mark
++    
++    # Clone the queryset and clear the slice
++    unsliced_qs = queryset._chain()
++    unsliced_qs.query.clear_limits()
++    
++    # Apply the filter
++    filtered_qs = unsliced_qs.filter(**filter_kwargs)
++    
++    # Reapply the slice
++    filtered_qs.query.set_limits(low_mark, high_mark)
++    
++    return filtered_qs
++
++
+ class ForeignKeyDeferredAttribute(DeferredAttribute):
+     def __set__(self, instance, value):
+         if instance.__dict__.get(self.field.attname) != value and self.field.is_cached(
+@@ -145,7 +174,7 @@ class ForwardManyToOneDescriptor:
+             }
+         else:
+             query = {"%s__in" % self.field.related_query_name(): instances}
+-        queryset = queryset.filter(**query)
++        queryset = filter_sliced_queryset(queryset, **query)
+ 
+         # Since we're going to assign directly in the cache,
+         # we must manage the reverse relation cache manually.
+@@ -404,7 +433,7 @@ class ReverseOneToOneDescriptor:
+         instance_attr = self.related.field.get_foreign_related_value
+         instances_dict = {instance_attr(inst): inst for inst in instances}
+         query = {"%s__in" % self.related.field.name: instances}
+-        queryset = queryset.filter(**query)
++        queryset = filter_sliced_queryset(queryset, **query)
+ 
+         # Since we're going to assign directly in the cache,
+         # we must manage the reverse relation cache manually.
+@@ -663,7 +692,7 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             if self._db:
+                 queryset = queryset.using(self._db)
+             queryset._defer_next_filter = True
+-            queryset = queryset.filter(**self.core_filters)
++            queryset = filter_sliced_queryset(queryset, **self.core_filters)
+             for field in self.field.foreign_related_fields:
+                 val = getattr(self.instance, field.attname)
+                 if val is None or (val == "" and empty_strings_as_null):
+@@ -719,7 +748,7 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             instance_attr = self.field.get_foreign_related_value
+             instances_dict = {instance_attr(inst): inst for inst in instances}
+             query = {"%s__in" % self.field.name: instances}
+-            queryset = queryset.filter(**query)
++            queryset = filter_sliced_queryset(queryset, **query)
+ 
+             # Since we just bypassed this class' get_queryset(), we must manage
+             # the reverse relation manually.
+@@ -1029,7 +1058,17 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+             if self._db:
+                 queryset = queryset.using(self._db)
+             queryset._defer_next_filter = True
+-            return queryset._next_is_sticky().filter(**self.core_filters)
++            if queryset.query.is_sliced:
++                # Handle sliced queryset: save slice, clear it, apply filter, reapply slice
++                low_mark = queryset.query.low_mark
++                high_mark = queryset.query.high_mark
++                unsliced_qs = queryset._chain()
++                unsliced_qs.query.clear_limits()
++                filtered_qs = unsliced_qs._next_is_sticky().filter(**self.core_filters)
++                filtered_qs.query.set_limits(low_mark, high_mark)
++                return filtered_qs
++            else:
++                return queryset._next_is_sticky().filter(**self.core_filters)
+ 
+         def _remove_prefetched_objects(self):
+             try:
+@@ -1052,6 +1091,14 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+             queryset = queryset.using(queryset._db or self._db)
+ 
+             query = {"%s__in" % self.query_field_name: instances}
++            
++            # Handle sliced queryset: save slice, clear it, do all operations, then reapply slice
++            slice_params = None
++            if queryset.query.is_sliced:
++                slice_params = (queryset.query.low_mark, queryset.query.high_mark)
++                queryset = queryset._chain()
++                queryset.query.clear_limits()
++            
+             queryset = queryset._next_is_sticky().filter(**query)
+ 
+             # M2M: need to annotate the query in order to get the primary model
+@@ -1073,6 +1120,10 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+                     for f in fk.local_related_fields
+                 }
+             )
++            
++            # Reapply slice if it was originally sliced
++            if slice_params:
++                queryset.query.set_limits(slice_params[0], slice_params[1])
+             return (
+                 queryset,
+                 lambda result: tuple(
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..edb0d6a819
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python
++"""
++Test script to verify the original issue from the GitHub issue is fixed.
++"""
++import os
++import sys
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++sys.path.insert(0, '/workspace/django__django__4.2/tests')
++
++import django
++django.setup()
++
++from django.db.models import Prefetch
++from prefetch_related.models import Author, Book
++
++def test_original_issue():
++    """Test the exact code from the GitHub issue."""
++    print("Testing the original issue code...")
++    
++    # Clear existing data
++    Author.objects.all().delete()
++    Book.objects.all().delete()
++    
++    # Create test data similar to the issue description
++    book1 = Book.objects.create(title="Post 1")
++    book2 = Book.objects.create(title="Post 2") 
++    book3 = Book.objects.create(title="Post 3")
++    book4 = Book.objects.create(title="Post 4")
++    
++    # Create categories (using Author as Category equivalent)
++    category1 = Author.objects.create(name="Category 1", first_book=book1)
++    category2 = Author.objects.create(name="Category 2", first_book=book2)
++    
++    # Add posts to categories (using books as posts)
++    category1.books.add(book1, book2, book3, book4)
++    category2.books.add(book2, book3, book4)
++    
++    print("Test data created.")
++    
++    try:
++        # This is the exact code from the issue that was failing
++        categories = Author.objects.prefetch_related(Prefetch(
++            'books',  # Using 'books' instead of 'post_set'
++            queryset=Book.objects.all()[:3],
++            to_attr='example_posts',
++        ))
++        
++        # Force evaluation
++        categories_list = list(categories)
++        
++        print("SUCCESS: The original issue code now works!")
++        
++        # Verify the results
++        for category in categories_list:
++            print(f"{category.name} has {len(category.example_posts)} example posts:")
++            for post in category.example_posts:
++                print(f"  - {post.title}")
++        
++        return True
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_original_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_prefetch_slice_issue.py b/test_prefetch_slice_issue.py
+new file mode 100644
+index 0000000000..b568478dc2
+--- /dev/null
++++ b/test_prefetch_slice_issue.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the Prefetch with sliced queryset issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.prefetch_related',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Prefetch
++from tests.prefetch_related.models import Author, Book
++
++def test_prefetch_with_slice():
++    """Test that demonstrates the issue with Prefetch and sliced querysets."""
++    print("Setting up test data...")
++    
++    # Create test data
++    author1 = Author.objects.create(name="Author 1")
++    author2 = Author.objects.create(name="Author 2")
++    
++    book1 = Book.objects.create(title="Book 1")
++    book2 = Book.objects.create(title="Book 2") 
++    book3 = Book.objects.create(title="Book 3")
++    book4 = Book.objects.create(title="Book 4")
++    book5 = Book.objects.create(title="Book 5")
++    
++    # Set first_book for authors (required field)
++    author1.first_book = book1
++    author1.save()
++    author2.first_book = book2
++    author2.save()
++    
++    # Add books to authors
++    author1.books.add(book1, book2, book3)
++    author2.books.add(book3, book4, book5)
++    
++    print("Test data created successfully.")
++    print(f"Author 1 has {author1.books.count()} books")
++    print(f"Author 2 has {author2.books.count()} books")
++    
++    print("\nTesting Prefetch with sliced queryset...")
++    
++    try:
++        # This should fail with "Cannot filter a query once a slice has been taken."
++        authors = Author.objects.prefetch_related(
++            Prefetch(
++                'books',
++                queryset=Book.objects.all()[:2],  # Slice to get only first 2 books
++                to_attr='limited_books',
++            )
++        )
++        
++        # Force evaluation
++        for author in authors:
++            print(f"{author.name} has {len(author.limited_books)} limited books:")
++            for book in author.limited_books:
++                print(f"  - {book.title}")
++                
++        print("SUCCESS: Prefetch with sliced queryset worked!")
++        return True
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++
++if __name__ == "__main__":
++    # Create tables
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        try:
++            schema_editor.create_model(Author)
++        except:
++            pass
++        try:
++            schema_editor.create_model(Book)
++        except:
++            pass
++        try:
++            # Create the many-to-many table
++            schema_editor.create_model(Book.authors.through)
++        except:
++            pass
++    
++    success = test_prefetch_with_slice()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_prefetch_slice_simple.py b/test_prefetch_slice_simple.py
+new file mode 100644
+index 0000000000..d64f1d7c79
+--- /dev/null
++++ b/test_prefetch_slice_simple.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python
++"""
++Simple test script to reproduce the Prefetch with sliced queryset issue.
++"""
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++os.chdir('/workspace/django__django__4.2/tests')
++
++# Run the test using Django's test runner
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++
++import django
++django.setup()
++
++from django.db.models import Prefetch
++from prefetch_related.models import Author, Book
++
++def test_prefetch_with_slice():
++    """Test that demonstrates the issue with Prefetch and sliced querysets."""
++    print("Setting up test data...")
++    
++    # Clear existing data
++    Author.objects.all().delete()
++    Book.objects.all().delete()
++    
++    # Create test data
++    book1 = Book.objects.create(title="Book 1")
++    book2 = Book.objects.create(title="Book 2") 
++    book3 = Book.objects.create(title="Book 3")
++    book4 = Book.objects.create(title="Book 4")
++    book5 = Book.objects.create(title="Book 5")
++    
++    author1 = Author.objects.create(name="Author 1", first_book=book1)
++    author2 = Author.objects.create(name="Author 2", first_book=book2)
++    
++    # Add books to authors
++    author1.books.add(book1, book2, book3)
++    author2.books.add(book3, book4, book5)
++    
++    print("Test data created successfully.")
++    print(f"Author 1 has {author1.books.count()} books")
++    print(f"Author 2 has {author2.books.count()} books")
++    
++    print("\nTesting Prefetch with sliced queryset...")
++    
++    try:
++        # This should fail with "Cannot filter a query once a slice has been taken."
++        authors = Author.objects.prefetch_related(
++            Prefetch(
++                'books',
++                queryset=Book.objects.all()[:2],  # Slice to get only first 2 books
++                to_attr='limited_books',
++            )
++        )
++        
++        # Force evaluation
++        for author in authors:
++            print(f"{author.name} has {len(author.limited_books)} limited books:")
++            for book in author.limited_books:
++                print(f"  - {book.title}")
++                
++        print("SUCCESS: Prefetch with sliced queryset worked!")
++        return True
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++
++if __name__ == "__main__":
++    success = test_prefetch_with_slice()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_slice_issue.py b/test_slice_issue.py
+new file mode 100644
+index 0000000000..a2cdf90bf6
+--- /dev/null
++++ b/test_slice_issue.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the Prefetch with sliced queryset issue.
++"""
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++os.chdir('/workspace/django__django__4.2/tests')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++
++# Import Django and configure
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'prefetch_related',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.models import Prefetch
++from prefetch_related.models import Author, Book
++
++def test_prefetch_with_slice():
++    """Test that demonstrates the issue with Prefetch and sliced querysets."""
++    print("Setting up test data...")
++    
++    # Create test data
++    book1 = Book.objects.create(title="Book 1")
++    book2 = Book.objects.create(title="Book 2") 
++    book3 = Book.objects.create(title="Book 3")
++    book4 = Book.objects.create(title="Book 4")
++    book5 = Book.objects.create(title="Book 5")
++    
++    author1 = Author.objects.create(name="Author 1", first_book=book1)
++    author2 = Author.objects.create(name="Author 2", first_book=book2)
++    
++    # Add books to authors
++    author1.books.add(book1, book2, book3)
++    author2.books.add(book3, book4, book5)
++    
++    print("Test data created successfully.")
++    print(f"Author 1 has {author1.books.count()} books")
++    print(f"Author 2 has {author2.books.count()} books")
++    
++    print("\nTesting Prefetch with sliced queryset...")
++    
++    try:
++        # This should fail with "Cannot filter a query once a slice has been taken."
++        authors = Author.objects.prefetch_related(
++            Prefetch(
++                'books',
++                queryset=Book.objects.all()[:2],  # Slice to get only first 2 books
++                to_attr='limited_books',
++            )
++        )
++        
++        # Force evaluation
++        for author in authors:
++            print(f"{author.name} has {len(author.limited_books)} limited books:")
++            for book in author.limited_books:
++                print(f"  - {book.title}")
++                
++        print("SUCCESS: Prefetch with sliced queryset worked!")
++        return True
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++
++if __name__ == "__main__":
++    success = test_prefetch_with_slice()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_slice_reproduction.py b/test_slice_reproduction.py
+new file mode 100644
+index 0000000000..262003f718
+--- /dev/null
++++ b/test_slice_reproduction.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the Prefetch with sliced queryset issue.
++"""
++import os
++import sys
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++sys.path.insert(0, '/workspace/django__django__4.2/tests')
++
++import django
++django.setup()
++
++from django.db.models import Prefetch
++from prefetch_related.models import Author, Book
++
++def test_prefetch_with_slice():
++    """Test that demonstrates the issue with Prefetch and sliced querysets."""
++    print("Setting up test data...")
++    
++    # Clear existing data
++    Author.objects.all().delete()
++    Book.objects.all().delete()
++    
++    # Create test data
++    book1 = Book.objects.create(title="Book 1")
++    book2 = Book.objects.create(title="Book 2") 
++    book3 = Book.objects.create(title="Book 3")
++    book4 = Book.objects.create(title="Book 4")
++    book5 = Book.objects.create(title="Book 5")
++    
++    author1 = Author.objects.create(name="Author 1", first_book=book1)
++    author2 = Author.objects.create(name="Author 2", first_book=book2)
++    
++    # Add books to authors
++    author1.books.add(book1, book2, book3)
++    author2.books.add(book3, book4, book5)
++    
++    print("Test data created successfully.")
++    print(f"Author 1 has {author1.books.count()} books")
++    print(f"Author 2 has {author2.books.count()} books")
++    
++    print("\nTesting Prefetch with sliced queryset...")
++    
++    try:
++        # This should fail with "Cannot filter a query once a slice has been taken."
++        authors = Author.objects.prefetch_related(
++            Prefetch(
++                'books',
++                queryset=Book.objects.all()[:2],  # Slice to get only first 2 books
++                to_attr='limited_books',
++            )
++        )
++        
++        # Force evaluation
++        authors_list = list(authors)
++        for author in authors_list:
++            print(f"{author.name} has {len(author.limited_books)} limited books:")
++            for book in author.limited_books:
++                print(f"  - {book.title}")
++                
++        print("SUCCESS: Prefetch with sliced queryset worked!")
++        return True
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    success = test_prefetch_with_slice()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/tests/prefetch_related/test_slice_issue.py b/tests/prefetch_related/test_slice_issue.py
+new file mode 100644
+index 0000000000..725ee67f72
+--- /dev/null
++++ b/tests/prefetch_related/test_slice_issue.py
+@@ -0,0 +1,98 @@
++"""
++Test for Prefetch with sliced querysets issue.
++"""
++from django.db.models import Prefetch
++from django.test import TestCase
++
++from .models import Author, Book
++
++
++class PrefetchSliceTests(TestCase):
++    def test_prefetch_with_sliced_queryset(self):
++        """Test that Prefetch works with sliced querysets."""
++        # Create test data
++        book1 = Book.objects.create(title="Book 1")
++        book2 = Book.objects.create(title="Book 2") 
++        book3 = Book.objects.create(title="Book 3")
++        book4 = Book.objects.create(title="Book 4")
++        book5 = Book.objects.create(title="Book 5")
++        
++        author1 = Author.objects.create(name="Author 1", first_book=book1)
++        author2 = Author.objects.create(name="Author 2", first_book=book2)
++        
++        # Add books to authors
++        author1.books.add(book1, book2, book3)
++        author2.books.add(book3, book4, book5)
++        
++        # This should work without raising "Cannot filter a query once a slice has been taken."
++        authors = Author.objects.prefetch_related(
++            Prefetch(
++                'books',
++                queryset=Book.objects.all()[:2],  # Slice to get only first 2 books
++                to_attr='limited_books',
++            )
++        )
++        
++        # Force evaluation
++        authors_list = list(authors)
++        
++        # Verify the results
++        self.assertEqual(len(authors_list), 2)
++        
++        for author in authors_list:
++            # Each author should have at most 2 books due to the slice
++            self.assertLessEqual(len(author.limited_books), 2)
++            # Verify that limited_books is a list (not a queryset)
++            self.assertIsInstance(author.limited_books, list)
++            
++    def test_prefetch_with_different_slice_patterns(self):
++        """Test Prefetch with various slice patterns."""
++        # Create test data
++        books = [Book.objects.create(title=f"Book {i}") for i in range(10)]
++        author = Author.objects.create(name="Test Author", first_book=books[0])
++        author.books.set(books)
++        
++        # Test different slice patterns (excluding step slices as they evaluate to lists)
++        test_cases = [
++            (slice(None, 3), 3),      # [:3]
++            (slice(1, 4), 3),         # [1:4]
++            (slice(2, None), 8),      # [2:]
++        ]
++        
++        for slice_obj, expected_max in test_cases:
++            with self.subTest(slice=slice_obj):
++                # Create sliced queryset
++                sliced_qs = Book.objects.all()[slice_obj.start:slice_obj.stop]
++                
++                authors = Author.objects.filter(pk=author.pk).prefetch_related(
++                    Prefetch('books', queryset=sliced_qs, to_attr='sliced_books')
++                )
++                
++                author_result = list(authors)[0]
++                self.assertLessEqual(len(author_result.sliced_books), expected_max)
++                self.assertIsInstance(author_result.sliced_books, list)
++                
++    def test_prefetch_with_slice_and_ordering(self):
++        """Test Prefetch with sliced and ordered querysets."""
++        # Create test data with specific ordering
++        books = []
++        for i in range(5):
++            books.append(Book.objects.create(title=f"Book {chr(65 + i)}"))  # A, B, C, D, E
++            
++        author = Author.objects.create(name="Test Author", first_book=books[0])
++        author.books.set(books)
++        
++        # Test with ordering and slice
++        authors = Author.objects.filter(pk=author.pk).prefetch_related(
++            Prefetch(
++                'books', 
++                queryset=Book.objects.order_by('-title')[:2],  # Reverse order, first 2
++                to_attr='top_books'
++            )
++        )
++        
++        author_result = list(authors)[0]
++        self.assertEqual(len(author_result.top_books), 2)
++        # Should get books E and D (reverse alphabetical order)
++        self.assertEqual(author_result.top_books[0].title, "Book E")
++        self.assertEqual(author_result.top_books[1].title, "Book D")
+\ No newline at end of file

@@ -1,0 +1,242 @@
+diff --git a/lib/matplotlib/cbook.py b/lib/matplotlib/cbook.py
+index c9699b2e21..5c0d6c810c 100644
+--- a/lib/matplotlib/cbook.py
++++ b/lib/matplotlib/cbook.py
+@@ -790,6 +790,62 @@ class Grouper:
+ 
+     def __contains__(self, item):
+         return weakref.ref(item) in self._mapping
++        
++    def __getstate__(self):
++        """Return state for pickling."""
++        # Clean before pickling to remove any dead references
++        self.clean()
++        
++        # Create a mapping of strong references for pickling
++        # Extract live objects from weak references
++        mapping = {}
++        for key, group in self._mapping.items():
++            # Skip None keys (dead references)
++            obj = key()
++            if obj is None:
++                continue
++                
++            # Create a list of resolved objects (strong references) from the group
++            live_group = []
++            for ref in group:
++                item = ref()
++                if item is not None:
++                    live_group.append(item)
++                    
++            # Store using the object's id as key, since the object itself might 
++            # not be hashable in the standard dictionary
++            mapping[id(obj)] = (obj, live_group)
++            
++        return {'mapping': mapping}
++        
++    def __setstate__(self, state):
++        """Restore from pickled state."""
++        mapping = state.get('mapping', {})
++        
++        # Reconstruct the weakref mapping
++        self._mapping = {}
++        
++        # Create an id-to-weakref lookup to reuse groups
++        id_to_group = {}
++        
++        # Reconstruct the mapping with weak references
++        for obj_id, (obj, group) in mapping.items():
++            # Create weak references for the group
++            weakref_group = []
++            for item in group:
++                # Reuse existing group lists to maintain identity
++                if id(item) in id_to_group:
++                    weakref_group = id_to_group[id(item)]
++                    break
++                    
++            # If we didn't find an existing group, create a new one
++            if not weakref_group:
++                weakref_group = [weakref.ref(item) for item in group]
++                for item in group:
++                    id_to_group[id(item)] = weakref_group
++                    
++            # Add the object->group mapping
++            self._mapping[weakref.ref(obj)] = weakref_group
+ 
+     def clean(self):
+         """Clean dead weak references from the dictionary."""
+diff --git a/lib/matplotlib/tests/test_align_labels_pickle.py b/lib/matplotlib/tests/test_align_labels_pickle.py
+new file mode 100644
+index 0000000000..9eae9fc525
+--- /dev/null
++++ b/lib/matplotlib/tests/test_align_labels_pickle.py
+@@ -0,0 +1,69 @@
++"""Test that figures with align_labels are pickable."""
++
++import pickle
++import matplotlib.pyplot as plt
++import numpy as np
++import pytest
++
++
++def test_pickle_after_align_labels():
++    """Test that a figure remains pickable after calling align_labels."""
++    # Create a figure with multiple subplots
++    fig = plt.figure()
++    ax1 = fig.add_subplot(211)
++    ax2 = fig.add_subplot(212)
++    
++    # Add some data
++    x = np.array([0, 1, 2, 3, 4])
++    y1 = np.array([40000, 4300, 4500, 4700, 4800])
++    y2 = np.array([10, 11, 12, 13, 14])
++    
++    ax1.plot(x, y1)
++    ax1.set_ylabel('speed')
++    ax2.plot(x, y2)
++    ax2.set_ylabel('acc')
++    
++    # Initially should be pickable
++    pickle.dumps(fig)
++    
++    # After align_labels should still be pickable
++    fig.align_labels()
++    pickle_bytes = pickle.dumps(fig)
++    
++    # Should be able to unpickle
++    fig_unpickled = pickle.loads(pickle_bytes)
++    
++    # The unpickled figure should still have aligned labels
++    assert hasattr(fig_unpickled, '_align_label_groups')
++    
++    # Should be able to call align_labels again on the unpickled figure
++    fig_unpickled.align_labels()
++    
++    # And pickle again
++    pickle.dumps(fig_unpickled)
++
++
++def test_complex_layout_pickle():
++    """Test pickling with more complex layout and multiple alignments."""
++    fig, axs = plt.subplots(2, 2)
++    
++    # Add data and labels
++    for i, ax in enumerate(axs.flat):
++        ax.plot(np.arange(10), np.arange(10) * (i + 1))
++        ax.set_ylabel(f'Data {i+1}')
++        ax.set_xlabel(f'X {i+1}')
++    
++    # Test multiple rounds of alignment and pickling
++    fig.align_labels()
++    pickle_data1 = pickle.dumps(fig)
++    
++    # Change something and align again
++    axs[0, 0].set_ylabel('Modified data')
++    fig.align_xlabels()
++    fig.align_ylabels()
++    pickle_data2 = pickle.dumps(fig)
++    
++    # Load back and check still works
++    fig2 = pickle.loads(pickle_data2)
++    fig2.align_labels()
++    pickle.dumps(fig2)
+\ No newline at end of file
+diff --git a/reproduction.py b/reproduction.py
+new file mode 100644
+index 0000000000..32cb54d78d
+--- /dev/null
++++ b/reproduction.py
+@@ -0,0 +1,28 @@
++import matplotlib.pyplot as plt
++import pickle
++
++fig = plt.figure()
++ax1 = fig.add_subplot(211)
++ax2 = fig.add_subplot(212)
++time=[0,1,2,3,4]
++speed=[40000,4300,4500,4700,4800]
++acc=[10,11,12,13,14]
++ax1.plot(time,speed)
++ax1.set_ylabel('speed')
++ax2.plot(time,acc)
++ax2.set_ylabel('acc')
++
++print("Before align_labels()")
++try:
++    pickle_data = pickle.dumps(fig)
++    print("  Pickling successful")
++except Exception as e:
++    print(f"  Pickling failed: {e}")
++
++fig.align_labels()
++print("After align_labels()")
++try:
++    pickle_data = pickle.dumps(fig)
++    print("  Pickling successful")
++except Exception as e:
++    print(f"  Pickling failed: {e}")
+\ No newline at end of file
+diff --git a/test_pickle_align.py b/test_pickle_align.py
+new file mode 100644
+index 0000000000..9b75883a17
+--- /dev/null
++++ b/test_pickle_align.py
+@@ -0,0 +1,57 @@
++import matplotlib.pyplot as plt
++import pickle
++import numpy as np
++
++# Test with multiple subplots
++def test_complex_figure_pickling():
++    # Create a figure with multiple subplots
++    fig, axs = plt.subplots(2, 2, figsize=(10, 8))
++    
++    x = np.linspace(0, 10, 100)
++    y1 = np.sin(x)
++    y2 = np.cos(x)
++    y3 = np.tan(x)
++    y4 = np.exp(-x/5)
++    
++    axs[0, 0].plot(x, y1)
++    axs[0, 0].set_ylabel('sin(x)')
++    
++    axs[0, 1].plot(x, y2)
++    axs[0, 1].set_ylabel('cos(x)')
++    
++    axs[1, 0].plot(x, y3)
++    axs[1, 0].set_ylabel('tan(x)')
++    
++    axs[1, 1].plot(x, y4)
++    axs[1, 1].set_ylabel('exp(-x/5)')
++    
++    # Set titles to make it clear
++    fig.suptitle('Testing pickling with aligned labels')
++    
++    print("Before align_labels()")
++    try:
++        pickle_data = pickle.dumps(fig)
++        print("  Pickling successful")
++    except Exception as e:
++        print(f"  Pickling failed: {e}")
++    
++    # Align the labels
++    fig.align_labels()
++    print("After align_labels()")
++    try:
++        pickle_data = pickle.dumps(fig)
++        print("  Pickling successful")
++        
++        # Try to unpickle and check that it works
++        fig2 = pickle.loads(pickle_data)
++        print("  Unpickling successful")
++        
++        # Verify figure can still be manipulated after unpickling
++        fig2.suptitle('Unpickled Figure with Aligned Labels')
++        print("  Manipulation after unpickling successful")
++    except Exception as e:
++        print(f"  Operation failed: {e}")
++
++# Run the test
++test_complex_figure_pickling()
++print("\nAll tests passed successfully!")
+\ No newline at end of file

@@ -1,0 +1,332 @@
+diff --git a/reproduce_symlink_issue.py b/reproduce_symlink_issue.py
+new file mode 100644
+index 000000000..dece156f7
+--- /dev/null
++++ b/reproduce_symlink_issue.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for symlinked directory collection issue.
++
++This script creates a test structure with symlinked directories and verifies
++that pytest can collect tests from them.
++"""
++
++import os
++import tempfile
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++
++def create_test_structure():
++    """Create a test structure with symlinked directories."""
++    # Create temporary directory
++    temp_dir = Path(tempfile.mkdtemp(prefix="pytest_symlink_test_"))
++    print(f"Created test directory: {temp_dir}")
++    
++    try:
++        # Create real test directory structure
++        real_tests = temp_dir / "real_tests"
++        real_tests.mkdir()
++        
++        # Create a test file in the real directory
++        test_file = real_tests / "test_example.py"
++        test_file.write_text("""
++def test_example():
++    assert True
++
++def test_another():
++    assert 1 + 1 == 2
++""")
++        
++        # Create a subdirectory with more tests
++        subdir = real_tests / "subdir"
++        subdir.mkdir()
++        subtest_file = subdir / "test_sub.py"
++        subtest_file.write_text("""
++def test_in_subdir():
++    assert "hello" == "hello"
++""")
++        
++        # Create symlinked directory pointing to real_tests
++        symlink_tests = temp_dir / "symlinked_tests"
++        try:
++            symlink_tests.symlink_to(real_tests, target_is_directory=True)
++            print(f"Created symlink: {symlink_tests} -> {real_tests}")
++        except OSError as e:
++            print(f"Failed to create symlink: {e}")
++            return None, None
++        
++        return temp_dir, symlink_tests
++        
++    except Exception as e:
++        print(f"Error creating test structure: {e}")
++        shutil.rmtree(temp_dir, ignore_errors=True)
++        return None, None
++
++
++def run_pytest_collect(test_dir):
++    """Run pytest --collect-only on the given directory."""
++    print(f"\nRunning pytest --collect-only on {test_dir}")
++    
++    try:
++        result = subprocess.run(
++            [sys.executable, "-m", "pytest", "--collect-only", "-q", str(test_dir)],
++            capture_output=True,
++            text=True,
++            cwd=test_dir.parent
++        )
++        
++        print(f"Exit code: {result.returncode}")
++        print(f"STDOUT:\n{result.stdout}")
++        if result.stderr:
++            print(f"STDERR:\n{result.stderr}")
++            
++        return result.returncode, result.stdout, result.stderr
++        
++    except Exception as e:
++        print(f"Error running pytest: {e}")
++        return -1, "", str(e)
++
++
++def main():
++    print("=== Pytest Symlinked Directory Collection Test ===")
++    
++    # Create test structure
++    temp_dir, symlink_tests = create_test_structure()
++    if not temp_dir:
++        print("Failed to create test structure")
++        return 1
++    
++    try:
++        real_tests = temp_dir / "real_tests"
++        
++        # Test 1: Collect from real directory (should work)
++        print("\n" + "="*50)
++        print("TEST 1: Collecting from real directory")
++        print("="*50)
++        real_exit, real_stdout, real_stderr = run_pytest_collect(real_tests)
++        
++        # Test 2: Collect from symlinked directory (should work but might fail due to bug)
++        print("\n" + "="*50)
++        print("TEST 2: Collecting from symlinked directory")
++        print("="*50)
++        symlink_exit, symlink_stdout, symlink_stderr = run_pytest_collect(symlink_tests)
++        
++        # Analysis
++        print("\n" + "="*50)
++        print("ANALYSIS")
++        print("="*50)
++        
++        # Count collected tests
++        real_test_count = real_stdout.count("::test_")
++        symlink_test_count = symlink_stdout.count("::test_")
++        
++        print(f"Tests collected from real directory: {real_test_count}")
++        print(f"Tests collected from symlinked directory: {symlink_test_count}")
++        
++        if real_test_count > 0 and symlink_test_count == real_test_count:
++            print("✅ SUCCESS: Symlinked directory collection works correctly!")
++            return 0
++        elif real_test_count > 0 and symlink_test_count == 0:
++            print("❌ FAILURE: Symlinked directory collection is broken!")
++            print("   Real directory collected tests but symlinked directory did not.")
++            return 1
++        elif real_test_count == 0:
++            print("⚠️  WARNING: No tests collected from either directory.")
++            print("   This might indicate a different issue.")
++            return 1
++        else:
++            print(f"⚠️  PARTIAL: Real={real_test_count}, Symlink={symlink_test_count}")
++            return 1
++            
++    finally:
++        # Cleanup
++        print(f"\nCleaning up {temp_dir}")
++        shutil.rmtree(temp_dir, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+\ No newline at end of file
+diff --git a/reproduce_symlink_issue_v2.py b/reproduce_symlink_issue_v2.py
+new file mode 100644
+index 000000000..6feb970cc
+--- /dev/null
++++ b/reproduce_symlink_issue_v2.py
+@@ -0,0 +1,161 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for symlinked directory collection issue - Version 2.
++
++This script creates a test structure where a symlinked directory is a subdirectory
++within a regular directory, which should trigger the visit() function traversal.
++"""
++
++import os
++import tempfile
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++
++def create_test_structure():
++    """Create a test structure with symlinked subdirectories."""
++    # Create temporary directory
++    temp_dir = Path(tempfile.mkdtemp(prefix="pytest_symlink_test_v2_"))
++    print(f"Created test directory: {temp_dir}")
++    
++    try:
++        # Create main test directory
++        main_tests = temp_dir / "tests"
++        main_tests.mkdir()
++        
++        # Create a regular test file in main directory
++        test_file = main_tests / "test_main.py"
++        test_file.write_text("""
++def test_main():
++    assert True
++""")
++        
++        # Create real test directory somewhere else
++        real_tests = temp_dir / "real_tests"
++        real_tests.mkdir()
++        
++        # Create test files in the real directory
++        test_file2 = real_tests / "test_real.py"
++        test_file2.write_text("""
++def test_real():
++    assert 1 + 1 == 2
++
++def test_real_another():
++    assert "hello" == "hello"
++""")
++        
++        # Create a subdirectory in real_tests
++        subdir = real_tests / "subdir"
++        subdir.mkdir()
++        subtest_file = subdir / "test_sub.py"
++        subtest_file.write_text("""
++def test_in_subdir():
++    assert True
++""")
++        
++        # Create symlinked directory inside main_tests pointing to real_tests
++        symlink_dir = main_tests / "symlinked_subdir"
++        try:
++            symlink_dir.symlink_to(real_tests, target_is_directory=True)
++            print(f"Created symlink: {symlink_dir} -> {real_tests}")
++        except OSError as e:
++            print(f"Failed to create symlink: {e}")
++            return None, None
++        
++        return temp_dir, main_tests
++        
++    except Exception as e:
++        print(f"Error creating test structure: {e}")
++        shutil.rmtree(temp_dir, ignore_errors=True)
++        return None, None
++
++
++def run_pytest_collect(test_dir):
++    """Run pytest --collect-only on the given directory."""
++    print(f"\nRunning pytest --collect-only on {test_dir}")
++    
++    try:
++        result = subprocess.run(
++            [sys.executable, "-m", "pytest", "--collect-only", "-q", str(test_dir)],
++            capture_output=True,
++            text=True,
++            cwd=test_dir.parent
++        )
++        
++        print(f"Exit code: {result.returncode}")
++        print(f"STDOUT:\n{result.stdout}")
++        if result.stderr:
++            print(f"STDERR:\n{result.stderr}")
++            
++        return result.returncode, result.stdout, result.stderr
++        
++    except Exception as e:
++        print(f"Error running pytest: {e}")
++        return -1, "", str(e)
++
++
++def main():
++    print("=== Pytest Symlinked Subdirectory Collection Test ===")
++    
++    # Create test structure
++    temp_dir, main_tests = create_test_structure()
++    if not temp_dir:
++        print("Failed to create test structure")
++        return 1
++    
++    try:
++        # Show the structure
++        print(f"\nTest structure:")
++        print(f"  {main_tests}/")
++        print(f"    test_main.py")
++        print(f"    symlinked_subdir/ -> {temp_dir}/real_tests/")
++        print(f"      test_real.py")
++        print(f"      subdir/")
++        print(f"        test_sub.py")
++        
++        # Test: Collect from main directory (should find all tests including symlinked ones)
++        print("\n" + "="*60)
++        print("TEST: Collecting from main directory (should include symlinked tests)")
++        print("="*60)
++        exit_code, stdout, stderr = run_pytest_collect(main_tests)
++        
++        # Analysis
++        print("\n" + "="*50)
++        print("ANALYSIS")
++        print("="*50)
++        
++        # Count collected tests
++        test_count = stdout.count("::test_")
++        main_tests_found = "test_main.py::test_main" in stdout
++        symlink_tests_found = "symlinked_subdir/test_real.py::test_real" in stdout
++        symlink_sub_tests_found = "symlinked_subdir/subdir/test_sub.py::test_in_subdir" in stdout
++        
++        print(f"Total tests collected: {test_count}")
++        print(f"Main test found: {main_tests_found}")
++        print(f"Symlinked test found: {symlink_tests_found}")
++        print(f"Symlinked subdir test found: {symlink_sub_tests_found}")
++        
++        expected_tests = 4  # test_main + test_real + test_real_another + test_in_subdir
++        
++        if test_count == expected_tests and main_tests_found and symlink_tests_found and symlink_sub_tests_found:
++            print("✅ SUCCESS: All tests including symlinked directory tests were collected!")
++            return 0
++        elif main_tests_found and not (symlink_tests_found or symlink_sub_tests_found):
++            print("❌ FAILURE: Symlinked directory tests were NOT collected!")
++            print("   This indicates the symlink traversal bug.")
++            return 1
++        else:
++            print(f"⚠️  PARTIAL: Expected {expected_tests} tests, got {test_count}")
++            print("   Some tests were collected but not all expected ones.")
++            return 1
++            
++    finally:
++        # Cleanup
++        print(f"\nCleaning up {temp_dir}")
++        shutil.rmtree(temp_dir, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+\ No newline at end of file
+diff --git a/src/_pytest/pathlib.py b/src/_pytest/pathlib.py
+index f0bdb1481..b96cba069 100644
+--- a/src/_pytest/pathlib.py
++++ b/src/_pytest/pathlib.py
+@@ -558,7 +558,7 @@ def visit(
+     entries = sorted(os.scandir(path), key=lambda entry: entry.name)
+     yield from entries
+     for entry in entries:
+-        if entry.is_dir(follow_symlinks=False) and recurse(entry):
++        if entry.is_dir() and recurse(entry):
+             yield from visit(entry.path, recurse)

@@ -1,0 +1,740 @@
+diff --git a/SOLUTION_SUMMARY.md b/SOLUTION_SUMMARY.md
+new file mode 100644
+index 000000000..b5edddbc9
+--- /dev/null
++++ b/SOLUTION_SUMMARY.md
+@@ -0,0 +1,59 @@
++# Solution Summary: Fix Duplicate Locations in Gettext Builder
++
++## Problem Description
++When running `make clean; make gettext`, the generated POT files contained duplicate location entries like:
++```
++#: ../../manual/modeling/hair.rst:0
++#: ../../manual/modeling/hair.rst:0
++#: ../../manual/modeling/hair.rst:0
++```
++
++## Root Cause Analysis
++The issue was in the `Catalog.__iter__` method in `/workspace/sphinx-doc__sphinx__5.0/sphinx/builders/gettext.py`:
++
++1. The `Catalog.add` method stores entries as `(source, line, uuid)` tuples in `self.metadata[msg]`
++2. The same message can be added multiple times at the same location with different UUIDs
++3. When creating `Message` objects in `__iter__`, the `positions` list was created by extracting `(source, line)` from each tuple, resulting in duplicates
++4. The template then rendered these duplicate locations
++
++## Solution Implemented
++Modified the `Catalog.__iter__` method to deduplicate locations while preserving:
++- Order of first occurrence
++- All UUIDs (for backward compatibility)
++
++### Code Changes
++```python
++def __iter__(self) -> Generator[Message, None, None]:
++    for message in self.messages:
++        positions = [(source, line) for source, line, uuid in self.metadata[message]]
++        uuids = [uuid for source, line, uuid in self.metadata[message]]
++        # Remove duplicate positions while preserving order
++        unique_positions = []
++        seen_positions = set()
++        for pos in positions:
++            if pos not in seen_positions:
++                unique_positions.append(pos)
++                seen_positions.add(pos)
++        yield Message(message, unique_positions, uuids)
++```
++
++## Testing
++1. **Reproduction Test**: Created tests that reproduce the exact issue described
++2. **Fix Verification**: Verified that duplicates are removed while preserving order and UUIDs
++3. **Regression Tests**: All existing gettext tests continue to pass
++4. **Edge Cases**: Tested various scenarios including no duplicates, multiple duplicates, and order preservation
++5. **Realistic Scenarios**: Tested with actual Sphinx builds to ensure real-world effectiveness
++
++## Results
++- ✅ Duplicate locations are eliminated from POT files
++- ✅ Order of first occurrence is preserved
++- ✅ All UUIDs are maintained for backward compatibility
++- ✅ All existing tests continue to pass
++- ✅ No breaking changes to the API
++- ✅ Minimal, focused change that addresses the root cause
++
++## Files Modified
++- `/workspace/sphinx-doc__sphinx__5.0/sphinx/builders/gettext.py` (lines 58-69)
++
++## Impact
++This fix resolves the issue described in the GitHub issue where duplicate location entries were appearing in generated POT files, making them cleaner and more maintainable for translators.
+\ No newline at end of file
+diff --git a/sphinx/builders/gettext.py b/sphinx/builders/gettext.py
+index e8bc547b7..f0890acd3 100644
+--- a/sphinx/builders/gettext.py
++++ b/sphinx/builders/gettext.py
+@@ -59,7 +59,14 @@ class Catalog:
+         for message in self.messages:
+             positions = [(source, line) for source, line, uuid in self.metadata[message]]
+             uuids = [uuid for source, line, uuid in self.metadata[message]]
+-            yield Message(message, positions, uuids)
++            # Remove duplicate positions while preserving order
++            unique_positions = []
++            seen_positions = set()
++            for pos in positions:
++                if pos not in seen_positions:
++                    unique_positions.append(pos)
++                    seen_positions.add(pos)
++            yield Message(message, unique_positions, uuids)
+ 
+ 
+ class MsgOrigin:
+diff --git a/test_duplicate_locations.py b/test_duplicate_locations.py
+new file mode 100644
+index 000000000..39daba03f
+--- /dev/null
++++ b/test_duplicate_locations.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the duplicate locations issue in gettext builder.
++"""
++
++import tempfile
++import os
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def test_duplicate_locations():
++    """Test that demonstrates the duplicate locations issue."""
++    
++    # Create a temporary directory for our test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "build"
++        doctreedir = outdir / ".doctrees"
++        
++        # Create source directory
++        srcdir.mkdir(parents=True)
++        
++        # Create a simple conf.py
++        conf_content = """
++project = 'Test Project'
++extensions = []
++"""
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create an index.rst file that will generate duplicate locations
++        # This simulates the scenario where the same message appears multiple times
++        # at the same location but with different UUIDs
++        index_content = """
++Test Document
++=============
++
++Type
++----
++
++This is a test document with repeated content.
++
++Type
++----
++
++Another section with the same title.
++
++Type
++----
++
++Yet another section with the same title.
++"""
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Build with gettext builder
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='gettext'
++            )
++            app.build()
++        
++        # Check the generated POT file
++        pot_file = outdir / "index.pot"
++        if pot_file.exists():
++            content = pot_file.read_text()
++            print("Generated POT file content:")
++            print("=" * 50)
++            print(content)
++            print("=" * 50)
++            
++            # Look for duplicate location entries
++            lines = content.split('\n')
++            location_lines = [line for line in lines if line.startswith('#:')]
++            
++            print(f"\nFound {len(location_lines)} location lines:")
++            for line in location_lines:
++                print(f"  {line}")
++            
++            # Check for duplicates
++            duplicates = []
++            seen = set()
++            for line in location_lines:
++                if line in seen:
++                    duplicates.append(line)
++                else:
++                    seen.add(line)
++            
++            if duplicates:
++                print(f"\nFound {len(duplicates)} duplicate location lines:")
++                for dup in duplicates:
++                    print(f"  {dup}")
++                return True
++            else:
++                print("\nNo duplicate location lines found.")
++                return False
++        else:
++            print("POT file not found!")
++            return False
++
++
++if __name__ == "__main__":
++    has_duplicates = test_duplicate_locations()
++    if has_duplicates:
++        print("\n✓ Successfully reproduced the duplicate locations issue!")
++    else:
++        print("\n✗ Could not reproduce the duplicate locations issue.")
+\ No newline at end of file
+diff --git a/test_duplicate_locations_direct.py b/test_duplicate_locations_direct.py
+new file mode 100644
+index 000000000..570bc3756
+--- /dev/null
++++ b/test_duplicate_locations_direct.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++"""
++Direct test to reproduce the duplicate locations issue by manually creating the scenario.
++"""
++
++from sphinx.builders.gettext import Catalog, MsgOrigin, Message
++
++
++def test_duplicate_locations_direct():
++    """Test that demonstrates the duplicate locations issue directly."""
++    
++    # Create a catalog
++    catalog = Catalog()
++    
++    # Simulate the same message appearing at the same location multiple times
++    # with different UUIDs (which is what causes the issue)
++    message_text = "Type"
++    source_file = "../../manual/modeling/hair.rst"
++    line_number = 0
++    
++    # Add the same message multiple times at the same location
++    # This simulates what happens when the same content is processed multiple times
++    for i in range(3):
++        origin = MsgOrigin(source_file, line_number)
++        catalog.add(message_text, origin)
++    
++    # Now check what happens when we iterate over the catalog
++    print("Testing duplicate locations issue:")
++    print("=" * 50)
++    
++    for message in catalog:
++        print(f"Message text: '{message.text}'")
++        print(f"Locations: {message.locations}")
++        print(f"UUIDs: {message.uuids}")
++        print()
++        
++        # Check for duplicate locations
++        unique_locations = list(set(message.locations))
++        if len(message.locations) != len(unique_locations):
++            print(f"✓ Found duplicate locations!")
++            print(f"  Original locations: {message.locations}")
++            print(f"  Unique locations: {unique_locations}")
++            print(f"  Duplicates: {len(message.locations) - len(unique_locations)}")
++            return True
++    
++    print("✗ No duplicate locations found.")
++    return False
++
++
++def test_message_template_output():
++    """Test what the template output would look like with duplicates."""
++    
++    # Create a message with duplicate locations
++    locations = [
++        ("../../manual/modeling/hair.rst", 0),
++        ("../../manual/modeling/hair.rst", 0),
++        ("../../manual/modeling/hair.rst", 0),
++        ("../../manual/physics/dynamic_paint/brush.rst", 0),
++        ("../../manual/physics/dynamic_paint/brush.rst", 0),
++    ]
++    uuids = ["uuid1", "uuid2", "uuid3", "uuid4", "uuid5"]
++    
++    message = Message("Type", locations, uuids)
++    
++    print("\nTemplate output simulation:")
++    print("=" * 50)
++    print("msgid \"Type\"")
++    print("msgstr \"\"")
++    print()
++    
++    # Simulate the template loop that generates location comments
++    print("Location comments that would be generated:")
++    for source, line in message.locations:
++        print(f"#: {source}:{line}")
++    
++    print()
++    print("This shows the duplicate location issue!")
++    return True
++
++
++if __name__ == "__main__":
++    print("Testing duplicate locations issue...")
++    
++    # Test 1: Direct reproduction
++    has_duplicates = test_duplicate_locations_direct()
++    
++    # Test 2: Template output simulation
++    test_message_template_output()
++    
++    if has_duplicates:
++        print("\n✓ Successfully reproduced the duplicate locations issue!")
++    else:
++        print("\n✗ Could not reproduce the duplicate locations issue.")
+\ No newline at end of file
+diff --git a/test_duplicate_locations_regression.py b/test_duplicate_locations_regression.py
+new file mode 100644
+index 000000000..9f4679bb2
+--- /dev/null
++++ b/test_duplicate_locations_regression.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Regression test for duplicate locations issue in gettext builder.
++This test can be added to the official test suite.
++"""
++
++import pytest
++from sphinx.builders.gettext import Catalog, MsgOrigin
++
++
++def test_catalog_no_duplicate_locations():
++    """Test that Catalog.__iter__ removes duplicate locations while preserving order and UUIDs."""
++    catalog = Catalog()
++    
++    # Add the same message multiple times at the same location (different UUIDs)
++    message_text = "Type"
++    source_file = "../../manual/modeling/hair.rst"
++    line_number = 0
++    
++    # This simulates the scenario described in the issue where the same message
++    # appears multiple times at the same location but with different UUIDs
++    for i in range(3):
++        origin = MsgOrigin(source_file, line_number)
++        catalog.add(message_text, origin)
++    
++    # Add the same message at a different location
++    catalog.add(message_text, MsgOrigin("other_file.rst", 5))
++    
++    # Get the messages from the catalog
++    messages = list(catalog)
++    
++    # Should have exactly one message
++    assert len(messages) == 1
++    message = messages[0]
++    
++    # Check that duplicate locations are removed
++    assert len(message.locations) == 2  # Should have 2 unique locations
++    assert (source_file, line_number) in message.locations
++    assert ("other_file.rst", 5) in message.locations
++    
++    # Check that all UUIDs are preserved (3 + 1 = 4)
++    assert len(message.uuids) == 4
++    
++    # Check that order is preserved (first occurrence)
++    assert message.locations[0] == (source_file, line_number)
++    assert message.locations[1] == ("other_file.rst", 5)
++
++
++def test_catalog_preserves_order_of_first_occurrence():
++    """Test that the order of first occurrence is preserved when removing duplicates."""
++    catalog = Catalog()
++    
++    message_text = "Test"
++    
++    # Add locations in a specific order with some duplicates
++    catalog.add(message_text, MsgOrigin("file_c.rst", 30))  # First
++    catalog.add(message_text, MsgOrigin("file_a.rst", 10))  # Second
++    catalog.add(message_text, MsgOrigin("file_c.rst", 30))  # Duplicate of first
++    catalog.add(message_text, MsgOrigin("file_b.rst", 20))  # Third
++    catalog.add(message_text, MsgOrigin("file_a.rst", 10))  # Duplicate of second
++    
++    messages = list(catalog)
++    assert len(messages) == 1
++    
++    message = messages[0]
++    
++    # Should have 3 unique locations in order of first occurrence
++    expected_locations = [
++        ("file_c.rst", 30),  # First occurrence
++        ("file_a.rst", 10),  # Second occurrence
++        ("file_b.rst", 20),  # Third occurrence
++    ]
++    
++    assert message.locations == expected_locations
++    assert len(message.uuids) == 5  # All UUIDs should be preserved
++
++
++def test_catalog_no_duplicates_case_unchanged():
++    """Test that normal case (no duplicates) still works correctly."""
++    catalog = Catalog()
++    
++    # Add different messages at different locations
++    catalog.add("Message 1", MsgOrigin("file1.rst", 10))
++    catalog.add("Message 2", MsgOrigin("file2.rst", 20))
++    catalog.add("Message 1", MsgOrigin("file3.rst", 30))  # Same message, different location
++    
++    messages = list(catalog)
++    
++    # Should have 2 unique messages
++    assert len(messages) == 2
++    
++    # Find "Message 1"
++    msg1 = next(m for m in messages if m.text == "Message 1")
++    assert len(msg1.locations) == 2  # Should have 2 locations
++    assert ("file1.rst", 10) in msg1.locations
++    assert ("file3.rst", 30) in msg1.locations
++    
++    # Find "Message 2"
++    msg2 = next(m for m in messages if m.text == "Message 2")
++    assert len(msg2.locations) == 1  # Should have 1 location
++    assert ("file2.rst", 20) in msg2.locations
++
++
++if __name__ == "__main__":
++    test_catalog_no_duplicate_locations()
++    test_catalog_preserves_order_of_first_occurrence()
++    test_catalog_no_duplicates_case_unchanged()
++    print("✓ All regression tests passed!")
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 000000000..4f70beb29
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,169 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the duplicate locations fix.
++"""
++
++from sphinx.builders.gettext import Catalog, MsgOrigin, Message
++
++
++def test_no_duplicates_case():
++    """Test that normal case (no duplicates) still works correctly."""
++    catalog = Catalog()
++    
++    # Add different messages at different locations
++    catalog.add("Message 1", MsgOrigin("file1.rst", 10))
++    catalog.add("Message 2", MsgOrigin("file2.rst", 20))
++    catalog.add("Message 1", MsgOrigin("file3.rst", 30))  # Same message, different location
++    
++    messages = list(catalog)
++    
++    # Should have 2 unique messages
++    assert len(messages) == 2
++    
++    # Find "Message 1"
++    msg1 = next(m for m in messages if m.text == "Message 1")
++    assert len(msg1.locations) == 2  # Should have 2 locations
++    assert ("file1.rst", 10) in msg1.locations
++    assert ("file3.rst", 30) in msg1.locations
++    
++    # Find "Message 2"
++    msg2 = next(m for m in messages if m.text == "Message 2")
++    assert len(msg2.locations) == 1  # Should have 1 location
++    assert ("file2.rst", 20) in msg2.locations
++    
++    print("✓ No duplicates case works correctly")
++
++
++def test_duplicate_locations_fixed():
++    """Test that duplicate locations are properly removed."""
++    catalog = Catalog()
++    
++    # Add the same message multiple times at the same location
++    message_text = "Type"
++    source_file = "../../manual/modeling/hair.rst"
++    line_number = 0
++    
++    for i in range(3):
++        origin = MsgOrigin(source_file, line_number)
++        catalog.add(message_text, origin)
++    
++    # Add the same message at a different location
++    catalog.add(message_text, MsgOrigin("other_file.rst", 5))
++    
++    messages = list(catalog)
++    assert len(messages) == 1  # Should have 1 unique message
++    
++    message = messages[0]
++    assert message.text == "Type"
++    
++    # Should have 2 unique locations (duplicates removed)
++    assert len(message.locations) == 2
++    assert (source_file, line_number) in message.locations
++    assert ("other_file.rst", 5) in message.locations
++    
++    # Should still have all UUIDs (3 + 1 = 4)
++    assert len(message.uuids) == 4
++    
++    print("✓ Duplicate locations are properly removed")
++
++
++def test_order_preservation():
++    """Test that the order of first occurrence is preserved."""
++    catalog = Catalog()
++    
++    message_text = "Test"
++    
++    # Add in specific order
++    catalog.add(message_text, MsgOrigin("file_c.rst", 30))
++    catalog.add(message_text, MsgOrigin("file_a.rst", 10))
++    catalog.add(message_text, MsgOrigin("file_c.rst", 30))  # Duplicate
++    catalog.add(message_text, MsgOrigin("file_b.rst", 20))
++    catalog.add(message_text, MsgOrigin("file_a.rst", 10))  # Duplicate
++    
++    messages = list(catalog)
++    assert len(messages) == 1
++    
++    message = messages[0]
++    
++    # Should have 3 unique locations in order of first occurrence
++    expected_locations = [
++        ("file_c.rst", 30),  # First
++        ("file_a.rst", 10),  # Second
++        ("file_b.rst", 20),  # Third
++    ]
++    
++    assert message.locations == expected_locations
++    assert len(message.uuids) == 5  # All UUIDs preserved
++    
++    print("✓ Order of first occurrence is preserved")
++
++
++def test_edge_cases():
++    """Test edge cases."""
++    catalog = Catalog()
++    
++    # Empty catalog
++    messages = list(catalog)
++    assert len(messages) == 0
++    
++    # Single message, single location
++    catalog.add("Single", MsgOrigin("file.rst", 1))
++    messages = list(catalog)
++    assert len(messages) == 1
++    assert len(messages[0].locations) == 1
++    
++    print("✓ Edge cases work correctly")
++
++
++def simulate_template_output(message):
++    """Simulate what the template would output."""
++    lines = []
++    for source, line in message.locations:
++        lines.append(f"#: {source}:{line}")
++    return lines
++
++
++def test_template_output():
++    """Test that template output no longer has duplicates."""
++    catalog = Catalog()
++    
++    # Create scenario from the original issue
++    message_text = "Type"
++    
++    # Add multiple times at same locations (simulating the original issue)
++    for _ in range(3):
++        catalog.add(message_text, MsgOrigin("../../manual/modeling/hair.rst", 0))
++    
++    for _ in range(4):
++        catalog.add(message_text, MsgOrigin("../../manual/physics/dynamic_paint/brush.rst", 0))
++    
++    messages = list(catalog)
++    assert len(messages) == 1
++    
++    message = messages[0]
++    template_lines = simulate_template_output(message)
++    
++    # Should only have 2 unique location lines
++    expected_lines = [
++        "#: ../../manual/modeling/hair.rst:0",
++        "#: ../../manual/physics/dynamic_paint/brush.rst:0"
++    ]
++    
++    assert template_lines == expected_lines
++    
++    print("✓ Template output no longer has duplicates")
++    print(f"  Generated lines: {template_lines}")
++
++
++if __name__ == "__main__":
++    print("Running comprehensive fix verification tests...")
++    print("=" * 60)
++    
++    test_no_duplicates_case()
++    test_duplicate_locations_fixed()
++    test_order_preservation()
++    test_edge_cases()
++    test_template_output()
++    
++    print("=" * 60)
++    print("✓ All tests passed! The fix works correctly.")
+\ No newline at end of file
+diff --git a/test_realistic_scenario.py b/test_realistic_scenario.py
+new file mode 100644
+index 000000000..9dde609cb
+--- /dev/null
++++ b/test_realistic_scenario.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++"""
++Test the fix with a more realistic Sphinx build scenario.
++"""
++
++import tempfile
++import os
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def test_realistic_gettext_build():
++    """Test with a realistic Sphinx build that might generate duplicate locations."""
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = Path(tmpdir) / "source"
++        outdir = Path(tmpdir) / "build"
++        doctreedir = outdir / ".doctrees"
++        
++        # Create source directory
++        srcdir.mkdir(parents=True)
++        
++        # Create a conf.py
++        conf_content = """
++project = 'Test Project'
++extensions = []
++"""
++        (srcdir / "conf.py").write_text(conf_content)
++        
++        # Create multiple files with the same content that might cause duplicates
++        # This simulates a real documentation project where the same terms appear
++        # in multiple places
++        
++        # Main index file
++        index_content = """
++Test Documentation
++==================
++
++This documentation contains several sections with common terms.
++
++Type
++----
++
++This section describes the Type concept.
++
++.. toctree::
++   :maxdepth: 2
++   
++   section1
++   section2
++"""
++        (srcdir / "index.rst").write_text(index_content)
++        
++        # Section 1
++        section1_content = """
++Section 1
++=========
++
++Type
++----
++
++Another description of Type in section 1.
++
++The Type concept is important here.
++"""
++        (srcdir / "section1.rst").write_text(section1_content)
++        
++        # Section 2
++        section2_content = """
++Section 2
++=========
++
++Type
++----
++
++Yet another description of Type in section 2.
++
++Type is also relevant in this context.
++"""
++        (srcdir / "section2.rst").write_text(section2_content)
++        
++        # Build with gettext builder
++        with docutils_namespace():
++            app = Sphinx(
++                srcdir=str(srcdir),
++                confdir=str(srcdir),
++                outdir=str(outdir),
++                doctreedir=str(doctreedir),
++                buildername='gettext'
++            )
++            app.build()
++        
++        # Check all generated POT files
++        pot_files = list(outdir.glob("*.pot"))
++        print(f"Generated {len(pot_files)} POT files:")
++        
++        total_duplicates = 0
++        
++        for pot_file in pot_files:
++            print(f"\nChecking {pot_file.name}:")
++            content = pot_file.read_text()
++            
++            # Look for location lines
++            lines = content.split('\n')
++            location_lines = [line for line in lines if line.startswith('#:')]
++            
++            # Check for duplicates
++            seen = set()
++            duplicates = []
++            for line in location_lines:
++                if line in seen:
++                    duplicates.append(line)
++                else:
++                    seen.add(line)
++            
++            if duplicates:
++                print(f"  ❌ Found {len(duplicates)} duplicate location lines:")
++                for dup in duplicates:
++                    print(f"    {dup}")
++                total_duplicates += len(duplicates)
++            else:
++                print(f"  ✅ No duplicate location lines found ({len(location_lines)} total)")
++        
++        return total_duplicates == 0
++
++
++if __name__ == "__main__":
++    print("Testing realistic Sphinx gettext build scenario...")
++    print("=" * 60)
++    
++    success = test_realistic_gettext_build()
++    
++    print("=" * 60)
++    if success:
++        print("✅ SUCCESS: No duplicate locations found in realistic scenario!")
++    else:
++        print("❌ FAILURE: Found duplicate locations in realistic scenario!")
+\ No newline at end of file

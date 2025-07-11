@@ -1,0 +1,432 @@
+diff --git a/final_test_original_issue.py b/final_test_original_issue.py
+new file mode 100644
+index 000000000..229e34166
+--- /dev/null
++++ b/final_test_original_issue.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""
++Final test of the exact original issue code.
++"""
++
++from sklearn.datasets import make_classification
++from sklearn.feature_selection import SequentialFeatureSelector
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.model_selection import LeaveOneGroupOut
++
++import numpy as np
++
++# Exact code from the original issue
++X, y = make_classification()
++
++groups = np.zeros_like(y, dtype=int)
++groups[y.size//2:] = 1
++
++cv = LeaveOneGroupOut()
++splits = cv.split(X, y, groups=groups)
++
++clf = KNeighborsClassifier(n_neighbors=5)
++
++seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
++seq.fit(X, y)
++
++print("SUCCESS! The original issue has been fixed.")
++print(f"Selected features: {seq.get_support()}")
++print(f"Number of selected features: {seq.n_features_to_select_}")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..56dd1769c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the SequentialFeatureSelector issue with cv splits.
++"""
++
++from sklearn.datasets import make_classification
++from sklearn.feature_selection import SequentialFeatureSelector
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.model_selection import LeaveOneGroupOut
++import numpy as np
++
++def test_sequential_feature_selector_with_splits():
++    """Test that reproduces the issue with passing splits to SequentialFeatureSelector."""
++    print("Creating test data...")
++    X, y = make_classification(n_samples=100, n_features=10, random_state=42)
++
++    groups = np.zeros_like(y, dtype=int)
++    groups[y.size//2:] = 1
++
++    print("Creating cross validator and splits...")
++    cv = LeaveOneGroupOut()
++    splits = cv.split(X, y, groups=groups)
++
++    print("Creating classifier and SequentialFeatureSelector...")
++    clf = KNeighborsClassifier(n_neighbors=5)
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
++
++    print("Fitting SequentialFeatureSelector...")
++    try:
++        seq.fit(X, y)
++        print("SUCCESS: SequentialFeatureSelector fitted without errors!")
++        print(f"Selected features: {seq.get_support()}")
++        print(f"Number of selected features: {seq.n_features_to_select_}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_sequential_feature_selector_with_cv_object():
++    """Test that SequentialFeatureSelector works with cv object (should work)."""
++    print("\n" + "="*60)
++    print("Testing with cv object (should work)...")
++    X, y = make_classification(n_samples=100, n_features=10, random_state=42)
++
++    # Use regular KFold instead of LeaveOneGroupOut to avoid groups issue
++    from sklearn.model_selection import KFold
++    cv = KFold(n_splits=3)
++    clf = KNeighborsClassifier(n_neighbors=5)
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=cv)
++
++    try:
++        seq.fit(X, y)
++        print("SUCCESS: SequentialFeatureSelector with cv object worked!")
++        print(f"Selected features: {seq.get_support()}")
++        print(f"Number of selected features: {seq.n_features_to_select_}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_sequential_feature_selector_with_integer():
++    """Test that SequentialFeatureSelector works with integer cv (should work)."""
++    print("\n" + "="*60)
++    print("Testing with integer cv (should work)...")
++    X, y = make_classification(n_samples=100, n_features=10, random_state=42)
++
++    clf = KNeighborsClassifier(n_neighbors=5)
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=5)
++
++    try:
++        seq.fit(X, y)
++        print("SUCCESS: SequentialFeatureSelector with integer cv worked!")
++        print(f"Selected features: {seq.get_support()}")
++        print(f"Number of selected features: {seq.n_features_to_select_}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++
++if __name__ == "__main__":
++    print("Testing SequentialFeatureSelector with different cv parameters...")
++    print("="*60)
++    
++    # Test the problematic case
++    test_sequential_feature_selector_with_splits()
++    
++    # Test working cases for comparison
++    test_sequential_feature_selector_with_cv_object()
++    test_sequential_feature_selector_with_integer()
+\ No newline at end of file
+diff --git a/sklearn/feature_selection/_sequential.py b/sklearn/feature_selection/_sequential.py
+index e983c55de..53a5efeda 100644
+--- a/sklearn/feature_selection/_sequential.py
++++ b/sklearn/feature_selection/_sequential.py
+@@ -14,6 +14,7 @@ from ..utils._param_validation import RealNotInt
+ from ..utils._tags import _safe_tags
+ from ..utils.validation import check_is_fitted
+ from ..model_selection import cross_val_score
++from ..model_selection._split import check_cv
+ from ..metrics import get_scorer_names
+ 
+ 
+@@ -261,6 +262,10 @@ class SequentialFeatureSelector(SelectorMixin, MetaEstimatorMixin, BaseEstimator
+ 
+         cloned_estimator = clone(self.estimator)
+ 
++        # Ensure cv is a proper cross-validator that can be reused multiple times
++        from ..base import is_classifier
++        cv = check_cv(self.cv, y, classifier=is_classifier(self.estimator))
++
+         # the current mask corresponds to the set of features:
+         # - that we have already *selected* if we do forward selection
+         # - that we have already *excluded* if we do backward selection
+@@ -275,7 +280,7 @@ class SequentialFeatureSelector(SelectorMixin, MetaEstimatorMixin, BaseEstimator
+         is_auto_select = self.tol is not None and self.n_features_to_select == "auto"
+         for _ in range(n_iterations):
+             new_feature_idx, new_score = self._get_best_new_feature_score(
+-                cloned_estimator, X, y, current_mask
++                cloned_estimator, X, y, current_mask, cv
+             )
+             if is_auto_select and ((new_score - old_score) < self.tol):
+                 break
+@@ -291,7 +296,7 @@ class SequentialFeatureSelector(SelectorMixin, MetaEstimatorMixin, BaseEstimator
+ 
+         return self
+ 
+-    def _get_best_new_feature_score(self, estimator, X, y, current_mask):
++    def _get_best_new_feature_score(self, estimator, X, y, current_mask, cv):
+         # Return the best new feature and its score to add to the current_mask,
+         # i.e. return the best new feature and its score to add (resp. remove)
+         # when doing forward selection (resp. backward selection).
+@@ -309,7 +314,7 @@ class SequentialFeatureSelector(SelectorMixin, MetaEstimatorMixin, BaseEstimator
+                 estimator,
+                 X_new,
+                 y,
+-                cv=self.cv,
++                cv=cv,
+                 scoring=self.scoring,
+                 n_jobs=self.n_jobs,
+             ).mean()
+diff --git a/test_cv_splits_fix.py b/test_cv_splits_fix.py
+new file mode 100644
+index 000000000..a05839a4f
+--- /dev/null
++++ b/test_cv_splits_fix.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Test specifically for the cv splits issue fix.
++This test can be added to the test suite.
++"""
++
++import numpy as np
++import pytest
++from sklearn.datasets import make_classification
++from sklearn.feature_selection import SequentialFeatureSelector
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.model_selection import LeaveOneGroupOut, KFold, StratifiedKFold
++
++
++def test_sequential_feature_selector_with_cv_splits():
++    """Test that SequentialFeatureSelector can accept splits from cv.split()."""
++    # Create test data
++    X, y = make_classification(n_samples=50, n_features=8, n_classes=2, random_state=42)
++    
++    # Test with different types of CV splits
++    cv_objects = [
++        KFold(n_splits=3),
++        StratifiedKFold(n_splits=3),
++    ]
++    
++    clf = KNeighborsClassifier(n_neighbors=3)
++    
++    for cv in cv_objects:
++        # Get splits from the cv object
++        splits = list(cv.split(X, y))
++        
++        # This should work without raising an IndexError
++        seq = SequentialFeatureSelector(
++            clf, n_features_to_select=3, scoring='accuracy', cv=splits
++        )
++        seq.fit(X, y)
++        
++        # Verify the selector worked
++        assert seq.n_features_to_select_ == 3
++        assert sum(seq.get_support()) == 3
++
++
++def test_sequential_feature_selector_with_group_cv_splits():
++    """Test that SequentialFeatureSelector can accept splits from group-based CV."""
++    # Create test data with groups
++    X, y = make_classification(n_samples=60, n_features=8, n_classes=2, random_state=42)
++    groups = np.array([0, 0, 1, 1, 2, 2] * 10)  # 60 samples, 3 groups
++    
++    # Test with LeaveOneGroupOut (the original issue case)
++    cv = LeaveOneGroupOut()
++    splits = list(cv.split(X, y, groups=groups))
++    
++    clf = KNeighborsClassifier(n_neighbors=3)
++    seq = SequentialFeatureSelector(
++        clf, n_features_to_select=3, scoring='accuracy', cv=splits
++    )
++    
++    # This should work without raising an IndexError
++    seq.fit(X, y)
++    
++    # Verify the selector worked
++    assert seq.n_features_to_select_ == 3
++    assert sum(seq.get_support()) == 3
++
++
++def test_sequential_feature_selector_original_issue():
++    """Test the exact scenario from the original GitHub issue."""
++    X, y = make_classification(n_samples=100, n_features=10, random_state=42)
++    
++    groups = np.zeros_like(y, dtype=int)
++    groups[y.size//2:] = 1
++    
++    cv = LeaveOneGroupOut()
++    splits = cv.split(X, y, groups=groups)
++    
++    clf = KNeighborsClassifier(n_neighbors=5)
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
++    
++    # This should work without raising an IndexError
++    seq.fit(X, y)
++    
++    # Verify the selector worked
++    assert seq.n_features_to_select_ == 5
++    assert sum(seq.get_support()) == 5
++
++
++if __name__ == "__main__":
++    test_sequential_feature_selector_with_cv_splits()
++    test_sequential_feature_selector_with_group_cv_splits()
++    test_sequential_feature_selector_original_issue()
++    print("All tests passed!")
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 000000000..8adcc910f
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,145 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the SequentialFeatureSelector fix.
++"""
++
++from sklearn.datasets import make_classification
++from sklearn.feature_selection import SequentialFeatureSelector
++from sklearn.neighbors import KNeighborsClassifier
++from sklearn.model_selection import (
++    LeaveOneGroupOut, KFold, StratifiedKFold, 
++    GroupKFold, LeaveOneOut, LeavePOut
++)
++import numpy as np
++
++def test_with_different_cv_types():
++    """Test SequentialFeatureSelector with various cv types."""
++    print("Testing SequentialFeatureSelector with different CV types...")
++    
++    # Create test data
++    X, y = make_classification(n_samples=50, n_features=8, n_classes=2, random_state=42)
++    groups = np.array([0, 0, 1, 1, 2, 2] * 8 + [3, 3])  # 50 samples
++    
++    clf = KNeighborsClassifier(n_neighbors=3)
++    
++    test_cases = [
++        ("Integer CV", 3),
++        ("KFold object", KFold(n_splits=3)),
++        ("StratifiedKFold object", StratifiedKFold(n_splits=3)),
++        ("KFold splits", list(KFold(n_splits=3).split(X, y))),
++        ("StratifiedKFold splits", list(StratifiedKFold(n_splits=3).split(X, y))),
++    ]
++    
++    # Test cases that require groups
++    group_test_cases = [
++        ("GroupKFold object", GroupKFold(n_splits=3)),
++        ("LeaveOneGroupOut object", LeaveOneGroupOut()),
++        ("GroupKFold splits", list(GroupKFold(n_splits=3).split(X, y, groups))),
++        ("LeaveOneGroupOut splits", list(LeaveOneGroupOut().split(X, y, groups))),
++    ]
++    
++    results = {}
++    
++    # Test regular cases
++    for name, cv in test_cases:
++        try:
++            seq = SequentialFeatureSelector(clf, n_features_to_select=3, scoring='accuracy', cv=cv)
++            seq.fit(X, y)
++            results[name] = "SUCCESS"
++            print(f"✅ {name}: SUCCESS - Selected {seq.n_features_to_select_} features")
++        except Exception as e:
++            results[name] = f"FAILED: {e}"
++            print(f"❌ {name}: FAILED - {e}")
++    
++    # Test group-based cases (these might not work due to groups parameter limitation)
++    for name, cv in group_test_cases:
++        try:
++            seq = SequentialFeatureSelector(clf, n_features_to_select=3, scoring='accuracy', cv=cv)
++            # Note: SequentialFeatureSelector doesn't accept groups parameter in fit()
++            # So group-based CV might not work as expected, but splits should still work
++            seq.fit(X, y)
++            results[name] = "SUCCESS"
++            print(f"✅ {name}: SUCCESS - Selected {seq.n_features_to_select_} features")
++        except Exception as e:
++            results[name] = f"FAILED: {e}"
++            print(f"❌ {name}: FAILED - {e}")
++    
++    return results
++
++def test_edge_cases():
++    """Test edge cases."""
++    print("\nTesting edge cases...")
++    
++    X, y = make_classification(n_samples=20, n_features=5, random_state=42)
++    clf = KNeighborsClassifier(n_neighbors=3)
++    
++    # Test with empty iterator (should fail gracefully)
++    try:
++        empty_splits = iter([])
++        seq = SequentialFeatureSelector(clf, n_features_to_select=2, scoring='accuracy', cv=empty_splits)
++        seq.fit(X, y)
++        print("❌ Empty iterator: Should have failed but didn't")
++    except Exception as e:
++        print(f"✅ Empty iterator: Correctly failed with {type(e).__name__}")
++    
++    # Test with single split
++    try:
++        single_split = [(np.arange(10), np.arange(10, 20))]
++        seq = SequentialFeatureSelector(clf, n_features_to_select=2, scoring='accuracy', cv=single_split)
++        seq.fit(X, y)
++        print(f"✅ Single split: SUCCESS - Selected {seq.n_features_to_select_} features")
++    except Exception as e:
++        print(f"❌ Single split: FAILED - {e}")
++
++def test_original_issue():
++    """Test the exact scenario from the original issue."""
++    print("\nTesting original issue scenario...")
++    
++    X, y = make_classification(n_samples=100, n_features=10, random_state=42)
++    
++    groups = np.zeros_like(y, dtype=int)
++    groups[y.size//2:] = 1
++    
++    cv = LeaveOneGroupOut()
++    splits = cv.split(X, y, groups=groups)
++    
++    clf = KNeighborsClassifier(n_neighbors=5)
++    seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
++    
++    try:
++        seq.fit(X, y)
++        print(f"✅ Original issue: FIXED - Selected {seq.n_features_to_select_} features")
++        print(f"   Selected features: {seq.get_support()}")
++        return True
++    except Exception as e:
++        print(f"❌ Original issue: STILL BROKEN - {e}")
++        return False
++
++if __name__ == "__main__":
++    print("="*70)
++    print("COMPREHENSIVE TEST FOR SEQUENTIALFEATURESELECTOR FIX")
++    print("="*70)
++    
++    # Test different CV types
++    results = test_with_different_cv_types()
++    
++    # Test edge cases
++    test_edge_cases()
++    
++    # Test original issue
++    original_fixed = test_original_issue()
++    
++    print("\n" + "="*70)
++    print("SUMMARY")
++    print("="*70)
++    
++    success_count = sum(1 for result in results.values() if result == "SUCCESS")
++    total_count = len(results)
++    
++    print(f"CV Type Tests: {success_count}/{total_count} passed")
++    print(f"Original Issue: {'FIXED' if original_fixed else 'STILL BROKEN'}")
++    
++    if original_fixed and success_count >= total_count * 0.8:  # Allow some group-based tests to fail
++        print("\n🎉 FIX VERIFICATION: SUCCESS!")
++    else:
++        print("\n❌ FIX VERIFICATION: ISSUES REMAIN")
+\ No newline at end of file

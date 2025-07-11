@@ -1,0 +1,453 @@
+diff --git a/django/apps/registry.py b/django/apps/registry.py
+index 0683f3ad3c..481dd1fc86 100644
+--- a/django/apps/registry.py
++++ b/django/apps/registry.py
+@@ -376,6 +376,7 @@ class Apps:
+         # Call expire cache on each model. This will purge
+         # the relation tree and the fields cache.
+         self.get_models.cache_clear()
++        self.get_swappable_settings_name.cache_clear()
+         if self.ready:
+             # Circumvent self.get_models() to prevent that the cache is refilled.
+             # This particularly prevents that an empty value is cached while cloning.
+diff --git a/test_cache_issue.py b/test_cache_issue.py
+new file mode 100644
+index 0000000000..d8671dbc87
+--- /dev/null
++++ b/test_cache_issue.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue with Apps.clear_cache() not clearing 
++get_swappable_settings_name cache.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.apps import apps
++
++
++def test_get_swappable_settings_name_cache_not_cleared():
++    """
++    Test that demonstrates the issue: get_swappable_settings_name cache 
++    is not cleared by clear_cache().
++    """
++    print("Testing get_swappable_settings_name cache clearing...")
++    
++    # First, call the method to populate the cache
++    result1 = apps.get_swappable_settings_name('auth.User')
++    print(f"First call result: {result1}")
++    
++    # Check if the cache has been populated
++    cache_info_before = apps.get_swappable_settings_name.cache_info()
++    print(f"Cache info before clear_cache(): {cache_info_before}")
++    
++    # Call clear_cache() - this should clear ALL caches
++    apps.clear_cache()
++    
++    # Check cache info after clear_cache()
++    cache_info_after = apps.get_swappable_settings_name.cache_info()
++    print(f"Cache info after clear_cache(): {cache_info_after}")
++    
++    # The issue: cache should be cleared but it's not
++    if cache_info_after.currsize > 0:
++        print("❌ ISSUE CONFIRMED: get_swappable_settings_name cache was NOT cleared by clear_cache()")
++        print(f"   Cache still has {cache_info_after.currsize} items")
++        return False
++    else:
++        print("✅ Cache was properly cleared")
++        return True
++
++
++def test_get_models_cache_is_cleared():
++    """
++    Test that get_models cache is properly cleared (this should work).
++    """
++    print("\nTesting get_models cache clearing (should work)...")
++    
++    # First, call the method to populate the cache
++    models1 = apps.get_models()
++    print(f"First call returned {len(models1)} models")
++    
++    # Check if the cache has been populated
++    cache_info_before = apps.get_models.cache_info()
++    print(f"Cache info before clear_cache(): {cache_info_before}")
++    
++    # Call clear_cache()
++    apps.clear_cache()
++    
++    # Check cache info after clear_cache()
++    cache_info_after = apps.get_models.cache_info()
++    print(f"Cache info after clear_cache(): {cache_info_after}")
++    
++    if cache_info_after.currsize == 0:
++        print("✅ get_models cache was properly cleared")
++        return True
++    else:
++        print(f"❌ get_models cache was NOT cleared (has {cache_info_after.currsize} items)")
++        return False
++
++
++def test_manual_cache_clear():
++    """
++    Test that manually calling cache_clear() on get_swappable_settings_name works.
++    """
++    print("\nTesting manual cache clear...")
++    
++    # Populate the cache
++    result = apps.get_swappable_settings_name('auth.User')
++    cache_info_before = apps.get_swappable_settings_name.cache_info()
++    print(f"Cache info before manual clear: {cache_info_before}")
++    
++    # Manually clear the cache
++    apps.get_swappable_settings_name.cache_clear()
++    
++    cache_info_after = apps.get_swappable_settings_name.cache_info()
++    print(f"Cache info after manual clear: {cache_info_after}")
++    
++    if cache_info_after.currsize == 0:
++        print("✅ Manual cache clear works")
++        return True
++    else:
++        print(f"❌ Manual cache clear failed (has {cache_info_after.currsize} items)")
++        return False
++
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("Testing Apps.clear_cache() issue")
++    print("=" * 60)
++    
++    # Test the issue
++    issue_confirmed = not test_get_swappable_settings_name_cache_not_cleared()
++    
++    # Test that get_models cache clearing works (as a control)
++    get_models_works = test_get_models_cache_is_cleared()
++    
++    # Test that manual clearing works
++    manual_works = test_manual_cache_clear()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"Issue confirmed (get_swappable_settings_name cache not cleared): {issue_confirmed}")
++    print(f"get_models cache clearing works: {get_models_works}")
++    print(f"Manual cache clearing works: {manual_works}")
++    
++    if issue_confirmed:
++        print("\n🔧 SOLUTION: Add 'self.get_swappable_settings_name.cache_clear()' to clear_cache() method")
++    
++    print("=" * 60)
+\ No newline at end of file
+diff --git a/test_clear_cache_fix.py b/test_clear_cache_fix.py
+new file mode 100644
+index 0000000000..2764e5e0ee
+--- /dev/null
++++ b/test_clear_cache_fix.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++"""
++Test to verify that the fix for Apps.clear_cache() works correctly
++in the context of Django's test framework.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.apps import apps
++
++
++class ClearCacheFixTest(TestCase):
++    """Test that clear_cache() properly clears get_swappable_settings_name cache."""
++    
++    def test_clear_cache_clears_get_swappable_settings_name(self):
++        """Test that clear_cache() clears the get_swappable_settings_name cache."""
++        # Populate the cache
++        result = apps.get_swappable_settings_name('auth.User')
++        self.assertEqual(result, 'AUTH_USER_MODEL')
++        
++        # Verify cache is populated
++        cache_info_before = apps.get_swappable_settings_name.cache_info()
++        self.assertGreater(cache_info_before.currsize, 0)
++        
++        # Clear cache
++        apps.clear_cache()
++        
++        # Verify cache is cleared
++        cache_info_after = apps.get_swappable_settings_name.cache_info()
++        self.assertEqual(cache_info_after.currsize, 0)
++    
++    def test_clear_cache_clears_both_caches(self):
++        """Test that clear_cache() clears both get_models and get_swappable_settings_name caches."""
++        # Populate both caches
++        models = apps.get_models()
++        swappable = apps.get_swappable_settings_name('auth.User')
++        
++        # Verify both caches are populated
++        models_cache_before = apps.get_models.cache_info()
++        swappable_cache_before = apps.get_swappable_settings_name.cache_info()
++        self.assertGreater(models_cache_before.currsize, 0)
++        self.assertGreater(swappable_cache_before.currsize, 0)
++        
++        # Clear cache
++        apps.clear_cache()
++        
++        # Verify both caches are cleared
++        models_cache_after = apps.get_models.cache_info()
++        swappable_cache_after = apps.get_swappable_settings_name.cache_info()
++        self.assertEqual(models_cache_after.currsize, 0)
++        self.assertEqual(swappable_cache_after.currsize, 0)
++    
++    def test_cache_functionality_after_clear(self):
++        """Test that cache functionality works correctly after clear_cache()."""
++        # Populate cache
++        result1 = apps.get_swappable_settings_name('auth.User')
++        cache_info1 = apps.get_swappable_settings_name.cache_info()
++        
++        # Second call should hit cache
++        result2 = apps.get_swappable_settings_name('auth.User')
++        cache_info2 = apps.get_swappable_settings_name.cache_info()
++        
++        self.assertEqual(result1, result2)
++        self.assertEqual(cache_info2.hits, 1)
++        
++        # Clear cache
++        apps.clear_cache()
++        
++        # Call again - should be a cache miss
++        result3 = apps.get_swappable_settings_name('auth.User')
++        cache_info3 = apps.get_swappable_settings_name.cache_info()
++        
++        self.assertEqual(result1, result3)
++        self.assertEqual(cache_info3.hits, 0)  # Reset after clear
++        self.assertEqual(cache_info3.misses, 1)  # New miss after clear
++
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_comprehensive_cache.py b/test_comprehensive_cache.py
+new file mode 100644
+index 0000000000..b2df80e09e
+--- /dev/null
++++ b/test_comprehensive_cache.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script to verify the fix for Apps.clear_cache() 
++not clearing get_swappable_settings_name cache.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.apps import apps
++
++
++def test_multiple_cache_calls():
++    """Test that cache works correctly after multiple calls and clears."""
++    print("Testing multiple cache calls and clears...")
++    
++    # First call
++    result1 = apps.get_swappable_settings_name('auth.User')
++    cache_info1 = apps.get_swappable_settings_name.cache_info()
++    print(f"After first call: {cache_info1}")
++    
++    # Second call (should hit cache)
++    result2 = apps.get_swappable_settings_name('auth.User')
++    cache_info2 = apps.get_swappable_settings_name.cache_info()
++    print(f"After second call: {cache_info2}")
++    
++    # Verify cache hit
++    if cache_info2.hits == 1 and cache_info2.misses == 1:
++        print("✅ Cache hit working correctly")
++    else:
++        print("❌ Cache hit not working")
++        return False
++    
++    # Clear cache
++    apps.clear_cache()
++    cache_info3 = apps.get_swappable_settings_name.cache_info()
++    print(f"After clear_cache(): {cache_info3}")
++    
++    # Verify cache cleared
++    if cache_info3.currsize == 0:
++        print("✅ Cache cleared successfully")
++    else:
++        print("❌ Cache not cleared")
++        return False
++    
++    # Call again (should be a miss)
++    result3 = apps.get_swappable_settings_name('auth.User')
++    cache_info4 = apps.get_swappable_settings_name.cache_info()
++    print(f"After call post-clear: {cache_info4}")
++    
++    if cache_info4.misses == 1 and cache_info4.hits == 0:
++        print("✅ Cache working correctly after clear")
++        return True
++    else:
++        print("❌ Cache not working correctly after clear")
++        return False
++
++
++def test_different_arguments():
++    """Test cache with different arguments."""
++    print("\nTesting cache with different arguments...")
++    
++    # Call with different arguments
++    result1 = apps.get_swappable_settings_name('auth.User')
++    result2 = apps.get_swappable_settings_name('contenttypes.ContentType')
++    
++    cache_info = apps.get_swappable_settings_name.cache_info()
++    print(f"After two different calls: {cache_info}")
++    
++    # Should have 2 cache entries
++    if cache_info.currsize == 2 and cache_info.misses == 2:
++        print("✅ Multiple arguments cached correctly")
++    else:
++        print("❌ Multiple arguments not cached correctly")
++        return False
++    
++    # Clear cache
++    apps.clear_cache()
++    cache_info_after = apps.get_swappable_settings_name.cache_info()
++    print(f"After clear_cache(): {cache_info_after}")
++    
++    if cache_info_after.currsize == 0:
++        print("✅ All cache entries cleared")
++        return True
++    else:
++        print("❌ Not all cache entries cleared")
++        return False
++
++
++def test_cache_isolation():
++    """Test that clearing one cache doesn't affect the other."""
++    print("\nTesting cache isolation...")
++    
++    # Populate both caches
++    models = apps.get_models()
++    swappable = apps.get_swappable_settings_name('auth.User')
++    
++    models_cache_before = apps.get_models.cache_info()
++    swappable_cache_before = apps.get_swappable_settings_name.cache_info()
++    
++    print(f"Models cache before: {models_cache_before}")
++    print(f"Swappable cache before: {swappable_cache_before}")
++    
++    # Clear only get_models cache manually
++    apps.get_models.cache_clear()
++    
++    models_cache_after = apps.get_models.cache_info()
++    swappable_cache_after = apps.get_swappable_settings_name.cache_info()
++    
++    print(f"Models cache after manual clear: {models_cache_after}")
++    print(f"Swappable cache after manual clear: {swappable_cache_after}")
++    
++    # Models cache should be cleared, swappable should not
++    if (models_cache_after.currsize == 0 and 
++        swappable_cache_after.currsize > 0):
++        print("✅ Cache isolation working correctly")
++        
++        # Now test that clear_cache() clears both
++        apps.get_models()  # Repopulate models cache
++        apps.clear_cache()  # Clear both
++        
++        models_final = apps.get_models.cache_info()
++        swappable_final = apps.get_swappable_settings_name.cache_info()
++        
++        if models_final.currsize == 0 and swappable_final.currsize == 0:
++            print("✅ clear_cache() clears both caches")
++            return True
++        else:
++            print("❌ clear_cache() doesn't clear both caches")
++            return False
++    else:
++        print("❌ Cache isolation not working")
++        return False
++
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("Comprehensive Cache Testing")
++    print("=" * 60)
++    
++    test1_passed = test_multiple_cache_calls()
++    test2_passed = test_different_arguments()
++    test3_passed = test_cache_isolation()
++    
++    print("\n" + "=" * 60)
++    print("COMPREHENSIVE TEST RESULTS:")
++    print(f"Multiple cache calls test: {'✅ PASSED' if test1_passed else '❌ FAILED'}")
++    print(f"Different arguments test: {'✅ PASSED' if test2_passed else '❌ FAILED'}")
++    print(f"Cache isolation test: {'✅ PASSED' if test3_passed else '❌ FAILED'}")
++    
++    all_passed = test1_passed and test2_passed and test3_passed
++    print(f"\nOVERALL: {'✅ ALL TESTS PASSED' if all_passed else '❌ SOME TESTS FAILED'}")
++    print("=" * 60)
+\ No newline at end of file

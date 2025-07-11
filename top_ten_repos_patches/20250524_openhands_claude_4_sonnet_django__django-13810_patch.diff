@@ -1,0 +1,1163 @@
+diff --git a/debug_middleware_loading.py b/debug_middleware_loading.py
+new file mode 100644
+index 0000000000..b475497231
+--- /dev/null
++++ b/debug_middleware_loading.py
+@@ -0,0 +1,153 @@
++#!/usr/bin/env python
++"""
++Debug middleware loading to understand the exact flow.
++"""
++
++import os
++import sys
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.exceptions import MiddlewareNotUsed
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'debug_middleware_loading.SyncMiddleware',
++            'debug_middleware_loading.MiddlewareNotUsedMiddleware', 
++        ],
++        ROOT_URLCONF='debug_middleware_loading',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++from django.core.handlers.base import BaseHandler
++
++
++class SyncMiddleware:
++    """A sync-only middleware."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"SyncMiddleware received handler type: {type(get_response)}")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++class MiddlewareNotUsedMiddleware:
++    """A middleware that raises MiddlewareNotUsed."""
++    sync_capable = False  # This forces adaptation
++    async_capable = True
++    
++    def __init__(self, get_response):
++        print(f"MiddlewareNotUsedMiddleware received handler type: {type(get_response)}")
++        raise MiddlewareNotUsed("This middleware is not used")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++# Monkey patch to add debug info
++original_load_middleware = BaseHandler.load_middleware
++
++def debug_load_middleware(self, is_async=False):
++    """Debug version of load_middleware with detailed logging."""
++    print(f"\n=== load_middleware(is_async={is_async}) ===")
++    
++    self._view_middleware = []
++    self._template_response_middleware = []
++    self._exception_middleware = []
++
++    get_response = self._get_response_async if is_async else self._get_response
++    handler = self.convert_exception_to_response(get_response)
++    handler_is_async = is_async
++    
++    print(f"Initial: handler={type(handler)}, handler_is_async={handler_is_async}")
++    
++    for i, middleware_path in enumerate(reversed(settings.MIDDLEWARE)):
++        print(f"\n--- Processing middleware {i+1}: {middleware_path} ---")
++        
++        middleware = self.import_string(middleware_path)
++        middleware_can_sync = getattr(middleware, 'sync_capable', True)
++        middleware_can_async = getattr(middleware, 'async_capable', False)
++        
++        print(f"  middleware_can_sync={middleware_can_sync}, middleware_can_async={middleware_can_async}")
++        print(f"  handler_is_async={handler_is_async}")
++        
++        if not middleware_can_sync and not middleware_can_async:
++            raise RuntimeError(
++                'Middleware %s must have at least one of '
++                'sync_capable/async_capable set to True.' % middleware_path
++            )
++        elif not handler_is_async and middleware_can_sync:
++            middleware_is_async = False
++        else:
++            middleware_is_async = middleware_can_async
++            
++        print(f"  middleware_is_async={middleware_is_async}")
++        
++        try:
++            # Adapt handler, if needed.
++            adapted_handler = self.adapt_method_mode(
++                middleware_is_async, handler, handler_is_async,
++                debug=settings.DEBUG, name='middleware %s' % middleware_path,
++            )
++            print(f"  adapted_handler={type(adapted_handler)}")
++            mw_instance = middleware(adapted_handler)
++        except MiddlewareNotUsed as exc:
++            print(f"  MiddlewareNotUsed raised: {exc}")
++            print(f"  Continuing with handler={type(handler)}, handler_is_async={handler_is_async}")
++            continue
++
++        if mw_instance is None:
++            raise self.ImproperlyConfigured(
++                'Middleware factory %s returned None.' % middleware_path
++            )
++
++        # Process middleware methods...
++        
++        # Only update handler if middleware instantiation succeeded
++        handler = self.convert_exception_to_response(mw_instance)
++        handler_is_async = middleware_is_async
++        print(f"  Updated: handler={type(handler)}, handler_is_async={handler_is_async}")
++
++    # Adapt the top of the stack, if needed.
++    handler = self.adapt_method_mode(is_async, handler, handler_is_async)
++    print(f"\nFinal: handler={type(handler)}")
++    
++    # We only assign to this when initialization is complete as it is used
++    # as a flag for initialization being complete.
++    self._middleware_chain = handler
++
++# Apply the monkey patch
++BaseHandler.load_middleware = debug_load_middleware
++BaseHandler.import_string = staticmethod(lambda path: globals()[path.split('.')[-1]])
++BaseHandler.convert_exception_to_response = lambda self, handler: handler
++BaseHandler.adapt_method_mode = BaseHandler.adapt_method_mode
++BaseHandler.ImproperlyConfigured = Exception
++
++
++def test_debug():
++    """Test with debug output."""
++    print("Debug test for MiddlewareNotUsed fix")
++    print("=" * 50)
++    
++    handler = BaseHandler()
++    handler.load_middleware(is_async=True)
++
++
++if __name__ == '__main__':
++    test_debug()
+\ No newline at end of file
+diff --git a/django/core/handlers/base.py b/django/core/handlers/base.py
+index 8e8c3da06a..be8a114eb1 100644
+--- a/django/core/handlers/base.py
++++ b/django/core/handlers/base.py
+@@ -51,11 +51,11 @@ class BaseHandler:
+                 middleware_is_async = middleware_can_async
+             try:
+                 # Adapt handler, if needed.
+-                handler = self.adapt_method_mode(
++                adapted_handler = self.adapt_method_mode(
+                     middleware_is_async, handler, handler_is_async,
+                     debug=settings.DEBUG, name='middleware %s' % middleware_path,
+                 )
+-                mw_instance = middleware(handler)
++                mw_instance = middleware(adapted_handler)
+             except MiddlewareNotUsed as exc:
+                 if settings.DEBUG:
+                     if str(exc):
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 0000000000..0882623501
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python
++"""
++Test to reproduce the exact issue described in the GitHub issue.
++
++The issue occurs when:
++1. We have an ASGI application
++2. A middleware raises MiddlewareNotUsed 
++3. The next middleware in the chain gets the wrong handler type
++4. This causes "TypeError: object HttpResponse can't be used in 'await' expression"
++"""
++
++import os
++import sys
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.exceptions import MiddlewareNotUsed
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'test_exact_issue.LastMiddleware',
++            'test_exact_issue.SyncMiddleware',
++            'test_exact_issue.MiddlewareNotUsedMiddleware', 
++        ],
++        ROOT_URLCONF='test_exact_issue',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++from django.core.handlers.base import BaseHandler
++
++
++class LastMiddleware:
++    """The last middleware that should return a coroutine in async context."""
++    sync_capable = True
++    async_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"LastMiddleware received handler type: {type(get_response)}")
++        
++    def __call__(self, request):
++        response = self.get_response(request)
++        print(f"LastMiddleware got response type: {type(response)}")
++        return response
++
++
++class SyncMiddleware:
++    """A sync-only middleware."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"SyncMiddleware received handler type: {type(get_response)}")
++        
++    def __call__(self, request):
++        response = self.get_response(request)
++        print(f"SyncMiddleware got response type: {type(response)}")
++        return response
++
++
++class MiddlewareNotUsedMiddleware:
++    """A middleware that raises MiddlewareNotUsed and forces adaptation."""
++    sync_capable = False  # This forces adaptation
++    async_capable = True
++    
++    def __init__(self, get_response):
++        print(f"MiddlewareNotUsedMiddleware received handler type: {type(get_response)}")
++        raise MiddlewareNotUsed("This middleware is not used")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++def test_middleware_chain():
++    """Test the middleware chain to see the exact issue."""
++    print("Testing exact issue reproduction")
++    print("=" * 40)
++    
++    print("\n1. Testing SYNC context:")
++    handler = BaseHandler()
++    handler.load_middleware(is_async=False)
++    print("   SYNC context completed")
++    
++    print("\n2. Testing ASYNC context:")
++    handler = BaseHandler()
++    handler.load_middleware(is_async=True)
++    print("   ASYNC context completed")
++    
++    print("\nAnalysis:")
++    print("The issue occurs when MiddlewareNotUsed causes the handler")
++    print("to be adapted incorrectly for subsequent middleware.")
++    print("This can cause sync middleware to receive async handlers")
++    print("or vice versa, leading to type errors during request processing.")
++
++
++if __name__ == '__main__':
++    test_middleware_chain()
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 0000000000..7e904bc414
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python
++"""
++Simple test to verify the MiddlewareNotUsed fix.
++"""
++
++import os
++import sys
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.exceptions import MiddlewareNotUsed
++from django.core.handlers.base import BaseHandler
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'test_fix_verification.SyncMiddleware',
++            'test_fix_verification.MiddlewareNotUsedMiddleware', 
++        ],
++        ROOT_URLCONF='test_fix_verification',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++
++class SyncMiddleware:
++    """A sync-only middleware."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"SyncMiddleware received handler type: {type(get_response)}")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++class MiddlewareNotUsedMiddleware:
++    """A middleware that raises MiddlewareNotUsed."""
++    sync_capable = False  # This forces adaptation
++    async_capable = True
++    
++    def __init__(self, get_response):
++        print(f"MiddlewareNotUsedMiddleware received handler type: {type(get_response)}")
++        raise MiddlewareNotUsed("This middleware is not used")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++def test_fix():
++    """Test that the fix works correctly."""
++    print("Testing MiddlewareNotUsed fix")
++    print("=" * 40)
++    
++    print("\n1. Testing SYNC context (should work fine):")
++    handler = BaseHandler()
++    handler.load_middleware(is_async=False)
++    print("   SYNC context: OK")
++    
++    print("\n2. Testing ASYNC context (this should now be fixed):")
++    handler = BaseHandler()
++    handler.load_middleware(is_async=True)
++    print("   ASYNC context: OK")
++    
++    print("\nExpected behavior after fix:")
++    print("- MiddlewareNotUsedMiddleware should receive adapted handler")
++    print("- SyncMiddleware should receive ORIGINAL handler (not adapted)")
++    print("- Both should show 'function' type, not 'AsyncToSync'")
++
++
++if __name__ == '__main__':
++    test_fix()
+\ No newline at end of file
+diff --git a/test_middleware_bug_comprehensive.py b/test_middleware_bug_comprehensive.py
+new file mode 100644
+index 0000000000..850fa1de6a
+--- /dev/null
++++ b/test_middleware_bug_comprehensive.py
+@@ -0,0 +1,180 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to reproduce the MiddlewareNotUsed bug in ASGI context.
++
++This test demonstrates the actual TypeError that occurs when a sync middleware
++receives an async-adapted handler due to the MiddlewareNotUsed bug.
++"""
++
++import os
++import sys
++import asyncio
++from unittest.mock import Mock
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.exceptions import MiddlewareNotUsed
++from django.core.handlers.base import BaseHandler
++from django.http import HttpResponse, HttpRequest
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'test_middleware_bug_comprehensive.SyncMiddleware',
++            'test_middleware_bug_comprehensive.MiddlewareNotUsedMiddleware', 
++        ],
++        ROOT_URLCONF='test_middleware_bug_comprehensive',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++
++class SyncMiddleware:
++    """A sync-only middleware that expects a sync handler."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"SyncMiddleware initialized with handler: {type(get_response)}")
++        
++    def __call__(self, request):
++        print(f"SyncMiddleware called with handler: {type(self.get_response)}")
++        # This is where the bug manifests - if get_response is async-adapted,
++        # calling it directly will return a coroutine instead of HttpResponse
++        response = self.get_response(request)
++        print(f"SyncMiddleware got response: {type(response)}")
++        
++        # If response is a coroutine, this would cause the TypeError in real usage
++        if asyncio.iscoroutine(response):
++            print("ERROR: SyncMiddleware received a coroutine instead of HttpResponse!")
++            print("This would cause: TypeError: object HttpResponse can't be used in 'await' expression")
++            return HttpResponse("Error: Got coroutine instead of response")
++        
++        return response
++
++
++class MiddlewareNotUsedMiddleware:
++    """A middleware that raises MiddlewareNotUsed during initialization."""
++    sync_capable = False  # This forces adaptation
++    async_capable = True
++    
++    def __init__(self, get_response):
++        print(f"MiddlewareNotUsedMiddleware received handler: {type(get_response)}")
++        raise MiddlewareNotUsed("This middleware is not used")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++def simple_view(request):
++    """A simple view that returns an HttpResponse."""
++    return HttpResponse("Hello World")
++
++
++def test_actual_request_handling():
++    """Test actual request handling to see the bug in action."""
++    print("\n=== Testing actual request handling ===")
++    
++    # Create a handler and load middleware in async mode
++    handler = BaseHandler()
++    handler.load_middleware(is_async=True)
++    
++    # Create a mock request
++    request = HttpRequest()
++    request.method = 'GET'
++    request.path = '/'
++    
++    # Try to handle the request
++    try:
++        # In async mode, this should work without issues
++        # But due to the bug, sync middleware gets async-adapted handlers
++        response = handler._middleware_chain(request)
++        print(f"Final response type: {type(response)}")
++        
++        if asyncio.iscoroutine(response):
++            print("BUG DETECTED: Middleware chain returned a coroutine in sync context!")
++            return False
++        else:
++            print("Request handled successfully")
++            return True
++            
++    except Exception as e:
++        print(f"Request handling failed: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++
++async def test_async_request_handling():
++    """Test async request handling to see the bug in action."""
++    print("\n=== Testing async request handling ===")
++    
++    # Create a handler and load middleware in async mode
++    handler = BaseHandler()
++    handler.load_middleware(is_async=True)
++    
++    # Create a mock request
++    request = HttpRequest()
++    request.method = 'GET'
++    request.path = '/'
++    
++    # Try to handle the request
++    try:
++        # In async mode, this should return a coroutine
++        response = handler._middleware_chain(request)
++        print(f"Response type: {type(response)}")
++        
++        if asyncio.iscoroutine(response):
++            print("Awaiting coroutine response...")
++            response = await response
++            print(f"Final response type: {type(response)}")
++            print("Async request handled successfully")
++            return True
++        else:
++            print("Got sync response in async context - this might be the bug")
++            return True
++            
++    except Exception as e:
++        print(f"Async request handling failed: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++
++def main():
++    """Run the comprehensive test."""
++    print("Comprehensive test for MiddlewareNotUsed bug in ASGI context")
++    print("=" * 60)
++    
++    # Test sync request handling
++    sync_success = test_actual_request_handling()
++    
++    # Test async request handling (Python 3.6 compatible)
++    loop = asyncio.new_event_loop()
++    asyncio.set_event_loop(loop)
++    try:
++        async_success = loop.run_until_complete(test_async_request_handling())
++    finally:
++        loop.close()
++    
++    if sync_success and async_success:
++        print("\nAll tests passed!")
++    else:
++        print("\nSome tests failed - bug reproduced!")
++    
++    return sync_success and async_success
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_middleware_not_used_bug.py b/test_middleware_not_used_bug.py
+new file mode 100644
+index 0000000000..e1bff25490
+--- /dev/null
++++ b/test_middleware_not_used_bug.py
+@@ -0,0 +1,145 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the MiddlewareNotUsed bug in ASGI context.
++
++This script demonstrates the issue where MiddlewareNotUsed leaves undesired 
++side effects when loading middleware in ASGI context, causing subsequent 
++middleware to receive an incorrectly adapted handler.
++"""
++
++import os
++import sys
++import asyncio
++from unittest.mock import Mock
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.exceptions import MiddlewareNotUsed
++from django.core.handlers.base import BaseHandler
++from django.http import HttpResponse
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'test_middleware_not_used_bug.SyncMiddleware',
++            'test_middleware_not_used_bug.MiddlewareNotUsedMiddleware', 
++            'test_middleware_not_used_bug.AsyncCapableMiddleware',
++        ],
++        ROOT_URLCONF='test_middleware_not_used_bug',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++
++class SyncMiddleware:
++    """A sync-only middleware that should work fine."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"SyncMiddleware initialized with handler: {type(get_response)}")
++        
++    def __call__(self, request):
++        print(f"SyncMiddleware called with handler: {type(self.get_response)}")
++        return self.get_response(request)
++
++
++class MiddlewareNotUsedMiddleware:
++    """A middleware that raises MiddlewareNotUsed during initialization."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        print(f"MiddlewareNotUsedMiddleware received handler: {type(get_response)}")
++        raise MiddlewareNotUsed("This middleware is not used")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++class AsyncCapableMiddleware:
++    """An async-capable middleware that should receive the correct handler."""
++    sync_capable = True
++    async_capable = True
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"AsyncCapableMiddleware initialized with handler: {type(get_response)}")
++        
++    def __call__(self, request):
++        print(f"AsyncCapableMiddleware called with handler: {type(self.get_response)}")
++        return self.get_response(request)
++
++
++def test_middleware_loading_sync():
++    """Test middleware loading in sync context (should work fine)."""
++    print("\n=== Testing SYNC middleware loading ===")
++    
++    handler = BaseHandler()
++    handler.load_middleware(is_async=False)
++    
++    print("SYNC test completed successfully")
++
++
++def test_middleware_loading_async():
++    """Test middleware loading in async context (demonstrates the bug)."""
++    print("\n=== Testing ASYNC middleware loading ===")
++    
++    handler = BaseHandler()
++    
++    try:
++        handler.load_middleware(is_async=True)
++        print("ASYNC test completed")
++        
++        # The bug: SyncMiddleware should receive a sync handler, not AsyncToSync
++        # In the current buggy implementation, SyncMiddleware receives AsyncToSync
++        # because the handler was adapted for MiddlewareNotUsedMiddleware before
++        # MiddlewareNotUsed was raised
++        
++        print("\nAnalyzing the bug:")
++        print("- AsyncCapableMiddleware should get the original handler")
++        print("- MiddlewareNotUsedMiddleware should get an adapted handler but then be skipped")
++        print("- SyncMiddleware should get the ORIGINAL handler, not the adapted one")
++        print("- But due to the bug, SyncMiddleware gets the adapted handler")
++        
++        return True
++        
++    except Exception as e:
++        print(f"ASYNC test failed with error: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++
++def main():
++    """Run the test to demonstrate the bug."""
++    print("Testing MiddlewareNotUsed bug in ASGI context")
++    print("=" * 50)
++    
++    # Test sync context (should work)
++    test_middleware_loading_sync()
++    
++    # Test async context (should demonstrate the bug)
++    success = test_middleware_loading_async()
++    
++    if success:
++        print("\nBoth tests passed - bug may be fixed!")
++    else:
++        print("\nAsync test failed - bug reproduced!")
++    
++    return success
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_middleware_not_used_fix.py b/test_middleware_not_used_fix.py
+new file mode 100644
+index 0000000000..c3ec03f3f8
+--- /dev/null
++++ b/test_middleware_not_used_fix.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python
++"""
++Test case for the MiddlewareNotUsed fix.
++
++This test verifies that when a middleware raises MiddlewareNotUsed during
++initialization, it doesn't affect the handler adaptation for subsequent
++middleware in the chain.
++"""
++
++import os
++import sys
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.exceptions import MiddlewareNotUsed
++from django.test import SimpleTestCase, override_settings
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='test_middleware_not_used_fix',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++from django.core.handlers.base import BaseHandler
++
++
++class SyncMiddleware:
++    """A sync-only middleware."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        self.handler_type = type(get_response)
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++class MiddlewareNotUsedMiddleware:
++    """A middleware that raises MiddlewareNotUsed."""
++    sync_capable = False  # This forces adaptation
++    async_capable = True
++    
++    def __init__(self, get_response):
++        self.handler_type = type(get_response)
++        raise MiddlewareNotUsed("This middleware is not used")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++class MiddlewareNotUsedFixTest(SimpleTestCase):
++    """Test that MiddlewareNotUsed doesn't poison the middleware chain."""
++    
++    @override_settings(MIDDLEWARE=[
++        'test_middleware_not_used_fix.SyncMiddleware',
++        'test_middleware_not_used_fix.MiddlewareNotUsedMiddleware',
++    ])
++    def test_middleware_not_used_sync_context(self):
++        """
++        Test that in sync context, when a middleware raises MiddlewareNotUsed,
++        the next middleware receives the correct handler type.
++        """
++        handler = BaseHandler()
++        handler.load_middleware(is_async=False)
++        
++        # Find the SyncMiddleware instance
++        sync_middleware = None
++        current = handler._middleware_chain
++        while hasattr(current, 'get_response'):
++            if isinstance(current, SyncMiddleware):
++                sync_middleware = current
++                break
++            current = getattr(current, 'get_response', None)
++        
++        self.assertIsNotNone(sync_middleware, "SyncMiddleware should be in the chain")
++        
++        # In sync context, SyncMiddleware should receive a function, not a wrapper
++        self.assertEqual(sync_middleware.handler_type.__name__, 'function',
++                        "SyncMiddleware should receive a function handler in sync context")
++    
++    @override_settings(MIDDLEWARE=[
++        'test_middleware_not_used_fix.SyncMiddleware',
++        'test_middleware_not_used_fix.MiddlewareNotUsedMiddleware',
++    ])
++    def test_middleware_not_used_async_context(self):
++        """
++        Test that in async context, when a middleware raises MiddlewareNotUsed,
++        the next middleware receives the correct handler type.
++        """
++        handler = BaseHandler()
++        handler.load_middleware(is_async=True)
++        
++        # Find the SyncMiddleware instance
++        sync_middleware = None
++        current = handler._middleware_chain
++        while hasattr(current, 'get_response'):
++            if isinstance(current, SyncMiddleware):
++                sync_middleware = current
++                break
++            current = getattr(current, 'get_response', None)
++        
++        self.assertIsNotNone(sync_middleware, "SyncMiddleware should be in the chain")
++        
++        # In async context, SyncMiddleware should receive AsyncToSync wrapper
++        self.assertEqual(sync_middleware.handler_type.__name__, 'AsyncToSync',
++                        "SyncMiddleware should receive AsyncToSync handler in async context")
++
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_middleware_not_used_simple.py b/test_middleware_not_used_simple.py
+new file mode 100644
+index 0000000000..9d6d2f4719
+--- /dev/null
++++ b/test_middleware_not_used_simple.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python
++"""
++Simple test case for the MiddlewareNotUsed fix.
++"""
++
++import os
++import sys
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.exceptions import MiddlewareNotUsed
++from django.test import SimpleTestCase, override_settings
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF='test_middleware_not_used_simple',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++from django.core.handlers.base import BaseHandler
++
++
++# Global variables to track handler types
++handler_types = []
++
++
++class SyncMiddleware:
++    """A sync-only middleware that records the handler type."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        handler_types.append(('SyncMiddleware', type(get_response).__name__))
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++class MiddlewareNotUsedMiddleware:
++    """A middleware that raises MiddlewareNotUsed."""
++    sync_capable = False  # This forces adaptation
++    async_capable = True
++    
++    def __init__(self, get_response):
++        handler_types.append(('MiddlewareNotUsedMiddleware', type(get_response).__name__))
++        raise MiddlewareNotUsed("This middleware is not used")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++class MiddlewareNotUsedFixTest(SimpleTestCase):
++    """Test that MiddlewareNotUsed doesn't poison the middleware chain."""
++    
++    def setUp(self):
++        global handler_types
++        handler_types = []
++    
++    @override_settings(MIDDLEWARE=[
++        'test_middleware_not_used_simple.SyncMiddleware',
++        'test_middleware_not_used_simple.MiddlewareNotUsedMiddleware',
++    ])
++    def test_middleware_not_used_sync_context(self):
++        """
++        Test that in sync context, when a middleware raises MiddlewareNotUsed,
++        the next middleware receives the correct handler type.
++        """
++        handler = BaseHandler()
++        handler.load_middleware(is_async=False)
++        
++        # Check the recorded handler types
++        self.assertEqual(len(handler_types), 2)
++        
++        # MiddlewareNotUsedMiddleware should receive SyncToAsync (adapted for async middleware)
++        middleware_not_used_handler = next(
++            (ht[1] for ht in handler_types if ht[0] == 'MiddlewareNotUsedMiddleware'), 
++            None
++        )
++        self.assertEqual(middleware_not_used_handler, 'SyncToAsync')
++        
++        # SyncMiddleware should receive function (original handler, not adapted)
++        sync_middleware_handler = next(
++            (ht[1] for ht in handler_types if ht[0] == 'SyncMiddleware'), 
++            None
++        )
++        self.assertEqual(sync_middleware_handler, 'function')
++    
++    @override_settings(MIDDLEWARE=[
++        'test_middleware_not_used_simple.SyncMiddleware',
++        'test_middleware_not_used_simple.MiddlewareNotUsedMiddleware',
++    ])
++    def test_middleware_not_used_async_context(self):
++        """
++        Test that in async context, when a middleware raises MiddlewareNotUsed,
++        the next middleware receives the correct handler type.
++        """
++        handler = BaseHandler()
++        handler.load_middleware(is_async=True)
++        
++        # Check the recorded handler types
++        self.assertEqual(len(handler_types), 2)
++        
++        # MiddlewareNotUsedMiddleware should receive function (no adaptation needed)
++        middleware_not_used_handler = next(
++            (ht[1] for ht in handler_types if ht[0] == 'MiddlewareNotUsedMiddleware'), 
++            None
++        )
++        self.assertEqual(middleware_not_used_handler, 'function')
++        
++        # SyncMiddleware should receive AsyncToSync (adapted for sync middleware in async context)
++        sync_middleware_handler = next(
++            (ht[1] for ht in handler_types if ht[0] == 'SyncMiddleware'), 
++            None
++        )
++        self.assertEqual(sync_middleware_handler, 'AsyncToSync')
++
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_response_processing.py b/test_response_processing.py
+new file mode 100644
+index 0000000000..9f391d9fd0
+--- /dev/null
++++ b/test_response_processing.py
+@@ -0,0 +1,161 @@
++#!/usr/bin/env python
++"""
++Test to reproduce the actual MiddlewareNotUsed bug in response processing.
++"""
++
++import os
++import sys
++import asyncio
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.exceptions import MiddlewareNotUsed
++from django.core.handlers.asgi import ASGIHandler
++from django.http import HttpResponse, HttpRequest
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        MIDDLEWARE=[
++            'test_response_processing.SyncMiddleware',
++            'test_response_processing.MiddlewareNotUsedMiddleware', 
++        ],
++        ROOT_URLCONF='test_response_processing',
++        USE_TZ=False,
++    )
++
++django.setup()
++
++
++class SyncMiddleware:
++    """A sync-only middleware that processes responses."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        self.get_response = get_response
++        print(f"SyncMiddleware.__init__: handler type = {type(get_response)}")
++        
++    def __call__(self, request):
++        print(f"SyncMiddleware.__call__: processing request")
++        response = self.get_response(request)
++        print(f"SyncMiddleware.__call__: got response type = {type(response)}")
++        
++        # This is where the bug manifests - if response is a coroutine,
++        # we can't process it synchronously
++        if asyncio.iscoroutine(response):
++            print("ERROR: SyncMiddleware received coroutine instead of HttpResponse!")
++            print("This would cause: TypeError: object HttpResponse can't be used in 'await' expression")
++            # In real usage, this would cause the error when the middleware
++            # tries to access response attributes or modify it
++            return HttpResponse("Error: Got coroutine")
++        
++        # Normal response processing
++        response['X-Processed-By'] = 'SyncMiddleware'
++        return response
++
++
++class MiddlewareNotUsedMiddleware:
++    """A middleware that raises MiddlewareNotUsed."""
++    sync_capable = False  # This forces adaptation
++    async_capable = True
++    
++    def __init__(self, get_response):
++        print(f"MiddlewareNotUsedMiddleware.__init__: handler type = {type(get_response)}")
++        raise MiddlewareNotUsed("This middleware is not used")
++        
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++# Simple URL patterns
++urlpatterns = []
++
++def simple_view(request):
++    """A simple view."""
++    return HttpResponse("Hello World")
++
++
++async def test_asgi_request():
++    """Test ASGI request processing."""
++    print("\n=== Testing ASGI request processing ===")
++    
++    # Create ASGI handler
++    handler = ASGIHandler()
++    
++    # Create a simple ASGI scope for HTTP request
++    scope = {
++        'type': 'http',
++        'method': 'GET',
++        'path': '/',
++        'query_string': b'',
++        'headers': [],
++        'server': ('localhost', 8000),
++    }
++    
++    # Mock receive and send
++    messages = []
++    
++    async def receive():
++        return {'type': 'http.request', 'body': b''}
++    
++    async def send(message):
++        messages.append(message)
++        print(f"ASGI send: {message}")
++    
++    try:
++        # Process the request
++        await handler(scope, receive, send)
++        
++        # Check if we got the expected response
++        if len(messages) >= 2:
++            start_message = messages[0]
++            body_message = messages[1]
++            
++            if start_message['type'] == 'http.response.start':
++                print(f"Response status: {start_message['status']}")
++            
++            if body_message['type'] == 'http.response.body':
++                print(f"Response body: {body_message['body']}")
++                
++        print("ASGI request processing completed")
++        return True
++        
++    except Exception as e:
++        print(f"ASGI request processing failed: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++
++def main():
++    """Run the test."""
++    print("Testing MiddlewareNotUsed bug in response processing")
++    print("=" * 55)
++    
++    # Test async request processing
++    loop = asyncio.new_event_loop()
++    asyncio.set_event_loop(loop)
++    try:
++        success = loop.run_until_complete(test_asgi_request())
++    finally:
++        loop.close()
++    
++    if success:
++        print("\nTest completed successfully!")
++    else:
++        print("\nTest failed - bug reproduced!")
++    
++    return success
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file

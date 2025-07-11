@@ -1,0 +1,131 @@
+diff --git a/repro_issue.py b/repro_issue.py
+new file mode 100644
+index 00000000..f2b71902
+--- /dev/null
++++ b/repro_issue.py
+@@ -0,0 +1,18 @@
++import xarray as xr
++
++# Load the data
++ds = xr.tutorial.load_dataset("air_temperature")
++
++# Print the original time coordinate attributes
++print("Original time attributes:", ds.time.attrs)
++
++# Print the original air attributes
++print("Original air attributes:", ds.air.attrs)
++
++# Apply xr.where with keep_attrs=True
++result = xr.where(True, ds.air, ds.air, keep_attrs=True)
++
++# Print the time attributes after xr.where
++print("Time attributes after xr.where:", result.time.attrs)
++
++# This is the issue: time attributes should be preserved, but they're being overwritten with air attributes
+\ No newline at end of file
+diff --git a/verify_extra_cases.py b/verify_extra_cases.py
+new file mode 100644
+index 00000000..2f5d013b
+--- /dev/null
++++ b/verify_extra_cases.py
+@@ -0,0 +1,44 @@
++import xarray as xr
++import numpy as np
++
++# Create test data
++ds = xr.Dataset(
++    {
++        "var1": (["time", "lat", "lon"], np.random.rand(3, 4, 5)),
++        "var2": (["time", "lat", "lon"], np.random.rand(3, 4, 5)),
++    },
++    coords={
++        "time": ("time", [1, 2, 3], {"units": "days", "standard_name": "time"}),
++        "lat": ("lat", range(4), {"units": "degrees_north", "standard_name": "latitude"}),
++        "lon": ("lon", range(5), {"units": "degrees_east", "standard_name": "longitude"}),
++    },
++)
++
++# Add attributes to the variables
++ds.var1.attrs = {"long_name": "Variable 1", "units": "K"}
++ds.var2.attrs = {"long_name": "Variable 2", "units": "m/s"}
++
++# Test case 1: Simple condition
++print("=== Test Case 1: Simple condition ===")
++cond = ds.var1 > 0.5
++result = xr.where(cond, ds.var1, ds.var2, keep_attrs=True)
++print("Time coordinate attributes:", result.time.attrs)
++print("Lat coordinate attributes:", result.lat.attrs)
++print("Lon coordinate attributes:", result.lon.attrs)
++print("Result variable attributes:", result.attrs)
++
++# Test case 2: Condition from another dataset
++print("\n=== Test Case 2: Condition from another dataset ===")
++ds2 = xr.Dataset(
++    {"cond": (["time", "lat", "lon"], np.random.rand(3, 4, 5) > 0.5)},
++    coords={
++        "time": ("time", [1, 2, 3], {"units": "hours", "standard_name": "time_hours"}),
++        "lat": ("lat", range(4), {"units": "rad", "standard_name": "latitude_rad"}),
++        "lon": ("lon", range(5), {"units": "rad", "standard_name": "longitude_rad"}),
++    },
++)
++result2 = xr.where(ds2.cond, ds.var1, ds.var2, keep_attrs=True)
++print("Time coordinate attributes:", result2.time.attrs)
++print("Lat coordinate attributes:", result2.lat.attrs)
++print("Lon coordinate attributes:", result2.lon.attrs)
++print("Result variable attributes:", result2.attrs)
+\ No newline at end of file
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 3f7e8f74..3877aaf9 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1857,13 +1857,16 @@ def where(cond, x, y, keep_attrs=None):
+     """
+     if keep_attrs is None:
+         keep_attrs = _get_keep_attrs(default=False)
++        
++    data_var_attrs = getattr(x, "attrs", {})
++    
+     if keep_attrs is True:
+         # keep the attributes of x, the second parameter, by default to
+         # be consistent with the `where` method of `DataArray` and `Dataset`
+-        keep_attrs = lambda attrs, context: getattr(x, "attrs", {})
++        keep_attrs = "override"
+ 
+     # alignment for three arguments is complicated, so don't support it yet
+-    return apply_ufunc(
++    result = apply_ufunc(
+         duck_array_ops.where,
+         cond,
+         x,
+@@ -1873,6 +1876,31 @@ def where(cond, x, y, keep_attrs=None):
+         dask="allowed",
+         keep_attrs=keep_attrs,
+     )
++    
++    if hasattr(result, "attrs") and hasattr(result, "coords"):
++        # Restore the original coordinate attributes
++        if hasattr(cond, "coords"):
++            for name, coord in result.coords.items():
++                if name in cond.coords:
++                    coord.attrs.update(cond.coords[name].attrs)
++        if hasattr(x, "coords"):
++            for name, coord in result.coords.items():
++                if name in x.coords:
++                    coord.attrs.update(x.coords[name].attrs)
++        if hasattr(y, "coords"):
++            for name, coord in result.coords.items():
++                if name in y.coords and name not in x.coords:
++                    coord.attrs.update(y.coords[name].attrs)
++                    
++        # Set data variable attributes from x
++        if data_var_attrs:
++            # Replace any existing attrs instead of updating
++            result.attrs = data_var_attrs
++        elif is_scalar(x) and is_scalar(y):
++            # For scalar values, result should have empty attrs
++            result.attrs = {}
++
++    return result
+ 
+ 
+ @overload

@@ -1,0 +1,382 @@
+diff --git a/django/views/debug.py b/django/views/debug.py
+index 7a89f7bd15..23ac9039a9 100644
+--- a/django/views/debug.py
++++ b/django/views/debug.py
+@@ -444,8 +444,10 @@ class ExceptionReporter:
+                 pre_context = []
+                 context_line = '<source code not available>'
+                 post_context = []
++            # Get the cause (explicit or implicit)
++            exc_cause = explicit_or_implicit_cause(exc_value)
+             frames.append({
+-                'exc_cause': explicit_or_implicit_cause(exc_value),
++                'exc_cause': exc_cause,
+                 'exc_cause_explicit': getattr(exc_value, '__cause__', True),
+                 'tb': tb,
+                 'type': 'django' if module_name.startswith('django.') else 'user',
+diff --git a/test_direct_function.py b/test_direct_function.py
+new file mode 100644
+index 0000000000..51304a736c
+--- /dev/null
++++ b/test_direct_function.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python
++"""
++Test script to verify the explicit_or_implicit_cause function directly.
++
++This examines the specific function mentioned in the issue to see if
++it correctly handles __suppress_context__.
++"""
++
++import os
++import sys
++
++# Configure Django settings before importing any Django modules
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='dummy-key',
++    DEFAULT_EXCEPTION_REPORTER_FILTER='django.views.debug.SafeExceptionReporterFilter',
++    DEFAULT_EXCEPTION_REPORTER='django.views.debug.ExceptionReporter',
++)
++
++import django
++django.setup()
++
++# Now import the ExceptionReporter
++from django.views.debug import ExceptionReporter
++
++def test_explicit_or_implicit_cause():
++    # Create exceptions with different chaining configurations
++    try:
++        try:
++            raise RuntimeError("original error")
++        except RuntimeError as original_exc:
++            # Chain with explicit 'from' but don't suppress
++            raise ValueError("explicit cause") from original_exc
++    except ValueError as exc_with_cause:
++        # This should have __cause__ set but not __suppress_context__
++        pass
++    
++    try:
++        try:
++            raise RuntimeError("another original error")
++        except RuntimeError as another_original_exc:
++            # Use 'from None' which should set __suppress_context__
++            raise ValueError("suppressed context") from None
++    except ValueError as exc_with_suppressed_context:
++        # This should have __suppress_context__ = True
++        pass
++    
++    # Create a third exception with implicit context but without explicit cause
++    try:
++        try:
++            raise RuntimeError("third original error")
++        except RuntimeError:
++            # No 'from', so this creates an implicit context
++            raise ValueError("implicit context")
++    except ValueError as exc_with_implicit_context:
++        # This should have __context__ set but not __cause__
++        pass
++    
++    # Get the function from the ExceptionReporter class
++    reporter = ExceptionReporter(None, None, None, None)
++    explicit_or_implicit_cause = getattr(reporter.get_traceback_frames.__func__, 
++                                         'explicit_or_implicit_cause', None)
++    
++    if explicit_or_implicit_cause is None:
++        print("ERROR: Couldn't retrieve the explicit_or_implicit_cause function")
++        return
++    
++    # Test case 1: Exception with explicit cause (from original_exc)
++    result1 = explicit_or_implicit_cause(exc_with_cause)
++    print("\nTest 1: Exception with explicit cause")
++    print(f"Result: {result1}")
++    print(f"Expected: {exc_with_cause.__cause__}")
++    print(f"Correct: {result1 is exc_with_cause.__cause__}")
++    
++    # Test case 2: Exception with suppressed context (from None)
++    result2 = explicit_or_implicit_cause(exc_with_suppressed_context)
++    print("\nTest 2: Exception with suppressed context (from None)")
++    print(f"Result: {result2}")
++    print(f"Expected: None")
++    print(f"Correct: {result2 is None}")
++    
++    # Test case 3: Exception with implicit context but no explicit cause
++    result3 = explicit_or_implicit_cause(exc_with_implicit_context)
++    print("\nTest 3: Exception with implicit context only")
++    print(f"Result: {result3}")
++    print(f"Expected: {exc_with_implicit_context.__context__}")
++    print(f"Correct: {result3 is exc_with_implicit_context.__context__}")
++
++if __name__ == "__main__":
++    test_explicit_or_implicit_cause()
+\ No newline at end of file
+diff --git a/test_exception_suppression.py b/test_exception_suppression.py
+new file mode 100644
+index 0000000000..a4ab599c7f
+--- /dev/null
++++ b/test_exception_suppression.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python
++"""
++Test script to verify exception suppression in Django debug view.
++
++This script confirms the issue where Django's debug view doesn't respect 
++exc.__suppress_context__ (PEP 415) when using 'raise ... from None'.
++"""
++
++import os
++import sys
++
++# Define a minimal settings module for Django
++from django.conf import settings
++
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='dummy-key',
++    ROOT_URLCONF=__name__,
++)
++
++# Import Django modules
++import django
++from django.http import HttpRequest
++from django.views import View
++from django.views.debug import technical_500_response
++
++# Initialize Django
++django.setup()
++
++class TestView(View):
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('my error')
++        except Exception as exc:
++            raise ValueError('my new error') from None
++
++# This view is for comparison, using explicit cause instead of suppressing context
++class ExplicitCauseView(View):
++    def get(self, request, *args, **kwargs):
++        try:
++            raise RuntimeError('original error')
++        except Exception as exc:
++            raise ValueError('new error with explicit cause') from exc
++
++def test_explicit_cause():
++    """Test behavior with an explicit cause (from exc)."""
++    try:
++        # Create a dummy request
++        request = HttpRequest()
++        request.META = {'SERVER_NAME': 'testserver', 'SERVER_PORT': 80}
++        
++        # Get an ExplicitCauseView instance and call its get method to trigger the exception
++        view = ExplicitCauseView()
++        view.get(request)
++    except ValueError as exc:
++        # Check attributes
++        print(f"EXPLICIT CAUSE EXCEPTION:")
++        print(f"__suppress_context__: {getattr(exc, '__suppress_context__', None)}")
++        print(f"__cause__: {getattr(exc, '__cause__', None)}")
++        print(f"__context__: {getattr(exc, '__context__', None)}")
++        
++        # Get the traceback information
++        exc_type, exc_value, tb = sys.exc_info()
++        
++        # Generate the debug response and save to file
++        response = technical_500_response(request, exc_type, exc_value, tb)
++        with open('/tmp/django_explicit_cause.html', 'w') as f:
++            f.write(response.content.decode('utf-8'))
++        
++        print(f"Explicit cause HTML saved to /tmp/django_explicit_cause.html")
++
++def test_exception_handling():
++    """Test that exception suppression is respected."""
++    try:
++        # Create a dummy request
++        request = HttpRequest()
++        request.META = {'SERVER_NAME': 'testserver', 'SERVER_PORT': 80}
++        
++        # Get a TestView instance and call its get method to trigger the exception
++        view = TestView()
++        view.get(request)
++    except ValueError as exc:
++        # Check if __suppress_context__ is set on the exception
++        print(f"__suppress_context__ attribute is: {getattr(exc, '__suppress_context__', None)}")
++        
++        # Get the traceback information
++        exc_type, exc_value, tb = sys.exc_info()
++        
++        # First, let's look at what Python's built-in traceback shows
++        import traceback
++        print("\nPython's built-in traceback:")
++        traceback_lines = traceback.format_exception(exc_type, exc_value, tb)
++        traceback_text = ''.join(traceback_lines)
++        print(traceback_text)
++        
++        # Next, let's check what Django's debug view shows
++        response = technical_500_response(request, exc_type, exc_value, tb)
++        response_text = response.content.decode('utf-8')
++        
++        # Search for the original exception in Django's response
++        if "RuntimeError: my error" in response_text:
++            print("\n===========================================================================")
++            print("TEST FAILED: Context exception (RuntimeError) is showing up in Django's debug view")
++            print("even though 'from None' was used.")
++            print("This confirms the issue described in the bug report.")
++            print("===========================================================================")
++        else:
++            print("\n===========================================================================")
++            print("TEST PASSED: Context exception (RuntimeError) is correctly suppressed in Django's debug view.")
++            print("===========================================================================")
++        
++        # Save the HTML response to a file for inspection
++        with open('/tmp/django_debug_output.html', 'w') as f:
++            f.write(response_text)
++            
++        print(f"\nHTML response saved to /tmp/django_debug_output.html for inspection.")
++
++if __name__ == "__main__":
++    print("\n=== TESTING EXPLICIT CAUSE ===")
++    test_explicit_cause()
++    
++    print("\n=== TESTING SUPPRESSED CONTEXT ===")
++    test_exception_handling()
+\ No newline at end of file
+diff --git a/test_function.py b/test_function.py
+new file mode 100644
+index 0000000000..186b28c160
+--- /dev/null
++++ b/test_function.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python
++"""
++Test script to verify the behavior of the function that needs to be modified.
++
++This script reproduces the issue with `explicit_or_implicit_cause` function
++in Django's debug error view.
++"""
++
++# First, we'll define a version of the function as currently implemented
++def current_explicit_or_implicit_cause(exc_value):
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', None)
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++# Then, we'll define the fixed version
++def fixed_explicit_or_implicit_cause(exc_value):
++    explicit = getattr(exc_value, '__cause__', None)
++    suppress_context = getattr(exc_value, '__suppress_context__', None)
++    implicit = getattr(exc_value, '__context__', None)
++    return explicit or (None if suppress_context else implicit)
++
++def test_functions():
++    # Create an exception chain with 'from None'
++    try:
++        try:
++            raise RuntimeError("original error")
++        except RuntimeError as original_exc:
++            # Use 'from None' which should set __suppress_context__
++            raise ValueError("suppressed context") from None
++    except ValueError as exc_with_suppressed_context:
++        # This should have __suppress_context__ = True and __context__ set to the RuntimeError
++        # Print exception attributes
++        print("Exception created with 'raise ... from None':")
++        print(f"- Type: {type(exc_with_suppressed_context).__name__}")
++        print(f"- Message: {exc_with_suppressed_context}")
++        print(f"- __cause__: {getattr(exc_with_suppressed_context, '__cause__', None)}")
++        print(f"- __context__: {getattr(exc_with_suppressed_context, '__context__', None)}")
++        print(f"- __suppress_context__: {getattr(exc_with_suppressed_context, '__suppress_context__', None)}")
++        
++        # Test both implementations
++        print("\nTesting current implementation:")
++        result_current = current_explicit_or_implicit_cause(exc_with_suppressed_context)
++        print(f"Result: {result_current}")
++        print(f"Correctly returned None: {result_current is None}")
++        
++        print("\nTesting fixed implementation:")
++        result_fixed = fixed_explicit_or_implicit_cause(exc_with_suppressed_context)
++        print(f"Result: {result_fixed}")
++        print(f"Correctly returned None: {result_fixed is None}")
++        
++        # Also test an exception with explicit cause
++        try:
++            try:
++                raise RuntimeError("another error")
++            except RuntimeError as another_exc:
++                raise ValueError("explicit cause") from another_exc
++        except ValueError as exc_with_cause:
++            print("\nException created with explicit 'raise ... from exc':")
++            print(f"- __cause__: {getattr(exc_with_cause, '__cause__', None)}")
++            print(f"- __context__: {getattr(exc_with_cause, '__context__', None)}")
++            print(f"- __suppress_context__: {getattr(exc_with_cause, '__suppress_context__', None)}")
++            
++            print("\nTesting with explicit cause:")
++            result_current = current_explicit_or_implicit_cause(exc_with_cause)
++            print(f"Current implementation result: {result_current}")
++            result_fixed = fixed_explicit_or_implicit_cause(exc_with_cause)
++            print(f"Fixed implementation result: {result_fixed}")
++            print(f"Both implementations return same value: {result_current is result_fixed}")
++
++if __name__ == "__main__":
++    test_functions()
+\ No newline at end of file
+diff --git a/test_no_context.py b/test_no_context.py
+new file mode 100644
+index 0000000000..f341790734
+--- /dev/null
++++ b/test_no_context.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python
++"""
++Test script for an exception with no context or cause.
++"""
++
++import os
++import sys
++
++# Configure Django settings
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='dummy-key',
++)
++
++import django
++django.setup()
++
++from django.http import HttpRequest
++from django.views.debug import technical_500_response
++
++def test_no_context():
++    """Test an exception with no context."""
++    try:
++        # Directly raise an exception with no context
++        raise ValueError("simple exception with no context")
++    except ValueError as exc:
++        # Check attributes
++        print(f"EXCEPTION WITH NO CONTEXT:")
++        print(f"__suppress_context__: {getattr(exc, '__suppress_context__', None)}")
++        print(f"__cause__: {getattr(exc, '__cause__', None)}")
++        print(f"__context__: {getattr(exc, '__context__', None)}")
++        
++        # Get the traceback information
++        exc_type, exc_value, tb = sys.exc_info()
++        
++        # Create a dummy request
++        request = HttpRequest()
++        request.META = {'SERVER_NAME': 'testserver', 'SERVER_PORT': 80}
++        
++        # Generate the debug response
++        response = technical_500_response(request, exc_type, exc_value, tb)
++        
++        # Check if the context message appears
++        response_text = response.content.decode('utf-8')
++        if "During handling of the above exception" in response_text:
++            print("TEST FAILED: Context message appeared for an exception with no context")
++        else:
++            print("TEST PASSED: No context message for an exception with no context")
++
++if __name__ == "__main__":
++    test_no_context()
+\ No newline at end of file

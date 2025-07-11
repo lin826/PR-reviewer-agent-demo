@@ -1,0 +1,609 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 0a5e5ff673..be1745f591 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -431,14 +431,14 @@ class Model(metaclass=ModelBase):
+             for val, field in zip(args, fields_iter):
+                 if val is _DEFERRED:
+                     continue
+-                _setattr(self, field.attname, val)
++                _setattr(self, field.attname, field.to_python(val))
+         else:
+             # Slower, kwargs-ready version.
+             fields_iter = iter(opts.fields)
+             for val, field in zip(args, fields_iter):
+                 if val is _DEFERRED:
+                     continue
+-                _setattr(self, field.attname, val)
++                _setattr(self, field.attname, field.to_python(val))
+                 kwargs.pop(field.name, None)
+ 
+         # Now we're left with the unprocessed fields that *must* come from
+@@ -482,7 +482,7 @@ class Model(metaclass=ModelBase):
+                     _setattr(self, field.name, rel_obj)
+             else:
+                 if val is not _DEFERRED:
+-                    _setattr(self, field.attname, val)
++                    _setattr(self, field.attname, field.to_python(val))
+ 
+         if kwargs:
+             property_names = opts._property_names
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index d610dc86f0..338559218c 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -14,7 +14,7 @@ from django.conf import settings
+ from django.core import checks, exceptions, validators
+ from django.db import connection, connections, router
+ from django.db.models.constants import LOOKUP_SEP
+-from django.db.models.query_utils import DeferredAttribute, RegisterLookupMixin
++from django.db.models.query_utils import DeferredAttribute, FieldDescriptor, RegisterLookupMixin
+ from django.utils import timezone
+ from django.utils.datastructures import DictWrapper
+ from django.utils.dateparse import (
+@@ -967,6 +967,7 @@ class BooleanField(Field):
+ 
+ class CharField(Field):
+     description = _("String (up to %(max_length)s)")
++    descriptor_class = FieldDescriptor
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -1008,7 +1009,13 @@ class CharField(Field):
+         return "CharField"
+ 
+     def to_python(self, value):
+-        if isinstance(value, str) or value is None:
++        if value is None:
++            return value
++        # Convert TextChoices enum to its underlying string value
++        if hasattr(value, '_value_') and hasattr(value, '_name_'):
++            # This is likely an enum, extract the underlying value
++            return str(value.value)
++        if isinstance(value, str):
+             return value
+         return str(value)
+ 
+@@ -1704,6 +1711,7 @@ class IntegerField(Field):
+         'invalid': _('“%(value)s” value must be an integer.'),
+     }
+     description = _("Integer")
++    descriptor_class = FieldDescriptor
+ 
+     def check(self, **kwargs):
+         return [
+@@ -1769,6 +1777,10 @@ class IntegerField(Field):
+     def to_python(self, value):
+         if value is None:
+             return value
++        # Convert IntegerChoices enum to its underlying integer value
++        if hasattr(value, '_value_') and hasattr(value, '_name_'):
++            # This is likely an enum, extract the underlying value
++            value = value.value
+         try:
+             return int(value)
+         except (TypeError, ValueError):
+@@ -2018,12 +2030,19 @@ class SmallIntegerField(IntegerField):
+ 
+ class TextField(Field):
+     description = _("Text")
++    descriptor_class = FieldDescriptor
+ 
+     def get_internal_type(self):
+         return "TextField"
+ 
+     def to_python(self, value):
+-        if isinstance(value, str) or value is None:
++        if value is None:
++            return value
++        # Convert TextChoices enum to its underlying string value
++        if hasattr(value, '_value_') and hasattr(value, '_name_'):
++            # This is likely an enum, extract the underlying value
++            return str(value.value)
++        if isinstance(value, str):
+             return value
+         return str(value)
+ 
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index 189fb4fa44..7e79683a97 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -151,6 +151,25 @@ class DeferredAttribute:
+         return None
+ 
+ 
++class FieldDescriptor:
++    """
++    A descriptor that handles field assignment and retrieval, with support for
++    converting enum values to their underlying types.
++    """
++    def __init__(self, field):
++        self.field = field
++
++    def __get__(self, instance, cls=None):
++        if instance is None:
++            return self
++        return instance.__dict__.get(self.field.attname)
++
++    def __set__(self, instance, value):
++        # Convert the value using the field's to_python method
++        converted_value = self.field.to_python(value)
++        instance.__dict__[self.field.attname] = converted_value
++
++
+ class RegisterLookupMixin:
+ 
+     @classmethod
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6e9cc51802
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the TextChoices/IntegerChoices field value type issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.utils.translation import gettext_lazy as _
++
++# Define the models as described in the issue
++class MyChoice(models.TextChoices):
++    FIRST_CHOICE = "first", _("The first choice, it is")
++    SECOND_CHOICE = "second", _("The second choice, it is")
++
++class MyIntChoice(models.IntegerChoices):
++    FIRST_CHOICE = 1, _("The first choice, it is")
++    SECOND_CHOICE = 2, _("The second choice, it is")
++
++class MyObject(models.Model):
++    my_str_value = models.CharField(max_length=10, choices=MyChoice.choices)
++    my_int_value = models.IntegerField(choices=MyIntChoice.choices)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(MyObject)
++
++def test_text_choices():
++    print("=== Testing TextChoices ===")
++    
++    # Create an instance with enum value
++    my_object = MyObject.objects.create(
++        my_str_value=MyChoice.FIRST_CHOICE,
++        my_int_value=MyIntChoice.FIRST_CHOICE
++    )
++    
++    print(f"Created object field value: {repr(my_object.my_str_value)}")
++    print(f"Created object field type: {type(my_object.my_str_value)}")
++    print(f"Created object str(field): {str(my_object.my_str_value)}")
++    print(f"Is instance of str: {isinstance(my_object.my_str_value, str)}")
++    print()
++    
++    # Retrieve the same instance from database
++    retrieved_object = MyObject.objects.last()
++    
++    print(f"Retrieved object field value: {repr(retrieved_object.my_str_value)}")
++    print(f"Retrieved object field type: {type(retrieved_object.my_str_value)}")
++    print(f"Retrieved object str(field): {str(retrieved_object.my_str_value)}")
++    print(f"Is instance of str: {isinstance(retrieved_object.my_str_value, str)}")
++    print()
++    
++    # Test the issue: str() should return the same value
++    created_str = str(my_object.my_str_value)
++    retrieved_str = str(retrieved_object.my_str_value)
++    
++    print(f"Created str == Retrieved str: {created_str == retrieved_str}")
++    print(f"Created str: '{created_str}'")
++    print(f"Retrieved str: '{retrieved_str}'")
++    print()
++
++def test_integer_choices():
++    print("=== Testing IntegerChoices ===")
++    
++    # Create an instance with enum value
++    my_object = MyObject.objects.create(
++        my_str_value=MyChoice.SECOND_CHOICE,
++        my_int_value=MyIntChoice.FIRST_CHOICE
++    )
++    
++    print(f"Created object field value: {repr(my_object.my_int_value)}")
++    print(f"Created object field type: {type(my_object.my_int_value)}")
++    print(f"Created object str(field): {str(my_object.my_int_value)}")
++    print(f"Is instance of int: {isinstance(my_object.my_int_value, int)}")
++    print()
++    
++    # Retrieve the same instance from database
++    retrieved_object = MyObject.objects.last()
++    
++    print(f"Retrieved object field value: {repr(retrieved_object.my_int_value)}")
++    print(f"Retrieved object field type: {type(retrieved_object.my_int_value)}")
++    print(f"Retrieved object str(field): {str(retrieved_object.my_int_value)}")
++    print(f"Is instance of int: {isinstance(retrieved_object.my_int_value, int)}")
++    print()
++    
++    # Test the issue: str() should return the same value
++    created_str = str(my_object.my_int_value)
++    retrieved_str = str(retrieved_object.my_int_value)
++    
++    print(f"Created str == Retrieved str: {created_str == retrieved_str}")
++    print(f"Created str: '{created_str}'")
++    print(f"Retrieved str: '{retrieved_str}'")
++    print()
++
++if __name__ == "__main__":
++    test_text_choices()
++    test_integer_choices()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..505dfd655d
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,191 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the TextChoices/IntegerChoices fix works in various scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.utils.translation import gettext_lazy as _
++
++# Define various enum types
++class MyTextChoice(models.TextChoices):
++    FIRST = "first", _("First Choice")
++    SECOND = "second", _("Second Choice")
++
++class MyIntChoice(models.IntegerChoices):
++    ONE = 1, _("One")
++    TWO = 2, _("Two")
++
++class MyTextChoiceNoLabel(models.TextChoices):
++    ALPHA = "alpha"
++    BETA = "beta"
++
++class MyIntChoiceNoLabel(models.IntegerChoices):
++    TEN = 10
++    TWENTY = 20
++
++class TestModel(models.Model):
++    text_field = models.CharField(max_length=20, choices=MyTextChoice.choices)
++    int_field = models.IntegerField(choices=MyIntChoice.choices)
++    text_field_no_label = models.CharField(max_length=20, choices=MyTextChoiceNoLabel.choices)
++    int_field_no_label = models.IntegerField(choices=MyIntChoiceNoLabel.choices)
++    text_field_optional = models.CharField(max_length=20, choices=MyTextChoice.choices, null=True, blank=True)
++    int_field_optional = models.IntegerField(choices=MyIntChoice.choices, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++def test_basic_functionality():
++    print("=== Testing Basic Functionality ===")
++    
++    # Test creation with enum values
++    obj = TestModel.objects.create(
++        text_field=MyTextChoice.FIRST,
++        int_field=MyIntChoice.ONE,
++        text_field_no_label=MyTextChoiceNoLabel.ALPHA,
++        int_field_no_label=MyIntChoiceNoLabel.TEN
++    )
++    
++    print(f"Created object text_field: {repr(obj.text_field)} (type: {type(obj.text_field)})")
++    print(f"Created object int_field: {repr(obj.int_field)} (type: {type(obj.int_field)})")
++    print(f"str(text_field): '{str(obj.text_field)}'")
++    print(f"str(int_field): '{str(obj.int_field)}'")
++    
++    # Test retrieval from database
++    retrieved = TestModel.objects.get(pk=obj.pk)
++    print(f"Retrieved object text_field: {repr(retrieved.text_field)} (type: {type(retrieved.text_field)})")
++    print(f"Retrieved object int_field: {repr(retrieved.int_field)} (type: {type(retrieved.int_field)})")
++    print(f"str(text_field): '{str(retrieved.text_field)}'")
++    print(f"str(int_field): '{str(retrieved.int_field)}'")
++    
++    # Verify consistency
++    assert str(obj.text_field) == str(retrieved.text_field), "TextChoices str() inconsistent"
++    assert str(obj.int_field) == str(retrieved.int_field), "IntegerChoices str() inconsistent"
++    assert obj.text_field == retrieved.text_field, "TextChoices value inconsistent"
++    assert obj.int_field == retrieved.int_field, "IntegerChoices value inconsistent"
++    
++    print("✓ Basic functionality test passed!")
++    print()
++
++def test_direct_assignment():
++    print("=== Testing Direct Assignment ===")
++    
++    obj = TestModel()
++    obj.text_field = MyTextChoice.SECOND
++    obj.int_field = MyIntChoice.TWO
++    obj.text_field_no_label = MyTextChoiceNoLabel.BETA
++    obj.int_field_no_label = MyIntChoiceNoLabel.TWENTY
++    obj.save()
++    
++    print(f"Direct assignment text_field: {repr(obj.text_field)} (type: {type(obj.text_field)})")
++    print(f"Direct assignment int_field: {repr(obj.int_field)} (type: {type(obj.int_field)})")
++    print(f"str(text_field): '{str(obj.text_field)}'")
++    print(f"str(int_field): '{str(obj.int_field)}'")
++    
++    # Test retrieval
++    retrieved = TestModel.objects.get(pk=obj.pk)
++    assert str(obj.text_field) == str(retrieved.text_field), "Direct assignment TextChoices str() inconsistent"
++    assert str(obj.int_field) == str(retrieved.int_field), "Direct assignment IntegerChoices str() inconsistent"
++    
++    print("✓ Direct assignment test passed!")
++    print()
++
++def test_none_values():
++    print("=== Testing None Values ===")
++    
++    obj = TestModel.objects.create(
++        text_field=MyTextChoice.FIRST,
++        int_field=MyIntChoice.ONE,
++        text_field_no_label=MyTextChoiceNoLabel.ALPHA,
++        int_field_no_label=MyIntChoiceNoLabel.TEN,
++        text_field_optional=None,
++        int_field_optional=None
++    )
++    
++    print(f"Optional text_field: {repr(obj.text_field_optional)}")
++    print(f"Optional int_field: {repr(obj.int_field_optional)}")
++    
++    retrieved = TestModel.objects.get(pk=obj.pk)
++    assert obj.text_field_optional == retrieved.text_field_optional, "None TextChoices inconsistent"
++    assert obj.int_field_optional == retrieved.int_field_optional, "None IntegerChoices inconsistent"
++    
++    print("✓ None values test passed!")
++    print()
++
++def test_string_and_int_values():
++    print("=== Testing String and Int Values ===")
++    
++    # Test creation with raw string/int values (should still work)
++    obj = TestModel.objects.create(
++        text_field="first",  # Raw string value
++        int_field=1,         # Raw int value
++        text_field_no_label="alpha",
++        int_field_no_label=10
++    )
++    
++    print(f"Raw value text_field: {repr(obj.text_field)} (type: {type(obj.text_field)})")
++    print(f"Raw value int_field: {repr(obj.int_field)} (type: {type(obj.int_field)})")
++    
++    retrieved = TestModel.objects.get(pk=obj.pk)
++    assert obj.text_field == retrieved.text_field, "Raw string value inconsistent"
++    assert obj.int_field == retrieved.int_field, "Raw int value inconsistent"
++    
++    print("✓ String and int values test passed!")
++    print()
++
++def test_equality_with_enums():
++    print("=== Testing Equality with Enums ===")
++    
++    obj = TestModel.objects.create(
++        text_field=MyTextChoice.FIRST,
++        int_field=MyIntChoice.ONE,
++        text_field_no_label=MyTextChoiceNoLabel.ALPHA,
++        int_field_no_label=MyIntChoiceNoLabel.TEN
++    )
++    
++    # Test that the converted values still equal the enum values
++    print(f"text_field == MyTextChoice.FIRST: {obj.text_field == MyTextChoice.FIRST}")
++    print(f"int_field == MyIntChoice.ONE: {obj.int_field == MyIntChoice.ONE}")
++    
++    # This should be True because TextChoices/IntegerChoices inherit from str/int
++    assert obj.text_field == MyTextChoice.FIRST, "TextChoices equality failed"
++    assert obj.int_field == MyIntChoice.ONE, "IntegerChoices equality failed"
++    
++    print("✓ Equality with enums test passed!")
++    print()
++
++if __name__ == "__main__":
++    test_basic_functionality()
++    test_direct_assignment()
++    test_none_values()
++    test_string_and_int_values()
++    test_equality_with_enums()
++    print("🎉 All tests passed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..107de8275b
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python
++"""
++Test edge cases to ensure the fix doesn't break existing functionality.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.exceptions import ValidationError
++
++class TestModel(models.Model):
++    char_field = models.CharField(max_length=50)
++    int_field = models.IntegerField()
++    text_field = models.TextField()
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++def test_normal_values():
++    print("=== Testing Normal Values ===")
++    
++    # Test with normal string and int values
++    obj = TestModel.objects.create(
++        char_field="hello",
++        int_field=42,
++        text_field="world"
++    )
++    
++    assert obj.char_field == "hello"
++    assert obj.int_field == 42
++    assert obj.text_field == "world"
++    
++    # Test direct assignment
++    obj.char_field = "updated"
++    obj.int_field = 100
++    obj.text_field = "updated text"
++    
++    assert obj.char_field == "updated"
++    assert obj.int_field == 100
++    assert obj.text_field == "updated text"
++    
++    print("✓ Normal values test passed!")
++
++def test_none_values():
++    print("=== Testing None Values ===")
++    
++    obj = TestModel()
++    obj.char_field = None
++    obj.int_field = None
++    obj.text_field = None
++    
++    # CharField and TextField should convert None to None
++    # IntegerField should convert None to None
++    assert obj.char_field is None
++    assert obj.int_field is None
++    assert obj.text_field is None
++    
++    print("✓ None values test passed!")
++
++def test_type_conversion():
++    print("=== Testing Type Conversion ===")
++    
++    obj = TestModel()
++    
++    # Test that CharField converts non-strings to strings
++    obj.char_field = 123
++    assert obj.char_field == "123"
++    assert isinstance(obj.char_field, str)
++    
++    # Test that IntegerField converts strings to ints
++    obj.int_field = "456"
++    assert obj.int_field == 456
++    assert isinstance(obj.int_field, int)
++    
++    # Test that TextField converts non-strings to strings
++    obj.text_field = 789
++    assert obj.text_field == "789"
++    assert isinstance(obj.text_field, str)
++    
++    print("✓ Type conversion test passed!")
++
++def test_invalid_values():
++    print("=== Testing Invalid Values ===")
++    
++    obj = TestModel()
++    
++    # Test that IntegerField raises ValidationError for invalid values
++    try:
++        obj.int_field = "not_a_number"
++        assert False, "Should have raised ValidationError"
++    except ValidationError:
++        pass  # Expected
++    
++    print("✓ Invalid values test passed!")
++
++def test_descriptor_access():
++    print("=== Testing Descriptor Access ===")
++    
++    # Test that accessing the field on the class returns the descriptor
++    descriptor = TestModel.char_field
++    assert hasattr(descriptor, '__get__')
++    assert hasattr(descriptor, '__set__')
++    
++    print("✓ Descriptor access test passed!")
++
++if __name__ == "__main__":
++    test_normal_values()
++    test_none_values()
++    test_type_conversion()
++    test_invalid_values()
++    test_descriptor_access()
++    print("🎉 All edge case tests passed!")
+\ No newline at end of file

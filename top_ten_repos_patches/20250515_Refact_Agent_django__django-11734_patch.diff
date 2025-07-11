@@ -1,0 +1,49 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 2b59dd301a..176f433a83 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -552,7 +552,14 @@ class ResolvedOuterRef(F):
+     """
+     contains_aggregate = False
+ 
+-    def as_sql(self, *args, **kwargs):
++    def as_sql(self, compiler, connection, *args, **kwargs):
++        # Check if we're inside a subquery context
++        query = getattr(compiler, 'query', None)
++        if query and getattr(query, 'subquery', False):
++            # We're inside a subquery, so this is valid
++            return super().as_sql(compiler, connection, *args, **kwargs)
++        
++        # Not in a subquery context, raise the error
+         raise ValueError(
+             'This queryset contains a reference to an outer query and may '
+             'only be used in a subquery.'
+@@ -1055,6 +1062,28 @@ class Subquery(Expression):
+     def external_aliases(self):
+         return self.query.external_aliases
+ 
++    def contains_outer_reference(self):
++        """
++        Return whether this subquery contains any outer references.
++        This is used to determine if the subquery needs to be reprocessed
++        when used in a negated context (exclude() or ~Q()).
++        """
++        from django.db.models.sql.where import WhereNode
++        
++        def _contains_outer_ref(node):
++            if isinstance(node, ResolvedOuterRef):
++                return True
++            if isinstance(node, WhereNode):
++                return any(_contains_outer_ref(child) for child in node.children)
++            if hasattr(node, 'lhs') and hasattr(node, 'rhs'):
++                return (_contains_outer_ref(node.lhs) or 
++                        _contains_outer_ref(node.rhs))
++            if hasattr(node, 'get_source_expressions'):
++                return any(_contains_outer_ref(expr) for expr in node.get_source_expressions() if expr)
++            return False
++        
++        return _contains_outer_ref(self.query.where)
++
+     def as_sql(self, compiler, connection, template=None, **extra_context):
+         connection.ops.check_expression_support(self)
+         template_params = {**self.extra, **extra_context}

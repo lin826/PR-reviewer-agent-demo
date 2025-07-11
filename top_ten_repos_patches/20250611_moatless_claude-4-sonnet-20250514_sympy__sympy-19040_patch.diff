@@ -1,0 +1,693 @@
+--- a/debug_factor.py
++++ b/debug_factor.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.abc import x, y
++from sympy.polys.polytools import _poly_from_expr
++from sympy.polys import polyoptions as options
++
++print("Debugging the factorization issue...")
++
++# Create the test expression
++z = expand((x-1)*(y-1))
++print(f"Original expression: z = {z}")
++
++# Test both cases - without and with extension
++print("\n=== Without extension ===")
++opt1 = options.build_options([], {})
++print(f"Options: {opt1}")
++
++try:
++    poly1, opt1_final = _poly_from_expr(z, opt1)
++    print(f"Polynomial: {poly1}")
++    print(f"Generators: {poly1.gens}")
++    print(f"Domain: {poly1.domain}")
++    
++    coeff, factors = poly1.factor_list()
++    print(f"Factor list: coeff={coeff}, factors={factors}")
++except Exception as e:
++    print(f"Error: {e}")
++
++print("\n=== With extension=[I] ===")
++opt2 = options.build_options([], {'extension': [I]})
++print(f"Options: {opt2}")
++
++try:
++    poly2, opt2_final = _poly_from_expr(z, opt2)
++    print(f"Polynomial: {poly2}")
++    print(f"Generators: {poly2.gens}")
++    print(f"Domain: {poly2.domain}")
++    
++    coeff, factors = poly2.factor_list()
++    print(f"Factor list: coeff={coeff}, factors={factors}")
++except Exception as e:
++    print(f"Error: {e}")
++
++print("\n=== With extension=I ===")
++opt3 = options.build_options([], {'extension': I})
++print(f"Options: {opt3}")
++
++try:
++    poly3, opt3_final = _poly_from_expr(z, opt3)
++    print(f"Polynomial: {poly3}")
++    print(f"Generators: {poly3.gens}")
++    print(f"Domain: {poly3.domain}")
++    
++    coeff, factors = poly3.factor_list()
++    print(f"Factor list: coeff={coeff}, factors={factors}")
++except Exception as e:
++    print(f"Error: {e}")
+
+--- a/sympy/polys/factortools.py
++++ b/sympy/polys/factortools.py
+@@ -1140,6 +1140,72 @@
+     if not u:
+         return dup_ext_factor(f, K)
+ 
++    # Check if we can factor over a simpler domain first
++    # This works around issues with the square-free norm transformation
++    # for polynomials with rational coefficients
++    try:
++        from sympy.polys.densetools import dmp_convert, dmp_ground_LC
++        from sympy.polys.densebasic import dmp_ground_p
++        
++        # Check if all coefficients are effectively in the base domain
++        # (i.e., algebraic numbers that are actually rational)
++        def all_coeffs_in_base_domain(f, u):
++            if u == 0:
++                # Univariate case
++                for coeff in f:
++                    if hasattr(coeff, 'is_ground') and not coeff.is_ground:
++                        return False
++                    elif hasattr(coeff, 'coeffs') and len(coeff.coeffs()) > 1:
++                        # ANP with non-constant polynomial means it involves extension
++                        return False
++                return True
++            else:
++                # Multivariate case
++                for subpoly in f:
++                    if not all_coeffs_in_base_domain(subpoly, u-1):
++                        return False
++                return True
++        
++        is_base_coeffs = all_coeffs_in_base_domain(f, u)
++        
++        if is_base_coeffs:
++            # Convert to the base domain and try factoring there
++            f_base = dmp_convert(f, u, K, K.dom)
++            coeff_base, factors_base = dmp_factor_list(f_base, u, K.dom)
++            
++            # Only use this approach if:
++            # 1. We get multiple factors over the base domain, OR
++            # 2. We're going to fall back to the problematic single-factor case anyway
++            if len(factors_base) > 1:
++                # Convert the factors back to the extension domain
++                factors_ext = []
++                for factor, mult in factors_base:
++                    factor_ext = dmp_convert(factor, u, K.dom, K)
++                    factors_ext.append((factor_ext, mult))
++                
++                coeff_ext = K.convert(coeff_base, K.dom)
++                return coeff_ext, factors_ext
++            else:
++                # Check if the original algorithm would produce the single-factor bug
++                # by doing a quick test of the square-free norm
++                f_sqf = dmp_sqf_part(f, u, K)
++                s, g, r = dmp_sqf_norm(f_sqf, u, K)
++                factors_r = dmp_factor_list_include(r, u, K.dom)
++                
++                if len(factors_r) == 1:
++                    # The original algorithm would hit the bug, so use our workaround
++                    factors_ext = []
++                    for factor, mult in factors_base:
++                        factor_ext = dmp_convert(factor, u, K.dom, K)
++                        factors_ext.append((factor_ext, mult))
++                    
++                    coeff_ext = K.convert(coeff_base, K.dom)
++                    return coeff_ext, factors_ext
++                # Otherwise, let the original algorithm handle it
++    except Exception as e:
++        # If the above approach fails, fall back to the original algorithm
++        pass
++
+     lc = dmp_ground_LC(f, u, K)
+     f = dmp_ground_monic(f, u, K)
+ 
+@@ -1152,15 +1218,18 @@
+     factors = dmp_factor_list_include(r, u, K.dom)
+ 
+     if len(factors) == 1:
+-        factors = [f]
+-    else:
+-        H = dmp_raise([K.one, s*K.unit], u, 0, K)
+-
+-        for i, (factor, _) in enumerate(factors):
+-            h = dmp_convert(factor, u, K.dom, K)
+-            h, _, g = dmp_inner_gcd(h, g, u, K)
+-            h = dmp_compose(h, H, u, K)
+-            factors[i] = h
++        # Even if r has only one factor over the base domain,
++        # f might still be reducible over the extension field.
++        # We should still process it through the normal transformation pipeline.
++        pass
++    
++    H = dmp_raise([K.one, s*K.unit], u, 0, K)
++
++    for i, (factor, _) in enumerate(factors):
++        h = dmp_convert(factor, u, K.dom, K)
++        h, _, g = dmp_inner_gcd(h, g, u, K)
++        h = dmp_compose(h, H, u, K)
++        factors[i] = h
+ 
+     return lc, dmp_trial_division(F, factors, u, K)
+ 
+
+--- a/debug_detailed.py
++++ b/debug_detailed.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.abc import x, y
++from sympy.polys.polytools import _poly_from_expr
++from sympy.polys import polyoptions as options
++from sympy.polys.factortools import dmp_ext_factor, dmp_factor_list_include
++from sympy.polys.sqfreetools import dmp_sqf_part, dmp_sqf_norm
++
++print("Detailed debugging of the factorization issue...")
++
++# Create the test expression
++z = expand((x-1)*(y-1))
++print(f"Original expression: z = {z}")
++
++print("\n=== With extension=[I] - Step by step ===")
++opt = options.build_options([], {'extension': [I]})
++poly, opt_final = _poly_from_expr(z, opt)
++print(f"Polynomial: {poly}")
++print(f"Domain: {poly.domain}")
++
++# Let's manually trace the dmp_ext_factor function
++f = poly.rep
++u = len(poly.gens) - 1  # number of variables - 1
++K = poly.domain
++print(f"Dense representation: {f}")
++print(f"u (num vars - 1): {u}")
++print(f"Domain K: {K}")
++
++# Step 1: Check if all degrees are <= 0
++from sympy.polys.densebasic import dmp_degree_list
++degrees = dmp_degree_list(f, u)
++print(f"Degree list: {degrees}")
++
++# Step 2: Square-free part
++f_sqf, F = dmp_sqf_part(f, u, K), f
++print(f"Square-free part: {f_sqf}")
++
++# Step 3: Square-free norm
++s, g, r = dmp_sqf_norm(f_sqf, u, K)
++print(f"Square-free norm: s={s}, g={g}, r={r}")
++
++# Step 4: Factor over the base domain
++factors = dmp_factor_list_include(r, u, K.dom)
++print(f"Factors over base domain: {factors}")
++
++print(f"Number of factors found: {len(factors)}")
++
++if len(factors) == 1:
++    print("Only one factor found - this is the bug!")
++    print("According to dmp_ext_factor, this means factors = [f]")
++else:
++    print("Multiple factors found - normal case")
+
+--- a/debug_simple.py
++++ b/debug_simple.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.abc import x, y
++from sympy.polys.polytools import _poly_from_expr
++from sympy.polys import polyoptions as options
++
++print("Simple debugging of the factorization issue...")
++
++# Create the test expression
++z = expand((x-1)*(y-1))
++print(f"Original expression: z = {z}")
++
++print("\n=== Testing different domains ===")
++
++# Test with ZZ domain (integers)
++print("\n1. ZZ domain (default):")
++opt1 = options.build_options([], {})
++poly1, _ = _poly_from_expr(z, opt1)
++print(f"Polynomial: {poly1}")
++print(f"Domain: {poly1.domain}")
++coeff1, factors1 = poly1.factor_list()
++print(f"Factors: {factors1}")
++
++# Test with QQ domain (rationals)
++print("\n2. QQ domain:")
++opt2 = options.build_options([], {'domain': 'QQ'})
++poly2, _ = _poly_from_expr(z, opt2)
++print(f"Polynomial: {poly2}")
++print(f"Domain: {poly2.domain}")
++coeff2, factors2 = poly2.factor_list()
++print(f"Factors: {factors2}")
++
++# Test with QQ<I> domain (rationals with I)
++print("\n3. QQ<I> domain (with extension):")
++opt3 = options.build_options([], {'extension': [I]})
++poly3, _ = _poly_from_expr(z, opt3)
++print(f"Polynomial: {poly3}")
++print(f"Domain: {poly3.domain}")
++coeff3, factors3 = poly3.factor_list()
++print(f"Factors: {factors3}")
++
++# Let's also try just specifying the domain directly
++print("\n4. Manual QQ<I> domain:")
++try:
++    from sympy.polys.domains import QQ
++    domain_QQ_I = QQ.algebraic_field(I)
++    opt4 = options.build_options([], {'domain': domain_QQ_I})
++    poly4, _ = _poly_from_expr(z, opt4)
++    print(f"Polynomial: {poly4}")
++    print(f"Domain: {poly4.domain}")
++    coeff4, factors4 = poly4.factor_list()
++    print(f"Factors: {factors4}")
++except Exception as e:
++    print(f"Error: {e}")
++
++print("\n=== Analysis ===")
++print(f"ZZ factors: {len(factors1)} factors")
++print(f"QQ factors: {len(factors2)} factors") 
++print(f"QQ<I> factors: {len(factors3)} factors")
++
++# Let's also check what happens if we use the Rep's factor_list directly
++print("\n=== Direct factor_list call ===")
++try:
++    rep_factors = poly3.rep.factor_list()
++    print(f"Direct rep.factor_list(): {rep_factors}")
++except Exception as e:
++    print(f"Error calling rep.factor_list(): {e}")
+
+--- a/debug_sqf_norm.py
++++ b/debug_sqf_norm.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.abc import x, y
++from sympy.polys.polytools import _poly_from_expr
++from sympy.polys import polyoptions as options
++from sympy.polys.sqfreetools import dmp_sqf_norm, dmp_sqf_part
++from sympy.polys.factortools import dmp_factor_list_include
++
++print("Debugging dmp_sqf_norm...")
++
++# Create the test expression
++z = expand((x-1)*(y-1))
++print(f"Original expression: z = {z}")
++
++# Create polynomial with extension
++opt = options.build_options([], {'extension': [I]})
++poly, _ = _poly_from_expr(z, opt)
++print(f"Polynomial: {poly}")
++print(f"Domain: {poly.domain}")
++
++# Get the internal representation
++f = poly.rep
++u = len(poly.gens) - 1
++K = poly.domain
++print(f"u (num vars - 1): {u}")
++print(f"Domain K: {K}")
++print(f"Base domain K.dom: {K.dom}")
++
++# Apply square-free part
++f_sqf, F = dmp_sqf_part(f, u, K), f
++print(f"\nSquare-free part:")
++print(f"f_sqf: {f_sqf}")
++
++# Apply square-free norm
++s, g, r = dmp_sqf_norm(f_sqf, u, K)
++print(f"\nSquare-free norm:")
++print(f"s: {s}")
++print(f"g: {g}")
++print(f"r: {r}")
++
++# Factor r over the base domain
++factors_r = dmp_factor_list_include(r, u, K.dom)
++print(f"\nFactoring r over base domain {K.dom}:")
++print(f"factors_r: {factors_r}")
++print(f"Number of factors: {len(factors_r)}")
++
++# This is the condition that triggers the bug:
++if len(factors_r) == 1:
++    print("\nBUG TRIGGER: Only one factor found, so algorithm returns original polynomial")
++else:
++    print("\nNormal case: Multiple factors found")
++
++# Let's also try without extension to see the difference
++print("\n" + "="*60)
++print("Comparison: Without extension")
++
++opt_normal = options.build_options([], {})
++poly_normal, _ = _poly_from_expr(z, opt_normal)
++print(f"Normal polynomial: {poly_normal}")
++print(f"Normal domain: {poly_normal.domain}")
++
++f_normal = poly_normal.rep
++u_normal = len(poly_normal.gens) - 1
++K_normal = poly_normal.domain
++
++f_sqf_normal, F_normal = dmp_sqf_part(f_normal, u_normal, K_normal), f_normal
++s_normal, g_normal, r_normal = dmp_sqf_norm(f_sqf_normal, u_normal, K_normal)
++factors_r_normal = dmp_factor_list_include(r_normal, u_normal, K_normal.dom if hasattr(K_normal, 'dom') else K_normal)
++
++print(f"Normal r: {r_normal}")
++print(f"Normal factors_r: {factors_r_normal}")
++print(f"Normal number of factors: {len(factors_r_normal)}")
+
+--- a/debug_repr.py
++++ b/debug_repr.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.abc import x, y
++from sympy.polys.polytools import _poly_from_expr
++from sympy.polys import polyoptions as options
++
++print("Debugging polynomial representation...")
++
++# Create the test expression
++z = expand((x-1)*(y-1))
++print(f"Original expression: z = {z}")
++
++# Create polynomial with extension
++opt = options.build_options([], {'extension': [I]})
++poly, _ = _poly_from_expr(z, opt)
++print(f"Polynomial: {poly}")
++print(f"Domain: {poly.domain}")
++
++# Check the representation
++rep = poly.rep
++print(f"\nRepresentation type: {type(rep)}")
++print(f"Representation: {rep}")
++
++# Check what methods are available
++print(f"\nMethods on representation:")
++methods = [m for m in dir(rep) if not m.startswith('_')]
++for method in methods:
++    print(f"  {method}")
++
++# Check if it has factor_list
++if hasattr(rep, 'factor_list'):
++    print(f"\nCalling rep.factor_list():")
++    try:
++        result = rep.factor_list()
++        print(f"Result type: {type(result)}")
++        print(f"Result: {result}")
++    except Exception as e:
++        print(f"Error: {e}")
++        import traceback
++        traceback.print_exc()
++
++# Check the domain type
++print(f"\nDomain type: {type(poly.domain)}")
++print(f"Domain: {poly.domain}")
++if hasattr(poly.domain, 'dom'):
++    print(f"Domain.dom: {poly.domain.dom}")
++
++# Let's also check the normal case
++print(f"\n" + "="*50)
++print("Normal case (without extension):")
++
++opt_normal = options.build_options([], {})
++poly_normal, _ = _poly_from_expr(z, opt_normal)
++rep_normal = poly_normal.rep
++
++print(f"Normal rep type: {type(rep_normal)}")
++print(f"Normal rep: {rep_normal}")
++
++if hasattr(rep_normal, 'factor_list'):
++    print(f"\nCalling normal rep.factor_list():")
++    try:
++        result_normal = rep_normal.factor_list()
++        print(f"Result: {result_normal}")
++    except Exception as e:
++        print(f"Error: {e}")
+
+--- a/debug_algorithm.py
++++ b/debug_algorithm.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.abc import x, y
++from sympy.polys.polytools import _poly_from_expr
++from sympy.polys import polyoptions as options
++
++# Monkey patch the dmp_ext_factor function to add debugging
++from sympy.polys import factortools
++
++original_dmp_ext_factor = factortools.dmp_ext_factor
++
++def debug_dmp_ext_factor(f, u, K):
++    """Debug version of dmp_ext_factor"""
++    print(f"\n=== dmp_ext_factor called ===")
++    print(f"f: {f}")
++    print(f"u: {u}")
++    print(f"K: {K}")
++    
++    if not u:
++        print("u=0, calling dup_ext_factor")
++        return factortools.dup_ext_factor(f, K)
++
++    from sympy.polys.densetools import dmp_ground_LC, dmp_ground_monic
++    from sympy.polys.densebasic import dmp_degree_list
++    from sympy.polys.sqfreetools import dmp_sqf_part, dmp_sqf_norm
++    from sympy.polys.factortools import dmp_factor_list_include, dmp_trial_division
++    from sympy.polys.densetools import dmp_raise
++    from sympy.polys.euclidtools import dmp_inner_gcd
++    from sympy.polys.densetools import dmp_convert, dmp_compose
++
++    lc = dmp_ground_LC(f, u, K)
++    f = dmp_ground_monic(f, u, K)
++    print(f"After monic: f = {f}, lc = {lc}")
++
++    # if all(d <= 0 for d in dmp_degree_list(f, u)):
++    #     return lc, []
++
++    f, F = dmp_sqf_part(f, u, K), f
++    print(f"Square-free part: f = {f}")
++    
++    s, g, r = dmp_sqf_norm(f, u, K)
++    print(f"Square-free norm: s = {s}, g = {g}, r = {r}")
++
++    factors = dmp_factor_list_include(r, u, K.dom)
++    print(f"Factors of r over base domain: {factors}")
++    print(f"Number of factors: {len(factors)}")
++
++    if len(factors) == 1:
++        print("Single factor case - processing with normal pipeline")
++    
++    H = dmp_raise([K.one, s*K.unit], u, 0, K)
++    print(f"H = {H}")
++
++    for i, (factor, _) in enumerate(factors):
++        print(f"\nProcessing factor {i}: {factor}")
++        h = dmp_convert(factor, u, K.dom, K)
++        print(f"After convert: {h}")
++        h, _, g = dmp_inner_gcd(h, g, u, K)
++        print(f"After inner_gcd: {h}")
++        h = dmp_compose(h, H, u, K)
++        print(f"After compose: {h}")
++        factors[i] = h
++
++    print(f"Final factors before trial division: {factors}")
++    
++    result = dmp_trial_division(F, factors, u, K)
++    print(f"Trial division result: {result}")
++    
++    return lc, result
++
++# Replace the function
++factortools.dmp_ext_factor = debug_dmp_ext_factor
++
++print("Testing the factorization with debug...")
++
++# Create the test expression
++z = expand((x-1)*(y-1))
++print(f"Original expression: z = {z}")
++
++# Test factorization with extension
++result = factor(z, extension=[I])
++print(f"\nFinal result: {result}")
++print(f"Expands correctly: {expand(result) == z}")
++
++# Restore original function
++factortools.dmp_ext_factor = original_dmp_ext_factor
+
+--- a/debug_simple_trace.py
++++ b/debug_simple_trace.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.abc import x, y
++
++# Simple debugging to see what's happening step by step
++print("Simple trace debugging...")
++
++# Create the test expression
++z = expand((x-1)*(y-1))
++print(f"Original expression: z = {z}")
++
++# Let's intercept the actual factorization call at a higher level
++from sympy.polys.polytools import _symbolic_factor_list
++
++original_symbolic_factor_list = _symbolic_factor_list
++
++def debug_symbolic_factor_list(expr, opt, method):
++    print(f"\n=== _symbolic_factor_list called ===")
++    print(f"expr: {expr}")
++    print(f"opt: {opt}")
++    print(f"method: {method}")
++    
++    result = original_symbolic_factor_list(expr, opt, method)
++    print(f"Result: {result}")
++    return result
++
++# Replace temporarily
++import sympy.polys.polytools
++sympy.polys.polytools._symbolic_factor_list = debug_symbolic_factor_list
++
++# Test factorization
++result1 = factor(z)
++print(f"\n--- Normal factorization result: {result1}")
++
++result2 = factor(z, extension=[I])
++print(f"\n--- Extension factorization result: {result2}")
++
++# Restore
++sympy.polys.polytools._symbolic_factor_list = original_symbolic_factor_list
+
+--- a/debug_ext_factor.py
++++ b/debug_ext_factor.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.abc import x, y
++from sympy.polys.polytools import _poly_from_expr
++from sympy.polys import polyoptions as options
++
++print("Direct debugging of dmp_ext_factor...")
++
++# Create the test expression and polynomial
++z = expand((x-1)*(y-1))
++print(f"Original expression: z = {z}")
++
++opt = options.build_options([], {'extension': [I]})
++poly, _ = _poly_from_expr(z, opt)
++print(f"Polynomial: {poly}")
++
++# Call factor_list to see what happens
++coeff, factors = poly.factor_list()
++print(f"factor_list result: coeff={coeff}, factors={factors}")
++
++# Let's also manually call the DMP factor_list method
++dmp_result = poly.rep.factor_list()
++print(f"DMP factor_list result: {dmp_result}")
++
++# Check the DMP factor_list method source
++print(f"\nDMP representation: {poly.rep}")
++print(f"DMP level: {poly.rep.lev}")
++print(f"DMP domain: {poly.rep.dom}")
++
++# Let's call dmp_factor_list directly
++from sympy.polys.factortools import dmp_factor_list
++
++direct_result = dmp_factor_list(poly.rep.rep, poly.rep.lev, poly.rep.dom)
++print(f"Direct dmp_factor_list result: {direct_result}")
++
++# Let's trace into dmp_ext_factor directly
++print(f"\n=== Calling dmp_ext_factor directly ===")
++from sympy.polys.factortools import dmp_ext_factor
++
++try:
++    ext_result = dmp_ext_factor(poly.rep.rep, poly.rep.lev, poly.rep.dom)
++    print(f"dmp_ext_factor result: {ext_result}")
++except Exception as e:
++    print(f"Error in dmp_ext_factor: {e}")
++    import traceback
++    traceback.print_exc()
++
++# For comparison, let's try the normal case
++print(f"\n=== Comparison with normal case ===")
++opt_normal = options.build_options([], {})
++poly_normal, _ = _poly_from_expr(z, opt_normal)
++print(f"Normal polynomial: {poly_normal}")
++
++normal_result = dmp_factor_list(poly_normal.rep.rep, poly_normal.rep.lev, poly_normal.rep.dom)
++print(f"Normal dmp_factor_list result: {normal_result}")
+
+--- a/debug_test_failure.py
++++ b/debug_test_failure.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++
++from sympy import *
++from sympy.polys import *
++from sympy.polys.domains import QQ
++from sympy.polys.polyclasses import ANP
++
++print("Debugging test failure...")
++
++# Reproduce the failing test case
++R, x, y = ring("x,y", QQ.algebraic_field(sqrt(2)))
++
++def anp(x):
++    return ANP(x, [QQ(1), QQ(0), QQ(-2)], QQ)
++
++f = anp([QQ(1)])*x**2 + anp([QQ(-2)])*y**2
++
++print(f"f = {f}")
++print(f"Expected factorization: (x - sqrt(2)*y)(x + sqrt(2)*y)")
++
++# Test the factorization
++result = R.dmp_ext_factor(f)
++print(f"Actual result: {result}")
++
++expected = (anp([QQ(1)]), [(anp([QQ(1)])*x + anp([QQ(-1), QQ(0)])*y, 1),
++                           (anp([QQ(1)])*x + anp([QQ( 1), QQ(0)])*y, 1)])
++print(f"Expected result: {expected}")
++
++print(f"Results match: {result == expected}")
++
++# Let's examine the structure
++print(f"\nActual coefficient: {result[0]}")
++print(f"Expected coefficient: {expected[0]}")
++print(f"Coefficients match: {result[0] == expected[0]}")
++
++print(f"\nActual factors: {result[1]}")
++print(f"Expected factors: {expected[1]}")
++
++# Check each factor
++for i, (actual_factor, expected_factor) in enumerate(zip(result[1], expected[1])):
++    print(f"Factor {i}:")
++    print(f"  Actual: {actual_factor}")
++    print(f"  Expected: {expected_factor}")
++    print(f"  Match: {actual_factor == expected_factor}")
++
++# Check if the coefficients involve sqrt(2)
++print(f"\nAnalyzing coefficients:")
++for coeff_list in f.rep:
++    for coeff in coeff_list:
++        print(f"Coefficient: {coeff}")
++        if hasattr(coeff, 'coeffs'):
++            print(f"  coeffs(): {coeff.coeffs()}")
++        print(f"  Involves extension: {hasattr(coeff, 'coeffs') and len(coeff.coeffs()) > 1}")

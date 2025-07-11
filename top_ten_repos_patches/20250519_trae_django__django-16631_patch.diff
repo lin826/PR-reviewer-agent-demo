@@ -1,0 +1,147 @@
+diff --git a/django/contrib/auth/__init__.py b/django/contrib/auth/__init__.py
+index 155330c596..d578601478 100644
+--- a/django/contrib/auth/__init__.py
++++ b/django/contrib/auth/__init__.py
+@@ -199,9 +199,13 @@ def get_user(request):
+             # Verify the session
+             if hasattr(user, "get_session_auth_hash"):
+                 session_hash = request.session.get(HASH_SESSION_KEY)
+-                session_hash_verified = session_hash and constant_time_compare(
+-                    session_hash, user.get_session_auth_hash()
+-                )
++                if session_hash:
++                    # Get the HMAC object instead of the hexdigest to use verify_against_fallbacks
++                    auth_hash_obj = user._get_session_auth_hash_without_digest()
++                    session_hash_verified = auth_hash_obj.verify_against_fallbacks(session_hash)
++                else:
++                    session_hash_verified = False
++                    
+                 if not session_hash_verified:
+                     request.session.flush()
+                     user = None
+diff --git a/django/contrib/auth/base_user.py b/django/contrib/auth/base_user.py
+index 5ee30bf59c..6ae417c202 100644
+--- a/django/contrib/auth/base_user.py
++++ b/django/contrib/auth/base_user.py
+@@ -5,6 +5,7 @@ not in INSTALLED_APPS.
+ import unicodedata
+ import warnings
+ 
++from django.conf import settings
+ from django.contrib.auth import password_validation
+ from django.contrib.auth.hashers import (
+     check_password,
+@@ -131,6 +132,19 @@ class AbstractBaseUser(models.Model):
+         """
+         return is_password_usable(self.password)
+ 
++    def _get_session_auth_hash_without_digest(self):
++        """
++        Return the raw HMAC object of the password field.
++        This is used for session verification with fallback keys.
++        """
++        key_salt = "django.contrib.auth.models.AbstractBaseUser.get_session_auth_hash"
++        return salted_hmac(
++            key_salt,
++            self.password,
++            fallback_secrets=getattr(settings, 'SECRET_KEY_FALLBACKS', []),
++            algorithm="sha256",
++        )
++
+     def get_session_auth_hash(self):
+         """
+         Return an HMAC of the password field.
+@@ -139,6 +153,7 @@ class AbstractBaseUser(models.Model):
+         return salted_hmac(
+             key_salt,
+             self.password,
++            fallback_secrets=getattr(settings, 'SECRET_KEY_FALLBACKS', []),
+             algorithm="sha256",
+         ).hexdigest()
+ 
+diff --git a/django/utils/crypto.py b/django/utils/crypto.py
+index 1c0e7001c6..369b5b81e0 100644
+--- a/django/utils/crypto.py
++++ b/django/utils/crypto.py
+@@ -15,16 +15,21 @@ class InvalidAlgorithm(ValueError):
+     pass
+ 
+ 
+-def salted_hmac(key_salt, value, secret=None, *, algorithm="sha1"):
++def salted_hmac(key_salt, value, secret=None, *, fallback_secrets=None, algorithm="sha1"):
+     """
+     Return the HMAC of 'value', using a key generated from key_salt and a
+     secret (which defaults to settings.SECRET_KEY). Default algorithm is SHA1,
+     but any algorithm name supported by hashlib can be passed.
+ 
+     A different key_salt should be passed in for every application of HMAC.
++    
++    If fallback_secrets is provided, it will be used for verification during compare().
+     """
+     if secret is None:
+         secret = settings.SECRET_KEY
++        
++    if fallback_secrets is None:
++        fallback_secrets = getattr(settings, 'SECRET_KEY_FALLBACKS', [])
+ 
+     key_salt = force_bytes(key_salt)
+     secret = force_bytes(secret)
+@@ -34,14 +39,50 @@ def salted_hmac(key_salt, value, secret=None, *, algorithm="sha1"):
+         raise InvalidAlgorithm(
+             "%r is not an algorithm accepted by the hashlib module." % algorithm
+         ) from e
+-    # We need to generate a derived key from our base key.  We can do this by
+-    # passing the key_salt and our base key through a pseudo-random function.
++    
++    # Generate the primary HMAC
+     key = hasher(key_salt + secret).digest()
+-    # If len(key_salt + secret) > block size of the hash algorithm, the above
+-    # line is redundant and could be replaced by key = key_salt + secret, since
+-    # the hmac module does the same thing for keys longer than the block size.
+-    # However, we need to ensure that we *always* do this.
+-    return hmac.new(key, msg=force_bytes(value), digestmod=hasher)
++    primary_hmac = hmac.new(key, msg=force_bytes(value), digestmod=hasher)
++    
++    # Create hmac objects for all fallback keys
++    fallback_hmacs = []
++    for fallback_secret in fallback_secrets:
++        fallback_secret = force_bytes(fallback_secret)
++        fallback_key = hasher(key_salt + fallback_secret).digest()
++        fallback_hmacs.append(
++            hmac.new(fallback_key, msg=force_bytes(value), digestmod=hasher)
++        )
++    
++    # Create a SaltedHmac wrapping the primary hmac with fallback functionality
++    return SaltedHmac(primary_hmac, fallback_hmacs)
++
++
++class SaltedHmac:
++    """
++    Wrapper around hmac that handles fallback verification.
++    """
++    def __init__(self, primary_hmac, fallback_hmacs=None):
++        self.primary_hmac = primary_hmac
++        self.fallback_hmacs = fallback_hmacs or []
++    
++    def digest(self):
++        return self.primary_hmac.digest()
++    
++    def hexdigest(self):
++        return self.primary_hmac.hexdigest()
++    
++    def verify_against_fallbacks(self, signature):
++        """Verify the signature against all fallback keys as well as the main key."""
++        # First check against the main key
++        if constant_time_compare(self.hexdigest(), signature):
++            return True
++        
++        # Then check against all fallback keys
++        for fallback_hmac in self.fallback_hmacs:
++            if constant_time_compare(fallback_hmac.hexdigest(), signature):
++                return True
++        
++        return False
+ 
+ 
+ RANDOM_STRING_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+

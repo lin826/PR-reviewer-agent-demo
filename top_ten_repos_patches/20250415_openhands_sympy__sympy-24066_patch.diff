@@ -1,0 +1,162 @@
+diff --git a/issue_test.py b/issue_test.py
+new file mode 100644
+index 0000000000..fe6be6ac6d
+--- /dev/null
++++ b/issue_test.py
+@@ -0,0 +1,14 @@
++from sympy import exp
++from sympy.physics import units
++from sympy.physics.units.systems.si import SI
++
++expr = units.second / (units.ohm * units.farad)
++dim = SI._collect_factor_and_dimension(expr)[1]
++
++assert SI.get_dimension_system().is_dimensionless(dim)
++
++buggy_expr = 100 + exp(expr)
++result = SI._collect_factor_and_dimension(buggy_expr)
++
++print(f"Result: {result}")
++print("Test passed!")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..2af145624e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,25 @@
++from sympy import exp
++from sympy.physics import units
++from sympy.physics.units.systems.si import SI
++
++# Define the expression
++expr = units.second / (units.ohm * units.farad)
++print(f"Expression: {expr}")
++
++# Get its dimension and verify it's dimensionless
++dim = SI._collect_factor_and_dimension(expr)[1]
++print(f"Dimension: {dim}")
++is_dimensionless = SI.get_dimension_system().is_dimensionless(dim)
++print(f"Is dimensionless: {is_dimensionless}")
++assert SI.get_dimension_system().is_dimensionless(dim)
++
++# Create a buggy expression
++buggy_expr = 100 + exp(expr)
++print(f"Buggy expression: {buggy_expr}")
++
++try:
++    # This should fail as per issue description
++    result = SI._collect_factor_and_dimension(buggy_expr)
++    print(f"Result: {result}")
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
+\ No newline at end of file
+diff --git a/sympy/physics/units/tests/test_exp_dimensionless.py b/sympy/physics/units/tests/test_exp_dimensionless.py
+new file mode 100644
+index 0000000000..1f721e9da1
+--- /dev/null
++++ b/sympy/physics/units/tests/test_exp_dimensionless.py
+@@ -0,0 +1,21 @@
++from sympy import exp
++from sympy.physics import units
++from sympy.physics.units.systems.si import SI
++
++def test_exp_dimensionless():
++    # Define the expression
++    expr = units.second / (units.ohm * units.farad)
++    
++    # Get its dimension and verify it's dimensionless
++    dim = SI._collect_factor_and_dimension(expr)[1]
++    assert SI.get_dimension_system().is_dimensionless(dim)
++    
++    # Create an expression with exp
++    buggy_expr = 100 + exp(expr)
++    
++    # This should now work properly
++    factor, dim = SI._collect_factor_and_dimension(buggy_expr)
++    
++    # The result should be dimensionless
++    from sympy.physics.units.dimensions import Dimension
++    assert dim == Dimension(1)
+\ No newline at end of file
+diff --git a/sympy/physics/units/unitsystem.py b/sympy/physics/units/unitsystem.py
+index 3daf84c108..74bcc16c46 100644
+--- a/sympy/physics/units/unitsystem.py
++++ b/sympy/physics/units/unitsystem.py
+@@ -190,10 +190,28 @@ def _collect_factor_and_dimension(self, expr):
+                 dim /= idim**count
+             return factor, dim
+         elif isinstance(expr, Function):
+-            fds = [self._collect_factor_and_dimension(
+-                arg) for arg in expr.args]
+-            return (expr.func(*(f[0] for f in fds)),
+-                    *(d[1] for d in fds))
++            from sympy.functions.elementary.exponential import exp, log
++            from sympy.functions.elementary.trigonometric import sin, cos, tan, sec, csc, cot, asin, acos, atan, acot, asec, acsc
++            from sympy.functions.elementary.hyperbolic import sinh, cosh, tanh, coth, sech, csch, asinh, acosh, atanh, acoth, asech, acsch
++            
++            # Special functions that require dimensionless arguments and return dimensionless results
++            dimensionless_functions = (exp, log, sin, cos, tan, sec, csc, cot, asin, acos, atan, acot, asec, acsc,
++                                     sinh, cosh, tanh, coth, sech, csch, asinh, acosh, atanh, acoth, asech, acsch)
++            
++            fds = [self._collect_factor_and_dimension(arg) for arg in expr.args]
++            
++            if expr.func in dimensionless_functions:
++                # Check if all arguments are dimensionless
++                for i, (_, dim) in enumerate(fds):
++                    if not self.get_dimension_system().is_dimensionless(dim):
++                        raise ValueError(f'Dimension of "{expr}" is {dim}, but it should be Dimension(1)')
++                
++                # If all arguments are dimensionless, return a dimensionless result
++                return (expr.func(*(f[0] for f in fds)), Dimension(1))
++            else:
++                # For other functions, keep the current behavior
++                return (expr.func(*(f[0] for f in fds)),
++                        *(d[1] for d in fds))
+         elif isinstance(expr, Dimension):
+             return S.One, expr
+         else:
+diff --git a/test_exp_dimensionless.py b/test_exp_dimensionless.py
+new file mode 100644
+index 0000000000..a9731995ed
+--- /dev/null
++++ b/test_exp_dimensionless.py
+@@ -0,0 +1,37 @@
++from sympy import exp
++from sympy.physics import units
++from sympy.physics.units.systems.si import SI
++
++def test_exp_dimensionless():
++    # Create the expression: second/(farad*ohm)
++    expr = units.second / (units.ohm * units.farad)
++    print(f"Original expression: {expr}")
++    
++    # Get its dimension
++    factor, dim = SI._collect_factor_and_dimension(expr)
++    print(f"Dimension: {dim}")
++    
++    # Verify it's dimensionless according to the SI system
++    is_dimensionless = SI.get_dimension_system().is_dimensionless(dim)
++    print(f"Is dimensionless: {is_dimensionless}")
++    assert SI.get_dimension_system().is_dimensionless(dim)
++    
++    # Create a buggy expression with exp
++    buggy_expr = 100 + exp(expr)
++    print(f"Buggy expression: {buggy_expr}")
++    
++    try:
++        # This should fail with the current implementation
++        factor, dim = SI._collect_factor_and_dimension(buggy_expr)
++        print(f"Result factor: {factor}")
++        print(f"Result dimension: {dim}")
++    except ValueError as e:
++        print(f"Error: {e}")
++        
++    # Verify the result
++    exp_factor, exp_dim = SI._collect_factor_and_dimension(exp(expr))
++    print(f"exp() factor: {exp_factor}")
++    print(f"exp() dimension: {exp_dim}")
++
++if __name__ == "__main__":
++    test_exp_dimensionless()
+\ No newline at end of file

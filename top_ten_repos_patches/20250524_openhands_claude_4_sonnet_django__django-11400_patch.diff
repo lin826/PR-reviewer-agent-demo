@@ -1,0 +1,1009 @@
+diff --git a/django/contrib/admin/filters.py b/django/contrib/admin/filters.py
+index d65e01d5e2..f977f9f80b 100644
+--- a/django/contrib/admin/filters.py
++++ b/django/contrib/admin/filters.py
+@@ -198,6 +198,8 @@ class RelatedFieldListFilter(FieldListFilter):
+         related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
+         if related_admin is not None:
+             ordering = related_admin.get_ordering(request)
++        if not ordering:
++            ordering = field.remote_field.model._meta.ordering
+         return field.get_choices(include_blank=False, ordering=ordering)
+ 
+     def choices(self, changelist):
+@@ -418,5 +420,11 @@ FieldListFilter.register(lambda f: True, AllValuesFieldListFilter)
+ 
+ class RelatedOnlyFieldListFilter(RelatedFieldListFilter):
+     def field_choices(self, field, request, model_admin):
++        ordering = ()
++        related_admin = model_admin.admin_site._registry.get(field.remote_field.model)
++        if related_admin is not None:
++            ordering = related_admin.get_ordering(request)
++        if not ordering:
++            ordering = field.remote_field.model._meta.ordering
+         pk_qs = model_admin.get_queryset(request).distinct().values_list('%s__pk' % self.field_path, flat=True)
+-        return field.get_choices(include_blank=False, limit_choices_to={'pk__in': pk_qs})
++        return field.get_choices(include_blank=False, ordering=ordering, limit_choices_to={'pk__in': pk_qs})
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..9efd451634
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,218 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the fix addresses all scenarios in the issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin import ModelAdmin, site
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from django.test import RequestFactory
++from django.contrib.auth.models import User
++
++
++# Test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['name']  # Meta.ordering defined
++        
++    def __str__(self):
++        return self.name
++
++
++class Publisher(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        # No ordering defined
++        
++    def __str__(self):
++        return self.name
++
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    publisher = models.ForeignKey(Publisher, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.title
++
++
++def test_comprehensive_scenarios():
++    """Test all scenarios mentioned in the issue."""
++    print("=== Comprehensive Test for Issue Fix ===")
++    
++    # Create test data
++    from django.db import connection
++    
++    # Create all necessary tables
++    with connection.schema_editor() as schema_editor:
++        # Create auth tables
++        from django.contrib.auth.models import User, Group, Permission
++        from django.contrib.contenttypes.models import ContentType
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(Permission)
++        schema_editor.create_model(Group)
++        schema_editor.create_model(User)
++        
++        # Create our test models
++        schema_editor.create_model(Author)
++        schema_editor.create_model(Publisher)
++        schema_editor.create_model(Book)
++    
++    # Create test data in reverse alphabetical order to test ordering
++    author_z = Author.objects.create(name='Z Author')
++    author_b = Author.objects.create(name='B Author') 
++    author_a = Author.objects.create(name='A Author')
++    
++    publisher_z = Publisher.objects.create(name='Z Publisher')
++    publisher_b = Publisher.objects.create(name='B Publisher') 
++    publisher_a = Publisher.objects.create(name='A Publisher')
++    
++    # Create books
++    Book.objects.create(title='Book 1', author=author_z, publisher=publisher_z)
++    Book.objects.create(title='Book 2', author=author_b, publisher=publisher_b)
++    Book.objects.create(title='Book 3', author=author_a, publisher=publisher_a)
++    
++    # Admin classes
++    class AuthorAdminNoOrdering(ModelAdmin):
++        pass  # No ordering - should fall back to Meta.ordering
++    
++    class AuthorAdminWithOrdering(ModelAdmin):
++        ordering = ['-name']  # Explicit ordering - should be used
++    
++    class PublisherAdminNoOrdering(ModelAdmin):
++        pass  # No ordering and no Meta.ordering - should use insertion order
++    
++    class PublisherAdminWithOrdering(ModelAdmin):
++        ordering = ['-name']  # Explicit ordering - should be used
++    
++    class BookAdminRelatedField(ModelAdmin):
++        list_filter = [
++            ('author', RelatedFieldListFilter),
++            ('publisher', RelatedFieldListFilter),
++        ]
++    
++    class BookAdminRelatedOnly(ModelAdmin):
++        list_filter = [
++            ('author', RelatedOnlyFieldListFilter),
++            ('publisher', RelatedOnlyFieldListFilter),
++        ]
++    
++    # Test scenarios
++    scenarios = [
++        {
++            'name': 'RelatedFieldListFilter - Author with Meta.ordering, no ModelAdmin ordering',
++            'admin_class': BookAdminRelatedField,
++            'author_admin': AuthorAdminNoOrdering,
++            'publisher_admin': PublisherAdminNoOrdering,
++            'expected_author': [(author_a.pk, 'A Author'), (author_b.pk, 'B Author'), (author_z.pk, 'Z Author')],
++            'expected_publisher': [(publisher_z.pk, 'Z Publisher'), (publisher_b.pk, 'B Publisher'), (publisher_a.pk, 'A Publisher')],  # insertion order
++        },
++        {
++            'name': 'RelatedFieldListFilter - Author with Meta.ordering, with ModelAdmin ordering',
++            'admin_class': BookAdminRelatedField,
++            'author_admin': AuthorAdminWithOrdering,
++            'publisher_admin': PublisherAdminWithOrdering,
++            'expected_author': [(author_z.pk, 'Z Author'), (author_b.pk, 'B Author'), (author_a.pk, 'A Author')],
++            'expected_publisher': [(publisher_z.pk, 'Z Publisher'), (publisher_b.pk, 'B Publisher'), (publisher_a.pk, 'A Publisher')],
++        },
++        {
++            'name': 'RelatedOnlyFieldListFilter - Author with Meta.ordering, no ModelAdmin ordering',
++            'admin_class': BookAdminRelatedOnly,
++            'author_admin': AuthorAdminNoOrdering,
++            'publisher_admin': PublisherAdminNoOrdering,
++            'expected_author': [(author_a.pk, 'A Author'), (author_b.pk, 'B Author'), (author_z.pk, 'Z Author')],
++            'expected_publisher': [(publisher_z.pk, 'Z Publisher'), (publisher_b.pk, 'B Publisher'), (publisher_a.pk, 'A Publisher')],  # insertion order
++        },
++        {
++            'name': 'RelatedOnlyFieldListFilter - Author with Meta.ordering, with ModelAdmin ordering',
++            'admin_class': BookAdminRelatedOnly,
++            'author_admin': AuthorAdminWithOrdering,
++            'publisher_admin': PublisherAdminWithOrdering,
++            'expected_author': [(author_z.pk, 'Z Author'), (author_b.pk, 'B Author'), (author_a.pk, 'A Author')],
++            'expected_publisher': [(publisher_z.pk, 'Z Publisher'), (publisher_b.pk, 'B Publisher'), (publisher_a.pk, 'A Publisher')],
++        },
++    ]
++    
++    for i, scenario in enumerate(scenarios, 1):
++        print(f"\n{i}. {scenario['name']}:")
++        
++        # Register admin classes
++        site.register(Author, scenario['author_admin'])
++        site.register(Publisher, scenario['publisher_admin'])
++        
++        try:
++            modeladmin = scenario['admin_class'](Book, site)
++            request = RequestFactory().get('/')
++            request.user = User.objects.create_superuser(f'admin{i}', f'admin{i}@test.com', 'password')
++            
++            changelist = modeladmin.get_changelist_instance(request)
++            filters = changelist.get_filters(request)[0]
++            
++            # Test author filter
++            author_filter = filters[0]
++            actual_author = list(author_filter.lookup_choices)
++            print(f"  Author choices: {actual_author}")
++            print(f"  Expected:       {scenario['expected_author']}")
++            author_pass = actual_author == scenario['expected_author']
++            print(f"  Author: {'✓ PASS' if author_pass else '✗ FAIL'}")
++            
++            # Test publisher filter
++            publisher_filter = filters[1]
++            actual_publisher = list(publisher_filter.lookup_choices)
++            print(f"  Publisher choices: {actual_publisher}")
++            print(f"  Expected:          {scenario['expected_publisher']}")
++            publisher_pass = actual_publisher == scenario['expected_publisher']
++            print(f"  Publisher: {'✓ PASS' if publisher_pass else '✗ FAIL'}")
++            
++            overall_pass = author_pass and publisher_pass
++            print(f"  Overall: {'✓ PASS' if overall_pass else '✗ FAIL'}")
++            
++        finally:
++            site.unregister(Author)
++            site.unregister(Publisher)
++    
++    print("\n=== Summary ===")
++    print("✓ RelatedFieldListFilter now falls back to Model._meta.ordering")
++    print("✓ RelatedOnlyFieldListFilter now respects ordering (ModelAdmin or Meta.ordering)")
++    print("✓ Both filters maintain backward compatibility")
++    print("✓ ModelAdmin ordering takes precedence over Meta.ordering")
++
++
++if __name__ == '__main__':
++    test_comprehensive_scenarios()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..603edeeffd
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the ordering fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin import ModelAdmin, site
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from django.test import RequestFactory
++from django.contrib.auth.models import User
++
++
++# Test models
++class CategoryNoOrdering(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        # No ordering defined - should use insertion order
++        
++    def __str__(self):
++        return self.name
++
++
++class CategoryWithOrdering(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['name']  # Should be used as fallback
++        
++    def __str__(self):
++        return self.name
++
++
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    category_no_ordering = models.ForeignKey(CategoryNoOrdering, on_delete=models.CASCADE, null=True, blank=True)
++    category_with_ordering = models.ForeignKey(CategoryWithOrdering, on_delete=models.CASCADE, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++
++def test_edge_cases():
++    """Test edge cases for the ordering fix."""
++    print("=== Testing Edge Cases ===")
++    
++    # Create test data
++    from django.db import connection
++    
++    # Create all necessary tables
++    with connection.schema_editor() as schema_editor:
++        # Create auth tables
++        from django.contrib.auth.models import User, Group, Permission
++        from django.contrib.contenttypes.models import ContentType
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(Permission)
++        schema_editor.create_model(Group)
++        schema_editor.create_model(User)
++        
++        # Create our test models
++        schema_editor.create_model(CategoryNoOrdering)
++        schema_editor.create_model(CategoryWithOrdering)
++        schema_editor.create_model(Product)
++    
++    # Create categories in reverse alphabetical order
++    cat_no_z = CategoryNoOrdering.objects.create(name='Z Category')
++    cat_no_b = CategoryNoOrdering.objects.create(name='B Category') 
++    cat_no_a = CategoryNoOrdering.objects.create(name='A Category')
++    
++    cat_with_z = CategoryWithOrdering.objects.create(name='Z Category')
++    cat_with_b = CategoryWithOrdering.objects.create(name='B Category') 
++    cat_with_a = CategoryWithOrdering.objects.create(name='A Category')
++    
++    # Create products
++    Product.objects.create(name='Product 1', category_no_ordering=cat_no_z, category_with_ordering=cat_with_z)
++    Product.objects.create(name='Product 2', category_no_ordering=cat_no_b, category_with_ordering=cat_with_b)
++    Product.objects.create(name='Product 3', category_no_ordering=cat_no_a, category_with_ordering=cat_with_a)
++    
++    class CategoryNoOrderingAdmin(ModelAdmin):
++        pass  # No ordering defined
++    
++    class ProductAdmin(ModelAdmin):
++        list_filter = [
++            ('category_no_ordering', RelatedFieldListFilter),
++            ('category_with_ordering', RelatedFieldListFilter),
++        ]
++    
++    class ProductAdminRelatedOnly(ModelAdmin):
++        list_filter = [
++            ('category_no_ordering', RelatedOnlyFieldListFilter),
++            ('category_with_ordering', RelatedOnlyFieldListFilter),
++        ]
++    
++    # Test 1: Model with no Meta.ordering
++    print("\n1. Testing RelatedFieldListFilter with model that has no Meta.ordering:")
++    site.register(CategoryNoOrdering, CategoryNoOrderingAdmin)
++    site.register(CategoryWithOrdering, CategoryNoOrderingAdmin)
++    try:
++        modeladmin = ProductAdmin(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin1', 'admin1@test.com', 'password')
++        
++        changelist = modeladmin.get_changelist_instance(request)
++        filters = changelist.get_filters(request)[0]
++        
++        # Filter for category_no_ordering (no Meta.ordering)
++        filter_no_ordering = filters[0]
++        print("CategoryNoOrdering choices:", filter_no_ordering.lookup_choices)
++        # Should use insertion order since no Meta.ordering
++        
++        # Filter for category_with_ordering (has Meta.ordering)
++        filter_with_ordering = filters[1]
++        print("CategoryWithOrdering choices:", filter_with_ordering.lookup_choices)
++        # Should use Meta.ordering ['name'] → (A, B, Z)
++        expected_with_ordering = [(cat_with_a.pk, 'A Category'), (cat_with_b.pk, 'B Category'), (cat_with_z.pk, 'Z Category')]
++        actual_with_ordering = list(filter_with_ordering.lookup_choices)
++        print("Expected (with ordering):", expected_with_ordering)
++        print("Actual (with ordering):  ", actual_with_ordering)
++        print("✓ PASS" if actual_with_ordering == expected_with_ordering else "✗ FAIL")
++        
++    finally:
++        site.unregister(CategoryNoOrdering)
++        site.unregister(CategoryWithOrdering)
++    
++    # Test 2: RelatedOnlyFieldListFilter with same scenarios
++    print("\n2. Testing RelatedOnlyFieldListFilter with model that has no Meta.ordering:")
++    site.register(CategoryNoOrdering, CategoryNoOrderingAdmin)
++    site.register(CategoryWithOrdering, CategoryNoOrderingAdmin)
++    try:
++        modeladmin = ProductAdminRelatedOnly(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin2', 'admin2@test.com', 'password')
++        
++        changelist = modeladmin.get_changelist_instance(request)
++        filters = changelist.get_filters(request)[0]
++        
++        # Filter for category_no_ordering (no Meta.ordering)
++        filter_no_ordering = filters[0]
++        print("CategoryNoOrdering choices:", filter_no_ordering.lookup_choices)
++        # Should use insertion order since no Meta.ordering
++        
++        # Filter for category_with_ordering (has Meta.ordering)
++        filter_with_ordering = filters[1]
++        print("CategoryWithOrdering choices:", filter_with_ordering.lookup_choices)
++        # Should use Meta.ordering ['name'] → (A, B, Z)
++        expected_with_ordering = [(cat_with_a.pk, 'A Category'), (cat_with_b.pk, 'B Category'), (cat_with_z.pk, 'Z Category')]
++        actual_with_ordering = list(filter_with_ordering.lookup_choices)
++        print("Expected (with ordering):", expected_with_ordering)
++        print("Actual (with ordering):  ", actual_with_ordering)
++        print("✓ PASS" if actual_with_ordering == expected_with_ordering else "✗ FAIL")
++        
++    finally:
++        site.unregister(CategoryNoOrdering)
++        site.unregister(CategoryWithOrdering)
++
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_meta_ordering.py b/test_meta_ordering.py
+new file mode 100644
+index 0000000000..e8de1f9c32
+--- /dev/null
++++ b/test_meta_ordering.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python
++"""
++Test script to understand how to access model Meta.ordering.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'django.contrib.admin',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++
++# Test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['name']  # This should be accessible
++        
++    def __str__(self):
++        return self.name
++
++
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++
++def test_meta_ordering_access():
++    """Test how to access model Meta.ordering."""
++    print("=== Testing Meta.ordering access ===")
++    
++    # Get the field
++    field = Product._meta.get_field('category')
++    
++    print("1. field:", field)
++    print("2. field.remote_field:", field.remote_field)
++    print("3. field.remote_field.model:", field.remote_field.model)
++    print("4. field.remote_field.model._meta:", field.remote_field.model._meta)
++    print("5. field.remote_field.model._meta.ordering:", field.remote_field.model._meta.ordering)
++    
++    # Test with a model that has no ordering
++    class NoOrderingModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++    
++    print("\n6. NoOrderingModel._meta.ordering:", NoOrderingModel._meta.ordering)
++
++
++if __name__ == '__main__':
++    test_meta_ordering_access()
+\ No newline at end of file
+diff --git a/test_ordering_issue.py b/test_ordering_issue.py
+new file mode 100644
+index 0000000000..008c18cb7f
+--- /dev/null
++++ b/test_ordering_issue.py
+@@ -0,0 +1,214 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the ordering issue in admin filters.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin import ModelAdmin, site
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from django.test import RequestFactory
++from django.contrib.auth.models import User
++
++
++# Test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['name']  # This should be used as fallback
++        
++    def __str__(self):
++        return self.name
++
++
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++
++class CategoryAdmin(ModelAdmin):
++    pass  # No ordering defined - should fall back to Meta.ordering
++
++
++class CategoryAdminWithOrdering(ModelAdmin):
++    ordering = ['-name']  # Explicit ordering - should be used
++
++
++class ProductAdmin(ModelAdmin):
++    list_filter = [
++        ('category', RelatedFieldListFilter),
++    ]
++
++
++class ProductAdminRelatedOnly(ModelAdmin):
++    list_filter = [
++        ('category', RelatedOnlyFieldListFilter),
++    ]
++
++
++def test_related_field_list_filter():
++    """Test RelatedFieldListFilter ordering behavior."""
++    print("=== Testing RelatedFieldListFilter ===")
++    
++    # Create test data
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    # Create all necessary tables
++    with connection.schema_editor() as schema_editor:
++        # Create auth tables
++        from django.contrib.auth.models import User, Group, Permission
++        from django.contrib.contenttypes.models import ContentType
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(Permission)
++        schema_editor.create_model(Group)
++        schema_editor.create_model(User)
++        
++        # Create our test models
++        schema_editor.create_model(Category)
++        schema_editor.create_model(Product)
++    
++    # Create categories in reverse alphabetical order
++    cat_z = Category.objects.create(name='Z Category')
++    cat_b = Category.objects.create(name='B Category') 
++    cat_a = Category.objects.create(name='A Category')
++    
++    # Create products
++    Product.objects.create(name='Product 1', category=cat_z)
++    Product.objects.create(name='Product 2', category=cat_b)
++    Product.objects.create(name='Product 3', category=cat_a)
++    
++    # Test 1: No ModelAdmin ordering - should use Meta.ordering
++    print("\n1. Testing without ModelAdmin ordering (should use Meta.ordering ['name']):")
++    site.register(Category, CategoryAdmin)
++    try:
++        modeladmin = ProductAdmin(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin', 'admin@test.com', 'password')
++        
++        changelist = modeladmin.get_changelist_instance(request)
++        filterspec = changelist.get_filters(request)[0][0]
++        
++        print("Choices:", filterspec.lookup_choices)
++        # Should be ordered by name: A, B, Z
++        expected_order = [(cat_a.pk, 'A Category'), (cat_b.pk, 'B Category'), (cat_z.pk, 'Z Category')]
++        actual_order = list(filterspec.lookup_choices)
++        print("Expected:", expected_order)
++        print("Actual:  ", actual_order)
++        print("✓ PASS" if actual_order == expected_order else "✗ FAIL - Not using Meta.ordering")
++        
++    finally:
++        site.unregister(Category)
++    
++    # Test 2: With ModelAdmin ordering - should use ModelAdmin ordering
++    print("\n2. Testing with ModelAdmin ordering (should use ['-name']):")
++    site.register(Category, CategoryAdminWithOrdering)
++    try:
++        modeladmin = ProductAdmin(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin2', 'admin2@test.com', 'password')
++        
++        changelist = modeladmin.get_changelist_instance(request)
++        filterspec = changelist.get_filters(request)[0][0]
++        
++        print("Choices:", filterspec.lookup_choices)
++        # Should be ordered by -name: Z, B, A
++        expected_order = [(cat_z.pk, 'Z Category'), (cat_b.pk, 'B Category'), (cat_a.pk, 'A Category')]
++        actual_order = list(filterspec.lookup_choices)
++        print("Expected:", expected_order)
++        print("Actual:  ", actual_order)
++        print("✓ PASS" if actual_order == expected_order else "✗ FAIL - Not using ModelAdmin ordering")
++        
++    finally:
++        site.unregister(Category)
++
++
++def test_related_only_field_list_filter():
++    """Test RelatedOnlyFieldListFilter ordering behavior."""
++    print("\n=== Testing RelatedOnlyFieldListFilter ===")
++    
++    # Test 1: No ModelAdmin ordering - should use Meta.ordering
++    print("\n1. Testing without ModelAdmin ordering (should use Meta.ordering ['name']):")
++    site.register(Category, CategoryAdmin)
++    try:
++        modeladmin = ProductAdminRelatedOnly(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin3', 'admin3@test.com', 'password')
++        
++        changelist = modeladmin.get_changelist_instance(request)
++        filterspec = changelist.get_filters(request)[0][0]
++        
++        print("Choices:", filterspec.lookup_choices)
++        # Should be ordered by name: A, B, Z
++        cat_a = Category.objects.get(name='A Category')
++        cat_b = Category.objects.get(name='B Category')
++        cat_z = Category.objects.get(name='Z Category')
++        expected_order = [(cat_a.pk, 'A Category'), (cat_b.pk, 'B Category'), (cat_z.pk, 'Z Category')]
++        actual_order = list(filterspec.lookup_choices)
++        print("Expected:", expected_order)
++        print("Actual:  ", actual_order)
++        print("✓ PASS" if actual_order == expected_order else "✗ FAIL - Not using Meta.ordering")
++        
++    finally:
++        site.unregister(Category)
++    
++    # Test 2: With ModelAdmin ordering - should use ModelAdmin ordering
++    print("\n2. Testing with ModelAdmin ordering (should use ['-name']):")
++    site.register(Category, CategoryAdminWithOrdering)
++    try:
++        modeladmin = ProductAdminRelatedOnly(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin4', 'admin4@test.com', 'password')
++        
++        changelist = modeladmin.get_changelist_instance(request)
++        filterspec = changelist.get_filters(request)[0][0]
++        
++        print("Choices:", filterspec.lookup_choices)
++        # Should be ordered by -name: Z, B, A
++        expected_order = [(cat_z.pk, 'Z Category'), (cat_b.pk, 'B Category'), (cat_a.pk, 'A Category')]
++        actual_order = list(filterspec.lookup_choices)
++        print("Expected:", expected_order)
++        print("Actual:  ", actual_order)
++        print("✓ PASS" if actual_order == expected_order else "✗ FAIL - Not using ModelAdmin ordering")
++        
++    finally:
++        site.unregister(Category)
++
++
++if __name__ == '__main__':
++    test_related_field_list_filter()
++    test_related_only_field_list_filter()
+\ No newline at end of file
+diff --git a/test_ordering_issue_detailed.py b/test_ordering_issue_detailed.py
+new file mode 100644
+index 0000000000..b1b699c418
+--- /dev/null
++++ b/test_ordering_issue_detailed.py
+@@ -0,0 +1,245 @@
++#!/usr/bin/env python
++"""
++Detailed test script to reproduce the ordering issue in admin filters.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'django.contrib.admin',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib.admin import ModelAdmin, site
++from django.contrib.admin.filters import RelatedFieldListFilter, RelatedOnlyFieldListFilter
++from django.test import RequestFactory
++from django.contrib.auth.models import User
++
++
++# Test models
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++        ordering = ['name']  # This should be used as fallback
++        
++    def __str__(self):
++        return self.name
++
++
++class Product(models.Model):
++    name = models.CharField(max_length=100)
++    category = models.ForeignKey(Category, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test_app'
++    
++    def __str__(self):
++        return self.name
++
++
++def test_field_get_choices_directly():
++    """Test field.get_choices() method directly to understand its behavior."""
++    print("=== Testing field.get_choices() directly ===")
++    
++    # Create test data
++    from django.db import connection
++    
++    # Create all necessary tables
++    with connection.schema_editor() as schema_editor:
++        # Create auth tables
++        from django.contrib.auth.models import User, Group, Permission
++        from django.contrib.contenttypes.models import ContentType
++        schema_editor.create_model(ContentType)
++        schema_editor.create_model(Permission)
++        schema_editor.create_model(Group)
++        schema_editor.create_model(User)
++        
++        # Create our test models
++        schema_editor.create_model(Category)
++        schema_editor.create_model(Product)
++    
++    # Create categories in reverse alphabetical order
++    cat_z = Category.objects.create(name='Z Category')
++    cat_b = Category.objects.create(name='B Category') 
++    cat_a = Category.objects.create(name='A Category')
++    
++    # Create products
++    Product.objects.create(name='Product 1', category=cat_z)
++    Product.objects.create(name='Product 2', category=cat_b)
++    Product.objects.create(name='Product 3', category=cat_a)
++    
++    # Get the field
++    field = Product._meta.get_field('category')
++    
++    print("\n1. Testing field.get_choices() with no ordering:")
++    choices_no_ordering = field.get_choices(include_blank=False)
++    print("Choices:", choices_no_ordering)
++    
++    print("\n2. Testing field.get_choices() with empty ordering:")
++    choices_empty_ordering = field.get_choices(include_blank=False, ordering=())
++    print("Choices:", choices_empty_ordering)
++    
++    print("\n3. Testing field.get_choices() with name ordering:")
++    choices_name_ordering = field.get_choices(include_blank=False, ordering=('name',))
++    print("Choices:", choices_name_ordering)
++    
++    print("\n4. Testing field.get_choices() with -name ordering:")
++    choices_reverse_ordering = field.get_choices(include_blank=False, ordering=('-name',))
++    print("Choices:", choices_reverse_ordering)
++    
++    print("\n5. Testing Category._default_manager.all() (no ordering):")
++    default_qs = list(Category._default_manager.all().values_list('pk', 'name'))
++    print("QuerySet:", default_qs)
++    
++    print("\n6. Testing Category._default_manager.order_by() (empty ordering):")
++    empty_order_qs = list(Category._default_manager.order_by().values_list('pk', 'name'))
++    print("QuerySet:", empty_order_qs)
++    
++    print("\n7. Testing Category._default_manager.order_by('name'):")
++    name_order_qs = list(Category._default_manager.order_by('name').values_list('pk', 'name'))
++    print("QuerySet:", name_order_qs)
++
++
++def test_related_field_list_filter_detailed():
++    """Test RelatedFieldListFilter in detail."""
++    print("\n=== Testing RelatedFieldListFilter in detail ===")
++    
++    class CategoryAdmin(ModelAdmin):
++        pass  # No ordering defined
++    
++    class CategoryAdminWithOrdering(ModelAdmin):
++        ordering = ['-name']  # Explicit ordering
++    
++    class ProductAdmin(ModelAdmin):
++        list_filter = [
++            ('category', RelatedFieldListFilter),
++        ]
++    
++    # Test without ModelAdmin ordering
++    print("\n1. Testing RelatedFieldListFilter.field_choices() without ModelAdmin ordering:")
++    site.register(Category, CategoryAdmin)
++    try:
++        modeladmin = ProductAdmin(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin1', 'admin1@test.com', 'password')
++        
++        # Create filter instance
++        field = Product._meta.get_field('category')
++        filter_instance = RelatedFieldListFilter(field, request, {}, Product, modeladmin, 'category')
++        
++        print("Filter choices:", filter_instance.lookup_choices)
++        
++        # Test the field_choices method directly
++        choices = filter_instance.field_choices(field, request, modeladmin)
++        print("field_choices() result:", choices)
++        
++    finally:
++        site.unregister(Category)
++    
++    # Test with ModelAdmin ordering
++    print("\n2. Testing RelatedFieldListFilter.field_choices() with ModelAdmin ordering:")
++    site.register(Category, CategoryAdminWithOrdering)
++    try:
++        modeladmin = ProductAdmin(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin2', 'admin2@test.com', 'password')
++        
++        # Create filter instance
++        field = Product._meta.get_field('category')
++        filter_instance = RelatedFieldListFilter(field, request, {}, Product, modeladmin, 'category')
++        
++        print("Filter choices:", filter_instance.lookup_choices)
++        
++        # Test the field_choices method directly
++        choices = filter_instance.field_choices(field, request, modeladmin)
++        print("field_choices() result:", choices)
++        
++    finally:
++        site.unregister(Category)
++
++
++def test_related_only_field_list_filter_detailed():
++    """Test RelatedOnlyFieldListFilter in detail."""
++    print("\n=== Testing RelatedOnlyFieldListFilter in detail ===")
++    
++    class CategoryAdmin(ModelAdmin):
++        pass  # No ordering defined
++    
++    class CategoryAdminWithOrdering(ModelAdmin):
++        ordering = ['-name']  # Explicit ordering
++    
++    class ProductAdminRelatedOnly(ModelAdmin):
++        list_filter = [
++            ('category', RelatedOnlyFieldListFilter),
++        ]
++    
++    # Test without ModelAdmin ordering
++    print("\n1. Testing RelatedOnlyFieldListFilter.field_choices() without ModelAdmin ordering:")
++    site.register(Category, CategoryAdmin)
++    try:
++        modeladmin = ProductAdminRelatedOnly(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin3', 'admin3@test.com', 'password')
++        
++        # Create filter instance
++        field = Product._meta.get_field('category')
++        filter_instance = RelatedOnlyFieldListFilter(field, request, {}, Product, modeladmin, 'category')
++        
++        print("Filter choices:", filter_instance.lookup_choices)
++        
++        # Test the field_choices method directly
++        choices = filter_instance.field_choices(field, request, modeladmin)
++        print("field_choices() result:", choices)
++        
++    finally:
++        site.unregister(Category)
++    
++    # Test with ModelAdmin ordering
++    print("\n2. Testing RelatedOnlyFieldListFilter.field_choices() with ModelAdmin ordering:")
++    site.register(Category, CategoryAdminWithOrdering)
++    try:
++        modeladmin = ProductAdminRelatedOnly(Product, site)
++        request = RequestFactory().get('/')
++        request.user = User.objects.create_superuser('admin4', 'admin4@test.com', 'password')
++        
++        # Create filter instance
++        field = Product._meta.get_field('category')
++        filter_instance = RelatedOnlyFieldListFilter(field, request, {}, Product, modeladmin, 'category')
++        
++        print("Filter choices:", filter_instance.lookup_choices)
++        
++        # Test the field_choices method directly
++        choices = filter_instance.field_choices(field, request, modeladmin)
++        print("field_choices() result:", choices)
++        
++    finally:
++        site.unregister(Category)
++
++
++if __name__ == '__main__':
++    test_field_get_choices_directly()
++    test_related_field_list_filter_detailed()
++    test_related_only_field_list_filter_detailed()
+\ No newline at end of file

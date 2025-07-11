@@ -1,0 +1,176 @@
+diff --git a/astropy/units/format/cds.py b/astropy/units/format/cds.py
+index 307e987ed6..c225f7851a 100644
+--- a/astropy/units/format/cds.py
++++ b/astropy/units/format/cds.py
+@@ -295,6 +295,24 @@ class CDS(Base):
+         if not isinstance(s, str):
+             s = s.decode("ascii")
+ 
++        # Pre-process unit strings with consecutive division operations
++        # This ensures correct order of operations for units like "J/m/s/kpc2"
++        # by converting them to "J/(m.s.kpc2)"
++        import re
++        # Regex to find patterns with consecutive divisions like "unit/unit/unit"
++        divisions_pattern = r'(?P<numerator>[^/]+)(?P<divisions>/[^/]+/.*)'
++        match = re.match(divisions_pattern, s)
++        if match:
++            numerator = match.group('numerator')
++            divisions = match.group('divisions')
++            
++            # Split divisions by "/" and remove empty strings
++            divisors = [d for d in divisions.split('/') if d]
++            
++            # Reconstruct with proper grouping: num/(divisor1.divisor2...)
++            if divisors:
++                s = f"{numerator}/({'.'.join(divisors)})"
++
+         # This is a short circuit for the case where the string
+         # is just a single unit name
+         try:
+diff --git a/astropy/units/tests/test_cds_consecutive_divisions.py b/astropy/units/tests/test_cds_consecutive_divisions.py
+new file mode 100644
+index 0000000000..9cd583621c
+--- /dev/null
++++ b/astropy/units/tests/test_cds_consecutive_divisions.py
+@@ -0,0 +1,29 @@
++"""
++Test for correct parsing of consecutive divisions in CDS units format
++"""
++
++import pytest
++from astropy import units as u
++
++
++def test_cds_consecutive_divisions():
++    """
++    Test that the CDS unit parser correctly handles consecutive division operations.
++    
++    This test verifies the fix for the issue where units like 'J/m/s/kpc2' were
++    being incorrectly parsed with division order not preserved.
++    """
++    # Test multiple consecutive divisions
++    assert u.Unit('J/m/s', format='cds').to_string() == 'J / (m s)'
++    assert u.Unit('J/m/s/kpc2', format='cds').to_string() == 'J / (kpc2 m s)'
++    assert u.Unit('10+3J/m/s/kpc2', format='cds').to_string() == '1000 J / (kpc2 m s)'
++    assert u.Unit('10-7J/s/kpc2', format='cds').to_string() == '1e-07 J / (kpc2 s)'
++    
++    # Test a case with a scale factor
++    assert u.Unit('10+3J/m/s', format='cds').to_string() == '1000 J / (m s)'
++    
++    # Test mixed product and division
++    assert u.Unit('kg.m/s2', format='cds').to_string() == 'kg m / s2'
++    
++    # Already parenthesized division
++    assert u.Unit('J/(m.s)', format='cds').to_string() == 'J / (m s)'
+\ No newline at end of file
+diff --git a/test_cds_units.py b/test_cds_units.py
+new file mode 100644
+index 0000000000..77ac1a7485
+--- /dev/null
++++ b/test_cds_units.py
+@@ -0,0 +1,104 @@
++"""
++Test script to reproduce the CDS units parsing issue.
++
++This script shows that when reading MRT files (CDS format), composite units 
++with multiple divisions are not parsed correctly.
++"""
++
++from astropy.table import Table
++import tempfile
++import os
++from astropy import units as u
++
++# Test direct unit parsing with various complex cases
++print("=== ADDITIONAL COMPLEX UNIT TESTS ===")
++test_units = [
++    '10+3J/m/s/kpc2',      # Multiple consecutive divisions
++    '10-7J/s/kpc2',         # Multiple divisions with exponent
++    'J/m/s',                # Simple triple division
++    'kg.m/s2',              # Mixed product and division
++    'J/s/(m2.K4)',          # Division with parenthesized product
++    'J/(m.s)',              # Simple division with parenthesized product
++]
++
++print("Testing direct CDS unit parsing:")
++for unit_str in test_units:
++    parsed = u.Unit(unit_str, format='cds')
++    print(f"{unit_str:20} -> {parsed}")
++
++print("\n")
++
++# Create a temporary file with test data
++fd, path = tempfile.mkstemp()
++try:
++    with os.fdopen(fd, 'w') as f:
++        f.write('''
++Title:
++Authors:
++Table:
++================================================================================
++Byte-by-byte Description of file: tab.txt
++--------------------------------------------------------------------------------
++   Bytes Format Units                   Label      Explanations
++--------------------------------------------------------------------------------
++   1- 10 A10    ---                     ID         ID
++  12- 21 F10.5  10+3J/m/s/kpc2          SBCONT     Cont surface brightness
++  23- 32 F10.5  10-7J/s/kpc2            SBLINE     Line surface brightness
++--------------------------------------------------------------------------------
++ID0001     70.99200   38.51040      
++ID0001     13.05120   28.19240      
++ID0001     3.83610    10.98370      
++ID0001     1.99101    6.78822       
++ID0001     1.31142    5.01932      
++''')
++    
++    # Read the table
++    dat = Table.read(path, format='ascii.cds')
++    
++    print("=== TABLE AS READ BY ASTROPY ===")
++    print(dat)
++    
++    print("\n=== COLUMN UNITS AS PARSED ===")
++    for name, col in dat.columns.items():
++        print(f"{name}: {col.unit}")
++    
++    print("\n=== DIRECT UNIT PARSING COMPARISON ===")
++    
++    # Compare with expected units
++    original_units = {
++        'SBCONT': '10+3J/m/s/kpc2',
++        'SBLINE': '10-7J/s/kpc2'
++    }
++    
++    expected_units = {
++        'SBCONT': '1000 J / (m s kpc2)',  # Expected interpretation
++        'SBLINE': '1e-07 J / (s kpc2)'    # Expected interpretation
++    }
++    
++    actual_units = {
++        'SBCONT': u.Unit('10+3J/m/s/kpc2', format='cds').to_string(),
++        'SBLINE': u.Unit('10-7J/s/kpc2', format='cds').to_string()
++    }
++    
++    print("Original unit strings from MRT file:")
++    for unit_name, unit_str in original_units.items():
++        print(f"  {unit_name}: {unit_str}")
++    
++    print("\nExpected unit interpretations:")
++    for unit_name, unit_str in expected_units.items():
++        print(f"  {unit_name}: {unit_str}")
++    
++    print("\nActual parsed units:")
++    for unit_name, unit_str in actual_units.items():
++        print(f"  {unit_name}: {unit_str}")
++    
++    print("\n=== ISSUE DEMONSTRATION ===")
++    print("The issue is that the division order is wrong:")
++    print(f"SBCONT parsed as: {u.Unit('10+3J/m/s/kpc2', format='cds')}")
++    print(f"But should be:    {u.Unit('10+3J', format='cds') / (u.Unit('m', format='cds') * u.Unit('s', format='cds') * u.Unit('kpc2', format='cds'))}")
++    
++    print(f"\nSBLINE parsed as: {u.Unit('10-7J/s/kpc2', format='cds')}")
++    print(f"But should be:    {u.Unit('10-7J', format='cds') / (u.Unit('s', format='cds') * u.Unit('kpc2', format='cds'))}")
++    
++finally:
++    os.unlink(path)
+\ No newline at end of file

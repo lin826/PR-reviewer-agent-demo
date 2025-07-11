@@ -1,0 +1,153 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index e6cbf8c64f..e36befa869 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -149,6 +149,15 @@ class OutputWrapper(TextIOBase):
+             msg += ending
+         style_func = style_func or self.style_func
+         self._out.write(style_func(msg))
++        
++    def flush(self):
++        """
++        Flush the underlying output stream.
++        This is needed for ensuring that output is displayed immediately during 
++        long-running operations like migrations.
++        """
++        if hasattr(self._out, 'flush'):
++            self._out.flush()
+ 
+ 
+ class BaseCommand:
+diff --git a/test_command_flush.py b/test_command_flush.py
+new file mode 100644
+index 0000000000..2b0e697c3a
+--- /dev/null
++++ b/test_command_flush.py
+@@ -0,0 +1,48 @@
++import sys
++import io
++import time
++from django.core.management.base import BaseCommand, OutputWrapper
++
++# Create a test buffer that logs flush calls
++class TestBuffer(io.StringIO):
++    def __init__(self):
++        super().__init__()
++        self.flush_called = 0
++    
++    def flush(self):
++        self.flush_called += 1
++        super().flush()
++        print(f"[TestBuffer] flush() called {self.flush_called} times")
++
++# Simulate a management command
++class TestCommand:
++    def __init__(self):
++        self.test_buffer = TestBuffer()
++        self.stdout = OutputWrapper(self.test_buffer)
++    
++    def run_test(self):
++        print("Starting test command...")
++        
++        # Write initial message
++        self.stdout.write("Operations to perform:")
++        self.stdout.write(" Apply all migrations: myapp")
++        self.stdout.write("Running migrations:")
++        
++        # Simulate migration work - should show "Applying..."
++        self.stdout.write("  Applying myapp.0002_auto_20200817_1030...", ending="")
++        self.stdout.flush()  # This flush is crucial for showing real-time progress
++        
++        # Simulate long-running operation
++        print("Simulating migration work (2 seconds)...")
++        time.sleep(2)
++        
++        # Finish the migration
++        self.stdout.write(" OK")
++        
++        # Print stats
++        print(f"\nTest buffer final contents:\n{self.test_buffer.getvalue()}")
++        print(f"Flush was called {self.test_buffer.flush_called} times")
++
++if __name__ == "__main__":
++    cmd = TestCommand()
++    cmd.run_test()
+\ No newline at end of file
+diff --git a/test_flush.py b/test_flush.py
+new file mode 100644
+index 0000000000..e8a20b536d
+--- /dev/null
++++ b/test_flush.py
+@@ -0,0 +1,32 @@
++import sys
++import time
++from io import StringIO
++from django.core.management.base import OutputWrapper 
++
++# Create a StringIO object to capture stdout
++output = StringIO()
++
++# Create an OutputWrapper around it
++wrapper = OutputWrapper(output)
++
++# Write something and check if it appears in the buffer
++wrapper.write("First line")
++print(f"After first write, buffer contains: {output.getvalue()}")
++
++# Try to flush
++try:
++    wrapper.flush()
++    print("Flush method exists, attempting to flush")
++except AttributeError:
++    print("Flush method doesn't exist on OutputWrapper")
++
++# Write again and check if previous content was flushed
++wrapper.write("Second line")
++print(f"After second write, buffer contains: {output.getvalue()}")
++
++# Get the raw buffer and try flushing it directly
++output.flush()
++print("Flushed the underlying buffer directly")
++
++wrapper.write("Third line")
++print(f"After third write, buffer contains: {output.getvalue()}")
+\ No newline at end of file
+diff --git a/test_migration_simulation.py b/test_migration_simulation.py
+new file mode 100644
+index 0000000000..fd023f71d0
+--- /dev/null
++++ b/test_migration_simulation.py
+@@ -0,0 +1,32 @@
++"""
++Test script that simulates the migrate command behavior to verify the flush() fix.
++"""
++import time
++import sys
++from django.core.management.base import OutputWrapper
++
++# Create a simple test that simulates the migrate command's output
++def simulate_migration(wrapper):
++    # Initial output - will be displayed immediately
++    wrapper.write("Operations to perform:")
++    wrapper.write(" Apply all migrations: myapp")
++    wrapper.write("Running migrations:")
++    
++    # Start of migration - this should be displayed before the migration work
++    wrapper.write("  Applying myapp.0002_auto_20200817_1030...", ending="")
++    wrapper.flush()
++    
++    # Simulate long-running work
++    print("\nSimulating migration work (3 seconds)...", file=sys.stderr)
++    time.sleep(3)
++    
++    # End of migration - this should be displayed after the work is done
++    wrapper.write(" OK")
++
++if __name__ == "__main__":
++    # Use the real stdout for a more accurate test
++    wrapper = OutputWrapper(sys.stdout)
++    
++    print("=== Starting migration simulation ===")
++    simulate_migration(wrapper)
++    print("\n=== Migration simulation complete ===")
+\ No newline at end of file

@@ -1,0 +1,187 @@
+diff --git a/check_post_init.py b/check_post_init.py
+new file mode 100644
+index 0000000000..7643033576
+--- /dev/null
++++ b/check_post_init.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++"""Simple script to verify post_init signal connections."""
++
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Set up Django
++os.environ['DJANGO_SETTINGS_MODULE'] = 'tests.test_sqlite'
++import django
++django.setup()
++
++from django.db import models
++from django.db.models.signals import post_init
++
++class ModelWithDimensionFields(models.Model):
++    """Model with ImageField that has width_field and height_field."""
++    width = models.IntegerField(null=True)
++    height = models.IntegerField(null=True)
++    image = models.ImageField(
++        upload_to='images',
++        width_field='width',
++        height_field='height',
++    )
++    
++    class Meta:
++        app_label = 'test_app'
++        
++
++class ModelWithoutDimensionFields(models.Model):
++    """Model with ImageField that doesn't have dimension fields."""
++    image = models.ImageField(
++        upload_to='images',
++    )
++    
++    class Meta:
++        app_label = 'test_app'
++
++print("Post-init signal receivers:", post_init.receivers)
+\ No newline at end of file
+diff --git a/django/db/models/fields/files.py b/django/db/models/fields/files.py
+index 7f8eb128e1..f5e196910a 100644
+--- a/django/db/models/fields/files.py
++++ b/django/db/models/fields/files.py
+@@ -441,7 +441,8 @@ class ImageField(FileField):
+         # after their corresponding image field don't stay cleared by
+         # Model.__init__, see bug #11196.
+         # Only run post-initialization dimension update on non-abstract models
+-        if not cls._meta.abstract:
++        # and only when dimension fields are defined
++        if not cls._meta.abstract and (self.width_field or self.height_field):
+             signals.post_init.connect(self.update_dimension_fields, sender=cls)
+ 
+     def update_dimension_fields(self, instance, force=False, *args, **kwargs):
+diff --git a/verify_imagefield_performance.py b/verify_imagefield_performance.py
+new file mode 100755
+index 0000000000..a0b0d079ba
+--- /dev/null
++++ b/verify_imagefield_performance.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""
++Script to verify ImageField post_init signal handler performance improvement.
++
++This script creates two different models - one with an ImageField that has
++width_field and height_field, and another with a regular ImageField with no
++dimension fields. It then measures the time to initialize a large number
++of model instances and compares the performance.
++"""
++
++import os
++import sys
++import time
++import inspect
++from functools import wraps
++
++# Add the Django project to the path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Set up Django
++os.environ['DJANGO_SETTINGS_MODULE'] = 'tests.test_sqlite'
++import django
++django.setup()
++
++from django.db import models
++from django.db.models.signals import post_init
++from django.core.files.base import ContentFile
++from django.core.files.storage import FileSystemStorage
++import tempfile
++
++# Create a temporary storage
++temp_storage = FileSystemStorage(location=tempfile.mkdtemp())
++
++def time_execution(func):
++    """Decorator to time the execution of a function."""
++    @wraps(func)
++    def wrapper(*args, **kwargs):
++        start = time.time()
++        result = func(*args, **kwargs)
++        end = time.time()
++        print(f"{func.__name__} took {end - start:.4f} seconds")
++        return result
++    return wrapper
++
++# Define models for testing
++class ModelWithDimensionFields(models.Model):
++    """Model with ImageField that has width_field and height_field."""
++    width = models.IntegerField(null=True)
++    height = models.IntegerField(null=True)
++    image = models.ImageField(
++        upload_to='images',
++        width_field='width',
++        height_field='height',
++        storage=temp_storage,
++    )
++    
++    class Meta:
++        app_label = 'test_app'
++        
++
++class ModelWithoutDimensionFields(models.Model):
++    """Model with ImageField that doesn't have dimension fields."""
++    image = models.ImageField(
++        upload_to='images',
++        storage=temp_storage,
++    )
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++@time_execution
++def test_model_initialization(model_class, n=10000):
++    """Test initializing n instances of the given model class."""
++    instances = [model_class() for _ in range(n)]
++    return instances
++
++
++def count_post_init_signals():
++    """Check signal connections for our test models."""
++    from django.db.models.signals import post_init
++    
++    # Print information about receivers
++    print(f"Total post_init signal receivers: {len(post_init.receivers)}")
++    
++    # Get all models with post_init signals (weak refs may have been garbage collected)
++    model_with_signals = set()
++    for receiver in post_init.receivers:
++        if isinstance(receiver, tuple) and len(receiver) >= 2:
++            if hasattr(receiver[1], '__module__') and 'django.db.models.fields.files' in receiver[1].__module__:
++                print(f"Found ImageField handler: {receiver[1]}")
++                if hasattr(receiver[1], '__self__'):
++                    if hasattr(receiver[1].__self__, 'model'):
++                        model_with_signals.add(receiver[1].__self__.model)
++    
++    for model_cls, description in [
++        (ModelWithDimensionFields, "with dimension fields"),
++        (ModelWithoutDimensionFields, "without dimension fields")
++    ]:
++        connected = model_cls in model_with_signals
++        print(f"Model {description} has ImageField signal handlers connected: {connected}")
++
++
++if __name__ == "__main__":
++    # Test with dimension fields
++    print("\nTesting model with dimension fields:")
++    instances_with_dim = test_model_initialization(ModelWithDimensionFields)
++    
++    # Test without dimension fields
++    print("\nTesting model without dimension fields:")
++    instances_without_dim = test_model_initialization(ModelWithoutDimensionFields)
++    
++    print("\nSignal connections:")
++    count_post_init_signals()
++    
++    print("\nSummary:")
++    print("Both models should have post_init signal handlers connected.")
++    print("After the fix, only ModelWithDimensionFields should have the signal handler connected.")
+\ No newline at end of file

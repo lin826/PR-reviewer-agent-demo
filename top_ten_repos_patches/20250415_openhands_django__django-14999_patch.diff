@@ -1,0 +1,249 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 982816be3a..321a3be642 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -320,6 +320,12 @@ class RenameModel(ModelOperation):
+         new_model = to_state.apps.get_model(app_label, self.new_name)
+         if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+             old_model = from_state.apps.get_model(app_label, self.old_name)
++            
++            # If the old and new db_table values are the same, this operation
++            # is a noop and we can skip all database operations
++            if old_model._meta.db_table == new_model._meta.db_table:
++                return
++                
+             # Move the main table
+             schema_editor.alter_db_table(
+                 new_model,
+@@ -368,6 +374,15 @@ class RenameModel(ModelOperation):
+                 )
+ 
+     def database_backwards(self, app_label, schema_editor, from_state, to_state):
++        # We need to check the db_table values directly because we're going to swap name values
++        new_model = from_state.apps.get_model(app_label, self.new_name)
++        old_model = to_state.apps.get_model(app_label, self.old_name)
++        
++        # If db_table is the same, this is a noop operation
++        if old_model._meta.db_table == new_model._meta.db_table:
++            return
++        
++        # Regular processing if db_tables are different
+         self.new_name_lower, self.old_name_lower = self.old_name_lower, self.new_name_lower
+         self.new_name, self.old_name = self.old_name, self.new_name
+ 
+diff --git a/test_rename_with_db_table.py b/test_rename_with_db_table.py
+new file mode 100644
+index 0000000000..5e6c7571b0
+--- /dev/null
++++ b/test_rename_with_db_table.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python
++
++import os
++import sys
++
++# Add Django parent directory to sys.path
++parent_dir = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, parent_dir)
++
++# Set up Django settings
++import django
++from django.conf import settings
++from django.db import connection, models
++from django.db.migrations.operations.models import RenameModel
++from django.db.migrations.state import ProjectState
++
++# Minimal settings required for Django
++settings.configure(
++    DATABASES={
++        "default": {
++            "ENGINE": "django.db.backends.sqlite3",
++            "NAME": ":memory:",
++        }
++    },
++    INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth"],
++)
++django.setup()
++
++# Create a simple model with a custom db_table
++class MockModel:
++    def __init__(self, name, db_table):
++        self._meta = type('_meta', (), {
++            'db_table': db_table,
++            'related_objects': [],
++            'local_many_to_many': [],
++        })
++        self.name = name
++
++# Mock state
++mock_from_state = ProjectState()
++mock_to_state = ProjectState()
++
++# Create mock models with same db_table name
++old_model = MockModel("OldModel", "custom_table_name")
++new_model = MockModel("NewModel", "custom_table_name")
++
++# Testing our understanding of how alter_db_table works
++from django.db import connections
++schema_editor = connections['default'].schema_editor()
++
++# Create a tracking class to check if alter_db_table is called
++class TrackingSchemaEditor:
++    def __init__(self, schema_editor):
++        self.schema_editor = schema_editor
++        self.alter_db_table_called = False
++        self.table_renamed = False
++        
++    def alter_db_table(self, model, old_db_table, new_db_table):
++        self.alter_db_table_called = True
++        # The base implementation should check if tables are the same
++        if old_db_table != new_db_table:
++            self.table_renamed = True
++            print(f"Would rename table from {old_db_table} to {new_db_table}")
++        else:
++            print(f"Tables are the same ({old_db_table} == {new_db_table}), no rename needed")
++        # Call the real implementation which should be a noop if tables are the same
++        return self.schema_editor.alter_db_table(model, old_db_table, new_db_table)
++
++# Set up our tracking schema editor
++tracking_editor = TrackingSchemaEditor(schema_editor)
++
++# Create the RenameModel operation
++rename_operation = RenameModel("OldModel", "NewModel")
++
++print("\nTest 1: Same db_table, should be noop")
++# Call database_forwards directly with our mock objects
++# Note: This is not actually testing the real implementation since we're mocking,
++# but this helps us understand the flow
++rename_operation.database_forwards(
++    "test_app",
++    tracking_editor,
++    {"apps": type("MockApps", (), {"get_model": lambda app, name: old_model})},
++    {"apps": type("MockApps", (), {"get_model": lambda app, name: new_model})}
++)
++
++print(f"alter_db_table called: {tracking_editor.alter_db_table_called}")
++print(f"table_renamed: {tracking_editor.table_renamed}")
++
++print("\nThis test demonstrates that alter_db_table is always called in RenameModel")
++print("even when the db_table is the same, which causes unnecessary operations")
++print("including dropping and recreating foreign keys in PostgreSQL.")
++
++print("\nA proper fix would check if old_model._meta.db_table == new_model._meta.db_table")
++print("and make the entire operation a noop in that case.")
+diff --git a/tests/migrations/test_db_table_rename.py b/tests/migrations/test_db_table_rename.py
+new file mode 100644
+index 0000000000..4c11fdaf21
+--- /dev/null
++++ b/tests/migrations/test_db_table_rename.py
+@@ -0,0 +1,109 @@
++from unittest import mock
++
++from django.db import connection
++from django.db.migrations.operations.models import RenameModel
++from django.test.testcases import TestCase
++
++from .test_operations import OperationTestBase
++
++
++class RenameModelWithTableTests(TestCase):
++
++    def test_rename_model_with_db_table_noop_forward(self):
++        """
++        When RenameModel is used on a model with db_table set and the table name doesn't
++        change, forward operation should be a no-op.
++        """
++        # Use mock objects to test the behavior without needing real database tables
++        schema_editor_mock = mock.MagicMock()
++        
++        # Set up mock models with the same db_table
++        old_model = mock.MagicMock()
++        old_model._meta.db_table = 'same_table'
++        old_model._meta.related_objects = []
++        old_model._meta.local_many_to_many = []
++
++        new_model = mock.MagicMock()
++        new_model._meta.db_table = 'same_table'
++
++        # Mock the "apps" objects in from_state and to_state
++        from_state = mock.MagicMock()
++        from_state.apps.get_model.return_value = old_model
++
++        to_state = mock.MagicMock() 
++        to_state.apps.get_model.return_value = new_model
++
++        # Create the RenameModel operation
++        operation = RenameModel('OldModel', 'NewModel')
++
++        # Run the operation
++        operation.database_forwards('app_label', schema_editor_mock, from_state, to_state)
++
++        # The schema_editor should NOT have been called if the tables have the same name
++        schema_editor_mock.alter_db_table.assert_not_called()
++        
++    def test_rename_model_with_db_table_noop_backward(self):
++        """
++        When RenameModel is used on a model with db_table set and the table name doesn't
++        change, backward operation should be a no-op.
++        """
++        # Use mock objects to test the behavior without needing real database tables
++        schema_editor_mock = mock.MagicMock()
++        
++        # Set up mock models with the same db_table
++        old_model = mock.MagicMock()
++        old_model._meta.db_table = 'same_table'
++
++        new_model = mock.MagicMock()
++        new_model._meta.db_table = 'same_table'
++
++        # Mock the "apps" objects in from_state and to_state
++        from_state = mock.MagicMock()
++        from_state.apps.get_model.return_value = new_model  # Swapped for backward
++
++        to_state = mock.MagicMock() 
++        to_state.apps.get_model.return_value = old_model  # Swapped for backward
++
++        # Create the RenameModel operation
++        operation = RenameModel('OldModel', 'NewModel')
++
++        # Run the operation
++        operation.database_backwards('app_label', schema_editor_mock, from_state, to_state)
++
++        # The schema_editor should NOT have been called if the tables have the same name
++        schema_editor_mock.alter_db_table.assert_not_called()
++        
++    def test_rename_model_with_different_db_table(self):
++        """
++        When RenameModel is used on a model with db_table set but the table names
++        are different, the operation should proceed normally.
++        """
++        # Use mock objects to test the behavior without needing real database tables
++        schema_editor_mock = mock.MagicMock()
++        
++        # Set up mock models with different db_table values
++        old_model = mock.MagicMock()
++        old_model._meta.db_table = 'old_table'
++        old_model._meta.related_objects = []
++        old_model._meta.local_many_to_many = []
++
++        new_model = mock.MagicMock()
++        new_model._meta.db_table = 'new_table'
++
++        # Mock the "apps" objects in from_state and to_state
++        from_state = mock.MagicMock()
++        from_state.apps.get_model.return_value = old_model
++
++        to_state = mock.MagicMock() 
++        to_state.apps.get_model.return_value = new_model
++
++        # Create the RenameModel operation
++        operation = RenameModel('OldModel', 'NewModel')
++
++        # Run the operation
++        operation.database_forwards('app_label', schema_editor_mock, from_state, to_state)
++
++        # The schema_editor SHOULD have been called since db_tables are different
++        schema_editor_mock.alter_db_table.assert_called_with(
++            new_model, 'old_table', 'new_table'
++        )
+\ No newline at end of file

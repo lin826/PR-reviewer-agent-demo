@@ -1,0 +1,507 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 137e6faa0f..a100f1c499 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -1631,7 +1631,7 @@ class ModelAdmin(BaseModelAdmin):
+ 
+     def _get_edited_object_pks(self, request, prefix):
+         """Return POST data values of list_editable primary keys."""
+-        pk_pattern = re.compile(r'{}-\d+-{}$'.format(prefix, self.model._meta.pk.name))
++        pk_pattern = re.compile(r'{}-\d+-{}$'.format(re.escape(prefix), self.model._meta.pk.name))
+         return [value for key, value in request.POST.items() if pk_pattern.match(key)]
+ 
+     def _get_list_editable_queryset(self, request, prefix):
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..dd93036229
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the regex fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++import re
++from django.contrib.admin.options import ModelAdmin
++from django.contrib.auth.models import User
++from django.db import models
++from django.test import RequestFactory
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++
++class TestModelAdmin(ModelAdmin):
++    pass
++
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix is robust."""
++    
++    print("Testing edge cases...")
++    
++    admin = TestModelAdmin(TestModel, None)
++    factory = RequestFactory()
++    
++    # Edge cases
++    test_cases = [
++        # Empty prefix (edge case)
++        ('', {'0-id': '1', '1-id': '2'}),
++        
++        # Very long prefix with special chars
++        ('very.long[prefix]*with+many?special^chars$and(groups)|and\\backslashes', {
++            'very.long[prefix]*with+many?special^chars$and(groups)|and\\backslashes-0-id': '1',
++            'very.long[prefix]*with+many?special^chars$and(groups)|and\\backslashes-1-id': '2',
++        }),
++        
++        # Prefix that looks like regex itself
++        ('\\d+', {'\\d+-0-id': '1', '\\d+-1-id': '2'}),
++        
++        # Unicode characters
++        ('form_ñ', {'form_ñ-0-id': '1', 'form_ñ-1-id': '2'}),
++        
++        # Mixed case
++        ('FormPrefix', {'FormPrefix-0-id': '1', 'FormPrefix-1-id': '2'}),
++        
++        # Numbers in prefix
++        ('form123', {'form123-0-id': '1', 'form123-1-id': '2'}),
++        
++        # Underscores and hyphens
++        ('form_test-prefix', {'form_test-prefix-0-id': '1', 'form_test-prefix-1-id': '2'}),
++    ]
++    
++    for prefix, post_data in test_cases:
++        print(f"\nTesting prefix: '{prefix}'")
++        
++        # Add some non-matching data to ensure we don't get false positives
++        full_post_data = dict(post_data)
++        full_post_data.update({
++            'other-field': 'value',
++            'form-other-field': 'value2',
++            f'{prefix}-invalid': 'should not match',
++            f'{prefix}-0-other': 'should not match',
++        })
++        
++        request = factory.post('/', data=full_post_data)
++        
++        try:
++            pks = admin._get_edited_object_pks(request, prefix)
++            expected_pks = list(post_data.values())
++            
++            print(f"  Expected PKs: {expected_pks}")
++            print(f"  Actual PKs: {pks}")
++            
++            if sorted(pks) == sorted(expected_pks):
++                print(f"  ✓ PASS: Correctly extracted PKs")
++            else:
++                print(f"  ✗ FAIL: Incorrect PKs extracted")
++                
++        except Exception as e:
++            print(f"  ✗ ERROR: {e}")
++
++
++def test_false_positives():
++    """Test that we don't get false positive matches."""
++    
++    print("\n" + "="*60)
++    print("Testing false positive prevention...")
++    
++    admin = TestModelAdmin(TestModel, None)
++    factory = RequestFactory()
++    
++    # Test case where unescaped regex could cause false positives
++    prefix = 'form|other'
++    
++    post_data = {
++        # These should match
++        'form|other-0-id': '1',
++        'form|other-1-id': '2',
++        
++        # These should NOT match (but would with unescaped regex)
++        'formXother-0-id': '999',  # Would match with unescaped | (alternation)
++        'other-0-id': '888',       # Would match with unescaped | (alternation)
++        
++        # Other non-matching data
++        'other-field': 'value',
++    }
++    
++    request = factory.post('/', data=post_data)
++    pks = admin._get_edited_object_pks(request, prefix)
++    
++    print(f"Prefix: '{prefix}'")
++    print(f"POST data: {post_data}")
++    print(f"Extracted PKs: {pks}")
++    
++    expected_pks = ['1', '2']  # Only the exact matches
++    if sorted(pks) == sorted(expected_pks):
++        print("✓ PASS: No false positives detected")
++    else:
++        print("✗ FAIL: False positives detected or missing expected matches")
++
++
++if __name__ == '__main__':
++    test_edge_cases()
++    test_false_positives()
+\ No newline at end of file
+diff --git a/test_regex_fix_for_django.py b/test_regex_fix_for_django.py
+new file mode 100644
+index 0000000000..8d780ec551
+--- /dev/null
++++ b/test_regex_fix_for_django.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python
++"""
++Test case that could be added to Django's test suite to verify the regex fix.
++This test ensures that formset prefixes with regex special characters work correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.admin.options import ModelAdmin
++from django.db import models
++from django.test import RequestFactory, TestCase
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++
++class TestModelAdmin(ModelAdmin):
++    pass
++
++
++class AdminRegexSpecialCharsTest(TestCase):
++    """Test that formset prefixes with regex special characters work correctly."""
++    
++    def setUp(self):
++        self.factory = RequestFactory()
++        self.admin = TestModelAdmin(TestModel, None)
++    
++    def test_get_edited_object_pks_with_regex_special_chars(self):
++        """
++        Test that _get_edited_object_pks correctly handles prefixes containing
++        regex special characters.
++        """
++        test_cases = [
++            # (prefix, expected_to_work)
++            ('form', True),  # Normal case
++            ('form[0]', True),  # Square brackets
++            ('form.prefix', True),  # Dot
++            ('form*', True),  # Asterisk
++            ('form+', True),  # Plus
++            ('form?', True),  # Question mark
++            ('form^start', True),  # Caret
++            ('form$end', True),  # Dollar sign
++            ('form(group)', True),  # Parentheses
++            ('form|or', True),  # Pipe
++            ('form\\escape', True),  # Backslash
++        ]
++        
++        for prefix, should_work in test_cases:
++            with self.subTest(prefix=prefix):
++                # Create POST data that should match the pattern
++                post_data = {
++                    f'{prefix}-0-id': '1',
++                    f'{prefix}-1-id': '2',
++                    f'{prefix}-2-id': '3',
++                    'other-field': 'value',  # Should not match
++                }
++                
++                request = self.factory.post('/', data=post_data)
++                
++                if should_work:
++                    # Should extract the primary keys correctly
++                    pks = self.admin._get_edited_object_pks(request, prefix)
++                    expected_pks = ['1', '2', '3']
++                    self.assertEqual(sorted(pks), sorted(expected_pks),
++                                   f"Failed to extract PKs for prefix '{prefix}'")
++                else:
++                    # Should handle gracefully (not crash)
++                    try:
++                        pks = self.admin._get_edited_object_pks(request, prefix)
++                        # If it doesn't crash, that's also acceptable
++                    except Exception as e:
++                        self.fail(f"Prefix '{prefix}' caused an exception: {e}")
++    
++    def test_no_false_positives_with_regex_special_chars(self):
++        """
++        Test that regex special characters in prefix don't cause false positive matches.
++        """
++        prefix = 'form|other'  # Pipe character could cause alternation in unescaped regex
++        
++        post_data = {
++            # These should match
++            'form|other-0-id': '1',
++            'form|other-1-id': '2',
++            
++            # These should NOT match (but would with unescaped | in regex)
++            'formXother-0-id': '999',  # Would match with unescaped |
++            'other-0-id': '888',       # Would match with unescaped |
++            
++            # Other non-matching data
++            'other-field': 'value',
++        }
++        
++        request = self.factory.post('/', data=post_data)
++        pks = self.admin._get_edited_object_pks(request, prefix)
++        
++        # Should only get the exact matches
++        expected_pks = ['1', '2']
++        self.assertEqual(sorted(pks), sorted(expected_pks),
++                        "False positive matches detected")
++
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_regex_issue.py b/test_regex_issue.py
+new file mode 100644
+index 0000000000..2307c10d2b
+--- /dev/null
++++ b/test_regex_issue.py
+@@ -0,0 +1,181 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the regex special characters issue in formset prefix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++import re
++from django.contrib.admin.options import ModelAdmin
++from django.contrib.auth.models import User
++from django.db import models
++from django.test import RequestFactory
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++
++class TestModelAdmin(ModelAdmin):
++    pass
++
++
++def test_regex_special_characters():
++    """Test that regex special characters in prefix cause issues."""
++    
++    print("Testing regex special characters in formset prefix...")
++    
++    # Create a test model admin
++    admin = TestModelAdmin(TestModel, None)
++    
++    # Create a mock request with POST data
++    factory = RequestFactory()
++    
++    # Test cases with different prefixes containing regex special characters
++    test_cases = [
++        'form',  # Normal case (should work)
++        'form[0]',  # Contains square brackets (regex special chars)
++        'form.prefix',  # Contains dot (regex special char)
++        'form*',  # Contains asterisk (regex special char)
++        'form+',  # Contains plus (regex special char)
++        'form?',  # Contains question mark (regex special char)
++        'form^start',  # Contains caret (regex special char)
++        'form$end',  # Contains dollar sign (regex special char)
++        'form(group)',  # Contains parentheses (regex special chars)
++        'form|or',  # Contains pipe (regex special char)
++        'form\\escape',  # Contains backslash (regex special char)
++    ]
++    
++    for prefix in test_cases:
++        print(f"\nTesting prefix: '{prefix}'")
++        
++        # Create POST data that would match the pattern
++        post_data = {
++            f'{prefix}-0-id': '1',
++            f'{prefix}-1-id': '2',
++            f'{prefix}-2-id': '3',
++            'other-field': 'value',
++        }
++        
++        request = factory.post('/', data=post_data)
++        
++        try:
++            # This should extract the primary keys from the POST data
++            pks = admin._get_edited_object_pks(request, prefix)
++            print(f"  Expected PKs: ['1', '2', '3']")
++            print(f"  Actual PKs: {pks}")
++            
++            # Check if we got the expected results
++            expected_pks = ['1', '2', '3']
++            if sorted(pks) == sorted(expected_pks):
++                print(f"  ✓ PASS: Correctly extracted PKs")
++            else:
++                print(f"  ✗ FAIL: Incorrect PKs extracted")
++                
++        except Exception as e:
++            print(f"  ✗ ERROR: {e}")
++
++
++def test_regex_compilation():
++    """Test regex compilation with special characters."""
++    
++    print("\n" + "="*60)
++    print("Testing regex compilation directly...")
++    
++    test_prefixes = [
++        'form',
++        'form[0]',
++        'form.prefix',
++        'form*',
++        'form+',
++        'form?',
++        'form^start',
++        'form$end',
++        'form(group)',
++        'form|or',
++        'form\\escape',
++    ]
++    
++    pk_name = 'id'  # Simulating model._meta.pk.name
++    
++    for prefix in test_prefixes:
++        print(f"\nTesting prefix: '{prefix}'")
++        
++        # Current implementation (vulnerable)
++        try:
++            pattern_str = r'{}-\d+-{}$'.format(prefix, pk_name)
++            print(f"  Pattern string: '{pattern_str}'")
++            pattern = re.compile(pattern_str)
++            print(f"  ✓ Compilation successful")
++            
++            # Test if it matches what we expect
++            test_key = f'{prefix}-0-{pk_name}'
++            if pattern.match(test_key):
++                print(f"  ✓ Correctly matches '{test_key}'")
++            else:
++                print(f"  ✗ Does not match '{test_key}'")
++                
++            # Test if it incorrectly matches other strings
++            false_positive_tests = [
++                f'{prefix}X0X{pk_name}',  # Should not match if prefix contains special chars
++                f'X{prefix}-0-{pk_name}',  # Should not match (extra prefix)
++            ]
++            
++            for test_str in false_positive_tests:
++                if pattern.match(test_str):
++                    print(f"  ⚠ WARNING: Incorrectly matches '{test_str}'")
++                    
++        except Exception as e:
++            print(f"  ✗ Compilation failed: {e}")
++            
++        # Fixed implementation (using re.escape)
++        try:
++            escaped_prefix = re.escape(prefix)
++            pattern_str_fixed = r'{}-\d+-{}$'.format(escaped_prefix, pk_name)
++            print(f"  Fixed pattern: '{pattern_str_fixed}'")
++            pattern_fixed = re.compile(pattern_str_fixed)
++            print(f"  ✓ Fixed compilation successful")
++            
++            # Test if it matches what we expect
++            test_key = f'{prefix}-0-{pk_name}'
++            if pattern_fixed.match(test_key):
++                print(f"  ✓ Fixed version correctly matches '{test_key}'")
++            else:
++                print(f"  ✗ Fixed version does not match '{test_key}'")
++                
++        except Exception as e:
++            print(f"  ✗ Fixed compilation failed: {e}")
++
++
++if __name__ == '__main__':
++    test_regex_compilation()
++    test_regex_special_characters()
+\ No newline at end of file

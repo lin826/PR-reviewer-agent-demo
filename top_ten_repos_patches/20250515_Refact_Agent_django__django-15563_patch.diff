@@ -1,0 +1,58 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 59a5d6abbb..f7d77a52e6 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1855,6 +1855,25 @@ class SQLUpdateCompiler(SQLCompiler):
+                 idents.extend(r[0] for r in rows)
+             self.query.add_filter("pk__in", idents)
+             self.query.related_ids = idents
++            
++            # For multiple inheritance, collect the correct IDs for each parent model
++            if self.query.related_updates:
++                self.query.related_ids_map = {}
++                opts = self.query.get_meta()
++                for parent_model in self.query.related_updates:
++                    # Get the OneToOne link from child to this parent
++                    link_field = opts.get_ancestor_link(parent_model)
++                    if link_field is None:
++                        continue  # Should not happen, guard only
++                    ptr_query = query.clone()
++                    ptr_query.clear_select_clause()
++                    ptr_query.select = []
++                    ptr_query.extra = {}
++                    ptr_query.add_fields([link_field.attname])  # e.g. 'otherbase_ptr_id'
++                    ptr_ids = []
++                    for rows in ptr_query.get_compiler(self.using).execute_sql(MULTI):
++                        ptr_ids.extend(r[0] for r in rows if r[0] is not None)
++                    self.query.related_ids_map[parent_model] = ptr_ids
+         else:
+             # The fast path. Filters and updates in one query.
+             self.query.add_filter("pk__in", query)
+diff --git a/django/db/models/sql/subqueries.py b/django/db/models/sql/subqueries.py
+index 04063f73bc..bef78f6de8 100644
+--- a/django/db/models/sql/subqueries.py
++++ b/django/db/models/sql/subqueries.py
+@@ -62,10 +62,12 @@ class UpdateQuery(Query):
+         self.values = []
+         self.related_ids = None
+         self.related_updates = {}
++        self.related_ids_map = {}
+ 
+     def clone(self):
+         obj = super().clone()
+         obj.related_updates = self.related_updates.copy()
++        obj.related_ids_map = self.related_ids_map.copy() if hasattr(self, 'related_ids_map') else {}
+         return obj
+ 
+     def update_batch(self, pk_list, values, using):
+@@ -134,7 +136,9 @@ class UpdateQuery(Query):
+             query = UpdateQuery(model)
+             query.values = values
+             if self.related_ids is not None:
+-                query.add_filter("pk__in", self.related_ids)
++                # Use the correct IDs for this parent model if available
++                rel_ids = self.related_ids_map.get(model, self.related_ids)
++                query.add_filter("pk__in", rel_ids)
+             result.append(query)
+         return result
+ 

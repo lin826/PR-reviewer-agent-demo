@@ -1,0 +1,121 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 844c01e95e..c73d858cc5 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -569,6 +569,16 @@ class Model(metaclass=ModelBase):
+         return getattr(self, meta.pk.attname)
+
+     def _set_pk_val(self, value):
++        """
++        Set the primary key value for this instance.
++        For inherited models, ensure the primary key is also set on parent models.
++        """
++        for parent, link in self._meta.parents.items():
++            if link and hasattr(self, parent._meta.pk.attname):
++                # If the value is None, propagate it to parent models
++                # Allow resetting PK on child models to work properly
++                setattr(self, parent._meta.pk.attname, value)
++
+         return setattr(self, self._meta.pk.attname, value)
+
+     pk = property(_get_pk_val, _set_pk_val)
+diff --git a/tests/model_inheritance/tests.py b/tests/model_inheritance/tests.py
+index 5eef0f5bfa..c218bc28f0 100644
+--- a/tests/model_inheritance/tests.py
++++ b/tests/model_inheritance/tests.py
+@@ -1,13 +1,13 @@
+ from operator import attrgetter
+
+ from django.core.exceptions import FieldError, ValidationError
+-from django.db import connection, models
++from django.db import connection, models, transaction
+ from django.test import SimpleTestCase, TestCase
+ from django.test.utils import CaptureQueriesContext, isolate_apps
+
+ from .models import (
+-    Base, Chef, CommonInfo, GrandChild, GrandParent, ItalianRestaurant,
+-    MixinModel, ParkingLot, Place, Post, Restaurant, Student, SubBase,
++    Base, Chef, Child, CommonInfo, GrandChild, GrandParent, ItalianRestaurant,
++    MixinModel, Parent, ParkingLot, Place, Post, Restaurant, Student, SubBase,
+     Supplier, Title, Worker,
+ )
+
+@@ -522,3 +522,78 @@ class InheritanceUniqueTests(TestCase):
+         msg = 'Grand parent with this First name and Last name already exists.'
+         with self.assertRaisesMessage(ValidationError, msg):
+             grand_child.validate_unique()
++
++
++class PKResetTests(TestCase):
++    def test_pk_reset_in_inheritance(self):
++        """Test that setting pk=None in a child model propagates to the parent."""
++        # Create a Restaurant with specific rating
++        r1 = Restaurant.objects.create(
++            name="Demon Dogs", address="944 W. Fullerton",
++            serves_hot_dogs=True, serves_pizza=False,
++            rating=2,
++        )
++        self.assertEqual(r1.rating, 2)
++        r1_pk = r1.pk
++
++        # Create a duplicate with pk=None
++        r2 = Restaurant(
++            name="Demon Cats", address="944 W. Fullerton",
++            serves_hot_dogs=True, serves_pizza=False,
++            rating=5,
++        )
++        r2.pk = None  # Explicitly set pk to None
++        r2.save()
++
++        self.assertNotEqual(r2.pk, r1_pk)  # Different primary keys
++
++        # Check the count to verify we have 2 restaurants now
++        self.assertEqual(Restaurant.objects.count(), 2)
++
++        # Check the values are correct
++        r1_again = Restaurant.objects.get(pk=r1_pk)
++        self.assertEqual(r1_again.rating, 2)
++        self.assertEqual(r1_again.name, "Demon Dogs")
++
++        r2_again = Restaurant.objects.get(pk=r2.pk)
++        self.assertEqual(r2_again.rating, 5)
++        self.assertEqual(r2_again.name, "Demon Cats")
++
++    def test_issue_reset_method(self):
++        """Test the specific case from the issue description with a reset method."""
++        # Create two parent-child model relationships
++        # Where a reset method sets uid/pk to None
++
++        with transaction.atomic():
++            # Create a first item
++            c1 = Child.objects.create(
++                first_name="Original", last_name="Child",
++                email="original.child@example.com")
++
++            # Get the parent and the child via parent
++            p1 = GrandParent.objects.get(pk=c1.pk)
++
++            # Store the original primary key
++            original_pk = c1.pk
++
++            # Create a second child with a different email
++            c2 = Child(
++                first_name="New", last_name="Child",
++                email="new.child@example.com")
++
++            # Explicitly set PK to None
++            c2.pk = None
++            c2.save()
++
++            # Verify we now have two objects
++            self.assertEqual(Child.objects.count(), 2)
++
++            # Verify different PKs
++            self.assertNotEqual(c1.pk, c2.pk)
++
++            # Verify the correct data is stored
++            c1_again = Child.objects.get(pk=original_pk)
++            self.assertEqual(c1_again.first_name, "Original")
++
++            c2_again = Child.objects.get(pk=c2.pk)
++            self.assertEqual(c2_again.first_name, "New")

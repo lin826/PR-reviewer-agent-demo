@@ -1,0 +1,171 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 85cd8311a7..ab577710b5 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1219,12 +1219,20 @@ class QuerySet:
+         """
+         Return True if the QuerySet is ordered -- i.e. has an order_by()
+         clause or a default ordering on the model (or is empty).
++
++        Note that this doesn't check whether the default ordering is actually
++        applied in the query. In particular, when GROUP BY is involved, the
++        default ordering may be ignored in the SQL query.
+         """
+         if isinstance(self, EmptyQuerySet):
+             return True
+         if self.query.extra_order_by or self.query.order_by:
+             return True
+         elif self.query.default_ordering and self.query.get_meta().ordering:
++            # Default ordering is not applied when GROUP BY is used and
++            # there are no explicit order_by() expressions
++            if hasattr(self.query, 'group_by') and self.query.group_by:
++                return False
+             return True
+         else:
+             return False
+diff --git a/tests/ordered_property/__init__.py b/tests/ordered_property/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/ordered_property/models.py b/tests/ordered_property/models.py
+new file mode 100644
+index 0000000000..e4658d7f1b
+--- /dev/null
++++ b/tests/ordered_property/models.py
+@@ -0,0 +1,8 @@
++from django.db import models
++
++
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        ordering = ['name']
+\ No newline at end of file
+diff --git a/tests/ordered_property/tests.py b/tests/ordered_property/tests.py
+new file mode 100644
+index 0000000000..81b7e50efe
+--- /dev/null
++++ b/tests/ordered_property/tests.py
+@@ -0,0 +1,66 @@
++from django.db.models import Count
++from django.test import TestCase
++
++from .models import SimpleModel
++
++
++class OrderedPropertyTests(TestCase):
++    def setUp(self):
++        # Create some test data
++        SimpleModel.objects.create(name='A')
++        SimpleModel.objects.create(name='B')
++        SimpleModel.objects.create(name='C')
++
++    def test_ordered_property_with_annotation(self):
++        """
++        Test that QuerySet.ordered is correct when GROUP BY queries are used
++        with models that have Meta.ordering.
++        """
++        # Regular queryset with default ordering
++        qs = SimpleModel.objects.all()
++        
++        # Debug output
++        print(f"\nRegular QuerySet:")
++        print(f"qs.ordered: {qs.ordered}")
++        print(f"qs.query.default_ordering: {qs.query.default_ordering}")
++        print(f"hasattr(qs.query, 'group_by'): {hasattr(qs.query, 'group_by')}")
++        if hasattr(qs.query, 'group_by'):
++            print(f"qs.query.group_by: {qs.query.group_by}")
++        print(f"SQL: {str(qs.query)}")
++        
++        # Verify ordered property is True and SQL has ORDER BY
++        self.assertTrue(qs.ordered)
++        self.assertIn('ORDER BY', str(qs.query))
++        
++        # Queryset with GROUP BY
++        qs2 = SimpleModel.objects.annotate(count=Count('pk'))
++        
++        # Debug output
++        print(f"\nAnnotated QuerySet:")
++        print(f"qs2.ordered: {qs2.ordered}")
++        print(f"qs2.query.default_ordering: {qs2.query.default_ordering}")
++        print(f"hasattr(qs2.query, 'group_by'): {hasattr(qs2.query, 'group_by')}")
++        if hasattr(qs2.query, 'group_by'):
++            print(f"qs2.query.group_by: {qs2.query.group_by}")
++        print(f"SQL: {str(qs2.query)}")
++        
++        # Verify SQL doesn't have ORDER BY
++        self.assertNotIn('ORDER BY', str(qs2.query))
++        
++        # With the fix, qs2.ordered should correctly return False
++        self.assertFalse(qs2.ordered)
++        
++        # Adding explicit ordering should make ordered=True again
++        qs3 = SimpleModel.objects.annotate(count=Count('pk')).order_by('name')
++        
++        # Debug output
++        print(f"\nAnnotated QuerySet with explicit ordering:")
++        print(f"qs3.ordered: {qs3.ordered}")
++        print(f"qs3.query.default_ordering: {qs3.query.default_ordering}")
++        print(f"hasattr(qs3.query, 'group_by'): {hasattr(qs3.query, 'group_by')}")
++        if hasattr(qs3.query, 'group_by'):
++            print(f"qs3.query.group_by: {qs3.query.group_by}")
++        print(f"SQL: {str(qs3.query)}")
++        
++        self.assertTrue(qs3.ordered)
++        self.assertIn('ORDER BY', str(qs3.query))
+\ No newline at end of file
+diff --git a/tests/ordered_property_test/__init__.py b/tests/ordered_property_test/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/ordered_property_test/models.py b/tests/ordered_property_test/models.py
+new file mode 100644
+index 0000000000..963fe4a26c
+--- /dev/null
++++ b/tests/ordered_property_test/models.py
+@@ -0,0 +1,9 @@
++from django.db import models
++
++
++class Foo(models.Model):
++    uuid = models.CharField(primary_key=True, max_length=36)
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        ordering = ['name']
+\ No newline at end of file
+diff --git a/tests/ordered_property_test/tests.py b/tests/ordered_property_test/tests.py
+new file mode 100644
+index 0000000000..db568dd831
+--- /dev/null
++++ b/tests/ordered_property_test/tests.py
+@@ -0,0 +1,29 @@
++from django.db.models import Count
++from django.test import TestCase
++from .models import Foo
++
++
++class OrderedPropertyTests(TestCase):
++    def setUp(self):
++        # Create some test data
++        Foo.objects.create(uuid='1', name='A')
++        Foo.objects.create(uuid='2', name='B')
++        Foo.objects.create(uuid='3', name='C')
++
++    def test_ordered_property_with_annotation(self):
++        # Regular queryset with default ordering
++        qs = Foo.objects.all()
++        
++        # Verify ordered property is True and SQL has ORDER BY
++        self.assertTrue(qs.ordered)
++        self.assertIn('ORDER BY', str(qs.query))
++        
++        # Queryset with GROUP BY
++        qs2 = Foo.objects.annotate(Count('pk'))
++        
++        # Verify SQL doesn't have ORDER BY
++        self.assertNotIn('ORDER BY', str(qs2.query))
++        
++        # This will fail because qs2.ordered is incorrectly True
++        # but the SQL doesn't have an ORDER BY clause
++        self.assertFalse(qs2.ordered)
+\ No newline at end of file

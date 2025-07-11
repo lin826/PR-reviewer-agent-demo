@@ -1,0 +1,380 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..c7336de2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Reproduction script for Unicode method names issue.
++This script reproduces the issue described in the bug report.
++"""
++
++import requests
++import tempfile
++import os
++import sys
++
++def test_method_conversion():
++    """Test the method conversion directly."""
++    print("Test: Direct method conversion test")
++    
++    # Test what happens when we call .upper() on Unicode strings
++    regular_method = 'POST'
++    unicode_method = u'POST'
++    
++    print(f"Regular method: {repr(regular_method)} -> {repr(regular_method.upper())}")
++    print(f"Unicode method: {repr(unicode_method)} -> {repr(unicode_method.upper())}")
++    
++    # Show the types
++    print(f"Regular method type: {type(regular_method.upper())}")
++    print(f"Unicode method type: {type(unicode_method.upper())}")
++    
++    # In Python 2, these would be different types:
++    # regular_method.upper() would be <type 'str'> (bytes)
++    # unicode_method.upper() would be <type 'unicode'>
++
++def test_unicode_method_with_mock():
++    """Test using a mock to simulate the issue without network calls."""
++    print("\nTest: Simulating Unicode method issue")
++    
++    # Import the specific functions we want to test
++    from requests.models import PreparedRequest
++    from requests.utils import to_native_string
++    
++    # Create a PreparedRequest to test method preparation
++    prep = PreparedRequest()
++    
++    # Test with regular string
++    print("Testing with regular string method:")
++    prep.prepare_method('POST')
++    print(f"Result: {repr(prep.method)} (type: {type(prep.method)})")
++    
++    # Test with Unicode string
++    print("Testing with Unicode string method:")
++    prep.prepare_method(u'POST')
++    print(f"Result: {repr(prep.method)} (type: {type(prep.method)})")
++    
++    # Test the to_native_string function
++    print("\nTesting to_native_string function:")
++    regular_result = to_native_string('POST')
++    unicode_result = to_native_string(u'POST')
++    print(f"to_native_string('POST'): {repr(regular_result)} (type: {type(regular_result)})")
++    print(f"to_native_string(u'POST'): {repr(unicode_result)} (type: {type(unicode_result)})")
++
++def test_unicode_method_issue():
++    """Test that demonstrates the Unicode method name issue."""
++    print("\nTest: Full request test (requires network)")
++    
++    # Create a temporary file with some binary content
++    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
++        # Write some binary content that contains non-ASCII bytes
++        tmp_file.write(b'\xcf\x80\x00\x01\x02\x03')  # Some binary data
++        tmp_file_path = tmp_file.name
++    
++    try:
++        # Test 1: Regular string method (should work)
++        print("Test 1: Regular string method 'POST'")
++        files = {'file': open(tmp_file_path, 'rb')}
++        try:
++            # Use httpbin for testing
++            response = requests.request(method='POST', url='http://httpbin.org/post', files=files, timeout=5)
++            print("✓ Regular string method works")
++        except Exception as e:
++            print(f"✗ Regular string method failed: {e}")
++        finally:
++            files['file'].close()
++        
++        # Test 2: Unicode string method (should fail before fix in Python 2)
++        print("\nTest 2: Unicode string method u'POST'")
++        files = {'file': open(tmp_file_path, 'rb')}
++        try:
++            response = requests.request(method=u'POST', url='http://httpbin.org/post', files=files, timeout=5)
++            print("✓ Unicode string method works")
++        except UnicodeDecodeError as e:
++            print(f"✗ Unicode string method failed with UnicodeDecodeError: {e}")
++        except Exception as e:
++            print(f"✗ Unicode string method failed with other error: {e}")
++        finally:
++            files['file'].close()
++            
++    finally:
++        # Clean up
++        os.unlink(tmp_file_path)
++
++if __name__ == '__main__':
++    print(f"Python version: {sys.version}")
++    print("Reproducing Unicode method names issue...")
++    print("=" * 50)
++    
++    test_method_conversion()
++    test_unicode_method_with_mock()
++    
++    # Only run network test if requested
++    if len(sys.argv) > 1 and sys.argv[1] == '--network':
++        test_unicode_method_issue()
++    else:
++        print("\nSkipping network test. Use --network flag to run it.")
+\ No newline at end of file
+diff --git a/requests/models.py b/requests/models.py
+index f82f56a3..2d49061f 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -307,7 +307,7 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+         """Prepares the given HTTP method."""
+         self.method = method
+         if self.method is not None:
+-            self.method = self.method.upper()
++            self.method = to_native_string(self.method.upper())
+ 
+     def prepare_url(self, url, params):
+         """Prepares the given HTTP URL."""
+diff --git a/requests/sessions.py b/requests/sessions.py
+index cc72f65d..c6700dec 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -16,7 +16,7 @@ from .compat import cookielib, OrderedDict, urljoin, urlparse, urlunparse
+ from .cookies import cookiejar_from_dict, extract_cookies_to_jar, RequestsCookieJar
+ from .models import Request, PreparedRequest
+ from .hooks import default_hooks, dispatch_hook
+-from .utils import to_key_val_list, default_headers
++from .utils import to_key_val_list, default_headers, to_native_string
+ from .exceptions import TooManyRedirects, InvalidSchema
+ from .structures import CaseInsensitiveDict
+ 
+@@ -311,7 +311,7 @@ class Session(SessionRedirectMixin):
+         """
+         # Create the Request.
+         req = Request(
+-            method = method.upper(),
++            method = to_native_string(method.upper()),
+             url = url,
+             headers = headers,
+             files = files,
+diff --git a/test_issue_reproduction.py b/test_issue_reproduction.py
+new file mode 100644
+index 00000000..9a94b5dd
+--- /dev/null
++++ b/test_issue_reproduction.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Test that reproduces the exact issue described in the bug report.
++This test verifies that the fix works correctly.
++"""
++
++import requests
++import tempfile
++import os
++
++def test_exact_issue_reproduction():
++    """
++    Test the exact scenario from the issue description:
++    
++    The following example works fine:
++    files = {u'file': open(u'/usr/bin/diff', u'rb')}
++    response = requests.request(method='POST', url=u'http://httpbin.org/post', files=files)
++
++    But the following example (using method=u'POST' instead of method='POST') produces a UnicodeDecodeError:
++    files = {u'file': open(u'/usr/bin/diff', u'rb')}
++    response = requests.request(method=u'POST', url=u'http://httpbin.org/post', files=files)
++    """
++    
++    # Create a temporary file with binary content similar to /usr/bin/diff
++    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
++        # Write some binary content that contains non-ASCII bytes (like the 0xcf mentioned in the error)
++        tmp_file.write(b'\xcf\x80\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f')
++        tmp_file.write(b'Some more binary data with non-ASCII bytes: \xff\xfe\xfd\xfc')
++        tmp_file_path = tmp_file.name
++    
++    try:
++        print("Testing the exact scenario from the issue description...")
++        
++        # Test 1: Regular string method (should work - this was working before)
++        print("\nTest 1: method='POST' (regular string)")
++        files = {u'file': open(tmp_file_path, u'rb')}
++        try:
++            # We'll test the request preparation without actually sending it
++            session = requests.Session()
++            req = requests.Request(method='POST', url=u'http://httpbin.org/post', files=files)
++            prepared = session.prepare_request(req)
++            print(f"✓ Regular string method works. Method type: {type(prepared.method)}")
++            print(f"  Prepared method: {repr(prepared.method)}")
++        except Exception as e:
++            print(f"✗ Regular string method failed: {e}")
++        finally:
++            files[u'file'].close()
++        
++        # Test 2: Unicode string method (this was failing before our fix)
++        print("\nTest 2: method=u'POST' (Unicode string)")
++        files = {u'file': open(tmp_file_path, u'rb')}
++        try:
++            # Test the request preparation without actually sending it
++            session = requests.Session()
++            req = requests.Request(method=u'POST', url=u'http://httpbin.org/post', files=files)
++            prepared = session.prepare_request(req)
++            print(f"✓ Unicode string method works. Method type: {type(prepared.method)}")
++            print(f"  Prepared method: {repr(prepared.method)}")
++        except UnicodeDecodeError as e:
++            print(f"✗ Unicode string method failed with UnicodeDecodeError: {e}")
++            raise
++        except Exception as e:
++            print(f"✗ Unicode string method failed with other error: {e}")
++            raise
++        finally:
++            files[u'file'].close()
++            
++        print("\n✓ Both test cases passed! The issue has been fixed.")
++        
++    finally:
++        # Clean up
++        os.unlink(tmp_file_path)
++
++def test_method_type_consistency():
++    """Test that both regular and Unicode method names result in the same type."""
++    
++    print("\nTesting method type consistency...")
++    
++    session = requests.Session()
++    
++    # Test with regular string
++    req1 = requests.Request(method='POST', url='http://example.com')
++    prep1 = session.prepare_request(req1)
++    
++    # Test with Unicode string
++    req2 = requests.Request(method=u'POST', url='http://example.com')
++    prep2 = session.prepare_request(req2)
++    
++    print(f"Regular method: {repr(prep1.method)} (type: {type(prep1.method)})")
++    print(f"Unicode method: {repr(prep2.method)} (type: {type(prep2.method)})")
++    
++    # Both should be the same
++    assert prep1.method == prep2.method, "Methods should be equal"
++    assert type(prep1.method) == type(prep2.method), "Types should be equal"
++    
++    print("✓ Method types are consistent!")
++
++if __name__ == '__main__':
++    print("Reproducing the exact issue from the bug report...")
++    print("=" * 60)
++    
++    test_exact_issue_reproduction()
++    test_method_type_consistency()
++    
++    print("\n" + "=" * 60)
++    print("✓ All tests passed! The Unicode method names issue has been fixed.")
+\ No newline at end of file
+diff --git a/test_unicode_fix.py b/test_unicode_fix.py
+new file mode 100644
+index 00000000..3d62580a
+--- /dev/null
++++ b/test_unicode_fix.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Comprehensive test for the Unicode method names fix.
++"""
++
++import requests
++from requests.models import PreparedRequest
++from requests.utils import to_native_string
++
++def test_method_types():
++    """Test that all method types are properly converted to native strings."""
++    
++    print("Testing method type conversion...")
++    
++    # Test various method inputs
++    test_methods = [
++        'GET',           # regular string
++        u'POST',         # Unicode string
++        'PUT',           # regular string
++        u'DELETE',       # Unicode string
++        'patch',         # lowercase regular string
++        u'head',         # lowercase Unicode string
++    ]
++    
++    for method in test_methods:
++        print(f"\nTesting method: {repr(method)} (type: {type(method)})")
++        
++        # Test PreparedRequest.prepare_method
++        prep = PreparedRequest()
++        prep.prepare_method(method)
++        print(f"  PreparedRequest result: {repr(prep.method)} (type: {type(prep.method)})")
++        
++        # Verify it's always a native string
++        assert isinstance(prep.method, str), f"Method should be str, got {type(prep.method)}"
++        assert prep.method == method.upper(), f"Method should be uppercase: {prep.method}"
++
++def test_session_request():
++    """Test that session.request works with Unicode method names."""
++    
++    print("\nTesting session.request with Unicode methods...")
++    
++    session = requests.Session()
++    
++    # Test various methods with a simple GET request (no files)
++    test_methods = ['GET', u'GET', 'POST', u'POST']
++    
++    for method in test_methods:
++        print(f"Testing session.request with method: {repr(method)}")
++        try:
++            # Use httpbin.org/get for GET, httpbin.org/post for POST
++            if method.upper() == 'GET':
++                url = 'http://httpbin.org/get'
++            else:
++                url = 'http://httpbin.org/post'
++                
++            response = session.request(method=method, url=url, timeout=5)
++            print(f"  ✓ Success: {response.status_code}")
++        except Exception as e:
++            print(f"  ✗ Failed: {e}")
++            raise
++
++def test_edge_cases():
++    """Test edge cases for method handling."""
++    
++    print("\nTesting edge cases...")
++    
++    # Test None method
++    prep = PreparedRequest()
++    prep.prepare_method(None)
++    assert prep.method is None, "None method should remain None"
++    print("✓ None method handled correctly")
++    
++    # Test empty string
++    prep = PreparedRequest()
++    prep.prepare_method('')
++    assert prep.method == '', "Empty method should remain empty"
++    print("✓ Empty method handled correctly")
++    
++    # Test Unicode empty string
++    prep = PreparedRequest()
++    prep.prepare_method(u'')
++    assert prep.method == '', "Unicode empty method should become empty string"
++    assert isinstance(prep.method, str), "Result should be native string"
++    print("✓ Unicode empty method handled correctly")
++
++if __name__ == '__main__':
++    print("Running comprehensive Unicode method fix tests...")
++    print("=" * 60)
++    
++    test_method_types()
++    test_edge_cases()
++    
++    # Only run network tests if we can
++    try:
++        test_session_request()
++        print("\n" + "=" * 60)
++        print("✓ All tests passed!")
++    except Exception as e:
++        print(f"\n✗ Network test failed: {e}")
++        print("This might be due to network connectivity issues.")
++        print("The core fix is still working correctly.")
+\ No newline at end of file

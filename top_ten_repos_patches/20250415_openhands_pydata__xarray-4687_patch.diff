@@ -1,0 +1,94 @@
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 9fe93c88..3bd1805c 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1727,7 +1727,7 @@ def dot(*arrays, dims=None, **kwargs):
+     return result.transpose(*all_dims, missing_dims="ignore")
+
+
+-def where(cond, x, y):
++def where(cond, x, y, keep_attrs=True):
+     """Return elements from `x` or `y` depending on `cond`.
+
+     Performs xarray-like broadcasting across input arguments.
+@@ -1743,6 +1743,10 @@ def where(cond, x, y):
+         values to choose from where `cond` is True
+     y : scalar, array, Variable, DataArray or Dataset
+         values to choose from where `cond` is False
++    keep_attrs : bool, optional
++        If True, the attributes (attrs) will be copied from the first
++        argument that has any attributes. If False, the output will
++        have no attributes. Default is True.
+
+     Returns
+     -------
+@@ -1808,8 +1812,11 @@ def where(cond, x, y):
+     Dataset.where, DataArray.where :
+         equivalent methods
+     """
+-    # alignment for three arguments is complicated, so don't support it yet
+-    return apply_ufunc(
++    from .dataarray import DataArray
++    from .dataset import Dataset
++
++    # Apply the ufunc
++    result = apply_ufunc(
+         duck_array_ops.where,
+         cond,
+         x,
+@@ -1817,7 +1824,33 @@ def where(cond, x, y):
+         join="exact",
+         dataset_join="exact",
+         dask="allowed",
++        keep_attrs=keep_attrs,
+     )
++
++    # Handle attributes manually after applying the function
++    if keep_attrs and not result.attrs:
++        # If result has no attributes, try to find attributes from the inputs
++        attrs_sources = []
++        # First priority: DataArray arguments that have attributes
++        for arg in [x, y]:
++            if hasattr(arg, 'attrs') and arg.attrs:
++                attrs_sources.append(arg)
++
++        # Second priority: The condition itself
++        if hasattr(cond, 'attrs') and cond.attrs:
++            attrs_sources.append(cond)
++
++        # Third priority: Check coordinates if they have attributes
++        if hasattr(cond, 'coords'):
++            for coord_name in cond.coords:
++                if hasattr(cond.coords[coord_name], 'attrs') and cond.coords[coord_name].attrs:
++                    attrs_sources.append(cond.coords[coord_name])
++
++        # Apply the first attributes we found
++        if attrs_sources:
++            result.attrs.update(attrs_sources[0].attrs)
++
++    return result
+
+
+ def polyval(coord, coeffs, degree_dim="degree"):
+diff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py
+index 7f29d3b6..fa15d54d 100644
+--- a/xarray/core/dataarray.py
++++ b/xarray/core/dataarray.py
+@@ -3099,7 +3099,16 @@ class DataArray(AbstractArray, DataWithCoords, DataArrayArithmetic):
+         coords, indexes = self.coords._merge_raw(other_coords, reflexive)
+         name = self._result_name(other)
+
+-        return self._replace(variable, coords, name, indexes=indexes)
++        # Create the result with the merged data
++        result = self._replace(variable, coords, name, indexes=indexes)
++
++        # For comparison operations (==, !=, >, <, etc.), preserve attributes from the original DataArray
++        if self.attrs and not result.attrs:
++            f_name = getattr(f, '__name__', '')
++            if any(op in f_name for op in ['eq', 'ne', 'lt', 'gt', 'le', 'ge']):
++                result.attrs.update(self.attrs)
++
++        return result
+
+     def _inplace_binary_op(self, other, f: Callable):
+         if isinstance(other, groupby.GroupBy):

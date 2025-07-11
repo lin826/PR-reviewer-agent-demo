@@ -1,0 +1,106 @@
+diff --git a/lib/matplotlib/axes/_base.py b/lib/matplotlib/axes/_base.py
+index da2dea6f57..8eef05e872 100644
+--- a/lib/matplotlib/axes/_base.py
++++ b/lib/matplotlib/axes/_base.py
+@@ -3644,10 +3644,21 @@ class _AxesBase(martist.Artist):
+                 f"Attempting to set identical bottom == top == {bottom} "
+                 f"results in singular transformations; automatically "
+                 f"expanding.")
++        # Track whether an inverted y-axis was requested
++        user_requested_inversion = bottom > top
++        
++        # Make sure limits are valid for the scale
+         bottom, top = self.yaxis.get_major_locator().nonsingular(bottom, top)
+         bottom, top = self.yaxis.limit_range_for_scale(bottom, top)
+ 
+-        self.viewLim.intervaly = (bottom, top)
++        # Set the view limits
++        if user_requested_inversion and self.get_yscale() == 'log':
++            # For log scale, we might not have bottom > top even if that was requested,
++            # because log scale limits are adjusted to be positive
++            # Force inversion by swapping the values here
++            self.viewLim.intervaly = (top, bottom)
++        else:
++            self.viewLim.intervaly = (bottom, top)
+         if auto is not None:
+             self._autoscaleYon = bool(auto)
+ 
+diff --git a/lib/matplotlib/scale.py b/lib/matplotlib/scale.py
+index b482a664b7..38eeffc446 100644
+--- a/lib/matplotlib/scale.py
++++ b/lib/matplotlib/scale.py
+@@ -424,9 +424,19 @@ class LogScale(ScaleBase):
+         if not np.isfinite(minpos):
+             minpos = 1e-300  # This value should rarely if ever
+                              # end up with a visible effect.
+-
+-        return (minpos if vmin <= 0 else vmin,
+-                minpos if vmax <= 0 else vmax)
++        
++        # Check if the axis was supposed to be inverted
++        inverted = vmin > vmax
++        
++        # Apply the log-scale constraint (must be positive)
++        vmin = minpos if vmin <= 0 else vmin
++        vmax = minpos if vmax <= 0 else vmax
++        
++        # Return the limits in the original order (preserving inversion if requested)
++        if inverted:
++            return vmax, vmin
++        else:
++            return vmin, vmax
+ 
+ 
+ class FuncScaleLog(LogScale):
+diff --git a/lib/matplotlib/ticker.py b/lib/matplotlib/ticker.py
+index 209a3f92ce..13751eea08 100644
+--- a/lib/matplotlib/ticker.py
++++ b/lib/matplotlib/ticker.py
+@@ -2376,26 +2376,43 @@ class LogLocator(Locator):
+         return vmin, vmax
+ 
+     def nonsingular(self, vmin, vmax):
++        """
++        Ensure that the scale is nonsingular and preserve the inversion request
++        if vmin > vmax.
++        """
+         if not np.isfinite(vmin) or not np.isfinite(vmax):
+             return 1, 10  # initial range, no data plotted yet
+ 
+-        if vmin > vmax:
+-            vmin, vmax = vmax, vmin
++        # Remember if the axis is being inverted
++        inverted = vmin > vmax
++        
++        # Ensure we have positive values for log scale
+         if vmax <= 0:
+             cbook._warn_external(
+                 "Data has no positive values, and therefore cannot be "
+                 "log-scaled.")
+             return 1, 10
+-
++        
++        # Get the minimum positive value
+         minpos = self.axis.get_minpos()
+         if not np.isfinite(minpos):
+             minpos = 1e-300  # This should never take effect.
++        
++        # Adjust negative values to be positive
++        orig_vmin = vmin  # save for comparison later
+         if vmin <= 0:
+             vmin = minpos
++        
++        # Check for singularity
+         if vmin == vmax:
+             vmin = _decade_less(vmin, self._base)
+             vmax = _decade_greater(vmax, self._base)
+-        return vmin, vmax
++        
++        # Respect the inversion request (vmin > vmax)
++        if inverted:
++            return vmax, vmin
++        else:
++            return vmin, vmax
+ 
+ 
+ class SymmetricalLogLocator(Locator):

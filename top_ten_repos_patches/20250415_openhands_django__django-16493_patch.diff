@@ -1,0 +1,170 @@
+diff --git a/django/db/models/fields/files.py b/django/db/models/fields/files.py
+index 7a99b12691..bcf150516b 100644
+--- a/django/db/models/fields/files.py
++++ b/django/db/models/fields/files.py
+@@ -295,7 +295,7 @@ class FileField(Field):
+         if kwargs.get("max_length") == 100:
+             del kwargs["max_length"]
+         kwargs["upload_to"] = self.upload_to
+-        if self.storage is not default_storage:
++        if hasattr(self, "_storage_callable") or self.storage is not default_storage:
+             kwargs["storage"] = getattr(self, "_storage_callable", self.storage)
+         return name, path, args, kwargs
+
+diff --git a/test_filefield_deconstruct.py b/test_filefield_deconstruct.py
+new file mode 100755
+index 0000000000..193856404a
+--- /dev/null
++++ b/test_filefield_deconstruct.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python
++
++import random
++import sys
++from django.conf import settings
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++from django.apps import apps
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        DEFAULT_FILE_STORAGE='django.core.files.storage.FileSystemStorage',
++        MEDIA_ROOT='/tmp/media'
++    )
++    apps.populate(settings.INSTALLED_APPS)
++
++# Define storage functions
++other_storage = FileSystemStorage(location='/tmp/other')
++
++def get_default_storage():
++    # This function always returns default_storage
++    return default_storage
++
++def get_random_storage():
++    # This function randomly returns either default_storage or other_storage
++    return random.choice([default_storage, other_storage])
++
++# Define model with FileField
++class MyModel(models.Model):
++    # This field's storage is a callable that always returns default_storage
++    file1 = models.FileField(upload_to='uploads', storage=get_default_storage)
++    # This field's storage is a callable that randomly returns default_storage or other_storage
++    file2 = models.FileField(upload_to='uploads', storage=get_random_storage)
++    # This field uses default_storage directly
++    file3 = models.FileField(upload_to='uploads', storage=default_storage)
++    # This field uses other_storage directly
++    file4 = models.FileField(upload_to='uploads', storage=other_storage)
++
++    class Meta:
++        # Add explicit app_label to avoid RuntimeError
++        app_label = 'test_app'
++
++def test_deconstruct():
++    """Test that the deconstruct method correctly handles callable storage"""
++    print("Testing FileField deconstruct method with callable storage...")
++
++    # Check if file1's deconstruct includes the storage parameter
++    name, path, args, kwargs = MyModel._meta.get_field('file1').deconstruct()
++    if 'storage' in kwargs:
++        print("✓ file1: storage parameter is correctly included when callable returns default_storage")
++    else:
++        print("✗ file1: storage parameter is missing when callable returns default_storage")
++
++    # Check if file2's deconstruct includes the storage parameter
++    name, path, args, kwargs = MyModel._meta.get_field('file2').deconstruct()
++    if 'storage' in kwargs:
++        print("✓ file2: storage parameter is correctly included for random storage callable")
++    else:
++        print("✗ file2: storage parameter is missing for random storage callable")
++
++    # Check file3 (should not have storage in deconstruct)
++    name, path, args, kwargs = MyModel._meta.get_field('file3').deconstruct()
++    if 'storage' not in kwargs:
++        print("✓ file3: storage parameter correctly omitted for default_storage")
++    else:
++        print("✗ file3: storage parameter incorrectly included for default_storage")
++
++    # Check file4 (should have storage in deconstruct)
++    name, path, args, kwargs = MyModel._meta.get_field('file4').deconstruct()
++    if 'storage' in kwargs:
++        print("✓ file4: storage parameter correctly included for non-default storage")
++    else:
++        print("✗ file4: storage parameter missing for non-default storage")
++
++if __name__ == "__main__":
++    test_deconstruct()
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..f1f5f51641
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python
++
++import random
++import sys
++from django.conf import settings
++from django.core.files.storage import FileSystemStorage, default_storage
++from django.db import models
++from django.apps import apps
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        DEFAULT_FILE_STORAGE='django.core.files.storage.FileSystemStorage',
++        MEDIA_ROOT='/tmp/media'
++    )
++    apps.populate(settings.INSTALLED_APPS)
++
++# Create the exact setup described in the issue
++other_storage = FileSystemStorage(location='/media/other')
++
++def get_storage():
++    return random.choice([default_storage, other_storage])
++
++class MyModel(models.Model):
++    my_file = models.FileField(storage=get_storage)
++
++    class Meta:
++        app_label = 'test_app'
++
++def check_deconstruct_includes_storage(iterations=10):
++    """
++    Check that the deconstructed form of the field consistently includes the storage parameter
++    regardless of what the callable returns. Run multiple iterations to check consistency.
++    """
++    print(f"Checking FileField.deconstruct() behavior over {iterations} iterations...")
++
++    inconsistent_results = False
++    storage_included_count = 0
++
++    for i in range(iterations):
++        # Reset random seed to get different random choices
++        random.seed(i)
++
++        # Get the deconstructed form
++        name, path, args, kwargs = MyModel._meta.get_field('my_file').deconstruct()
++
++        if 'storage' in kwargs:
++            storage_included_count += 1
++        else:
++            # If ever not included, mark as inconsistent
++            inconsistent_results = True
++
++    if inconsistent_results:
++        print(f"✗ FAILURE: storage parameter inconsistently included ({storage_included_count}/{iterations} times)")
++    else:
++        print(f"✓ SUCCESS: storage parameter consistently included in all {iterations} iterations")
++
++    return not inconsistent_results
++
++if __name__ == "__main__":
++    success = check_deconstruct_includes_storage()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

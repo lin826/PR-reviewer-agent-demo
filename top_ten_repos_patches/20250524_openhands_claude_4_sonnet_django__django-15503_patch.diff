@@ -1,0 +1,625 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..7401c15af2
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++"""
++Debug script to understand what's happening with the failing test.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from django.db.models import F
++from django.db.models.functions import Cast
++from django.db.models.fields.json import KeyTransform
++
++class NullableJSONModel(models.Model):
++    value = models.JSONField(null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def debug_key_transform_expression():
++    """Debug the failing test_key_transform_expression."""
++    print(f"Testing on {connection.vendor} database...")
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(NullableJSONModel)
++    
++    # Create test data similar to the failing test
++    test_data = {
++        "a": "b",
++        "c": 14,
++        "d": ["e", {"f": "g"}],
++        "h": True,
++        "i": False,
++        "j": None,
++        "k": {"l": "m"},
++        "n": [None, True, False],
++        "o": '"quoted"',
++        "p": 4.2,
++        "r": {"s": True, "t": False},
++    }
++    
++    obj = NullableJSONModel.objects.create(value=test_data)
++    print(f"Created object with data: {obj.value}")
++    
++    # Test the failing query
++    print("\nTesting the failing query:")
++    qs = NullableJSONModel.objects.filter(value__d__0__isnull=False).annotate(
++        key=KeyTransform("d", "value"),
++        chain=KeyTransform("0", "key"),
++        expr=KeyTransform("0", Cast("key", models.JSONField())),
++    ).filter(chain=F("expr"))
++    
++    print(f"Query: {qs.query}")
++    print(f"Results: {list(qs)}")
++    
++    # Test individual parts
++    print("\nTesting individual parts:")
++    
++    # Test value__d__0
++    d0_qs = NullableJSONModel.objects.filter(value__d__0__isnull=False)
++    print(f"value__d__0__isnull=False: {list(d0_qs)}")
++    
++    # Test annotations
++    annotated_qs = NullableJSONModel.objects.annotate(
++        key=KeyTransform("d", "value"),
++        chain=KeyTransform("0", "key"),
++        expr=KeyTransform("0", Cast("key", models.JSONField())),
++    )
++    
++    for obj in annotated_qs:
++        print(f"Object {obj.id}: key={obj.key}, chain={obj.chain}, expr={obj.expr}")
++
++if __name__ == '__main__':
++    debug_key_transform_expression()
+\ No newline at end of file
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..3298764fd2 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -237,8 +237,115 @@ class HasKey(HasKeyLookup):
+     postgres_operator = "?"
+     prepare_rhs = False
+ 
++    def _compile_json_path_for_has_key(self, key_transforms, include_root=True):
++        """
++        Compile JSON path for has_key lookups, treating all keys as object properties.
++        This is different from the general compile_json_path which treats numeric
++        strings as array indices.
++        """
++        path = ["$"] if include_root else []
++        for key_transform in key_transforms:
++            path.append(".")
++            path.append(json.dumps(key_transform))
++        return "".join(path)
++
++    def as_mysql(self, compiler, connection):
++        # Process JSON path from the left-hand side.
++        if isinstance(self.lhs, KeyTransform):
++            lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(
++                compiler, connection
++            )
++            lhs_json_path = compile_json_path(lhs_key_transforms)
++        else:
++            lhs, lhs_params = self.process_lhs(compiler, connection)
++            lhs_json_path = "$"
++        
++        # Process JSON path from the right-hand side.
++        rhs = self.rhs
++        rhs_params = []
++        if not isinstance(rhs, (list, tuple)):
++            rhs = [rhs]
++        for key in rhs:
++            if isinstance(key, KeyTransform):
++                *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
++                rhs_path = compile_json_path(rhs_key_transforms, include_root=False)
++            else:
++                # For has_key lookups, always treat the key as an object property
++                rhs_path = self._compile_json_path_for_has_key([key], include_root=False)
++            rhs_params.append("%s%s" % (lhs_json_path, rhs_path))
++        
++        # Add condition for each key.
++        sql = "JSON_CONTAINS_PATH(%s, 'one', %%s)" % lhs
++        if self.logical_operator:
++            sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
++        return sql, tuple(lhs_params) + tuple(rhs_params)
++
++    def as_oracle(self, compiler, connection):
++        # Process JSON path from the left-hand side.
++        if isinstance(self.lhs, KeyTransform):
++            lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(
++                compiler, connection
++            )
++            lhs_json_path = compile_json_path(lhs_key_transforms)
++        else:
++            lhs, lhs_params = self.process_lhs(compiler, connection)
++            lhs_json_path = "$"
++        
++        # Process JSON path from the right-hand side.
++        rhs = self.rhs
++        rhs_params = []
++        if not isinstance(rhs, (list, tuple)):
++            rhs = [rhs]
++        for key in rhs:
++            if isinstance(key, KeyTransform):
++                *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
++                rhs_path = compile_json_path(rhs_key_transforms, include_root=False)
++            else:
++                # For has_key lookups, always treat the key as an object property
++                rhs_path = self._compile_json_path_for_has_key([key], include_root=False)
++            rhs_params.append("%s%s" % (lhs_json_path, rhs_path))
++        
++        # Add condition for each key.
++        sql = "JSON_EXISTS(%s, '%%s')" % lhs
++        if self.logical_operator:
++            sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
++        # Add paths directly into SQL because path expressions cannot be passed
++        # as bind variables on Oracle.
++        return sql % tuple(rhs_params), tuple(lhs_params)
++
++    def as_sqlite(self, compiler, connection):
++        # Process JSON path from the left-hand side.
++        if isinstance(self.lhs, KeyTransform):
++            lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(
++                compiler, connection
++            )
++            lhs_json_path = compile_json_path(lhs_key_transforms)
++        else:
++            lhs, lhs_params = self.process_lhs(compiler, connection)
++            lhs_json_path = "$"
++        
++        # Process JSON path from the right-hand side.
++        rhs = self.rhs
++        rhs_params = []
++        if not isinstance(rhs, (list, tuple)):
++            rhs = [rhs]
++        for key in rhs:
++            if isinstance(key, KeyTransform):
++                *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
++                rhs_path = compile_json_path(rhs_key_transforms, include_root=False)
++            else:
++                # For has_key lookups, always treat the key as an object property
++                rhs_path = self._compile_json_path_for_has_key([key], include_root=False)
++            rhs_params.append("%s%s" % (lhs_json_path, rhs_path))
++        
++        # Add condition for each key.
++        sql = "JSON_TYPE(%s, %%s) IS NOT NULL" % lhs
++        if self.logical_operator:
++            sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
++        return sql, tuple(lhs_params) + tuple(rhs_params)
++
+ 
+-class HasKeys(HasKeyLookup):
++class HasKeys(HasKey):
+     lookup_name = "has_keys"
+     postgres_operator = "?&"
+     logical_operator = " AND "
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..2738dfc8ac
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the JSONField has_key lookup issue with numeric keys.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++
++class JsonFieldHasKeyTest(models.Model):
++    data = models.JSONField()
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def test_has_key_numeric_issue():
++    """Test that reproduces the has_key issue with numeric keys."""
++    print(f"Testing on {connection.vendor} database...")
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(JsonFieldHasKeyTest)
++    
++    # Create test data
++    test1 = JsonFieldHasKeyTest(data={'foo': 'bar'})
++    test2 = JsonFieldHasKeyTest(data={'1111': 'bar'})
++    test3 = JsonFieldHasKeyTest(data={'123': 'baz'})
++    test4 = JsonFieldHasKeyTest(data={123: 'numeric_key'})  # This will be converted to string
++    
++    test1.save()
++    test2.save()
++    test3.save()
++    test4.save()
++    
++    print("Created test data:")
++    for obj in JsonFieldHasKeyTest.objects.all():
++        print(f"  ID {obj.id}: {obj.data}")
++    
++    # Test has_key lookups
++    print("\nTesting has_key lookups:")
++    
++    # Test non-numeric key (should work)
++    c1 = JsonFieldHasKeyTest.objects.filter(data__has_key='foo').count()
++    print(f"data__has_key='foo': {c1} (expected: 1)")
++    
++    # Test numeric-looking string key (this is the bug)
++    c2 = JsonFieldHasKeyTest.objects.filter(data__has_key='1111').count()
++    print(f"data__has_key='1111': {c2} (expected: 1)")
++    
++    # Test another numeric-looking string key
++    c3 = JsonFieldHasKeyTest.objects.filter(data__has_key='123').count()
++    print(f"data__has_key='123': {c3} (expected: 2)")  # Both test3 and test4 should match
++    
++    # Show the actual SQL being generated
++    print("\nGenerated SQL queries:")
++    
++    # Get the SQL for the problematic query
++    qs = JsonFieldHasKeyTest.objects.filter(data__has_key='1111')
++    print(f"Query for data__has_key='1111': {qs.query}")
++    
++    # Test has_keys and has_any_keys as well
++    print("\nTesting has_keys and has_any_keys:")
++    c4 = JsonFieldHasKeyTest.objects.filter(data__has_keys=['1111']).count()
++    print(f"data__has_keys=['1111']: {c4} (expected: 1)")
++    
++    c5 = JsonFieldHasKeyTest.objects.filter(data__has_any_keys=['1111', 'foo']).count()
++    print(f"data__has_any_keys=['1111', 'foo']: {c5} (expected: 2)")
++    
++    # Check if the issue exists
++    if c2 == 0:
++        print("\n❌ BUG CONFIRMED: Numeric-looking string keys are not found!")
++        return False
++    else:
++        print("\n✅ No bug detected: Numeric-looking string keys work correctly.")
++        return True
++
++
++if __name__ == '__main__':
++    test_has_key_numeric_issue()
+\ No newline at end of file
+diff --git a/test_compile_json_path.py b/test_compile_json_path.py
+new file mode 100644
+index 0000000000..2613d53cc6
+--- /dev/null
++++ b/test_compile_json_path.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python
++"""
++Test the compile_json_path function directly to understand the bug.
++"""
++import sys
++import os
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++from django.db.models.fields.json import compile_json_path
++
++def test_compile_json_path():
++    """Test the compile_json_path function directly."""
++    print("Testing compile_json_path function:")
++    
++    # Test cases showing the bug
++    test_cases = [
++        # (input, current_output, expected_output)
++        (['foo'], '$."foo"', '$."foo"'),  # Non-numeric key - works correctly
++        (['1111'], '$[1111]', '$."1111"'),  # Numeric-looking string key - BUG!
++        (['123'], '$[123]', '$."123"'),   # Another numeric-looking string key - BUG!
++        ([1], '$[1]', '$[1]'),          # Actual integer (for array access) - works correctly
++        (['foo', 'bar'], '$."foo"."bar"', '$."foo"."bar"'),  # Nested keys - works correctly
++        (['foo', '123'], '$."foo"[123]', '$."foo"."123"'),  # Mixed keys - BUG in second part!
++        (['0'], '$[0]', '$."0"'),       # Zero as string - BUG!
++        (['-1'], '$[-1]', '$."-1"'),    # Negative number as string - BUG!
++    ]
++    
++    print("Current behavior vs expected behavior:")
++    print("=" * 60)
++    
++    bugs_found = 0
++    for key_transforms, expected_current, expected_correct in test_cases:
++        result = compile_json_path(key_transforms)
++        is_bug = result != expected_correct
++        status = "❌ BUG" if is_bug else "✅ OK"
++        
++        print(f"{status} compile_json_path({key_transforms})")
++        print(f"     Current:  '{result}'")
++        print(f"     Expected: '{expected_correct}'")
++        
++        if is_bug:
++            bugs_found += 1
++            print(f"     Problem:  String '{key_transforms[0]}' treated as integer")
++        print()
++    
++    print(f"Summary: {bugs_found} bugs found in compile_json_path function")
++    print("\nThe issue: compile_json_path treats string keys that look like numbers")
++    print("as array indices instead of object property names.")
++    
++    return bugs_found == 0
++
++if __name__ == '__main__':
++    test_compile_json_path()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..e2cc5a2723
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the fix for numeric keys in has_key lookups.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++
++class JsonFieldTest(models.Model):
++    data = models.JSONField()
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def test_comprehensive_has_key():
++    """Comprehensive test for has_key lookups with various key types."""
++    print(f"Testing on {connection.vendor} database...")
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(JsonFieldTest)
++    
++    # Create test data with various key types
++    test_cases = [
++        {'foo': 'bar'},                    # Regular string key
++        {'1111': 'numeric_string'},        # Numeric-looking string key (main bug)
++        {'123': 'another_numeric'},        # Another numeric string
++        {'0': 'zero_string'},              # Zero as string
++        {'-1': 'negative_string'},         # Negative number as string
++        {'1.5': 'decimal_string'},         # Decimal as string
++        {'': 'empty_string'},              # Empty string key
++        {'key with spaces': 'spaced'},     # Key with spaces
++        {'key-with-dashes': 'dashed'},     # Key with dashes
++        {'key_with_underscores': 'underscored'},  # Key with underscores
++        {'UPPERCASE': 'upper'},            # Uppercase key
++        {'MixedCase': 'mixed'},            # Mixed case key
++        {'unicode_key_ñ': 'unicode'},      # Unicode key
++        {'123abc': 'mixed_alphanumeric'},  # Mixed alphanumeric starting with number
++        {'abc123': 'mixed_alphanumeric2'}, # Mixed alphanumeric ending with number
++    ]
++    
++    # Create objects
++    objects = []
++    for i, data in enumerate(test_cases):
++        obj = JsonFieldTest.objects.create(data=data)
++        objects.append(obj)
++        print(f"Created object {i+1}: {data}")
++    
++    print(f"\nTesting has_key lookups:")
++    
++    # Test each key
++    all_passed = True
++    for i, data in enumerate(test_cases):
++        key = list(data.keys())[0]
++        expected_value = data[key]
++        
++        # Test has_key
++        results = JsonFieldTest.objects.filter(data__has_key=key)
++        count = results.count()
++        
++        if count == 1:
++            result_obj = results.first()
++            actual_value = result_obj.data.get(key)
++            if actual_value == expected_value:
++                print(f"✅ has_key='{key}': Found correct object with value '{actual_value}'")
++            else:
++                print(f"❌ has_key='{key}': Found object but wrong value. Expected '{expected_value}', got '{actual_value}'")
++                all_passed = False
++        else:
++            print(f"❌ has_key='{key}': Expected 1 result, got {count}")
++            all_passed = False
++    
++    print(f"\nTesting has_keys lookups:")
++    
++    # Test has_keys with multiple numeric-looking keys
++    numeric_keys = ['1111', '123', '0', '-1']
++    results = JsonFieldTest.objects.filter(data__has_keys=numeric_keys)
++    count = results.count()
++    print(f"has_keys={numeric_keys}: {count} results (expected: 0, since no object has all these keys)")
++    
++    # Test has_keys with existing keys
++    existing_keys = ['1111', '123']
++    results = JsonFieldTest.objects.filter(data__has_keys=existing_keys)
++    count = results.count()
++    print(f"has_keys={existing_keys}: {count} results (expected: 0, since no single object has both keys)")
++    
++    print(f"\nTesting has_any_keys lookups:")
++    
++    # Test has_any_keys with numeric-looking keys
++    results = JsonFieldTest.objects.filter(data__has_any_keys=numeric_keys)
++    count = results.count()
++    print(f"has_any_keys={numeric_keys}: {count} results (expected: 4)")
++    
++    # Test has_any_keys with mix of existing and non-existing keys
++    mixed_keys = ['1111', 'nonexistent', 'foo']
++    results = JsonFieldTest.objects.filter(data__has_any_keys=mixed_keys)
++    count = results.count()
++    print(f"has_any_keys={mixed_keys}: {count} results (expected: 2)")
++    
++    print(f"\nTesting edge cases:")
++    
++    # Test empty string key
++    results = JsonFieldTest.objects.filter(data__has_key='')
++    count = results.count()
++    print(f"has_key='': {count} results (expected: 1)")
++    
++    # Test key that doesn't exist
++    results = JsonFieldTest.objects.filter(data__has_key='nonexistent')
++    count = results.count()
++    print(f"has_key='nonexistent': {count} results (expected: 0)")
++    
++    if all_passed:
++        print(f"\n✅ All tests passed! The fix works correctly.")
++    else:
++        print(f"\n❌ Some tests failed!")
++    
++    return all_passed
++
++
++if __name__ == '__main__':
++    test_comprehensive_has_key()
+\ No newline at end of file
+diff --git a/test_mysql.py b/test_mysql.py
+new file mode 100644
+index 0000000000..cb7909a3b7
+--- /dev/null
++++ b/test_mysql.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python
++"""
++Test the issue with MySQL backend (simulated).
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings for MySQL
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.mysql',
++                'NAME': 'test_db',
++                'USER': 'test',
++                'PASSWORD': 'test',
++                'HOST': 'localhost',
++                'PORT': '3306',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.fields.json import compile_json_path
++
++class JsonFieldHasKeyTest(models.Model):
++    data = models.JSONField()
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_compile_json_path():
++    """Test the compile_json_path function directly."""
++    print("Testing compile_json_path function:")
++    
++    # Test cases
++    test_cases = [
++        (['foo'], '$."foo"'),  # Non-numeric key
++        (['1111'], '$."1111"'),  # Numeric-looking string key (this is the bug)
++        (['123'], '$."123"'),   # Another numeric-looking string key
++        ([1], '$[1]'),          # Actual integer (for array access)
++        (['foo', 'bar'], '$."foo"."bar"'),  # Nested keys
++        (['foo', '123'], '$."foo"."123"'),  # Mixed keys
++    ]
++    
++    for key_transforms, expected in test_cases:
++        result = compile_json_path(key_transforms)
++        status = "✅" if result == expected else "❌"
++        print(f"{status} compile_json_path({key_transforms}) = '{result}' (expected: '{expected}')")
++        
++        if result != expected:
++            print(f"   This shows the bug: numeric-looking strings are treated as array indices")
++
++if __name__ == '__main__':
++    test_compile_json_path()
+\ No newline at end of file

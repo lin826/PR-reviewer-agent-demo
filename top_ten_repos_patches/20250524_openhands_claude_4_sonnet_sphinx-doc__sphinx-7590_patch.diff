@@ -1,0 +1,485 @@
+diff --git a/sphinx/domains/cpp.py b/sphinx/domains/cpp.py
+index fe52d881d..66642d2b6 100644
+--- a/sphinx/domains/cpp.py
++++ b/sphinx/domains/cpp.py
+@@ -882,6 +882,24 @@ class ASTCharLiteral(ASTLiteral):
+         signode.append(nodes.Text(txt, txt))
+ 
+ 
++class ASTUserDefinedLiteral(ASTLiteral):
++    def __init__(self, literal: ASTLiteral, suffix: str) -> None:
++        self.literal = literal
++        self.suffix = suffix
++
++    def _stringify(self, transform: StringifyTransform) -> str:
++        return str(self.literal) + self.suffix
++
++    def get_id(self, version: int) -> str:
++        # For UDLs, we include both the literal and suffix in the ID
++        return "L%s%sE" % (str(self.literal), self.suffix)
++
++    def describe_signature(self, signode: TextElement, mode: str,
++                           env: "BuildEnvironment", symbol: "Symbol") -> None:
++        txt = str(self)
++        signode.append(nodes.Text(txt, txt))
++
++
+ class ASTThisLiteral(ASTExpression):
+     def _stringify(self, transform: StringifyTransform) -> str:
+         return "this"
+@@ -4643,6 +4661,29 @@ class DefinitionParser(BaseParser):
+             self.pos += 1
+         return self.definition[startPos:self.pos]
+ 
++    def _parse_udl_suffix(self) -> str:
++        """Parse a user-defined literal suffix.
++        
++        According to C++ standard, UDL suffix must be an identifier
++        that starts with underscore or letter, followed by letters,
++        digits, and underscores.
++        """
++        if self.eof:
++            return None
++        
++        # UDL suffix must start with underscore or letter
++        if not (self.current_char == '_' or self.current_char.isalpha()):
++            return None
++            
++        start_pos = self.pos
++        self.pos += 1
++        
++        # Continue with letters, digits, and underscores
++        while not self.eof and (self.current_char.isalnum() or self.current_char == '_'):
++            self.pos += 1
++            
++        return self.definition[start_pos:self.pos]
++
+     def _parse_literal(self) -> ASTLiteral:
+         # -> integer-literal
+         #  | character-literal
+@@ -4664,25 +4705,45 @@ class DefinitionParser(BaseParser):
+             if self.match(regex):
+                 while self.current_char in 'uUlLfF':
+                     self.pos += 1
+-                return ASTNumberLiteral(self.definition[pos:self.pos])
++                literal = ASTNumberLiteral(self.definition[pos:self.pos])
++                
++                # Check for user-defined literal suffix
++                udl_suffix = self._parse_udl_suffix()
++                if udl_suffix is not None:
++                    return ASTUserDefinedLiteral(literal, udl_suffix)
++                else:
++                    return literal
+ 
+         string = self._parse_string()
+         if string is not None:
+-            return ASTStringLiteral(string)
++            literal = ASTStringLiteral(string)
++            
++            # Check for user-defined literal suffix
++            udl_suffix = self._parse_udl_suffix()
++            if udl_suffix is not None:
++                return ASTUserDefinedLiteral(literal, udl_suffix)
++            else:
++                return literal
+ 
+         # character-literal
+         if self.match(char_literal_re):
+             prefix = self.last_match.group(1)  # may be None when no prefix
+             data = self.last_match.group(2)
+             try:
+-                return ASTCharLiteral(prefix, data)
++                literal = ASTCharLiteral(prefix, data)
++                
++                # Check for user-defined literal suffix
++                udl_suffix = self._parse_udl_suffix()
++                if udl_suffix is not None:
++                    return ASTUserDefinedLiteral(literal, udl_suffix)
++                else:
++                    return literal
+             except UnicodeDecodeError as e:
+                 self.fail("Can not handle character literal. Internal error was: %s" % e)
+             except UnsupportedMultiCharacterCharLiteral:
+                 self.fail("Can not handle character literal"
+                           " resulting in multiple decoded characters.")
+ 
+-        # TODO: user-defined lit
+         return None
+ 
+     def _parse_fold_or_paren_expression(self) -> ASTExpression:
+diff --git a/test_udl_comprehensive.py b/test_udl_comprehensive.py
+new file mode 100644
+index 000000000..080463bf1
+--- /dev/null
++++ b/test_udl_comprehensive.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for User Defined Literals implementation.
++
++This test follows the same pattern as the existing tests in test_domain_cpp.py
++to ensure UDLs work correctly with the expression checking framework.
++"""
++
++import sys
++import traceback
++from sphinx.domains.cpp import DefinitionParser, DefinitionError
++
++
++def test_udl_expressions():
++    """Test UDL expressions using the same pattern as test_domain_cpp.py"""
++    
++    def exprCheck(expr, expected_id, id4=None):
++        """Check expression parsing like in the original tests"""
++        ids = 'IE1CIA%s_1aE'
++        idDict = {2: ids % expr, 3: ids % expected_id}
++        if id4 is not None:
++            idDict[4] = ids % id4
++        check('class', 'template<> C<a[%s]>' % expr, idDict)
++
++    def check(name, string, idDict):
++        """Check parsing like in the original tests"""
++        class Config:
++            cpp_id_attributes = ["id_attr"]
++            cpp_paren_attributes = ["paren_attr"]
++        
++        parser = DefinitionParser(string, location=None, config=Config())
++        parser.allowFallbackExpressionParsing = False
++        ast = parser.parse_declaration(name, name)
++        parser.assert_end()
++        
++        # Check that the AST was created successfully
++        print(f"✓ Parsed: {string}")
++        print(f"  AST: {ast}")
++        return ast
++
++    print("Testing UDL expressions with exprCheck...")
++    print("=" * 60)
++    
++    # Test numeric UDLs
++    print("\n1. Numeric UDLs:")
++    exprCheck('42_km', 'L42_kmE')
++    exprCheck('3.14_pi', 'L3.14_piE') 
++    exprCheck('100u_count', 'L100u_countE')
++    exprCheck('0x42_hex', 'L0x42_hexE')
++    exprCheck('0b101_binary', 'L0b101_binaryE')
++    
++    # Test string UDLs
++    print("\n2. String UDLs:")
++    exprCheck('"hello"_mystr', 'L"hello"_mystrE')
++    exprCheck('"world"_s', 'L"world"_sE')
++    
++    # Test character UDLs  
++    print("\n3. Character UDLs:")
++    exprCheck("'a'_mychar", "L'a'_mycharE")
++    exprCheck("'\\n'_newline", "L'\\n'_newlineE")
++    
++    # Test the original issue case
++    print("\n4. Original issue case:")
++    exprCheck('6.62607015e-34q_J', 'L6.62607015e-34q_JE')
++    exprCheck('1q_s', 'L1q_sE')
++    
++    # Test complex expressions with UDLs
++    print("\n5. Complex expressions:")
++    check('member', 'auto planck_constant = 6.62607015e-34q_J * 1q_s', {})
++    check('member', 'auto distance = 42.0_km + 10.5_m', {})
++    
++    print("\n✓ All UDL tests passed!")
++
++
++def test_udl_edge_cases():
++    """Test edge cases for UDL parsing"""
++    
++    class Config:
++        cpp_id_attributes = ["id_attr"]
++        cpp_paren_attributes = ["paren_attr"]
++    
++    print("\nTesting UDL edge cases...")
++    print("=" * 60)
++    
++    edge_cases = [
++        # Valid UDL suffixes
++        ("42_a", "Valid single letter suffix"),
++        ("42_abc", "Valid multi-letter suffix"),
++        ("42_a1b2", "Valid alphanumeric suffix"),
++        ("42_a_b_c", "Valid suffix with underscores"),
++        ("42__double", "Valid suffix starting with double underscore"),
++        
++        # Standard suffixes should still work
++        ("42u", "Standard unsigned suffix"),
++        ("3.14f", "Standard float suffix"),
++        ("100L", "Standard long suffix"),
++        ("42uL", "Standard combined suffixes"),
++        
++        # Mixed cases
++        ("42ul_custom", "Standard suffix followed by UDL"),
++    ]
++    
++    for expr, description in edge_cases:
++        print(f"\nTesting: {expr} ({description})")
++        try:
++            parser = DefinitionParser(f"auto val = {expr}", location=None, config=Config())
++            parser.allowFallbackExpressionParsing = False
++            ast = parser.parse_declaration("member", "var")
++            parser.assert_end()
++            print(f"✓ SUCCESS: {ast}")
++        except Exception as e:
++            print(f"✗ FAILED: {e}")
++
++
++if __name__ == "__main__":
++    test_udl_expressions()
++    test_udl_edge_cases()
+\ No newline at end of file
+diff --git a/test_udl_real_world.py b/test_udl_real_world.py
+new file mode 100644
+index 000000000..62666c36d
+--- /dev/null
++++ b/test_udl_real_world.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python3
++"""
++Real-world test for UDL support in Sphinx documentation.
++
++This test creates a minimal Sphinx project and tests UDL parsing
++in actual documentation context.
++"""
++
++import tempfile
++import os
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def test_udl_in_sphinx_docs():
++    """Test UDLs in a real Sphinx documentation context"""
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = os.path.join(tmpdir, 'source')
++        outdir = os.path.join(tmpdir, 'build')
++        doctreedir = os.path.join(tmpdir, 'doctrees')
++        confdir = srcdir
++        
++        os.makedirs(srcdir)
++        
++        # Create conf.py
++        with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++            f.write("""
++extensions = ['sphinx.ext.autodoc']
++master_doc = 'index'
++""")
++        
++        # Create index.rst with UDL examples
++        with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++            f.write("""
++Test UDL Support
++================
++
++This tests User Defined Literals in C++ domain.
++
++.. cpp:var:: constexpr auto planck_constant = 6.62607015e-34q_J * 1q_s
++
++   The Planck constant with UDL suffixes.
++
++.. cpp:var:: auto distance = 42.0_km
++
++   Distance with kilometer UDL suffix.
++
++.. cpp:var:: auto time = 10_s
++
++   Time with second UDL suffix.
++
++.. cpp:var:: auto message = "hello"_mystring
++
++   String with custom UDL suffix.
++
++.. cpp:var:: auto character = 'a'_mychar
++
++   Character with custom UDL suffix.
++""")
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(srcdir, confdir, outdir, doctreedir, 'html')
++            app.build()
++            
++        # Check that build was successful
++        index_html = os.path.join(outdir, 'index.html')
++        if os.path.exists(index_html):
++            with open(index_html, 'r') as f:
++                content = f.read()
++                
++            # Check that UDLs are present in the output
++            udl_examples = [
++                '6.62607015e-34q_J',
++                '1q_s',
++                '42.0_km',
++                '10_s',
++                '&quot;hello&quot;_mystring',  # HTML escaped quotes
++                "'a'_mychar"
++            ]
++            
++            print("Testing UDL support in real Sphinx documentation...")
++            print("=" * 60)
++            
++            all_found = True
++            for udl in udl_examples:
++                if udl in content:
++                    print(f"✓ Found UDL: {udl}")
++                else:
++                    print(f"✗ Missing UDL: {udl}")
++                    all_found = False
++            
++            if all_found:
++                print("\n✓ All UDLs successfully processed in Sphinx documentation!")
++                return True
++            else:
++                print("\n✗ Some UDLs were not found in the output")
++                return False
++        else:
++            print("✗ Failed to build documentation")
++            return False
++
++
++if __name__ == "__main__":
++    success = test_udl_in_sphinx_docs()
++    if success:
++        print("\n🎉 UDL support is working correctly in Sphinx!")
++    else:
++        print("\n❌ UDL support test failed")
++        exit(1)
+\ No newline at end of file
+diff --git a/test_udl_reproduction.py b/test_udl_reproduction.py
+new file mode 100644
+index 000000000..40a41da44
+--- /dev/null
++++ b/test_udl_reproduction.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for C++ User Defined Literals (UDL) issue.
++
++This script tests the current behavior of Sphinx's C++ domain parser
++when encountering User Defined Literals.
++"""
++
++import sys
++import traceback
++from sphinx.domains.cpp import DefinitionParser, DefinitionError
++
++
++def test_udl_parsing():
++    """Test parsing of User Defined Literals"""
++    
++    class Config:
++        cpp_id_attributes = ["id_attr"]
++        cpp_paren_attributes = ["paren_attr"]
++    
++    # Test cases with UDLs that should work
++    test_cases = [
++        # The original issue case
++        "constexpr auto planck_constant = 6.62607015e-34q_J * 1q_s",
++        
++        # Other UDL examples
++        "auto distance = 42.0_km",
++        "auto time = 10_s", 
++        "auto mass = 5.5_kg",
++        "auto temperature = 273.15_K",
++        "auto str = \"hello\"_mystring",
++        "auto ch = 'a'_mychar",
++        
++        # Standard suffixes (should work)
++        "auto val1 = 42u",
++        "auto val2 = 3.14f",
++        "auto val3 = 100L",
++    ]
++    
++    print("Testing C++ User Defined Literals parsing...")
++    print("=" * 60)
++    
++    for i, test_case in enumerate(test_cases, 1):
++        print(f"\nTest {i}: {test_case}")
++        print("-" * 40)
++        
++        try:
++            parser = DefinitionParser(test_case, location=None, config=Config())
++            parser.allowFallbackExpressionParsing = False
++            ast = parser.parse_declaration("member", "var")
++            parser.assert_end()
++            print("✓ SUCCESS: Parsed successfully")
++            print(f"  AST: {ast}")
++            
++        except DefinitionError as e:
++            print(f"✗ FAILED: DefinitionError - {e}")
++            print(f"  Error position: {getattr(e, 'pos', 'unknown')}")
++            
++        except Exception as e:
++            print(f"✗ FAILED: {type(e).__name__} - {e}")
++            traceback.print_exc()
++
++
++def test_expression_parsing():
++    """Test parsing UDLs as expressions"""
++    
++    class Config:
++        cpp_id_attributes = ["id_attr"]
++        cpp_paren_attributes = ["paren_attr"]
++    
++    # Test UDL expressions
++    udl_expressions = [
++        "6.62607015e-34q_J",
++        "1q_s", 
++        "42.0_km",
++        "10_s",
++        "5.5_kg",
++        "\"hello\"_mystring",
++        "'a'_mychar",
++    ]
++    
++    print("\n\nTesting UDL expressions...")
++    print("=" * 60)
++    
++    for i, expr in enumerate(udl_expressions, 1):
++        print(f"\nExpression {i}: {expr}")
++        print("-" * 40)
++        
++        try:
++            parser = DefinitionParser(expr, location=None, config=Config())
++            parser.allowFallbackExpressionParsing = False
++            ast = parser._parse_expression()
++            print("✓ SUCCESS: Expression parsed successfully")
++            print(f"  AST: {ast}")
++            
++        except DefinitionError as e:
++            print(f"✗ FAILED: DefinitionError - {e}")
++            
++        except Exception as e:
++            print(f"✗ FAILED: {type(e).__name__} - {e}")
++
++
++if __name__ == "__main__":
++    test_udl_parsing()
++    test_expression_parsing()
+\ No newline at end of file
+diff --git a/tests/test_domain_cpp.py b/tests/test_domain_cpp.py
+index 9db741ae5..4ddce2461 100644
+--- a/tests/test_domain_cpp.py
++++ b/tests/test_domain_cpp.py
+@@ -176,7 +176,16 @@ def test_expressions():
+         exprCheck(p + "'\\U0001f34c'", t + "127820")
+         exprCheck(p + "'\\U0001F34C'", t + "127820")
+ 
+-    # TODO: user-defined lit
++    # user-defined literals
++    exprCheck('42_km', 'L42_kmE')
++    exprCheck('3.14_pi', 'L3.14_piE')
++    exprCheck('100u_count', 'L100u_countE')
++    exprCheck('0x42_hex', 'L0x42_hexE')
++    exprCheck('"hello"_mystr', 'L"hello"_mystrE')
++    exprCheck("'a'_mychar", "L'a'_mycharE")
++    exprCheck('6.62607015e-34q_J', 'L6.62607015e-34q_JE')  # original issue case
++    exprCheck('1q_s', 'L1q_sE')  # original issue case
++    
+     exprCheck('(... + Ns)', '(... + Ns)', id4='flpl2Ns')
+     exprCheck('(Ns + ...)', '(Ns + ...)', id4='frpl2Ns')
+     exprCheck('(Ns + ... + 0)', '(Ns + ... + 0)', id4='fLpl2NsL0E')

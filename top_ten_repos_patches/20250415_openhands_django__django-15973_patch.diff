@@ -1,0 +1,198 @@
+diff --git a/django/db/models/fields/reverse_related.py b/django/db/models/fields/reverse_related.py
+index eb2d4714bb..fb08c9e5d2 100644
+--- a/django/db/models/fields/reverse_related.py
++++ b/django/db/models/fields/reverse_related.py
+@@ -12,6 +12,7 @@ they're the closest concept currently available.
+ from django.core import exceptions
+ from django.utils.functional import cached_property
+ from django.utils.hashable import make_hashable
++from django.apps.registry import AppRegistryNotReady
+ 
+ from . import BLANK_CHOICE_DASH
+ from .mixins import FieldCacheMixin
+@@ -363,7 +364,7 @@ class ManyToManyRel(ForeignObjectRel):
+ 
+         if through and not db_constraint:
+             raise ValueError("Can't supply a through model and db_constraint=False")
+-        self.through = through
++        self._through = through
+ 
+         if through_fields and not through:
+             raise ValueError("Cannot specify through_fields without a through model")
+@@ -371,11 +372,31 @@ class ManyToManyRel(ForeignObjectRel):
+ 
+         self.symmetrical = symmetrical
+         self.db_constraint = db_constraint
++        
++    @property
++    def through(self):
++        # If self._through is a string model reference, resolve it to the actual model
++        # only when needed (like when accessing _meta)
++        if isinstance(self._through, str):
++            from django.apps import apps
++            try:
++                # Only try to resolve models when the registry is ready
++                if apps.apps_ready and apps.models_ready:
++                    return apps.get_model(self._through)
++            except (LookupError, ValueError, AppRegistryNotReady):
++                # Leave unresolved if the model isn't loaded or 
++                # string reference isn't valid app.Model format
++                pass
++        return self._through
++        
++    @through.setter
++    def through(self, through):
++        self._through = through
+ 
+     @property
+     def identity(self):
+         return super().identity + (
+-            self.through,
++            self._through,
+             make_hashable(self.through_fields),
+             self.db_constraint,
+         )
+diff --git a/tests/many_to_many_through_external/__init__.py b/tests/many_to_many_through_external/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/many_to_many_through_external/apps.py b/tests/many_to_many_through_external/apps.py
+new file mode 100644
+index 0000000000..b0d910938f
+--- /dev/null
++++ b/tests/many_to_many_through_external/apps.py
+@@ -0,0 +1,6 @@
++from django.apps import AppConfig
++
++
++class ManyToManyThroughExternalConfig(AppConfig):
++    name = 'many_to_many_through_external'
++    label = 'many_to_many_through_external'
+\ No newline at end of file
+diff --git a/tests/many_to_many_through_external/models.py b/tests/many_to_many_through_external/models.py
+new file mode 100644
+index 0000000000..6ecb662482
+--- /dev/null
++++ b/tests/many_to_many_through_external/models.py
+@@ -0,0 +1,39 @@
++from django.db import models
++
++class VariavelModel(models.Model):
++    nome = models.TextField(unique=True)
++    descricao = models.TextField()
++
++    class Meta:
++        db_table = 'variaveis'
++        verbose_name = 'Variável'
++        verbose_name_plural = 'Variáveis'
++
++
++class FonteVariavelModel(models.Model):
++    variavel = models.ForeignKey('many_to_many_through_external.VariavelModel', on_delete=models.CASCADE)
++    fonte = models.ForeignKey('many_to_many_through_external.FonteModel', on_delete=models.CASCADE)
++    
++    class Meta:
++        db_table = 'fontes_variaveis'
++        verbose_name = 'Fonte'
++        verbose_name_plural = 'Fontes'
++
++
++class FonteModel(models.Model):
++    nome = models.TextField(unique=True)
++    descricao = models.TextField()
++    data_inicial = models.DateField()
++    data_final = models.DateField(blank=True, null=True)
++    variaveis = models.ManyToManyField(
++        "many_to_many_through_external.VariavelModel",
++        through="many_to_many_through_external.FonteVariavelModel"
++    )
++    
++    def __str__(self):
++        return self.nome
++    
++    class Meta:
++        db_table = "fontes"
++        verbose_name = "Fonte"
++        verbose_name_plural = "Fontes"
+\ No newline at end of file
+diff --git a/tests/many_to_many_through_external/tests.py b/tests/many_to_many_through_external/tests.py
+new file mode 100644
+index 0000000000..c0a631aa09
+--- /dev/null
++++ b/tests/many_to_many_through_external/tests.py
+@@ -0,0 +1,75 @@
++from django.db import connection
++from django.test import TestCase
++from django.test.utils import isolate_apps
++from django.db import migrations, models
++
++
++class ManyToManyThroughExternalTests(TestCase):
++
++    @isolate_apps('many_to_many_through_external')
++    def test_m2m_through_reference_from_another_app(self):
++        """
++        Test that a ManyToManyField referencing a model from another app
++        where the through model is also from a different app works properly,
++        specifically during migrations.
++        """
++        from django.db.migrations.state import ProjectState
++        from django.db.migrations.executor import MigrationExecutor
++
++        executor = MigrationExecutor(connection)
++        project_state = ProjectState()
++        
++        # Create a simple migration that adds the FonteModel
++        migration = type('Migration', (migrations.Migration,), {
++            'operations': [
++                migrations.CreateModel(
++                    name='VariavelModel',
++                    fields=[
++                        ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
++                        ('nome', models.TextField(unique=True)),
++                        ('descricao', models.TextField()),
++                    ],
++                    options={
++                        'verbose_name': 'Variável',
++                        'verbose_name_plural': 'Variáveis',
++                        'db_table': 'variaveis',
++                    },
++                ),
++                migrations.CreateModel(
++                    name='FonteVariavelModel',
++                    fields=[
++                        ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
++                        ('variavel', models. ForeignKey('many_to_many_through_external.VariavelModel', on_delete=models.CASCADE)),
++                        ('fonte', models.ForeignKey('many_to_many_through_external.FonteModel', on_delete=models.CASCADE)),
++                    ],
++                    options={
++                        'verbose_name': 'Fonte',
++                        'verbose_name_plural': 'Fontes',
++                        'db_table': 'fontes_variaveis',
++                    },
++                ),
++                migrations.CreateModel(
++                    name='FonteModel',
++                    fields=[
++                        ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False)),
++                        ('nome', models.TextField(unique=True)),
++                        ('descricao', models.TextField()),
++                        ('data_inicial', models.DateField()),
++                        ('data_final', models.DateField(blank=True, null=True)),
++                        ('variaveis', models.ManyToManyField(
++                            'many_to_many_through_external.VariavelModel',
++                            through='many_to_many_through_external.FonteVariavelModel'
++                        )),
++                    ],
++                    options={
++                        'verbose_name': 'Fonte',
++                        'verbose_name_plural': 'Fontes',
++                        'db_table': 'fontes',
++                    },
++                ),
++            ],
++        })
++        
++        # This would fail before the fix with AttributeError: 'str' object has no attribute '_meta'
++        executor.apply_migration(project_state, migration)
++        self.addCleanup(executor.loader.reset)
+\ No newline at end of file

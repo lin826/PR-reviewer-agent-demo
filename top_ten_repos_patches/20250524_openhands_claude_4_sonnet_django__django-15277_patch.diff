@@ -1,0 +1,509 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index f30b523346..88c9ca9f28 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -1010,7 +1010,8 @@ class CharField(Field):
+     def __init__(self, *args, db_collation=None, **kwargs):
+         super().__init__(*args, **kwargs)
+         self.db_collation = db_collation
+-        self.validators.append(validators.MaxLengthValidator(self.max_length))
++        if self.max_length is not None:
++            self.validators.append(validators.MaxLengthValidator(self.max_length))
+ 
+     def check(self, **kwargs):
+         databases = kwargs.get('databases') or []
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..a80884c8e0
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,212 @@
++#!/usr/bin/env python
++"""
++Final verification that the fix works correctly and meets all requirements
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db.models import Value
++from django.db.models.fields import CharField
++from django.core.validators import MaxLengthValidator
++import time
++
++def test_original_issue():
++    """Test that the original issue is resolved"""
++    print("=== Testing Original Issue Resolution ===")
++    
++    # Create Value with string - this was the original failing case
++    x = Value('test')
++    y = x._resolve_output_field()
++    
++    print(f"Value('test')._resolve_output_field():")
++    print(f"  Field type: {type(y).__name__}")
++    print(f"  Max length: {y.max_length}")
++    print(f"  Number of validators: {len(y.validators)}")
++    
++    # This should work without errors now
++    try:
++        result = y.clean('test_string', model_instance=None)
++        print(f"  clean() result: {result} ✓")
++    except Exception as e:
++        print(f"  clean() ERROR: {type(e).__name__}: {e} ✗")
++        return False
++    
++    # Validators should be empty
++    if len(y.validators) == 0:
++        print("  No broken validators ✓")
++    else:
++        print(f"  Unexpected validators: {y.validators} ✗")
++        return False
++    
++    return True
++
++def test_normal_charfield():
++    """Test that normal CharField with max_length still works"""
++    print("\n=== Testing Normal CharField Functionality ===")
++    
++    # CharField with max_length should still have validator
++    field = CharField(max_length=10)
++    print(f"CharField(max_length=10):")
++    print(f"  Number of validators: {len(field.validators)}")
++    
++    if len(field.validators) != 1:
++        print(f"  Expected 1 validator, got {len(field.validators)} ✗")
++        return False
++    
++    validator = field.validators[0]
++    if not isinstance(validator, MaxLengthValidator):
++        print(f"  Expected MaxLengthValidator, got {type(validator)} ✗")
++        return False
++    
++    if validator.limit_value != 10:
++        print(f"  Expected limit_value=10, got {validator.limit_value} ✗")
++        return False
++    
++    print("  Validator correctly configured ✓")
++    
++    # Test validator functionality
++    try:
++        validator('short')  # Should pass
++        print("  Short string validation: PASS ✓")
++    except Exception as e:
++        print(f"  Short string validation: FAIL - {e} ✗")
++        return False
++    
++    try:
++        validator('this_is_too_long')  # Should fail
++        print("  Long string validation: UNEXPECTED PASS ✗")
++        return False
++    except Exception:
++        print("  Long string validation: EXPECTED FAIL ✓")
++    
++    return True
++
++def test_performance():
++    """Test performance improvement"""
++    print("\n=== Testing Performance ===")
++    
++    x = Value('test')
++    iterations = 10000
++    
++    start_time = time.time()
++    for _ in range(iterations):
++        field = x._resolve_output_field()
++    end_time = time.time()
++    
++    avg_time = (end_time - start_time) / iterations * 1000000
++    print(f"Average time per _resolve_output_field() call: {avg_time:.2f} µs")
++    
++    # The issue mentioned improvement from ~8.1µs to ~5.86µs
++    # We should see significant improvement (target < 7µs)
++    if avg_time < 7.0:
++        print(f"  Performance improved ✓ (target: < 7.0µs)")
++        return True
++    else:
++        print(f"  Performance not improved enough ✗ (target: < 7.0µs)")
++        return False
++
++def test_edge_cases():
++    """Test edge cases"""
++    print("\n=== Testing Edge Cases ===")
++    
++    # CharField with max_length=0
++    try:
++        field = CharField(max_length=0)
++        if len(field.validators) == 1 and field.validators[0].limit_value == 0:
++            print("  CharField(max_length=0): ✓")
++        else:
++            print("  CharField(max_length=0): ✗")
++            return False
++    except Exception as e:
++        print(f"  CharField(max_length=0): ERROR - {e} ✗")
++        return False
++    
++    # CharField with max_length=None explicitly
++    try:
++        field = CharField(max_length=None)
++        if len(field.validators) == 0:
++            print("  CharField(max_length=None): ✓")
++        else:
++            print("  CharField(max_length=None): ✗")
++            return False
++    except Exception as e:
++        print(f"  CharField(max_length=None): ERROR - {e} ✗")
++        return False
++    
++    # Different Value types
++    test_values = [
++        ('string', str),
++        (123, int),
++        (True, bool),
++        (3.14, float),
++    ]
++    
++    for value, expected_type in test_values:
++        x = Value(value)
++        field = x._resolve_output_field()
++        try:
++            result = field.clean(str(value), model_instance=None)
++            print(f"  Value({value!r}) -> {type(field).__name__}: ✓")
++        except Exception as e:
++            print(f"  Value({value!r}) -> {type(field).__name__}: ERROR - {e} ✗")
++            return False
++    
++    return True
++
++def main():
++    """Run all tests"""
++    print("Final Verification of CharField MaxLengthValidator Fix")
++    print("=" * 60)
++    
++    tests = [
++        test_original_issue,
++        test_normal_charfield,
++        test_performance,
++        test_edge_cases,
++    ]
++    
++    results = []
++    for test in tests:
++        try:
++            result = test()
++            results.append(result)
++        except Exception as e:
++            print(f"Test {test.__name__} failed with exception: {e}")
++            results.append(False)
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    
++    all_passed = all(results)
++    for i, (test, result) in enumerate(zip(tests, results)):
++        status = "✓ PASS" if result else "✗ FAIL"
++        print(f"  {test.__name__}: {status}")
++    
++    print(f"\nOverall: {'✓ ALL TESTS PASSED' if all_passed else '✗ SOME TESTS FAILED'}")
++    return all_passed
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..ab8c8a12a2
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the CharField MaxLengthValidator issue with Value._resolve_output_field()
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db.models import Value
++import time
++
++def test_issue():
++    """Test the issue described in the bug report"""
++    print("=== Testing Value._resolve_output_field() issue ===")
++    
++    # Create a Value object with a string
++    x = Value('test')
++    print(f"Created Value: {x}")
++    
++    # Call _resolve_output_field() to get the CharField
++    y = x._resolve_output_field()
++    print(f"Output field: {y}")
++    print(f"Output field type: {type(y)}")
++    print(f"Max length: {y.max_length}")
++    
++    # Check the validators
++    print(f"Validators: {y.validators}")
++    
++    # Try to use the validator - this should cause the TypeError
++    try:
++        result = y.clean('1', model_instance=None)
++        print(f"Clean result: {result}")
++    except Exception as e:
++        print(f"ERROR when calling clean(): {type(e).__name__}: {e}")
++    
++    # Try to call the validator directly
++    if y.validators:
++        validator = y.validators[0]
++        print(f"Validator: {validator}")
++        print(f"Validator limit_value: {validator.limit_value}")
++        
++        try:
++            validator('test_string')
++            print("Validator call succeeded")
++        except Exception as e:
++            print(f"ERROR when calling validator: {type(e).__name__}: {e}")
++
++def test_performance():
++    """Test the performance impact"""
++    print("\n=== Performance Test ===")
++    
++    x = Value('test')
++    
++    # Time the _resolve_output_field call
++    iterations = 10000
++    start_time = time.time()
++    for _ in range(iterations):
++        y = x._resolve_output_field()
++    end_time = time.time()
++    
++    avg_time = (end_time - start_time) / iterations * 1000000  # Convert to microseconds
++    print(f"Average time per _resolve_output_field() call: {avg_time:.2f} µs")
++
++def test_with_max_length():
++    """Test that CharField with max_length works correctly"""
++    print("\n=== Testing CharField with max_length ===")
++    
++    from django.db.models.fields import CharField
++    
++    # Create CharField with max_length
++    field = CharField(max_length=100)
++    print(f"CharField with max_length=100: {field}")
++    print(f"Validators: {field.validators}")
++    
++    # This should work fine
++    try:
++        result = field.clean('test', model_instance=None)
++        print(f"Clean result: {result}")
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++
++if __name__ == '__main__':
++    test_issue()
++    test_performance()
++    test_with_max_length()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..ce63e939ed
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the CharField MaxLengthValidator fix
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db.models import Value
++from django.db.models.fields import CharField
++from django.core.validators import MaxLengthValidator
++import time
++
++def test_value_resolve_output_field():
++    """Test Value._resolve_output_field() with different types"""
++    print("=== Testing Value._resolve_output_field() ===")
++    
++    test_cases = [
++        ('test', 'str'),
++        (123, 'int'),
++        (True, 'bool'),
++        (3.14, 'float'),
++    ]
++    
++    for value, value_type in test_cases:
++        x = Value(value)
++        field = x._resolve_output_field()
++        print(f"{value_type} value '{value}': {type(field).__name__}, validators: {len(field.validators)}")
++        
++        # Test that the field can be used without errors
++        try:
++            result = field.clean(str(value), model_instance=None)
++            print(f"  Clean successful: {result}")
++        except Exception as e:
++            print(f"  ERROR: {type(e).__name__}: {e}")
++
++def test_charfield_variants():
++    """Test CharField with different max_length values"""
++    print("\n=== Testing CharField variants ===")
++    
++    test_cases = [
++        (None, "no max_length"),
++        (50, "max_length=50"),
++        (0, "max_length=0"),
++        (1, "max_length=1"),
++    ]
++    
++    for max_length, description in test_cases:
++        try:
++            if max_length is None:
++                field = CharField()
++            else:
++                field = CharField(max_length=max_length)
++            
++            print(f"{description}: validators={len(field.validators)}")
++            
++            # Test validator functionality
++            if field.validators:
++                validator = field.validators[0]
++                print(f"  Validator limit_value: {validator.limit_value}")
++                
++                # Test with a string that should pass
++                try:
++                    validator('x')
++                    print(f"  Validator test 'x': PASS")
++                except Exception as e:
++                    print(f"  Validator test 'x': FAIL - {e}")
++                
++                # Test with a string that should fail (if max_length > 0)
++                if max_length and max_length > 0:
++                    long_string = 'x' * (max_length + 1)
++                    try:
++                        validator(long_string)
++                        print(f"  Validator test long string: UNEXPECTED PASS")
++                    except Exception as e:
++                        print(f"  Validator test long string: EXPECTED FAIL - {type(e).__name__}")
++            
++        except Exception as e:
++            print(f"{description}: ERROR creating field - {type(e).__name__}: {e}")
++
++def test_performance_comparison():
++    """Compare performance before and after fix"""
++    print("\n=== Performance Comparison ===")
++    
++    # Test Value._resolve_output_field performance
++    x = Value('test')
++    iterations = 10000
++    
++    start_time = time.time()
++    for _ in range(iterations):
++        field = x._resolve_output_field()
++    end_time = time.time()
++    
++    avg_time = (end_time - start_time) / iterations * 1000000
++    print(f"Value._resolve_output_field(): {avg_time:.2f} µs per call")
++    
++    # Test CharField creation performance
++    start_time = time.time()
++    for _ in range(iterations):
++        field = CharField()
++    end_time = time.time()
++    
++    avg_time = (end_time - start_time) / iterations * 1000000
++    print(f"CharField() creation: {avg_time:.2f} µs per call")
++    
++    # Test CharField with max_length creation performance
++    start_time = time.time()
++    for _ in range(iterations):
++        field = CharField(max_length=100)
++    end_time = time.time()
++    
++    avg_time = (end_time - start_time) / iterations * 1000000
++    print(f"CharField(max_length=100) creation: {avg_time:.2f} µs per call")
++
++def test_validator_behavior():
++    """Test MaxLengthValidator behavior"""
++    print("\n=== Testing MaxLengthValidator behavior ===")
++    
++    # Test with valid max_length
++    validator = MaxLengthValidator(5)
++    print(f"MaxLengthValidator(5) limit_value: {validator.limit_value}")
++    
++    test_strings = ['', 'x', 'hello', 'toolong']
++    for s in test_strings:
++        try:
++            validator(s)
++            print(f"  '{s}' (len={len(s)}): PASS")
++        except Exception as e:
++            print(f"  '{s}' (len={len(s)}): FAIL - {type(e).__name__}")
++
++if __name__ == '__main__':
++    test_value_resolve_output_field()
++    test_charfield_variants()
++    test_performance_comparison()
++    test_validator_behavior()
+\ No newline at end of file

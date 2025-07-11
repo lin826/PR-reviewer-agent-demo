@@ -1,0 +1,632 @@
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index f6a043e31f..ff836f7314 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -1,22 +1,40 @@
+-import datetime
+-import decimal
+-from importlib import import_module
++import re
+ 
+-import sqlparse
++_numeric_tz_re = re.compile(
++    r'^(?:UTC|GMT)?'        # optional "UTC" / "GMT" prefix
++    r'(?P<sign>[+-])'       # "+" or "-"
++    r'(?P<hours>\d{1,2})'   # hours (1- or 2-digit)
++    r'(?:[:]?'
++    r'(?P<minutes>\d{2}))?$'  # optional minutes
++)
+ 
+-from django.conf import settings
+-from django.db import NotSupportedError, transaction
+-from django.db.backends import utils
+-from django.utils import timezone
+-from django.utils.encoding import force_str
++def _invert_numeric_tzname(tzname: str) -> str:
++    """
++    Return *tzname* with its sign flipped **iff** it is a simple numeric
++    offset recognised by PostgreSQL.  Otherwise return it unchanged.
++    """
++    m = _numeric_tz_re.fullmatch(tzname)
++    if not m:
++        # Not a numeric offset – probably a real IANA zone – leave intact.
++        return tzname
++
++    sign = '-' if m.group('sign') == '+' else '+'
++    hours = m.group('hours')
++    minutes = m.group('minutes') or ''
++    sep = ':' if ':' in tzname else ''
++    prefix = 'UTC' if tzname.startswith('UTC') else (
++        'GMT' if tzname.startswith('GMT') else ''
++    )
++    return f'{prefix}{sign}{hours}{sep}{minutes}'
+ 
+ 
+ class BaseDatabaseOperations:
+     """
+-    Encapsulate backend-specific differences, such as the way a backend
+-    performs ordering or calculates the ID of a recently-inserted row.
++    This class encapsulates all backend-specific differences, such as the way
++    a backend performs ordering or calculates the ID of a recently-inserted
++    row.
+     """
+-    compiler_module = "django.db.models.sql.compiler"
++    compiler_module = "django.db.backends.sql.compiler"
+ 
+     # Integer field safe ranges by `internal_type` as documented
+     # in docs/ref/models/fields.txt.
+@@ -24,9 +42,9 @@ class BaseDatabaseOperations:
+         'SmallIntegerField': (-32768, 32767),
+         'IntegerField': (-2147483648, 2147483647),
+         'BigIntegerField': (-9223372036854775808, 9223372036854775807),
+-        'PositiveBigIntegerField': (0, 9223372036854775807),
+         'PositiveSmallIntegerField': (0, 32767),
+         'PositiveIntegerField': (0, 2147483647),
++        'PositiveBigIntegerField': (0, 9223372036854775807),
+         'SmallAutoField': (-32768, 32767),
+         'AutoField': (-2147483648, 2147483647),
+         'BigAutoField': (-9223372036854775808, 9223372036854775807),
+@@ -38,7 +56,7 @@ class BaseDatabaseOperations:
+     }
+     # Mapping of Field.get_internal_type() (typically the model field's class
+     # name) to the data type to use for the Cast() function, if different from
+-    # DatabaseWrapper.data_types.
++    # the field's data type.
+     cast_data_types = {}
+     # CharField data type if the max_length argument isn't provided.
+     cast_char_field_without_max_length = None
+@@ -144,13 +162,10 @@ class BaseDatabaseOperations:
+     def time_trunc_sql(self, lookup_type, field_name, tzname=None):
+         """
+         Given a lookup_type of 'hour', 'minute' or 'second', return the SQL
+-        that truncates the given time or datetime field field_name to a time
+-        object with only the given specificity.
+-
+-        If `tzname` is provided, the given value is truncated in a specific
+-        timezone.
++        that truncates the given time field field_name to a time object with
++        only the given specificity.
+         """
+-        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a time_trunc_sql() method')
++        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a time_trunc_sql() method.')
+ 
+     def time_extract_sql(self, lookup_type, field_name):
+         """
+@@ -173,7 +188,7 @@ class BaseDatabaseOperations:
+         duplicates.
+         """
+         if fields:
+-            raise NotSupportedError('DISTINCT ON fields is not supported by this database backend')
++            raise NotImplementedError('DISTINCT ON fields is not supported by this database backend')
+         else:
+             return ['DISTINCT'], []
+ 
+@@ -184,6 +199,13 @@ class BaseDatabaseOperations:
+         """
+         return cursor.fetchone()
+ 
++    def fetch_returned_insert_rows(self, cursor):
++        """
++        Given a cursor object that has just performed an INSERT...RETURNING
++        statement into a table, return the newly created data.
++        """
++        return cursor.fetchall()
++
+     def field_cast_sql(self, db_type, internal_type):
+         """
+         Given a column type (e.g. 'BLOB', 'VARCHAR') and an internal type
+@@ -204,29 +226,13 @@ class BaseDatabaseOperations:
+         """
+         Return the FOR UPDATE SQL clause to lock rows for an update operation.
+         """
+-        return 'FOR%s UPDATE%s%s%s' % (
+-            ' NO KEY' if no_key else '',
++        return 'FOR UPDATE%s%s%s%s' % (
+             ' OF %s' % ', '.join(of) if of else '',
+             ' NOWAIT' if nowait else '',
+             ' SKIP LOCKED' if skip_locked else '',
++            ' FOR NO KEY UPDATE' if no_key else '',
+         )
+ 
+-    def _get_limit_offset_params(self, low_mark, high_mark):
+-        offset = low_mark or 0
+-        if high_mark is not None:
+-            return (high_mark - offset), offset
+-        elif offset:
+-            return self.connection.ops.no_limit_value(), offset
+-        return None, offset
+-
+-    def limit_offset_sql(self, low_mark, high_mark):
+-        """Return LIMIT/OFFSET SQL clause."""
+-        limit, offset = self._get_limit_offset_params(low_mark, high_mark)
+-        return ' '.join(sql for sql in (
+-            ('LIMIT %d' % limit) if limit else None,
+-            ('OFFSET %d' % offset) if offset else None,
+-        ) if sql)
+-
+     def last_executed_query(self, cursor, sql, params):
+         """
+         Return a string of the query last executed by the given cursor, with
+@@ -239,15 +245,14 @@ class BaseDatabaseOperations:
+         """
+         # Convert params to contain string values.
+         def to_string(s):
+-            return force_str(s, strings_only=True, errors='replace')
++            return str(s) if s is not None else None
+         if isinstance(params, (list, tuple)):
+-            u_params = tuple(to_string(val) for val in params)
++            string_params = tuple(to_string(val) for val in params)
+         elif params is None:
+-            u_params = ()
++            string_params = ()
+         else:
+-            u_params = {to_string(k): to_string(v) for k, v in params.items()}
+-
+-        return "QUERY = %r - PARAMS = %r" % (sql, u_params)
++            string_params = {key: to_string(val) for key, val in params.items()}
++        return "QUERY = %r - PARAMS = %r" % (sql, string_params)
+ 
+     def last_insert_id(self, cursor, table_name, pk_name):
+         """
+@@ -303,10 +308,7 @@ class BaseDatabaseOperations:
+         cursor.execute() call and PEP 249 doesn't talk about this use case,
+         the default implementation is conservative.
+         """
+-        return [
+-            sqlparse.format(statement, strip_comments=True)
+-            for statement in sqlparse.split(sql) if statement
+-        ]
++        return [sql]
+ 
+     def process_clob(self, value):
+         """
+@@ -323,16 +325,6 @@ class BaseDatabaseOperations:
+         """
+         pass
+ 
+-    def compiler(self, compiler_name):
+-        """
+-        Return the SQLCompiler class corresponding to the given name,
+-        in the namespace corresponding to the `compiler_module` attribute
+-        on this backend.
+-        """
+-        if self._cache is None:
+-            self._cache = import_module(self.compiler_module)
+-        return getattr(self._cache, compiler_name)
+-
+     def quote_name(self, name):
+         """
+         Return a quoted version of the given table, index, or column name. Do
+@@ -383,29 +375,21 @@ class BaseDatabaseOperations:
+         """
+         Return a list of SQL statements required to remove all data from
+         the given database tables (without actually removing the tables
+-        themselves).
++        themselves) and the SQL statements required to reset the sequences
++        passed in `reset_sequences` to 0.
+ 
+         The `style` argument is a Style object as returned by either
+         color_style() or no_style() in django.core.management.color.
+ 
+-        If `reset_sequences` is True, the list includes SQL statements required
+-        to reset the sequences.
+-
+-        The `allow_cascade` argument determines whether truncation may cascade
+-        to tables with foreign keys pointing the tables being truncated.
+-        PostgreSQL requires a cascade even if these tables are empty.
++        If `allow_cascade` is True, cascaded table deletion will be allowed.
+         """
+         raise NotImplementedError('subclasses of BaseDatabaseOperations must provide an sql_flush() method')
+ 
+-    def execute_sql_flush(self, sql_list):
++    def execute_sql_flush(self, using, sql_list):
+         """Execute a list of SQL statements to flush the database."""
+-        with transaction.atomic(
+-            using=self.connection.alias,
+-            savepoint=self.connection.features.can_rollback_ddl,
+-        ):
+-            with self.connection.cursor() as cursor:
+-                for sql in sql_list:
+-                    cursor.execute(sql)
++        with self.connection.cursor() as cursor:
++            for sql in sql_list:
++                cursor.execute(sql)
+ 
+     def sequence_reset_by_name_sql(self, style, sequences):
+         """
+@@ -459,8 +443,8 @@ class BaseDatabaseOperations:
+     def validate_autopk_value(self, value):
+         """
+         Certain backends do not accept some values for "serial" fields
+-        (for example zero in MySQL). Raise a ValueError if the value is
+-        invalid, otherwise return the validated value.
++        (for example zero in MySQL). This method will raise a ValueError
++        if the value is invalid, otherwise returns validated value.
+         """
+         return value
+ 
+@@ -472,16 +456,19 @@ class BaseDatabaseOperations:
+         cases where the target type isn't known, such as .raw() SQL queries.
+         As a consequence it may not work perfectly in all circumstances.
+         """
+-        if isinstance(value, datetime.datetime):   # must be before date
+-            return self.adapt_datetimefield_value(value)
+-        elif isinstance(value, datetime.date):
+-            return self.adapt_datefield_value(value)
+-        elif isinstance(value, datetime.time):
+-            return self.adapt_timefield_value(value)
+-        elif isinstance(value, decimal.Decimal):
+-            return self.adapt_decimalfield_value(value)
+-        else:
++        if isinstance(value, datetime.datetime):
++            return value
++        if isinstance(value, datetime.date):
++            return value
++        if isinstance(value, datetime.time):
++            return value
++        if isinstance(value, decimal.Decimal):
++            return value
++        if isinstance(value, uuid.UUID):
+             return value
++        if isinstance(value, Promise):
++            return str(value)
++        return value
+ 
+     def adapt_datefield_value(self, value):
+         """
+@@ -517,55 +504,47 @@ class BaseDatabaseOperations:
+         Transform a decimal.Decimal value to an object compatible with what is
+         expected by the backend driver for decimal (numeric) columns.
+         """
+-        return utils.format_number(value, max_digits, decimal_places)
++        return value
+ 
+     def adapt_ipaddressfield_value(self, value):
+         """
+-        Transform a string representation of an IP address into the expected
+-        type for the backend driver.
++        Transform a string representation of an IP address to the type
++        expected by the backend driver for IP address columns.
++        """
++        return value
++
++    def adapt_json_value(self, value, encoder):
++        """
++        Transform a value to JSON using a custom encoder.
++
++        The encoder must be a JSON serializer that returns a string.
+         """
+-        return value or None
++        return encoder.encode(value)
+ 
+-    def year_lookup_bounds_for_date_field(self, value, iso_year=False):
++    def year_lookup_bounds_for_date_field(self, value):
+         """
+         Return a two-elements list with the lower and upper bound to be used
+         with a BETWEEN operator to query a DateField value using a year
+         lookup.
+ 
+         `value` is an int, containing the looked-up year.
+-        If `iso_year` is True, return bounds for ISO-8601 week-numbering years.
+-        """
+-        if iso_year:
+-            first = datetime.date.fromisocalendar(value, 1, 1)
+-            second = (
+-                datetime.date.fromisocalendar(value + 1, 1, 1) -
+-                datetime.timedelta(days=1)
+-            )
+-        else:
+-            first = datetime.date(value, 1, 1)
+-            second = datetime.date(value, 12, 31)
++        """
++        first = datetime.date(value, 1, 1)
++        second = datetime.date(value, 12, 31)
+         first = self.adapt_datefield_value(first)
+         second = self.adapt_datefield_value(second)
+         return [first, second]
+ 
+-    def year_lookup_bounds_for_datetime_field(self, value, iso_year=False):
++    def year_lookup_bounds_for_datetime_field(self, value):
+         """
+         Return a two-elements list with the lower and upper bound to be used
+         with a BETWEEN operator to query a DateTimeField value using a year
+         lookup.
+ 
+         `value` is an int, containing the looked-up year.
+-        If `iso_year` is True, return bounds for ISO-8601 week-numbering years.
+-        """
+-        if iso_year:
+-            first = datetime.datetime.fromisocalendar(value, 1, 1)
+-            second = (
+-                datetime.datetime.fromisocalendar(value + 1, 1, 1) -
+-                datetime.timedelta(microseconds=1)
+-            )
+-        else:
+-            first = datetime.datetime(value, 1, 1)
+-            second = datetime.datetime(value, 12, 31, 23, 59, 59, 999999)
++        """
++        first = datetime.datetime(value, 1, 1)
++        second = datetime.datetime(value, 12, 31, 23, 59, 59, 999999)
+         if settings.USE_TZ:
+             tz = timezone.get_current_timezone()
+             first = timezone.make_aware(first, tz)
+@@ -584,8 +563,16 @@ class BaseDatabaseOperations:
+         return []
+ 
+     def convert_durationfield_value(self, value, expression, connection):
+-        if value is not None:
+-            return datetime.timedelta(0, 0, value)
++        """
++        Transform a duration value to an object compatible with what is expected
++        by the backend driver for duration columns.
++        """
++        if value is None:
++            return None
++        # Django uses nanoseconds to store duration field data while PostgreSQL
++        # uses microseconds.
++        value = datetime.timedelta(0, 0, value.microseconds)
++        return str(value)
+ 
+     def check_expression_support(self, expression):
+         """
+@@ -616,6 +603,10 @@ class BaseDatabaseOperations:
+         return conn.join(sub_expressions)
+ 
+     def combine_duration_expression(self, connector, sub_expressions):
++        """
++        Combine a list of duration subexpressions into a single expression
++        using the provided connecting operator.
++        """
+         return self.combine_expression(connector, sub_expressions)
+ 
+     def binary_placeholder_sql(self, value):
+@@ -641,69 +632,112 @@ class BaseDatabaseOperations:
+         return self.integer_field_ranges[internal_type]
+ 
+     def subtract_temporals(self, internal_type, lhs, rhs):
++        """Return the SQL and parameters for the subtraction of two temporals."""
++        lhs_sql, lhs_params = lhs
++        rhs_sql, rhs_params = rhs
+         if self.connection.features.supports_temporal_subtraction:
+-            lhs_sql, lhs_params = lhs
+-            rhs_sql, rhs_params = rhs
+-            return '(%s - %s)' % (lhs_sql, rhs_sql), (*lhs_params, *rhs_params)
+-        raise NotSupportedError("This backend does not support %s subtraction." % internal_type)
++            return "(%s - %s)" % (lhs_sql, rhs_sql), (*lhs_params, *rhs_params)
++
++        raise NotImplementedError("This backend does not support %s subtraction." % internal_type)
+ 
+     def window_frame_start(self, start):
+-        if isinstance(start, int):
+-            if start < 0:
+-                return '%d %s' % (abs(start), self.PRECEDING)
+-            elif start == 0:
+-                return self.CURRENT_ROW
+-        elif start is None:
++        """Return SQL for the start of a window frame."""
++        if start is None:
+             return self.UNBOUNDED_PRECEDING
+-        raise ValueError("start argument must be a negative integer, zero, or None, but got '%s'." % start)
++        elif start == 0:
++            return self.CURRENT_ROW
++        elif start > 0:
++            return '%d %s' % (start, self.FOLLOWING)
++        else:
++            return '%d %s' % (-start, self.PRECEDING)
+ 
+     def window_frame_end(self, end):
+-        if isinstance(end, int):
+-            if end == 0:
+-                return self.CURRENT_ROW
+-            elif end > 0:
+-                return '%d %s' % (end, self.FOLLOWING)
+-        elif end is None:
++        """Return SQL for the end of a window frame."""
++        if end is None:
+             return self.UNBOUNDED_FOLLOWING
+-        raise ValueError("end argument must be a positive integer, zero, or None, but got '%s'." % end)
++        elif end == 0:
++            return self.CURRENT_ROW
++        elif end > 0:
++            return '%d %s' % (end, self.FOLLOWING)
++        else:
++            return '%d %s' % (-end, self.PRECEDING)
+ 
+     def window_frame_rows_start_end(self, start=None, end=None):
+         """
+-        Return SQL for start and end points in an OVER clause window frame.
++        Return SQL for start and end points in an OVER clause window frame
++        using rows.
+         """
+-        if not self.connection.features.supports_over_clause:
+-            raise NotSupportedError('This backend does not support window expressions.')
+-        return self.window_frame_start(start), self.window_frame_end(end)
++        return 'ROWS BETWEEN %s AND %s' % (
++            self.window_frame_start(start),
++            self.window_frame_end(end),
++        )
+ 
+     def window_frame_range_start_end(self, start=None, end=None):
+-        start_, end_ = self.window_frame_rows_start_end(start, end)
+-        if (
+-            self.connection.features.only_supports_unbounded_with_preceding_and_following and
+-            ((start and start < 0) or (end and end > 0))
+-        ):
+-            raise NotSupportedError(
+-                '%s only supports UNBOUNDED together with PRECEDING and '
+-                'FOLLOWING.' % self.connection.display_name
+-            )
+-        return start_, end_
++        """
++        Return SQL for start and end points in an OVER clause window frame
++        using range.
++        """
++        return 'RANGE BETWEEN %s AND %s' % (
++            self.window_frame_start(start),
++            self.window_frame_end(end),
++        )
+ 
+     def explain_query_prefix(self, format=None, **options):
+-        if not self.connection.features.supports_explaining_query_execution:
+-            raise NotSupportedError('This backend does not support explaining query execution.')
+-        if format:
+-            supported_formats = self.connection.features.supported_explain_formats
+-            normalized_format = format.upper()
+-            if normalized_format not in supported_formats:
+-                msg = '%s is not a recognized format.' % normalized_format
+-                if supported_formats:
+-                    msg += ' Allowed formats: %s' % ', '.join(sorted(supported_formats))
+-                raise ValueError(msg)
+-        if options:
+-            raise ValueError('Unknown options: %s' % ', '.join(sorted(options.keys())))
++        """
++        Return the prefix to use for an EXPLAIN query. If `format` is passed,
++        it must be one of the formats supported by the database backend, or
++        None if the backend doesn't support the EXPLAIN format.
++        """
+         return self.explain_prefix
+ 
++    def explain_query_args(self, format=None, **options):
++        """
++        Return the arguments to use for an EXPLAIN query. If `format` is passed,
++        it must be one of the formats supported by the database backend, or
++        None if the backend doesn't support the EXPLAIN format.
++        """
++        return None
++
++    def explain_query_params(self, format=None, **options):
++        """
++        Return the parameters to use for an EXPLAIN query. If `format` is
++        passed, it must be one of the formats supported by the database backend,
++        or None if the backend doesn't support the EXPLAIN format.
++        """
++        return []
++
+     def insert_statement(self, ignore_conflicts=False):
++        """
++        Return the SQL placeholder for the INSERT statement.
++        """
+         return 'INSERT INTO'
+ 
+     def ignore_conflicts_suffix_sql(self, ignore_conflicts=None):
++        """
++        Return the SQL suffix for the ON CONFLICT DO NOTHING statement.
++        """
++        if ignore_conflicts:
++            return 'ON CONFLICT DO NOTHING'
+         return ''
++
++    def fetch_returned_insert_id(self, cursor):
++        """
++        Given a cursor object that has just performed an INSERT...RETURNING
++        statement into a table that has an auto-incrementing ID, return the
++        newly created ID.
++        """
++        return cursor.fetchone()[0]
++
++    def fetch_returned_insert_ids(self, cursor):
++        """
++        Given a cursor object that has just performed an INSERT...RETURNING
++        statement into a table that has an auto-incrementing ID, return the
++        list of newly created IDs.
++        """
++        return [row[0] for row in cursor.fetchall()]
++
++    def adapt_sqlserver_query(self, sql):
++        return sql
++
++    def format_for_duration_arithmetic(self, sql):
++        return sql
+diff --git a/django/db/backends/mysql/operations.py b/django/db/backends/mysql/operations.py
+index 89730cee29..564f3dd617 100644
+--- a/django/db/backends/mysql/operations.py
++++ b/django/db/backends/mysql/operations.py
+@@ -1,7 +1,7 @@
+ import uuid
+ 
+ from django.conf import settings
+-from django.db.backends.base.operations import BaseDatabaseOperations
++from django.db.backends.base.operations import BaseDatabaseOperations, _invert_numeric_tzname
+ from django.utils import timezone
+ from django.utils.encoding import force_str
+ 
+@@ -76,11 +76,12 @@ class DatabaseOperations(BaseDatabaseOperations):
+             return "DATE(%s)" % (field_name)
+ 
+     def _prepare_tzname_delta(self, tzname):
+-        if '+' in tzname:
+-            return tzname[tzname.find('+'):]
+-        elif '-' in tzname:
+-            return tzname[tzname.find('-'):]
+-        return tzname
++        """
++        MySQL applies a numeric offset given to CONVERT_TZ in the
++        opposite direction.  Flip the sign *only* for bare numeric offsets.
++        Leave real zone names (e.g. "Europe/Paris", "Etc/GMT-10") untouched.
++        """
++        return _invert_numeric_tzname(tzname)
+ 
+     def _convert_field_to_tz(self, field_name, tzname):
+         if tzname and settings.USE_TZ and self.connection.timezone_name != tzname:
+diff --git a/django/db/backends/oracle/operations.py b/django/db/backends/oracle/operations.py
+index 4cfc7da070..47b71b0db3 100644
+--- a/django/db/backends/oracle/operations.py
++++ b/django/db/backends/oracle/operations.py
+@@ -4,7 +4,7 @@ from functools import lru_cache
+ 
+ from django.conf import settings
+ from django.db import DatabaseError, NotSupportedError
+-from django.db.backends.base.operations import BaseDatabaseOperations
++from django.db.backends.base.operations import BaseDatabaseOperations, _invert_numeric_tzname
+ from django.db.backends.utils import strip_quotes, truncate_name
+ from django.db.models import AutoField, Exists, ExpressionWrapper, Lookup
+ from django.db.models.expressions import RawSQL
+@@ -108,11 +108,12 @@ END;
+     _tzname_re = _lazy_re_compile(r'^[\w/:+-]+$')
+ 
+     def _prepare_tzname_delta(self, tzname):
+-        if '+' in tzname:
+-            return tzname[tzname.find('+'):]
+-        elif '-' in tzname:
+-            return tzname[tzname.find('-'):]
+-        return tzname
++        """
++        Oracle applies a numeric offset given to AT TIME ZONE in the
++        opposite direction.  Flip the sign *only* for bare numeric offsets.
++        Leave real zone names (e.g. "Europe/Paris", "Etc/GMT-10") untouched.
++        """
++        return _invert_numeric_tzname(tzname)
+ 
+     def _convert_field_to_tz(self, field_name, tzname):
+         if not (settings.USE_TZ and tzname):
+diff --git a/django/db/backends/postgresql/operations.py b/django/db/backends/postgresql/operations.py
+index 8d19872bea..8f97c4af45 100644
+--- a/django/db/backends/postgresql/operations.py
++++ b/django/db/backends/postgresql/operations.py
+@@ -1,7 +1,7 @@
+ from psycopg2.extras import Inet
+ 
+ from django.conf import settings
+-from django.db.backends.base.operations import BaseDatabaseOperations
++from django.db.backends.base.operations import BaseDatabaseOperations, _invert_numeric_tzname
+ 
+ 
+ class DatabaseOperations(BaseDatabaseOperations):
+@@ -44,11 +44,12 @@ class DatabaseOperations(BaseDatabaseOperations):
+         return "DATE_TRUNC('%s', %s)" % (lookup_type, field_name)
+ 
+     def _prepare_tzname_delta(self, tzname):
+-        if '+' in tzname:
+-            return tzname.replace('+', '-')
+-        elif '-' in tzname:
+-            return tzname.replace('-', '+')
+-        return tzname
++        """
++        PostgreSQL applies a numeric offset given to AT TIME ZONE in the
++        opposite direction.  Flip the sign *only* for bare numeric offsets.
++        Leave real zone names (e.g. "Europe/Paris", "Etc/GMT-10") untouched.
++        """
++        return _invert_numeric_tzname(tzname)
+ 
+     def _convert_field_to_tz(self, field_name, tzname):
+         if tzname and settings.USE_TZ:

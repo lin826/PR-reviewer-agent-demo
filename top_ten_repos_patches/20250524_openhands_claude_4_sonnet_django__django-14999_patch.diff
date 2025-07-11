@@ -1,0 +1,593 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 982816be3a..5b8d014501 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -320,6 +320,9 @@ class RenameModel(ModelOperation):
+         new_model = to_state.apps.get_model(app_label, self.new_name)
+         if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+             old_model = from_state.apps.get_model(app_label, self.old_name)
++            # If the table name doesn't change, this is a no-op.
++            if old_model._meta.db_table == new_model._meta.db_table:
++                return
+             # Move the main table
+             schema_editor.alter_db_table(
+                 new_model,
+diff --git a/test_rename_model_db_table.py b/test_rename_model_db_table.py
+new file mode 100644
+index 0000000000..50e7621ebb
+--- /dev/null
++++ b/test_rename_model_db_table.py
+@@ -0,0 +1,226 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the RenameModel with db_table issue.
++
++This script demonstrates that RenameModel operations on models with custom db_table
++should be no-ops but currently perform unnecessary database operations.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection, migrations, models
++from django.db.migrations.state import ProjectState
++from django.test.utils import setup_test_environment, teardown_test_environment
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_rename_model_with_db_table():
++    """Test that RenameModel with db_table should be a no-op."""
++    
++    print("Testing RenameModel with db_table...")
++    
++    # Create initial state with a model that has custom db_table
++    project_state = ProjectState()
++    
++    # Add a model with custom db_table
++    create_operation = migrations.CreateModel(
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        options={'db_table': 'custom_table_name'}
++    )
++    
++    # Apply the create operation
++    create_operation.state_forwards('test_app', project_state)
++    
++    with connection.schema_editor() as schema_editor:
++        create_operation.database_forwards('test_app', schema_editor, ProjectState(), project_state)
++    
++    # Check that the table was created with the custom name
++    with connection.cursor() as cursor:
++        table_names = connection.introspection.table_names(cursor)
++        print(f"Tables after create: {table_names}")
++        assert 'custom_table_name' in table_names
++        assert 'test_app_testmodel' not in table_names
++    
++    # Now test RenameModel operation
++    rename_operation = migrations.RenameModel('TestModel', 'RenamedModel')
++    
++    # Create new state after rename
++    new_state = project_state.clone()
++    rename_operation.state_forwards('test_app', new_state)
++    
++    # Get the models to check their db_table
++    old_model = project_state.apps.get_model('test_app', 'TestModel')
++    new_model = new_state.apps.get_model('test_app', 'RenamedModel')
++    
++    print(f"Old model db_table: {old_model._meta.db_table}")
++    print(f"New model db_table: {new_model._meta.db_table}")
++    
++    # Both should have the same db_table since it's explicitly set
++    assert old_model._meta.db_table == new_model._meta.db_table == 'custom_table_name'
++    
++    # Apply the rename operation and capture any SQL queries
++    from django.test.utils import CaptureQueriesContext
++    
++    with CaptureQueriesContext(connection) as context:
++        with connection.schema_editor() as schema_editor:
++            rename_operation.database_forwards('test_app', schema_editor, project_state, new_state)
++    
++    print(f"SQL queries executed during rename: {len(context.captured_queries)}")
++    
++    # Filter out transaction management queries to focus on actual table operations
++    table_operation_queries = []
++    for query in context.captured_queries:
++        sql = query['sql'].strip()
++        print(f"  {sql}")
++        # Skip transaction management queries
++        if not (sql.startswith('PRAGMA') or sql in ('BEGIN', 'COMMIT', 'ROLLBACK')):
++            table_operation_queries.append(query)
++    
++    print(f"Table operation queries: {len(table_operation_queries)}")
++    for query in table_operation_queries:
++        print(f"  TABLE OP: {query['sql']}")
++    
++    # Check that table still exists with the same name
++    with connection.cursor() as cursor:
++        table_names = connection.introspection.table_names(cursor)
++        print(f"Tables after rename: {table_names}")
++        assert 'custom_table_name' in table_names
++    
++    # The issue: Currently this will show table operation queries being executed
++    # when it should be a no-op (no table operation queries)
++    if len(table_operation_queries) > 0:
++        print("❌ ISSUE REPRODUCED: RenameModel executed table operation queries even though db_table is custom!")
++        print("   This should be a no-op since the table name doesn't change.")
++        return False
++    else:
++        print("✅ FIXED: RenameModel was a no-op as expected!")
++        return True
++
++def test_rename_model_without_db_table():
++    """Test that RenameModel without db_table works normally."""
++    
++    print("\nTesting RenameModel without db_table (should execute SQL)...")
++    
++    # Create initial state with a model that uses default table naming
++    project_state = ProjectState()
++    
++    # Add a model without custom db_table
++    create_operation = migrations.CreateModel(
++        'NormalModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++    )
++    
++    # Apply the create operation
++    create_operation.state_forwards('test_app', project_state)
++    
++    with connection.schema_editor() as schema_editor:
++        create_operation.database_forwards('test_app', schema_editor, ProjectState(), project_state)
++    
++    # Check that the table was created with the default name
++    with connection.cursor() as cursor:
++        table_names = connection.introspection.table_names(cursor)
++        print(f"Tables after create: {table_names}")
++        assert 'test_app_normalmodel' in table_names
++    
++    # Now test RenameModel operation
++    rename_operation = migrations.RenameModel('NormalModel', 'RenamedNormalModel')
++    
++    # Create new state after rename
++    new_state = project_state.clone()
++    rename_operation.state_forwards('test_app', new_state)
++    
++    # Get the models to check their db_table
++    old_model = project_state.apps.get_model('test_app', 'NormalModel')
++    new_model = new_state.apps.get_model('test_app', 'RenamedNormalModel')
++    
++    print(f"Old model db_table: {old_model._meta.db_table}")
++    print(f"New model db_table: {new_model._meta.db_table}")
++    
++    # They should have different db_table names
++    assert old_model._meta.db_table != new_model._meta.db_table
++    
++    # Apply the rename operation and capture any SQL queries
++    from django.test.utils import CaptureQueriesContext
++    
++    with CaptureQueriesContext(connection) as context:
++        with connection.schema_editor() as schema_editor:
++            rename_operation.database_forwards('test_app', schema_editor, project_state, new_state)
++    
++    print(f"SQL queries executed during rename: {len(context.captured_queries)}")
++    
++    # Filter out transaction management queries to focus on actual table operations
++    table_operation_queries = []
++    for query in context.captured_queries:
++        sql = query['sql'].strip()
++        print(f"  {sql}")
++        # Skip transaction management queries
++        if not (sql.startswith('PRAGMA') or sql in ('BEGIN', 'COMMIT', 'ROLLBACK')):
++            table_operation_queries.append(query)
++    
++    print(f"Table operation queries: {len(table_operation_queries)}")
++    for query in table_operation_queries:
++        print(f"  TABLE OP: {query['sql']}")
++    
++    # Check that table was renamed
++    with connection.cursor() as cursor:
++        table_names = connection.introspection.table_names(cursor)
++        print(f"Tables after rename: {table_names}")
++        assert 'test_app_renamednormalmodel' in table_names
++        assert 'test_app_normalmodel' not in table_names
++    
++    # This should execute table operation queries since the table name actually changes
++    if len(table_operation_queries) > 0:
++        print("✅ EXPECTED: RenameModel executed table operation queries as expected!")
++        return True
++    else:
++        print("❌ UNEXPECTED: RenameModel was a no-op when it should have executed table operations!")
++        return False
++
++if __name__ == '__main__':
++    setup_test_environment()
++    try:
++        # Test the issue case
++        issue_reproduced = not test_rename_model_with_db_table()
++        
++        # Test the normal case
++        normal_case_works = test_rename_model_without_db_table()
++        
++        print(f"\nSummary:")
++        print(f"Issue reproduced: {issue_reproduced}")
++        print(f"Normal case works: {normal_case_works}")
++        
++        if issue_reproduced:
++            print("\n🔍 The issue is confirmed: RenameModel with db_table performs unnecessary operations.")
++            sys.exit(1)
++        else:
++            print("\n✅ All tests passed!")
++            sys.exit(0)
++            
++    finally:
++        teardown_test_environment()
+\ No newline at end of file
+diff --git a/test_rename_model_db_table_django_test.py b/test_rename_model_db_table_django_test.py
+new file mode 100644
+index 0000000000..a9a7672b9d
+--- /dev/null
++++ b/test_rename_model_db_table_django_test.py
+@@ -0,0 +1,99 @@
++"""
++Test case that could be added to Django's test suite for the RenameModel db_table fix.
++This test should be added to tests/migrations/test_operations.py
++"""
++
++from django.db import connection, migrations, models
++from django.test.utils import CaptureQueriesContext
++
++from .test_base import OperationTestBase
++
++
++class RenameModelDbTableTests(OperationTestBase):
++    """
++    Tests for RenameModel operation when models have custom db_table.
++    """
++
++    def test_rename_model_with_db_table_noop(self):
++        """
++        RenameModel operations on models with custom db_table should be no-ops
++        when the table name doesn't change.
++        """
++        # Create a model with custom db_table
++        project_state = self.set_up_test_model("test_rmwdt", db_table="custom_table")
++        
++        # Test the rename operation
++        operation = migrations.RenameModel("Pony", "Horse")
++        
++        # Get the models to verify they have the same db_table
++        old_model = project_state.apps.get_model("test_rmwdt", "Pony")
++        new_state = project_state.clone()
++        operation.state_forwards("test_rmwdt", new_state)
++        new_model = new_state.apps.get_model("test_rmwdt", "Horse")
++        
++        # Both models should have the same custom db_table
++        self.assertEqual(old_model._meta.db_table, "custom_table")
++        self.assertEqual(new_model._meta.db_table, "custom_table")
++        
++        # Apply the operation and capture queries
++        with CaptureQueriesContext(connection) as context:
++            with connection.schema_editor() as editor:
++                operation.database_forwards("test_rmwdt", editor, project_state, new_state)
++        
++        # Filter out transaction management queries
++        table_operation_queries = [
++            query for query in context.captured_queries
++            if not (query['sql'].strip().startswith('PRAGMA') or 
++                   query['sql'].strip() in ('BEGIN', 'COMMIT', 'ROLLBACK'))
++        ]
++        
++        # Should be no table operation queries since db_table doesn't change
++        self.assertEqual(len(table_operation_queries), 0)
++        
++        # Verify the table still exists with the original name
++        self.assertTableExists("custom_table")
++        
++    def test_rename_model_without_db_table_executes_sql(self):
++        """
++        RenameModel operations on models without custom db_table should
++        execute SQL to rename the table.
++        """
++        # Create a model without custom db_table
++        project_state = self.set_up_test_model("test_rmwodt")
++        
++        # Test the rename operation
++        operation = migrations.RenameModel("Pony", "Horse")
++        
++        # Get the models to verify they have different db_table values
++        old_model = project_state.apps.get_model("test_rmwodt", "Pony")
++        new_state = project_state.clone()
++        operation.state_forwards("test_rmwodt", new_state)
++        new_model = new_state.apps.get_model("test_rmwodt", "Horse")
++        
++        # Models should have different db_table values
++        self.assertEqual(old_model._meta.db_table, "test_rmwodt_pony")
++        self.assertEqual(new_model._meta.db_table, "test_rmwodt_horse")
++        
++        # Apply the operation and capture queries
++        with CaptureQueriesContext(connection) as context:
++            with connection.schema_editor() as editor:
++                operation.database_forwards("test_rmwodt", editor, project_state, new_state)
++        
++        # Filter out transaction management queries
++        table_operation_queries = [
++            query for query in context.captured_queries
++            if not (query['sql'].strip().startswith('PRAGMA') or 
++                   query['sql'].strip() in ('BEGIN', 'COMMIT', 'ROLLBACK'))
++        ]
++        
++        # Should execute at least one table operation query
++        self.assertGreater(len(table_operation_queries), 0)
++        
++        # Verify the table was renamed
++        self.assertTableNotExists("test_rmwodt_pony")
++        self.assertTableExists("test_rmwodt_horse")
++
++
++if __name__ == '__main__':
++    # This would normally be run as part of Django's test suite
++    print("This test should be added to tests/migrations/test_operations.py")
+\ No newline at end of file
+diff --git a/test_rename_model_edge_cases.py b/test_rename_model_edge_cases.py
+new file mode 100644
+index 0000000000..6270b40246
+--- /dev/null
++++ b/test_rename_model_edge_cases.py
+@@ -0,0 +1,233 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the RenameModel with db_table fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection, migrations, models
++from django.db.migrations.state import ProjectState
++from django.test.utils import setup_test_environment, teardown_test_environment, CaptureQueriesContext
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def count_table_operations(queries):
++    """Count actual table operation queries, excluding transaction management."""
++    table_ops = 0
++    for query in queries:
++        sql = query['sql'].strip()
++        if not (sql.startswith('PRAGMA') or sql in ('BEGIN', 'COMMIT', 'ROLLBACK')):
++            table_ops += 1
++    return table_ops
++
++def test_rename_model_with_foreign_keys():
++    """Test RenameModel with db_table when there are foreign key relationships."""
++    
++    print("Testing RenameModel with db_table and foreign keys...")
++    
++    project_state = ProjectState()
++    
++    # Create a model with custom db_table
++    create_parent = migrations.CreateModel(
++        'Parent',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        options={'db_table': 'custom_parent_table'}
++    )
++    
++    # Create a child model that references the parent
++    create_child = migrations.CreateModel(
++        'Child',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('parent', models.ForeignKey('Parent', on_delete=models.CASCADE)),
++            ('name', models.CharField(max_length=100)),
++        ],
++    )
++    
++    # Apply the create operations
++    create_parent.state_forwards('test_app', project_state)
++    create_child.state_forwards('test_app', project_state)
++    
++    with connection.schema_editor() as schema_editor:
++        create_parent.database_forwards('test_app', schema_editor, ProjectState(), project_state)
++        
++    # Create a new state for the child
++    child_state = project_state.clone()
++    with connection.schema_editor() as schema_editor:
++        create_child.database_forwards('test_app', schema_editor, project_state, child_state)
++    
++    # Now test RenameModel operation on the parent (which has custom db_table)
++    rename_operation = migrations.RenameModel('Parent', 'RenamedParent')
++    
++    new_state = child_state.clone()
++    rename_operation.state_forwards('test_app', new_state)
++    
++    # Apply the rename operation and capture queries
++    with CaptureQueriesContext(connection) as context:
++        with connection.schema_editor() as schema_editor:
++            rename_operation.database_forwards('test_app', schema_editor, child_state, new_state)
++    
++    table_ops = count_table_operations(context.captured_queries)
++    print(f"Table operation queries with FK relationships: {table_ops}")
++    
++    # Should still be 0 since the parent table name doesn't change
++    if table_ops == 0:
++        print("✅ PASSED: RenameModel with FK relationships was a no-op as expected!")
++        return True
++    else:
++        print("❌ FAILED: RenameModel with FK relationships executed unnecessary operations!")
++        return False
++
++def test_rename_model_with_m2m():
++    """Test RenameModel with db_table when there are many-to-many relationships."""
++    
++    print("\nTesting RenameModel with db_table and M2M relationships...")
++    
++    project_state = ProjectState()
++    
++    # Create models with M2M relationship
++    create_author = migrations.CreateModel(
++        'Author',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        options={'db_table': 'custom_author_table'}
++    )
++    
++    create_book = migrations.CreateModel(
++        'Book',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('title', models.CharField(max_length=100)),
++            ('authors', models.ManyToManyField('Author')),
++        ],
++    )
++    
++    # Apply the create operations
++    create_author.state_forwards('test_app', project_state)
++    create_book.state_forwards('test_app', project_state)
++    
++    with connection.schema_editor() as schema_editor:
++        create_author.database_forwards('test_app', schema_editor, ProjectState(), project_state)
++        
++    book_state = project_state.clone()
++    with connection.schema_editor() as schema_editor:
++        create_book.database_forwards('test_app', schema_editor, project_state, book_state)
++    
++    # Now test RenameModel operation on the author (which has custom db_table)
++    rename_operation = migrations.RenameModel('Author', 'RenamedAuthor')
++    
++    new_state = book_state.clone()
++    rename_operation.state_forwards('test_app', new_state)
++    
++    # Apply the rename operation and capture queries
++    with CaptureQueriesContext(connection) as context:
++        with connection.schema_editor() as schema_editor:
++            rename_operation.database_forwards('test_app', schema_editor, book_state, new_state)
++    
++    table_ops = count_table_operations(context.captured_queries)
++    print(f"Table operation queries with M2M relationships: {table_ops}")
++    
++    # Should still be 0 since the author table name doesn't change
++    if table_ops == 0:
++        print("✅ PASSED: RenameModel with M2M relationships was a no-op as expected!")
++        return True
++    else:
++        print("❌ FAILED: RenameModel with M2M relationships executed unnecessary operations!")
++        return False
++
++def test_rename_model_different_db_tables():
++    """Test that RenameModel still works when old and new models have different db_table values."""
++    
++    print("\nTesting RenameModel when db_table values are different...")
++    
++    project_state = ProjectState()
++    
++    # Create a model with custom db_table
++    create_operation = migrations.CreateModel(
++        'TestModel',
++        [
++            ('id', models.AutoField(primary_key=True)),
++            ('name', models.CharField(max_length=100)),
++        ],
++        options={'db_table': 'old_custom_table'}
++    )
++    
++    create_operation.state_forwards('test_app', project_state)
++    
++    with connection.schema_editor() as schema_editor:
++        create_operation.database_forwards('test_app', schema_editor, ProjectState(), project_state)
++    
++    # Create a new state where the renamed model has a different db_table
++    new_state = project_state.clone()
++    
++    # Manually modify the model state to have a different db_table
++    model_state = new_state.models['test_app', 'testmodel']
++    model_state.options['db_table'] = 'new_custom_table'
++    
++    # Rename the model in the state
++    new_state.rename_model('test_app', 'TestModel', 'RenamedModel')
++    
++    # Create a RenameModel operation
++    rename_operation = migrations.RenameModel('TestModel', 'RenamedModel')
++    
++    # Apply the rename operation and capture queries
++    with CaptureQueriesContext(connection) as context:
++        with connection.schema_editor() as schema_editor:
++            rename_operation.database_forwards('test_app', schema_editor, project_state, new_state)
++    
++    table_ops = count_table_operations(context.captured_queries)
++    print(f"Table operation queries with different db_table values: {table_ops}")
++    
++    # Should execute operations since the table names are different
++    if table_ops > 0:
++        print("✅ PASSED: RenameModel with different db_table values executed operations as expected!")
++        return True
++    else:
++        print("❌ FAILED: RenameModel with different db_table values should have executed operations!")
++        return False
++
++if __name__ == '__main__':
++    setup_test_environment()
++    try:
++        test1 = test_rename_model_with_foreign_keys()
++        test2 = test_rename_model_with_m2m()
++        test3 = test_rename_model_different_db_tables()
++        
++        print(f"\nSummary:")
++        print(f"FK test passed: {test1}")
++        print(f"M2M test passed: {test2}")
++        print(f"Different db_table test passed: {test3}")
++        
++        if all([test1, test2, test3]):
++            print("\n✅ All edge case tests passed!")
++            sys.exit(0)
++        else:
++            print("\n❌ Some edge case tests failed!")
++            sys.exit(1)
++            
++    finally:
++        teardown_test_environment()
+\ No newline at end of file

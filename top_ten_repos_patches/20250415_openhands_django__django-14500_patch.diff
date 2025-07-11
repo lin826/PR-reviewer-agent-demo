@@ -1,0 +1,409 @@
+diff --git a/django/db/migrations/executor.py b/django/db/migrations/executor.py
+index 57042a8690..d65f22e3b5 100644
+--- a/django/db/migrations/executor.py
++++ b/django/db/migrations/executor.py
+@@ -254,6 +254,10 @@ class MigrationExecutor:
+         if migration.replaces:
+             for app_label, name in migration.replaces:
+                 self.recorder.record_unapplied(app_label, name)
++            # We don't mark the squashed migration itself as unapplied because we may
++            # want it to still be marked as applied even when some of its replaced
++            # migrations are unapplied. The check_replacements() method will mark it
++            # as unapplied if all replaced migrations are unapplied.
+         else:
+             self.recorder.record_unapplied(migration.app_label, migration.name)
+         # Report progress
+@@ -264,6 +268,8 @@ class MigrationExecutor:
+     def check_replacements(self):
+         """
+         Mark replacement migrations applied if their replaced set all are.
++        Also mark squashed migrations as unapplied if none of their replaced migrations
++        are applied.
+ 
+         Do this unconditionally on every migrate, rather than just when
+         migrations are applied or unapplied, to correctly handle the case
+@@ -275,8 +281,14 @@ class MigrationExecutor:
+         applied = self.recorder.applied_migrations()
+         for key, migration in self.loader.replacements.items():
+             all_applied = all(m in applied for m in migration.replaces)
++            any_applied = any(m in applied for m in migration.replaces)
++            
++            # Mark squashed migration as applied if all replaced migrations are applied
+             if all_applied and key not in applied:
+                 self.recorder.record_applied(*key)
++            # Mark squashed migration as unapplied if none of the replaced migrations are applied
++            elif not any_applied and key in applied:
++                self.recorder.record_unapplied(*key)
+ 
+     def detect_soft_applied(self, project_state, migration):
+         """
+diff --git a/test_fixed_migration_bug.py b/test_fixed_migration_bug.py
+new file mode 100644
+index 0000000000..7071b68668
+--- /dev/null
++++ b/test_fixed_migration_bug.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python
++"""
++Test script to verify our fix for the squashed migration issue.
++
++This verifies that after our fix, when unapplying a squashed migration,
++only the replaced migrations are marked as unapplied, and the squashed 
++migration remains marked as applied.
++"""
++
++import os
++import sys
++import django
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.test.utils import override_settings
++
++# Setup Django settings
++os.environ['DJANGO_SETTINGS_MODULE'] = 'test_settings'
++django.setup()
++
++# Create a migration recorder manually
++from django.db.migrations.recorder import MigrationRecorder
++recorder = MigrationRecorder(connection)
++
++# Ensure the migration table exists
++print("Ensuring migration table exists...")
++recorder.ensure_schema()
++
++# Clear any existing migration records
++print("Clearing migration records...")
++try:
++    recorder.flush()
++except:
++    pass
++
++# Set up a mock migration and its squashed version
++app_label = "test_app"
++migration_name1 = "0001_initial"
++migration_name2 = "0002_second"
++squashed_name = "0001_squashed_0002"
++
++class MockMigration:
++    def __init__(self, app_label, name, replaces=None, atomic=True):
++        self.app_label = app_label
++        self.name = name
++        self.replaces = replaces or []
++        self.atomic = atomic
++
++    def unapply(self, state, schema_editor):
++        return state
++
++# Create and set up a migration executor
++executor = MigrationExecutor(connection)
++executor.loader.replacements = {
++    (app_label, squashed_name): MockMigration(
++        app_label, 
++        squashed_name, 
++        [(app_label, migration_name1), (app_label, migration_name2)]
++    )
++}
++
++# TEST 1: Unapplying regular migrations
++print("\n--- TEST 1: Unapplying regular migrations ---")
++
++# Reset the database state
++recorder.flush()
++recorder.record_applied(app_label, migration_name1)
++
++# Record the migrations as applied
++print("Applied migrations before unapplying:")
++applied = recorder.applied_migrations()
++for key in applied:
++    print(f"  {key[0]}.{key[1]}")
++
++# Unapply a normal migration
++print("\nUnapplying a normal migration...")
++executor.unapply_migration(None, MockMigration(app_label, migration_name1))
++
++# Check what's happened - it should be unapplied
++applied = recorder.applied_migrations()
++print("Applied migrations after unapplying:")
++for key in applied:
++    print(f"  {key[0]}.{key[1]}")
++
++print("\nNormal migration unapply test result:")
++if (app_label, migration_name1) not in applied:
++    print("✅ CORRECT: Regular migration was correctly marked as unapplied")
++else:
++    print("❌ INCORRECT: Regular migration was incorrectly still marked as applied")
++
++# TEST 2: Unapplying squashed migrations
++print("\n--- TEST 2: Unapplying squashed migrations ---")
++
++# Reset the database state
++recorder.flush()
++recorder.record_applied(app_label, migration_name1)
++recorder.record_applied(app_label, migration_name2)
++recorder.record_applied(app_label, squashed_name)
++
++# Record the migrations as applied
++print("Applied migrations before unapplying:")
++applied = recorder.applied_migrations()
++for key in applied:
++    print(f"  {key[0]}.{key[1]}")
++
++# Unapply a squashed migration
++print("\nUnapplying a squashed migration...")
++executor.unapply_migration(None, executor.loader.replacements[(app_label, squashed_name)])
++
++# Check what's happened - replaced migrations should be unapplied, but squashed migration should still be applied
++applied = recorder.applied_migrations()
++print("Applied migrations after unapplying:")
++for key in applied:
++    print(f"  {key[0]}.{key[1]}")
++
++print("\nSquashed migration unapply test result:")
++if (app_label, migration_name1) not in applied and (app_label, migration_name2) not in applied:
++    print("✅ CORRECT: Replaced migrations were correctly marked as unapplied")
++else:
++    print("❌ INCORRECT: Some replaced migrations were incorrectly still marked as applied")
++
++if (app_label, squashed_name) in applied:
++    print("✅ CORRECT: Squashed migration was correctly still marked as applied")
++else:
++    print("❌ INCORRECT: Squashed migration was incorrectly marked as unapplied")
++
++# TEST 3: Check replacements handling
++print("\n--- TEST 3: Check replacements handling ---")
++
++# Reset the database state
++recorder.flush() 
++recorder.record_applied(app_label, squashed_name)
++# Note: We don't apply the individual migrations here
++
++# Record the migrations as applied
++print("Applied migrations before check_replacements:")
++applied = recorder.applied_migrations()
++for key in applied:
++    print(f"  {key[0]}.{key[1]}")
++
++# Call check_replacements
++print("\nCalling check_replacements...")
++executor.check_replacements()
++
++# Check what's happened - should still be applied
++applied = recorder.applied_migrations()
++print("Applied migrations after check_replacements:")
++for key in applied:
++    print(f"  {key[0]}.{key[1]}")
++
++# There are no replaced migrations, so the squashed migration should not be applied
++if (app_label, squashed_name) not in applied:
++    print("\n✅ CORRECT: check_replacements correctly marked squashed migration as unapplied when all replaced migrations are unapplied")
++else:
++    print("\n❌ INCORRECT: check_replacements incorrectly kept squashed migration as applied when all replaced migrations are unapplied")
++
++print("\nAll tests completed.")
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..51b87ffadf
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,19 @@
++"""
++Minimal Django settings file for testing
++"""
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++
++INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++]
++
++SECRET_KEY = 'test-key'
++
++USE_TZ = True
+\ No newline at end of file
+diff --git a/test_squashed_migration_bug.py b/test_squashed_migration_bug.py
+new file mode 100644
+index 0000000000..f84a637b8b
+--- /dev/null
++++ b/test_squashed_migration_bug.py
+@@ -0,0 +1,173 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the squashed migration issue.
++
++This demonstrates that when unapplying a squashed migration, the squashed migration
++itself is incorrectly marked as unapplied, even though its replaced migrations may
++still be applied.
++"""
++
++import os
++import sys
++import django
++from django.db import connection
++from django.db.migrations.executor import MigrationExecutor
++from django.test.utils import override_settings
++
++# Setup Django settings
++os.environ['DJANGO_SETTINGS_MODULE'] = 'test_settings'
++django.setup()
++
++# Create a migration recorder manually
++from django.db.migrations.recorder import MigrationRecorder
++recorder = MigrationRecorder(connection)
++
++# Ensure the migration table exists
++print("Ensuring migration table exists...")
++recorder.ensure_schema()
++
++# Clear any existing migration records
++print("Clearing migration records...")
++try:
++    recorder.flush()
++except:
++    pass
++
++# Set up a mock migration and its squashed version
++app_label = "test_app"
++migration_name1 = "0001_initial"
++migration_name2 = "0002_second"
++squashed_name = "0001_squashed_0002"
++
++# Record migrations as applied (simulating a real migration)
++print("Recording migrations as applied...")
++recorder.record_applied(app_label, migration_name1)
++recorder.record_applied(app_label, migration_name2)
++recorder.record_applied(app_label, squashed_name)
++
++# Check the applied migrations
++applied = recorder.applied_migrations()
++print("Applied migrations before unapplying:")
++for migration in applied.keys():
++    print(f"  {migration[0]}.{migration[1]}")
++
++# Create a migration executor
++executor = MigrationExecutor(connection)
++
++# Patch the executor's loader to include our mock squashed migration
++class MockMigration:
++    def __init__(self, app_label, name, replaces=None):
++        self.app_label = app_label
++        self.name = name
++        self.replaces = replaces or []
++
++executor.loader.replacements = {
++    (app_label, squashed_name): MockMigration(app_label, squashed_name, [(app_label, migration_name1), (app_label, migration_name2)])
++}
++
++# Create a buggy unapply_migration method to demonstrate the issue
++def buggy_unapply_migration(executor, state, migration, fake=False):
++    """Simulates the buggy behavior of the current MigrationExecutor.unapply_migration"""
++    print(f"Unapplying migration {migration.app_label}.{migration.name}")
++    
++    # Unapply the squashed migration itself along with all its replacements
++    if migration.replaces:
++        for app_label, name in migration.replaces:
++            recorder.record_unapplied(app_label, name)
++    
++    # BUGGY BEHAVIOR: Also record the squashed migration as unapplied
++    recorder.record_unapplied(migration.app_label, migration.name)
++    
++    return state
++
++# Create a fixed unapply_migration method to demonstrate the correct behavior
++def fixed_unapply_migration(executor, state, migration, fake=False):
++    """Simulates a fixed implementation of MigrationExecutor.unapply_migration"""
++    print(f"Unapplying migration {migration.app_label}.{migration.name} (fixed version)")
++    
++    # Only unapply the replaced migrations
++    if migration.replaces:
++        for app_label, name in migration.replaces:
++            recorder.record_unapplied(app_label, name)
++        
++        # Remember, in the fixed version we don't mark the squashed migration as unapplied
++        # because we want it to still show as applied as long as any of its contents remain
++        # applied, and we'll let check_replacements handle this.
++    else:
++        # For regular migrations, record as unapplied normally
++        recorder.record_unapplied(migration.app_label, migration.name)
++    
++    return state
++
++# Simulate unapplying the migrations with the buggy behavior
++print("\nUnapplying migrations with current buggy implementation...")
++# Reset our database state
++recorder.record_applied(app_label, migration_name1)
++recorder.record_applied(app_label, migration_name2)
++recorder.record_applied(app_label, squashed_name)
++
++# Simulate the current buggy behavior
++buggy_unapply_migration(executor, None, executor.loader.replacements[(app_label, squashed_name)])
++
++# Check what's happened with the squashed migration
++applied = recorder.applied_migrations()
++print("Applied migrations after buggy unapplying:")
++for migration in applied.keys():
++    print(f"  {migration[0]}.{migration[1]}")
++
++print("\nBug demonstration:")
++if (app_label, squashed_name) in applied:
++    print(f"✅ SUCCESS: The squashed migration {app_label}.{squashed_name} is still marked as applied (correct)")
++else:
++    print(f"❌ BUG: The squashed migration {app_label}.{squashed_name} is incorrectly marked as unapplied")
++    
++# Now test with the fixed implementation
++print("\nTesting with fixed implementation...")
++# Reset our database state
++recorder.record_applied(app_label, migration_name1)
++recorder.record_applied(app_label, migration_name2)
++recorder.record_applied(app_label, squashed_name)
++
++# Simulate the fixed behavior
++fixed_unapply_migration(executor, None, executor.loader.replacements[(app_label, squashed_name)])
++
++# Check again after the fix
++applied = recorder.applied_migrations()
++print("Applied migrations after fixed unapplying:")
++for migration in applied.keys():
++    print(f"  {migration[0]}.{migration[1]}")
++
++print("\nFixed behavior demonstration:")
++if (app_label, squashed_name) in applied:
++    print(f"✅ SUCCESS: The squashed migration {app_label}.{squashed_name} is still marked as applied (correct)")
++else:
++    print(f"❌ INCORRECT: The squashed migration {app_label}.{squashed_name} is marked as unapplied")
++
++# Let's unapply one more replaced migration and then check if check_replacements works
++# to clean up the squashed migration status
++print("\nTesting with check_replacements after all replaced migrations unapplied...")
++# Manually remove the squashed migration from applied list
++recorder.record_unapplied(app_label, squashed_name)
++# Call the check replacements method to fix squashed migration state
++executor.check_replacements()
++
++# Check again after check_replacements
++applied = recorder.applied_migrations()
++print("Applied migrations after check_replacements:")
++for migration in applied.keys():
++    print(f"  {migration[0]}.{migration[1]}")
++
++if (app_label, squashed_name) not in applied:
++    print(f"✅ CORRECT: The squashed migration {app_label}.{squashed_name} is marked as unapplied because all replacements are unapplied")
++else:
++    print(f"❌ INCORRECT: The squashed migration {app_label}.{squashed_name} is incorrectly marked as applied when all replaced migrations are unapplied")
++
++# Now test with our proposed fix
++print("\nTesting with potential fix (calling check_replacements)...")
++executor.check_replacements()
++
++# Check again after the fix
++applied = recorder.applied_migrations()
++print("Applied migrations after check_replacements:")
++for migration in applied.keys():
++    print(f"  {migration[0]}.{migration[1]}")
+\ No newline at end of file

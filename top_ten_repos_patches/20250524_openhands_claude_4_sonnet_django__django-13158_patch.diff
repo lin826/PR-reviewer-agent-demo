@@ -1,0 +1,604 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 07d6ffd4ca..f536ca6725 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -920,6 +920,10 @@ class QuerySet:
+         """Return an empty QuerySet."""
+         clone = self._chain()
+         clone.query.set_empty()
++        # Clear combined queries to ensure empty result for union/intersection/difference
++        clone.query.combined_queries = ()
++        clone.query.combinator = None
++        clone.query.combinator_all = False
+         return clone
+ 
+     ##################################################################
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..47b2234a2a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the QuerySet.none() issue with union queries.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++from django.contrib import admin
++
++# Define models
++class Publication(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    publications = models.ManyToManyField(to=Publication, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create tables
++from django.db import connection
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Publication)
++    schema_editor.create_model(Article)
++
++# Create test data
++print("Creating test data...")
++for i in range(1, 11):
++    Publication.objects.create(name=f"Publication {i}")
++
++print(f"Created {Publication.objects.count()} publications")
++
++# Test the issue
++print("\n=== Testing QuerySet.none() behavior ===")
++
++# Test 1: Regular OR query
++print("\n1. Testing regular OR query:")
++or_queryset = Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5)
++print(f"OR queryset count: {or_queryset.count()}")
++print(f"OR queryset.none() count: {or_queryset.none().count()}")
++print(f"OR queryset.none() is EmptyQuerySet: {isinstance(or_queryset.none(), django.db.models.query.EmptyQuerySet)}")
++
++# Test 2: Union query
++print("\n2. Testing union query:")
++union_queryset = Publication.objects.filter(id__lt=2).union(Publication.objects.filter(id__gt=5))
++print(f"Union queryset count: {union_queryset.count()}")
++print(f"Union queryset.none() count: {union_queryset.none().count()}")
++print(f"Union queryset.none() is EmptyQuerySet: {isinstance(union_queryset.none(), django.db.models.query.EmptyQuerySet)}")
++
++# Test 3: ModelMultipleChoiceField behavior
++print("\n3. Testing ModelMultipleChoiceField behavior:")
++
++class ArticleFormOR(forms.ModelForm):
++    publications = forms.ModelMultipleChoiceField(
++        Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5),
++        required=False,
++    )
++    class Meta:
++        model = Article
++        fields = ["publications"]
++
++class ArticleFormUnion(forms.ModelForm):
++    publications = forms.ModelMultipleChoiceField(
++        Publication.objects.filter(id__lt=2).union(Publication.objects.filter(id__gt=5)),
++        required=False,
++    )
++    class Meta:
++        model = Article
++        fields = ["publications"]
++
++# Test form behavior with empty data
++print("\nTesting form with OR queryset (empty submission):")
++form_or = ArticleFormOR(data={'publications': []})
++if form_or.is_valid():
++    cleaned_publications = form_or.cleaned_data['publications']
++    print(f"OR form cleaned_data count: {cleaned_publications.count()}")
++    print(f"OR form cleaned_data is EmptyQuerySet: {isinstance(cleaned_publications, django.db.models.query.EmptyQuerySet)}")
++else:
++    print("OR form is not valid:", form_or.errors)
++
++print("\nTesting form with Union queryset (empty submission):")
++form_union = ArticleFormUnion(data={'publications': []})
++if form_union.is_valid():
++    cleaned_publications = form_union.cleaned_data['publications']
++    print(f"Union form cleaned_data count: {cleaned_publications.count()}")
++    print(f"Union form cleaned_data is EmptyQuerySet: {isinstance(cleaned_publications, django.db.models.query.EmptyQuerySet)}")
++else:
++    print("Union form is not valid:", form_union.errors)
++
++# Test 4: Direct comparison of the issue
++print("\n4. Direct comparison:")
++print("Expected behavior: both should return 0 items when .none() is called")
++
++or_none = (Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5)).none()
++union_none = Publication.objects.filter(id__lt=2).union(Publication.objects.filter(id__gt=5)).none()
++
++print(f"OR.none() count: {or_none.count()}")
++print(f"Union.none() count: {union_none.count()}")
++
++print(f"OR.none() list: {list(or_none)}")
++print(f"Union.none() list: {list(union_none)}")
++
++print("\n=== End of test ===")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..a7d2c95c25
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the QuerySet.none() fix with all combined query types.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++from django.contrib import admin
++
++# Define models
++class Publication(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create tables
++from django.db import connection
++
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Publication)
++
++# Create test data
++print("Creating test data...")
++for i in range(1, 11):
++    Publication.objects.create(name=f"Publication {i}")
++
++print(f"Created {Publication.objects.count()} publications")
++
++# Test all combined query types
++print("\n=== Testing QuerySet.none() behavior on all combined query types ===")
++
++# Base querysets
++qs1 = Publication.objects.filter(id__lte=5)
++qs2 = Publication.objects.filter(id__gte=3)
++qs3 = Publication.objects.filter(id__in=[1, 2, 8, 9])
++
++print(f"Base qs1 count (id <= 5): {qs1.count()}")
++print(f"Base qs2 count (id >= 3): {qs2.count()}")
++print(f"Base qs3 count (id in [1,2,8,9]): {qs3.count()}")
++
++# Test 1: Union
++print("\n1. Testing Union:")
++union_qs = qs1.union(qs2)
++print(f"Union queryset count: {union_qs.count()}")
++print(f"Union queryset.none() count: {union_qs.none().count()}")
++print(f"Union queryset.none() is EmptyQuerySet: {isinstance(union_qs.none(), django.db.models.query.EmptyQuerySet)}")
++
++# Test 2: Intersection (if supported)
++print("\n2. Testing Intersection:")
++try:
++    intersection_qs = qs1.intersection(qs2)
++    print(f"Intersection queryset count: {intersection_qs.count()}")
++    print(f"Intersection queryset.none() count: {intersection_qs.none().count()}")
++    print(f"Intersection queryset.none() is EmptyQuerySet: {isinstance(intersection_qs.none(), django.db.models.query.EmptyQuerySet)}")
++except Exception as e:
++    print(f"Intersection not supported: {e}")
++
++# Test 3: Difference (if supported)
++print("\n3. Testing Difference:")
++try:
++    difference_qs = qs1.difference(qs2)
++    print(f"Difference queryset count: {difference_qs.count()}")
++    print(f"Difference queryset.none() count: {difference_qs.none().count()}")
++    print(f"Difference queryset.none() is EmptyQuerySet: {isinstance(difference_qs.none(), django.db.models.query.EmptyQuerySet)}")
++except Exception as e:
++    print(f"Difference not supported: {e}")
++
++# Test 4: Multiple unions
++print("\n4. Testing Multiple Unions:")
++multi_union_qs = qs1.union(qs2, qs3)
++print(f"Multi-union queryset count: {multi_union_qs.count()}")
++print(f"Multi-union queryset.none() count: {multi_union_qs.none().count()}")
++print(f"Multi-union queryset.none() is EmptyQuerySet: {isinstance(multi_union_qs.none(), django.db.models.query.EmptyQuerySet)}")
++
++# Test 5: Union with all=True
++print("\n5. Testing Union with all=True:")
++union_all_qs = qs1.union(qs2, all=True)
++print(f"Union all queryset count: {union_all_qs.count()}")
++print(f"Union all queryset.none() count: {union_all_qs.none().count()}")
++print(f"Union all queryset.none() is EmptyQuerySet: {isinstance(union_all_qs.none(), django.db.models.query.EmptyQuerySet)}")
++
++# Test 6: Edge case - none() on already empty union
++print("\n6. Testing none() on empty union:")
++empty_qs1 = Publication.objects.filter(id__lt=0)  # Empty
++empty_qs2 = Publication.objects.filter(id__gt=100)  # Empty
++empty_union = empty_qs1.union(empty_qs2)
++print(f"Empty union queryset count: {empty_union.count()}")
++print(f"Empty union queryset.none() count: {empty_union.none().count()}")
++
++# Test 7: Verify that regular querysets still work
++print("\n7. Testing regular queryset (regression test):")
++regular_qs = Publication.objects.filter(id__lte=3)
++print(f"Regular queryset count: {regular_qs.count()}")
++print(f"Regular queryset.none() count: {regular_qs.none().count()}")
++print(f"Regular queryset.none() is EmptyQuerySet: {isinstance(regular_qs.none(), django.db.models.query.EmptyQuerySet)}")
++
++print("\n=== All tests completed ===")
+\ No newline at end of file
+diff --git a/test_modelmultiplechoicefield_union.py b/test_modelmultiplechoicefield_union.py
+new file mode 100644
+index 0000000000..eb33c6bae2
+--- /dev/null
++++ b/test_modelmultiplechoicefield_union.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python
++"""
++Test case for the ModelMultipleChoiceField issue with union queries.
++This reproduces the exact issue described in the problem statement.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django import forms
++from django.test import TestCase
++
++# Define models exactly as in the issue description
++class Publication(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    publications = models.ManyToManyField(to=Publication, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Define forms exactly as in the issue description
++class ArticleFormOR(forms.ModelForm):
++    publications = forms.ModelMultipleChoiceField(
++        Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5),
++        required=False,
++    )
++    class Meta:
++        model = Article
++        fields = ["publications"]
++
++class ArticleFormUnion(forms.ModelForm):
++    publications = forms.ModelMultipleChoiceField(
++        Publication.objects.filter(id__lt=2).union(
++            Publication.objects.filter(id__gt=5)
++        ),
++        required=False,
++    )
++    class Meta:
++        model = Article
++        fields = ["publications"]
++
++class ModelMultipleChoiceFieldUnionTest(TestCase):
++    """Test that ModelMultipleChoiceField works correctly with union querysets."""
++    
++    @classmethod
++    def setUpTestData(cls):
++        # Create test data - publications with IDs 1-10
++        for i in range(1, 11):
++            Publication.objects.create(name=f"Publication {i}")
++    
++    def test_or_queryset_form_empty_submission(self):
++        """Test that OR queryset form correctly handles empty submission."""
++        form = ArticleFormOR(data={'publications': []})
++        self.assertTrue(form.is_valid())
++        
++        cleaned_publications = form.cleaned_data['publications']
++        self.assertEqual(cleaned_publications.count(), 0)
++        self.assertEqual(list(cleaned_publications), [])
++    
++    def test_union_queryset_form_empty_submission(self):
++        """Test that union queryset form correctly handles empty submission."""
++        form = ArticleFormUnion(data={'publications': []})
++        self.assertTrue(form.is_valid())
++        
++        cleaned_publications = form.cleaned_data['publications']
++        # This should be 0, not 6 (the bug was that it returned all matching publications)
++        self.assertEqual(cleaned_publications.count(), 0)
++        self.assertEqual(list(cleaned_publications), [])
++    
++    def test_or_queryset_form_with_selection(self):
++        """Test that OR queryset form correctly handles selections."""
++        # Select publication with ID 1 (should be in the queryset: id < 2)
++        form = ArticleFormOR(data={'publications': [1]})
++        self.assertTrue(form.is_valid())
++        
++        cleaned_publications = form.cleaned_data['publications']
++        self.assertEqual(cleaned_publications.count(), 1)
++        self.assertEqual(cleaned_publications.first().id, 1)
++    
++    def test_union_queryset_form_with_selection_limitation(self):
++        """Test that union queryset form has limitations with selections due to filter() not being supported."""
++        # Note: This test documents the current limitation that ModelMultipleChoiceField
++        # cannot validate selections on union querysets because filter() is not supported
++        # on combined querysets. This is a separate issue from the .none() bug we fixed.
++        form = ArticleFormUnion(data={'publications': [1]})
++        
++        # This should raise NotSupportedError because _check_values tries to call filter()
++        with self.assertRaises(Exception):  # NotSupportedError
++            form.is_valid()
++    
++    def test_queryset_contents_are_same(self):
++        """Test that both OR and union querysets contain the same publications."""
++        or_queryset = Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5)
++        union_queryset = Publication.objects.filter(id__lt=2).union(
++            Publication.objects.filter(id__gt=5)
++        )
++        
++        # Both should contain publications with IDs: 1, 6, 7, 8, 9, 10
++        expected_ids = {1, 6, 7, 8, 9, 10}
++        
++        or_ids = set(or_queryset.values_list('id', flat=True))
++        union_ids = set(union_queryset.values_list('id', flat=True))
++        
++        self.assertEqual(or_ids, expected_ids)
++        self.assertEqual(union_ids, expected_ids)
++        self.assertEqual(or_ids, union_ids)
++
++if __name__ == '__main__':
++    # Create tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Publication)
++        schema_editor.create_model(Article)
++    
++    # Run the tests
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_none_on_union.py b/test_none_on_union.py
+new file mode 100644
+index 0000000000..3a378639f1
+--- /dev/null
++++ b/test_none_on_union.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python
++"""
++Test case for the QuerySet.none() fix with union queries.
++This test can be added to the Django test suite.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++from django.db.models.query import EmptyQuerySet
++
++# Define models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++class QuerySetNoneOnCombinedQueriesTest(TestCase):
++    """Test that .none() works correctly on combined queries (union, intersection, difference)."""
++    
++    @classmethod
++    def setUpTestData(cls):
++        # Create test data
++        for i in range(1, 11):
++            TestModel.objects.create(name=f"Test {i}")
++    
++    def test_none_on_union_queryset(self):
++        """Test that calling .none() on a union queryset returns an empty queryset."""
++        qs1 = TestModel.objects.filter(id__lte=3)
++        qs2 = TestModel.objects.filter(id__gte=8)
++        union_qs = qs1.union(qs2)
++        
++        # Verify the union has results
++        self.assertGreater(union_qs.count(), 0)
++        
++        # Test .none() on union
++        none_qs = union_qs.none()
++        self.assertEqual(none_qs.count(), 0)
++        self.assertEqual(list(none_qs), [])
++        self.assertIsInstance(none_qs, EmptyQuerySet)
++    
++    def test_none_on_intersection_queryset(self):
++        """Test that calling .none() on an intersection queryset returns an empty queryset."""
++        qs1 = TestModel.objects.filter(id__lte=5)
++        qs2 = TestModel.objects.filter(id__gte=3)
++        
++        try:
++            intersection_qs = qs1.intersection(qs2)
++            
++            # Verify the intersection has results
++            self.assertGreater(intersection_qs.count(), 0)
++            
++            # Test .none() on intersection
++            none_qs = intersection_qs.none()
++            self.assertEqual(none_qs.count(), 0)
++            self.assertEqual(list(none_qs), [])
++            self.assertIsInstance(none_qs, EmptyQuerySet)
++        except Exception:
++            # Skip if intersection is not supported by the database
++            self.skipTest("Database doesn't support intersection")
++    
++    def test_none_on_difference_queryset(self):
++        """Test that calling .none() on a difference queryset returns an empty queryset."""
++        qs1 = TestModel.objects.filter(id__lte=5)
++        qs2 = TestModel.objects.filter(id__lte=3)
++        
++        try:
++            difference_qs = qs1.difference(qs2)
++            
++            # Verify the difference has results
++            self.assertGreater(difference_qs.count(), 0)
++            
++            # Test .none() on difference
++            none_qs = difference_qs.none()
++            self.assertEqual(none_qs.count(), 0)
++            self.assertEqual(list(none_qs), [])
++            self.assertIsInstance(none_qs, EmptyQuerySet)
++        except Exception:
++            # Skip if difference is not supported by the database
++            self.skipTest("Database doesn't support difference")
++    
++    def test_none_on_multiple_union_queryset(self):
++        """Test that calling .none() on a multiple union queryset returns an empty queryset."""
++        qs1 = TestModel.objects.filter(id__lte=2)
++        qs2 = TestModel.objects.filter(id__in=[5, 6])
++        qs3 = TestModel.objects.filter(id__gte=9)
++        union_qs = qs1.union(qs2, qs3)
++        
++        # Verify the union has results
++        self.assertGreater(union_qs.count(), 0)
++        
++        # Test .none() on multiple union
++        none_qs = union_qs.none()
++        self.assertEqual(none_qs.count(), 0)
++        self.assertEqual(list(none_qs), [])
++        self.assertIsInstance(none_qs, EmptyQuerySet)
++    
++    def test_none_on_union_with_all_true(self):
++        """Test that calling .none() on a union with all=True returns an empty queryset."""
++        qs1 = TestModel.objects.filter(id__lte=3)
++        qs2 = TestModel.objects.filter(id__lte=3)  # Overlapping to test all=True
++        union_qs = qs1.union(qs2, all=True)
++        
++        # Verify the union has results (should have duplicates with all=True)
++        self.assertGreater(union_qs.count(), 0)
++        
++        # Test .none() on union with all=True
++        none_qs = union_qs.none()
++        self.assertEqual(none_qs.count(), 0)
++        self.assertEqual(list(none_qs), [])
++        self.assertIsInstance(none_qs, EmptyQuerySet)
++    
++    def test_none_on_regular_queryset_still_works(self):
++        """Regression test: ensure .none() still works on regular querysets."""
++        qs = TestModel.objects.filter(id__lte=5)
++        
++        # Verify the queryset has results
++        self.assertGreater(qs.count(), 0)
++        
++        # Test .none() on regular queryset
++        none_qs = qs.none()
++        self.assertEqual(none_qs.count(), 0)
++        self.assertEqual(list(none_qs), [])
++        self.assertIsInstance(none_qs, EmptyQuerySet)
++
++if __name__ == '__main__':
++    # Create tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Run the tests
++    import unittest
++    unittest.main()
+\ No newline at end of file

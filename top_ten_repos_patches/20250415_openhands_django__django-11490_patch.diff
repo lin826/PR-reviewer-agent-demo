@@ -1,0 +1,241 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index a44adfc760..0985543671 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -424,13 +424,16 @@ class SQLCompiler:
+             try:
+                 # If the columns list is limited, then all combined queries
+                 # must have the same columns list. Set the selects defined on
+-                # the query on all combined queries, if not already set.
+-                if not compiler.query.values_select and self.query.values_select:
+-                    compiler.query.set_values((
+-                        *self.query.extra_select,
+-                        *self.query.values_select,
+-                        *self.query.annotation_select,
+-                    ))
++                # the main query to all combined queries to ensure consistent selection.
++                if self.query.values_select:
++                    # Check if fields would be compatible by comparing models
++                    if (not compiler.query.values_select or 
++                        compiler.query.model == self.query.model):
++                        compiler.query.set_values((
++                            *self.query.extra_select,
++                            *self.query.values_select,
++                            *self.query.annotation_select,
++                        ))
+                 part_sql, part_args = compiler.as_sql()
+                 if compiler.query.combinator:
+                     # Wrap in a subquery if wrapping in parentheses isn't
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..cb1eb7a9b6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,69 @@
++"""
++Script to reproduce and test the issue with composed queries and values_list.
++"""
++import os
++import sys
++import sqlite3
++import django
++
++# Set up Django
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.settings')
++
++# Configure basic settings
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++        'django.contrib.sites',
++    ],
++)
++
++django.setup()
++
++# Define a simple model for testing
++from django.db import models
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=20)
++    order = models.IntegerField()
++
++    class Meta:
++        app_label = 'reproduce_issue'
++
++    def __str__(self):
++        return self.name
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test data
++TestModel.objects.create(name='a', order=2)
++
++# Test the issue
++qs1 = TestModel.objects.all()
++print("\nTesting the issue with composed queries and values_list()\n")
++
++# First query - both fields
++result1 = qs1.union(qs1).values_list('name', 'order').get()
++print("1. values_list('name', 'order').get():", result1)
++
++# Second query - only 'order' field
++# This should return (2,) but returns ('a', 2)
++result2 = qs1.union(qs1).values_list('order').get()
++print("2. values_list('order').get():", result2)
++
++# Third query - using values() instead of values_list()
++# This should return {'order': 2} but returns {'name': 'a', 'order': 2}
++result3 = qs1.union(qs1).values('order').get()
++print("3. values('order').get():", result3)
+\ No newline at end of file
+diff --git a/test_all_cases.py b/test_all_cases.py
+new file mode 100644
+index 0000000000..2400d20380
+--- /dev/null
++++ b/test_all_cases.py
+@@ -0,0 +1,90 @@
++"""
++Script to test various cases of composed queries with values() and values_list()
++"""
++import os
++import sys
++import django
++
++# Set up Django
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.settings')
++
++# Configure basic settings
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++        'django.contrib.sites',
++    ],
++)
++
++django.setup()
++
++# Define simple models for testing
++from django.db import models
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=20)
++    order = models.IntegerField()
++    tag = models.CharField(max_length=10, default='default')
++
++    class Meta:
++        app_label = 'test_all_cases'
++
++    def __str__(self):
++        return self.name
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test data
++TestModel.objects.create(name='a', order=1, tag='one')
++TestModel.objects.create(name='b', order=2, tag='two')
++
++print("\n--- Testing various cases of composed queries with values() and values_list() ---\n")
++
++# Basic test with union
++qs1 = TestModel.objects.filter(order=1)
++qs2 = TestModel.objects.filter(order=2)
++
++print("1. Basic union with values_list('name')")
++result = list(qs1.union(qs2).values_list('name', flat=True))
++print(f"Expected: ['a', 'b'], Got: {result}")
++
++print("\n2. Basic union with values_list('name', 'order')")
++result = list(qs1.union(qs2).values_list('name', 'order'))
++print(f"Expected: [('a', 1), ('b', 2)], Got: {result}")
++
++print("\n3. Change fields from all to subset")
++qs_all = TestModel.objects.all()
++result = list(qs_all.union(qs_all).values_list('order', flat=True))
++print(f"Expected: [1, 2], Got: {result}")
++
++print("\n4. Change fields from subset to different subset")
++qs_subset = TestModel.objects.all().values_list('name', 'tag')
++result = list(qs_subset.union(qs_subset).values_list('tag', flat=True))
++print(f"Expected: ['one', 'two'], Got: {result}")
++
++print("\n5. Using values() instead of values_list()")
++result = list(qs1.union(qs2).values('name', 'order'))
++print("Expected: [{'name': 'a', 'order': 1}, {'name': 'b', 'order': 2}]")
++print(f"Got: {result}")
++
++print("\n6. Annotated queryset with values()")
++from django.db.models import Value, CharField
++qs_annotated = TestModel.objects.annotate(extra=Value('x', output_field=CharField()))
++result = list(qs_annotated.union(qs_annotated).values('name', 'extra'))
++print("Expected: [{'name': 'a', 'extra': 'x'}, {'name': 'b', 'extra': 'x'}]")
++print(f"Got: {result}")
++
++print("\n--- All tests completed ---")
+\ No newline at end of file
+diff --git a/test_composed_query_values.py b/test_composed_query_values.py
+new file mode 100644
+index 0000000000..464de610fc
+--- /dev/null
++++ b/test_composed_query_values.py
+@@ -0,0 +1,33 @@
++import os
++import sys
++
++# Add the Django project to the Python path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Set up Django settings
++os.environ['DJANGO_SETTINGS_MODULE'] = 'tests.test_sqlite'
++
++import django
++django.setup()
++
++from django.db import connection
++from tests.queries.models import ReservedName
++
++# Create a test model instance
++ReservedName.objects.all().delete()
++ReservedName.objects.create(name='a', order=2)
++
++# Test case that demonstrates the issue
++qs1 = ReservedName.objects.all()
++
++# First test case - should return ('a', 2)
++result1 = qs1.union(qs1).values_list('name', 'order').get()
++print("First test - values_list('name', 'order'):", result1)
++
++# Second test case - should return (2,) but returns ('a', 2)
++result2 = qs1.union(qs1).values_list('order').get()
++print("Second test - values_list('order'):", result2)
++
++# Third test case - should return {'order': 2} but returns {'name': 'a', 'order': 2}
++result3 = qs1.union(qs1).values('order').get()
++print("Third test - values('order'):", result3)
+\ No newline at end of file

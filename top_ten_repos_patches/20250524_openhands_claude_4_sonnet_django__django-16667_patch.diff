@@ -1,0 +1,582 @@
+diff --git a/django/forms/widgets.py b/django/forms/widgets.py
+index 842b73e95c..f4bc74b7cd 100644
+--- a/django/forms/widgets.py
++++ b/django/forms/widgets.py
+@@ -1157,7 +1157,7 @@ class SelectDateWidget(Widget):
+             input_format = formats.sanitize_strftime_format(input_format)
+             try:
+                 date_value = datetime.date(int(y), int(m), int(d))
+-            except ValueError:
++            except (ValueError, OverflowError):
+                 # Return pseudo-ISO dates with zeros for any unselected values,
+                 # e.g. '2017-0-23'.
+                 return "%s-%s-%s" % (y or 0, m or 0, d or 0)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e1a497862a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,145 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the SelectDateWidget OverflowError issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django import forms
++from django.forms import SelectDateWidget
++from django.http import HttpResponse
++
++
++class ReproForm(forms.Form):
++    my_date = forms.DateField(widget=SelectDateWidget())
++
++
++def test_overflow_error():
++    """Test that reproduces the OverflowError issue."""
++    print("Testing SelectDateWidget with large year value...")
++    
++    # Simulate the problematic request data
++    request_data = {
++        'my_date_day': '1',
++        'my_date_month': '1', 
++        'my_date_year': '1234567821345678'  # This will cause OverflowError
++    }
++    
++    try:
++        form = ReproForm(request_data)
++        print("Form created successfully")
++        
++        # This should trigger the OverflowError
++        is_valid = form.is_valid()
++        print(f"Form is_valid: {is_valid}")
++        
++        if not is_valid:
++            print(f"Form errors: {form.errors}")
++        
++        print("Test completed successfully - no crash!")
++        return True
++        
++    except OverflowError as e:
++        print(f"OverflowError occurred: {e}")
++        print("This is the bug we need to fix!")
++        return False
++    except Exception as e:
++        print(f"Unexpected error: {type(e).__name__}: {e}")
++        return False
++
++
++def test_normal_case():
++    """Test that normal cases still work."""
++    print("\nTesting SelectDateWidget with normal values...")
++    
++    request_data = {
++        'my_date_day': '15',
++        'my_date_month': '6', 
++        'my_date_year': '2023'
++    }
++    
++    try:
++        form = ReproForm(request_data)
++        is_valid = form.is_valid()
++        print(f"Form is_valid: {is_valid}")
++        
++        if is_valid:
++            print(f"Cleaned data: {form.cleaned_data}")
++        else:
++            print(f"Form errors: {form.errors}")
++            
++        return True
++        
++    except Exception as e:
++        print(f"Unexpected error in normal case: {type(e).__name__}: {e}")
++        return False
++
++
++def test_edge_cases():
++    """Test various edge cases."""
++    print("\nTesting edge cases...")
++    
++    test_cases = [
++        # (description, data)
++        ("Empty values", {'my_date_day': '', 'my_date_month': '', 'my_date_year': ''}),
++        ("Invalid date", {'my_date_day': '31', 'my_date_month': '2', 'my_date_year': '2023'}),
++        ("Large but valid year", {'my_date_day': '1', 'my_date_month': '1', 'my_date_year': '9999'}),
++        ("Negative year", {'my_date_day': '1', 'my_date_month': '1', 'my_date_year': '-1'}),
++        ("Very large year (sys.maxsize)", {'my_date_day': '1', 'my_date_month': '1', 'my_date_year': str(sys.maxsize)}),
++        ("Extremely large year", {'my_date_day': '1', 'my_date_month': '1', 'my_date_year': '999999999999999999999999999999'}),
++    ]
++    
++    for description, data in test_cases:
++        print(f"\n  Testing: {description}")
++        try:
++            form = ReproForm(data)
++            is_valid = form.is_valid()
++            print(f"    Result: is_valid={is_valid}")
++            if not is_valid:
++                print(f"    Errors: {form.errors}")
++        except Exception as e:
++            print(f"    Exception: {type(e).__name__}: {e}")
++
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("SelectDateWidget OverflowError Reproduction Script")
++    print("=" * 60)
++    
++    # Test the main issue
++    overflow_test_passed = test_overflow_error()
++    
++    # Test normal functionality
++    normal_test_passed = test_normal_case()
++    
++    # Test edge cases
++    test_edge_cases()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"Overflow test passed (no crash): {overflow_test_passed}")
++    print(f"Normal test passed: {normal_test_passed}")
++    
++    if not overflow_test_passed:
++        print("\nThe OverflowError bug is confirmed!")
++        sys.exit(1)
++    else:
++        print("\nNo OverflowError detected - fix appears to be working!")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..d3c3f7a452
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the SelectDateWidget OverflowError fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++    )
++
++django.setup()
++
++from django.forms import SelectDateWidget
++
++
++def test_value_from_datadict_overflow_cases():
++    """Test that OverflowError cases are handled gracefully."""
++    widget = SelectDateWidget()
++    
++    test_cases = [
++        # (description, data, expected_result)
++        ("Normal date", {"field_year": "2023", "field_month": "6", "field_day": "15"}, "2023-06-15"),
++        ("Invalid date (Feb 31)", {"field_year": "2023", "field_month": "2", "field_day": "31"}, "2023-2-31"),
++        ("Large year causing OverflowError", {"field_year": "1234567821345678", "field_month": "1", "field_day": "1"}, "1234567821345678-1-1"),
++        ("sys.maxsize year", {"field_year": str(sys.maxsize), "field_month": "1", "field_day": "1"}, f"{sys.maxsize}-1-1"),
++        ("Extremely large year", {"field_year": "999999999999999999999999999999", "field_month": "1", "field_day": "1"}, "999999999999999999999999999999-1-1"),
++        ("Large month", {"field_year": "2023", "field_month": "1234567821345678", "field_day": "1"}, "2023-1234567821345678-1"),
++        ("Large day", {"field_year": "2023", "field_month": "1", "field_day": "1234567821345678"}, "2023-1-1234567821345678"),
++        ("All large values", {"field_year": "999999999999999999", "field_month": "999999999999999999", "field_day": "999999999999999999"}, "999999999999999999-999999999999999999-999999999999999999"),
++        ("Empty values", {"field_year": "", "field_month": "", "field_day": ""}, None),
++        ("Missing year", {"field_month": "1", "field_day": "1"}, None),
++        ("Missing month", {"field_year": "2023", "field_day": "1"}, None),
++        ("Missing day", {"field_year": "2023", "field_month": "1"}, None),
++    ]
++    
++    print("Testing value_from_datadict with various inputs...")
++    all_passed = True
++    
++    for description, data, expected in test_cases:
++        print(f"\n  Testing: {description}")
++        try:
++            result = widget.value_from_datadict(data, {}, "field")
++            print(f"    Input: {data}")
++            print(f"    Expected: {expected}")
++            print(f"    Got: {result}")
++            
++            if result == expected:
++                print("    ✓ PASS")
++            else:
++                print("    ✗ FAIL - Result doesn't match expected")
++                all_passed = False
++                
++        except Exception as e:
++            print(f"    ✗ FAIL - Exception: {type(e).__name__}: {e}")
++            all_passed = False
++    
++    return all_passed
++
++
++def test_direct_overflow_scenarios():
++    """Test direct scenarios that would cause OverflowError."""
++    import datetime
++    
++    print("\nTesting direct OverflowError scenarios...")
++    
++    # Test what would cause OverflowError in datetime.date()
++    overflow_values = [
++        (sys.maxsize + 1, 1, 1),
++        (1234567821345678, 1, 1),
++        (2023, sys.maxsize + 1, 1),
++        (2023, 1, sys.maxsize + 1),
++    ]
++    
++    for year, month, day in overflow_values:
++        try:
++            datetime.date(year, month, day)
++            print(f"  Unexpected: datetime.date({year}, {month}, {day}) did not raise OverflowError")
++        except OverflowError:
++            print(f"  ✓ Confirmed: datetime.date({year}, {month}, {day}) raises OverflowError")
++        except ValueError as e:
++            print(f"  Note: datetime.date({year}, {month}, {day}) raises ValueError: {e}")
++        except Exception as e:
++            print(f"  Unexpected exception for datetime.date({year}, {month}, {day}): {type(e).__name__}: {e}")
++
++
++def test_widget_behavior_consistency():
++    """Test that the widget behavior is consistent with the fix."""
++    widget = SelectDateWidget()
++    
++    print("\nTesting widget behavior consistency...")
++    
++    # Test that ValueError and OverflowError are handled the same way
++    value_error_data = {"field_year": "2023", "field_month": "2", "field_day": "31"}  # Invalid date
++    overflow_error_data = {"field_year": "1234567821345678", "field_month": "1", "field_day": "1"}  # Overflow
++    
++    try:
++        value_error_result = widget.value_from_datadict(value_error_data, {}, "field")
++        overflow_error_result = widget.value_from_datadict(overflow_error_data, {}, "field")
++        
++        print(f"  ValueError case result: {value_error_result}")
++        print(f"  OverflowError case result: {overflow_error_result}")
++        
++        # Both should return pseudo-ISO format strings
++        if isinstance(value_error_result, str) and isinstance(overflow_error_result, str):
++            print("  ✓ Both cases return string results (pseudo-ISO format)")
++            return True
++        else:
++            print("  ✗ Inconsistent result types")
++            return False
++            
++    except Exception as e:
++        print(f"  ✗ Exception during consistency test: {type(e).__name__}: {e}")
++        return False
++
++
++if __name__ == "__main__":
++    print("=" * 70)
++    print("Comprehensive SelectDateWidget OverflowError Fix Test")
++    print("=" * 70)
++    
++    # Run all tests
++    test1_passed = test_value_from_datadict_overflow_cases()
++    test_direct_overflow_scenarios()
++    test2_passed = test_widget_behavior_consistency()
++    
++    print("\n" + "=" * 70)
++    print("SUMMARY:")
++    print(f"value_from_datadict test passed: {test1_passed}")
++    print(f"Widget behavior consistency test passed: {test2_passed}")
++    
++    if test1_passed and test2_passed:
++        print("\n✓ All tests passed! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\n✗ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..fb835c2a41
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python
++"""
++Test the exact scenario described in the original issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        ROOT_URLCONF=__name__,
++    )
++
++django.setup()
++
++from django import forms
++from django.forms import SelectDateWidget
++from django.http import HttpResponse
++from django.urls import path
++
++
++class ReproForm(forms.Form):
++    my_date = forms.DateField(widget=SelectDateWidget())
++
++
++def repro_view(request):
++    form = ReproForm(request.GET)  # for ease of reproducibility
++    if form.is_valid():
++        return HttpResponse("ok")
++    else:
++        return HttpResponse("not ok")
++
++
++# URL patterns for testing
++urlpatterns = [
++    path('repro/', repro_view, name='repro'),
++]
++
++
++def test_original_issue():
++    """Test the exact scenario from the issue description."""
++    print("Testing the original issue scenario...")
++    
++    # Simulate the problematic GET request
++    # http://127.0.0.1:8000/repro/?my_date_day=1&my_date_month=1&my_date_year=1234567821345678
++    from django.test import RequestFactory
++    
++    factory = RequestFactory()
++    request = factory.get('/repro/', {
++        'my_date_day': '1',
++        'my_date_month': '1', 
++        'my_date_year': '1234567821345678'
++    })
++    
++    try:
++        response = repro_view(request)
++        print(f"Response status: {response.status_code}")
++        print(f"Response content: {response.content.decode()}")
++        
++        # Should return "not ok" since the form is invalid, but no crash
++        if response.content.decode() == "not ok":
++            print("✓ SUCCESS: Form correctly identified as invalid, no server crash!")
++            return True
++        else:
++            print("✗ UNEXPECTED: Form was considered valid with invalid date")
++            return False
++            
++    except OverflowError as e:
++        print(f"✗ FAILED: OverflowError still occurs: {e}")
++        return False
++    except Exception as e:
++        print(f"✗ FAILED: Unexpected error: {type(e).__name__}: {e}")
++        return False
++
++
++def test_normal_case():
++    """Test that normal cases still work."""
++    print("\nTesting normal case...")
++    
++    from django.test import RequestFactory
++    
++    factory = RequestFactory()
++    request = factory.get('/repro/', {
++        'my_date_day': '15',
++        'my_date_month': '6', 
++        'my_date_year': '2023'
++    })
++    
++    try:
++        response = repro_view(request)
++        print(f"Response status: {response.status_code}")
++        print(f"Response content: {response.content.decode()}")
++        
++        # Should return "ok" since the form is valid
++        if response.content.decode() == "ok":
++            print("✓ SUCCESS: Normal date processing works correctly!")
++            return True
++        else:
++            print("✗ FAILED: Normal date was not processed correctly")
++            return False
++            
++    except Exception as e:
++        print(f"✗ FAILED: Unexpected error in normal case: {type(e).__name__}: {e}")
++        return False
++
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("Testing Original Issue Scenario")
++    print("=" * 60)
++    
++    original_test_passed = test_original_issue()
++    normal_test_passed = test_normal_case()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"Original issue test passed: {original_test_passed}")
++    print(f"Normal case test passed: {normal_test_passed}")
++    
++    if original_test_passed and normal_test_passed:
++        print("\n✓ All tests passed! The original issue is fixed.")
++        sys.exit(0)
++    else:
++        print("\n✗ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_overflow_fix.py b/test_overflow_fix.py
+new file mode 100644
+index 0000000000..019ef3050e
+--- /dev/null
++++ b/test_overflow_fix.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python
++"""
++Test case specifically for the OverflowError fix in SelectDateWidget.
++This test can be added to the existing test suite.
++"""
++
++import sys
++from django.forms import SelectDateWidget
++from django.test import SimpleTestCase
++
++
++class SelectDateWidgetOverflowTest(SimpleTestCase):
++    """Test that SelectDateWidget handles OverflowError gracefully."""
++    
++    def setUp(self):
++        self.widget = SelectDateWidget()
++    
++    def test_overflow_error_handling(self):
++        """Test that OverflowError is handled gracefully in value_from_datadict."""
++        # Test case that would cause OverflowError
++        data = {
++            "field_year": "1234567821345678",  # Very large year
++            "field_month": "1",
++            "field_day": "1"
++        }
++        
++        # This should not raise OverflowError, but return a pseudo-ISO string
++        result = self.widget.value_from_datadict(data, {}, "field")
++        
++        # Should return pseudo-ISO format like ValueError cases
++        self.assertEqual(result, "1234567821345678-1-1")
++    
++    def test_overflow_error_with_sys_maxsize(self):
++        """Test OverflowError handling with sys.maxsize values."""
++        data = {
++            "field_year": str(sys.maxsize),
++            "field_month": "1", 
++            "field_day": "1"
++        }
++        
++        result = self.widget.value_from_datadict(data, {}, "field")
++        self.assertEqual(result, f"{sys.maxsize}-1-1")
++    
++    def test_overflow_error_all_fields(self):
++        """Test OverflowError handling when all fields have large values."""
++        large_value = "999999999999999999999999999999"
++        data = {
++            "field_year": large_value,
++            "field_month": large_value,
++            "field_day": large_value
++        }
++        
++        result = self.widget.value_from_datadict(data, {}, "field")
++        expected = f"{large_value}-{large_value}-{large_value}"
++        self.assertEqual(result, expected)
++    
++    def test_normal_dates_still_work(self):
++        """Test that normal date processing is not affected by the fix."""
++        data = {
++            "field_year": "2023",
++            "field_month": "6",
++            "field_day": "15"
++        }
++        
++        result = self.widget.value_from_datadict(data, {}, "field")
++        # Should return properly formatted date string
++        self.assertEqual(result, "2023-06-15")
++    
++    def test_value_error_still_works(self):
++        """Test that ValueError handling is not affected by the fix."""
++        # Invalid date (Feb 31)
++        data = {
++            "field_year": "2023",
++            "field_month": "2",
++            "field_day": "31"
++        }
++        
++        result = self.widget.value_from_datadict(data, {}, "field")
++        # Should return pseudo-ISO format
++        self.assertEqual(result, "2023-2-31")
++
++
++if __name__ == "__main__":
++    import django
++    from django.conf import settings
++    from django.test.utils import get_runner
++    
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++            USE_TZ=True,
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++        )
++    
++    django.setup()
++    
++    # Run the tests
++    import unittest
++    loader = unittest.TestLoader()
++    suite = loader.loadTestsFromTestCase(SelectDateWidgetOverflowTest)
++    runner = unittest.TextTestRunner(verbosity=2)
++    result = runner.run(suite)
++    
++    if result.wasSuccessful():
++        print("\n✓ All OverflowError fix tests passed!")
++        sys.exit(0)
++    else:
++        print("\n✗ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file

@@ -1,0 +1,80 @@
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 823cbe02..974f9c6e 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1892,6 +1892,7 @@ def polyval(
+     xarray.DataArray.polyfit
+     numpy.polynomial.polynomial.polyval
+     """
++    from .dataarray import DataArray
+ 
+     if degree_dim not in coeffs._indexes:
+         raise ValueError(
+@@ -1905,20 +1906,31 @@ def polyval(
+     coeffs = coeffs.reindex(
+         {degree_dim: np.arange(max_deg + 1)}, fill_value=0, copy=False
+     )
+-    coord = _ensure_numeric(coord)  # type: ignore # https://github.com/python/mypy/issues/1533 ?
++    
++    # This is the important part for our fix
++    # We need to use the values from the coordinate, not the data array itself for evaluation
++    if isinstance(coord, DataArray):
++        # If the data array has a coordinate with the same name as itself,
++        # we want to use those coordinate values for polynomial evaluation
++        if coord.name in coord.coords:
++            coord_values = _ensure_numeric(coord.coords[coord.name])
++        else:
++            coord_values = _ensure_numeric(coord)
++    else:
++        coord_values = _ensure_numeric(coord)
+ 
+     # using Horner's method
+     # https://en.wikipedia.org/wiki/Horner%27s_method
+-    res = coeffs.isel({degree_dim: max_deg}, drop=True) + zeros_like(coord)
++    res = coeffs.isel({degree_dim: max_deg}, drop=True) + zeros_like(coord_values)
+     for deg in range(max_deg - 1, -1, -1):
+-        res *= coord
++        res *= coord_values
+         res += coeffs.isel({degree_dim: deg}, drop=True)
+ 
+     return res
+ 
+ 
+ def _ensure_numeric(data: T_Xarray) -> T_Xarray:
+-    """Converts all datetime64 variables to float64
++    """Converts all datetime64 and timedelta64 variables to float64
+ 
+     Parameters
+     ----------
+@@ -1928,12 +1940,12 @@ def _ensure_numeric(data: T_Xarray) -> T_Xarray:
+     Returns
+     -------
+     DataArray or Dataset
+-        Variables with datetime64 dtypes converted to float64.
++        Variables with datetime64 or timedelta64 dtypes converted to float64.
+     """
+     from .dataset import Dataset
+ 
+     def to_floatable(x: DataArray) -> DataArray:
+-        if x.dtype.kind in "mM":
++        if x.dtype.kind == "M":  # datetime64
+             return x.copy(
+                 data=datetime_to_numeric(
+                     x.data,
+@@ -1941,6 +1953,15 @@ def _ensure_numeric(data: T_Xarray) -> T_Xarray:
+                     datetime_unit="ns",
+                 ),
+             )
++        elif x.dtype.kind == "m":  # timedelta64
++            # For timedeltas, no need to use a datetime offset
++            return x.copy(
++                data=datetime_to_numeric(
++                    x.data,
++                    offset=None,  # Use the minimum value as offset (as per default behavior)
++                    datetime_unit="ns",
++                ),
++            )
+         return x
+ 
+     if isinstance(data, Dataset):
+

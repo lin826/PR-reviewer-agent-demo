@@ -1,0 +1,61 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index a778cd413b..4e37bc72bc 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -65,8 +65,36 @@ class Aggregate(Func):
+         c.filter = c.filter and c.filter.resolve_expression(
+             query, allow_joins, reuse, summarize
+         )
++
+         if summarize:
++            # Re‑point source expressions that referred to annotations which
++            # have been moved into a subquery (i.e. those containing an OVER
++            # clause). Such references are represented internally by Ref()
++            # objects pointing at annotation aliases. If the alias is no
++            # longer present in the current query's annotations, convert the
++            # reference to F(alias) so that it targets the column produced by
++            # the subquery instead of the (now absent) annotation. This must
++            # happen before any further validation of summarized aggregates.
++            from django.db.models.expressions import F, Ref
++
++            def _repoint(expr):
++
++                if isinstance(expr, Ref):
++                    ref_names = expr.get_refs()
++                    ref_name = next(iter(ref_names), None)
++                    if ref_name is not None and ref_name not in getattr(query, "annotations", {}):
++                        return F(ref_name)
++
++                if hasattr(expr, "get_source_expressions"):
++                    expr = expr.copy()
++                    expr.set_source_expressions(
++                        [_repoint(e) for e in expr.get_source_expressions()]
++                    )
++                return expr
++
++            c = _repoint(c)
+             # Summarized aggregates cannot refer to summarized aggregates.
++
+             for ref in c.get_refs():
+                 if query.annotations[ref].is_summary:
+                     raise FieldError(
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 280cb967b4..ac042d40bf 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1887,4 +1887,4 @@ class ValueRange(WindowFrame):
+     frame_type = "RANGE"
+ 
+     def window_frame_start_end(self, connection, start, end):
+-        return connection.ops.window_frame_range_start_end(start, end)
++        return connection.ops.window_frame_range_start_end(start, end)
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 395ba6e404..9149abb77d 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -2644,4 +2644,4 @@ def get_related_populators(klass_info, select, db):
+     for rel_klass_info in related_klass_infos:
+         rel_cls = RelatedPopulator(rel_klass_info, select, db)
+         iterators.append(rel_cls)
+-    return iterators
++    return iterators

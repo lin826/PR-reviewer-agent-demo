@@ -1,0 +1,580 @@
+--- a/reproduce_issue.py
++++ b/reproduce_issue.py
+@@ -0,0 +1,24 @@
++import numpy as np
++import matplotlib.pyplot as plt
++import matplotlib
++
++print(f"Matplotlib version: {matplotlib.__version__}")
++
++fig, axes = plt.subplots(2, 2, sharex=True, sharey=True)
++
++x = np.arange(0.0, 2*np.pi, 0.01)
++y = np.sin(x)
++
++for ax in axes.flatten():
++    ax.clear()
++    ax.plot(x, y)
++
++plt.savefig('test_clear_issue.png', dpi=100)
++print("Plot saved as test_clear_issue.png")
++
++# Let's also check the tick labels visibility
++for i, ax in enumerate(axes.flatten()):
++    print(f"Axis {i}:")
++    print(f"  X-axis labels visible: {[label.get_visible() for label in ax.get_xticklabels()]}")
++    print(f"  Y-axis labels visible: {[label.get_visible() for label in ax.get_yticklabels()]}")
++    print(f"  X-axis ticks visible: {ax.xaxis.get_tick_params()['which']}")
+
+--- a/lib/matplotlib/axes/_base.py
++++ b/lib/matplotlib/axes/_base.py
+@@ -1308,6 +1308,19 @@
+         if self._sharey is not None:
+             self.yaxis.set_visible(yaxis_visible)
+             self.patch.set_visible(patch_visible)
++
++        # If this is a subplot with shared axes, re-apply the outer labeling
++        # to ensure tick labels are properly hidden for inner subplots
++        if (hasattr(self, 'get_subplotspec') and hasattr(self, '_subplotspec') 
++                and self.get_subplotspec() is not None):
++            # Check if this axis is part of shared axes groups and apply
++            # the same outer labeling logic as the initial setup
++            x_shared = len(self._shared_axes["x"].get_siblings(self)) > 1
++            y_shared = len(self._shared_axes["y"].get_siblings(self)) > 1
++            if x_shared:
++                self._label_outer_xaxis()
++            if y_shared:
++                self._label_outer_yaxis()
+ 
+         self.stale = True
+ 
+
+--- a/debug_fix.py
++++ b/debug_fix.py
+@@ -0,0 +1,36 @@
++import numpy as np
++import matplotlib.pyplot as plt
++import matplotlib
++
++print(f"Matplotlib version: {matplotlib.__version__}")
++
++# Test the fix with the original issue
++fig, axes = plt.subplots(2, 2, sharex=True, sharey=True)
++
++x = np.arange(0.0, 2*np.pi, 0.01)
++y = np.sin(x)
++
++print("Before clear():")
++for i, ax in enumerate(axes.flatten()):
++    print(f"Axis {i}: x-labels visible: {any(label.get_visible() for label in ax.get_xticklabels())}, "
++          f"y-labels visible: {any(label.get_visible() for label in ax.get_yticklabels())}")
++    print(f"  Has subplot spec: {hasattr(ax, '_subplotspec')}")
++    if hasattr(ax, '_subplotspec'):
++        print(f"  Subplot spec: {ax.get_subplotspec()}")
++        ss = ax.get_subplotspec()
++        print(f"  Is first row: {ss.is_first_row()}, is last row: {ss.is_last_row()}")
++        print(f"  Is first col: {ss.is_first_col()}, is last col: {ss.is_last_col()}")
++    print(f"  _sharex: {ax._sharex}, _sharey: {ax._sharey}")
++
++# Clear and plot - let's see what happens
++print("\nClearing axes...")
++for i, ax in enumerate(axes.flatten()):
++    print(f"Before clearing axis {i}: has _subplotspec: {hasattr(ax, '_subplotspec')}")
++    ax.clear()
++    print(f"After clearing axis {i}: has _subplotspec: {hasattr(ax, '_subplotspec')}")
++    ax.plot(x, y)
++
++print("\nAfter clear() with fix:")
++for i, ax in enumerate(axes.flatten()):
++    print(f"Axis {i}: x-labels visible: {any(label.get_visible() for label in ax.get_xticklabels())}, "
++          f"y-labels visible: {any(label.get_visible() for label in ax.get_yticklabels())}")
+
+--- a/debug_shared_axes.py
++++ b/debug_shared_axes.py
+@@ -0,0 +1,26 @@
++import numpy as np
++import matplotlib.pyplot as plt
++import matplotlib
++
++# Test to understand shared axes structure better
++fig, axes = plt.subplots(2, 2, sharex=True, sharey=True)
++
++print("Shared axes structure:")
++for i, ax in enumerate(axes.flatten()):
++    print(f"Axis {i}:")
++    print(f"  _sharex: {ax._sharex}")
++    print(f"  _sharey: {ax._sharey}")
++    
++    # Check the shared axes grouper
++    shared_x = ax.get_shared_x_axes()
++    shared_y = ax.get_shared_y_axes()
++    
++    # Get the siblings in the shared axes group
++    x_siblings = list(shared_x.get_siblings(ax))
++    y_siblings = list(shared_y.get_siblings(ax))
++    
++    print(f"  X-axis siblings: {len(x_siblings)} axes")
++    print(f"  Y-axis siblings: {len(y_siblings)} axes")
++    print(f"  Is part of shared X group: {len(x_siblings) > 1}")
++    print(f"  Is part of shared Y group: {len(y_siblings) > 1}")
++    print()
+
+--- a/debug_test_failure.py
++++ b/debug_test_failure.py
+@@ -0,0 +1,45 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++def check_detailed_visibility(axs):
++    """Detailed check of tick label visibility."""
++    for i, ax in enumerate(axs.flatten()):
++        print(f"\nAxis {i}:")
++        
++        # Check x-axis labels
++        x_labels = ax.get_xticklabels()
++        x_visible = [l.get_visible() for l in x_labels]
++        print(f"  X-labels: {x_visible} (any visible: {any(x_visible)})")
++        
++        # Check y-axis labels  
++        y_labels = ax.get_yticklabels()
++        y_visible = [l.get_visible() for l in y_labels]
++        print(f"  Y-labels: {y_visible} (any visible: {any(y_visible)})")
++        
++        # Check offset text
++        print(f"  X offset text visible: {ax.xaxis.offsetText.get_visible()}")
++        print(f"  Y offset text visible: {ax.yaxis.offsetText.get_visible()}")
++
++# Test the expected initial state
++print("=== Testing initial state ===")
++fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++check_detailed_visibility(axs)
++
++print("\n=== Testing after clear() ===")
++for ax in axs.flatten():
++    ax.clear()
++    ax.plot([0, 1], [0, 1])
++
++check_detailed_visibility(axs)
++
++plt.close(fig)
++
++# Test without shared axes for comparison
++print("\n=== Testing non-shared axes ===")
++fig, axs = plt.subplots(2, 2, sharex=False, sharey=False)
++for ax in axs.flatten():
++    ax.plot([0, 1], [0, 1])
++
++check_detailed_visibility(axs)
++
++plt.close(fig)
+
+--- a/debug_offset_text.py
++++ b/debug_offset_text.py
+@@ -0,0 +1,29 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++def check_offset_positions(axs):
++    """Check offset text positions."""
++    for i, ax in enumerate(axs.flatten()):
++        print(f"\nAxis {i}:")
++        x_pos = ax.xaxis.offsetText.get_position()
++        y_pos = ax.yaxis.offsetText.get_position()
++        print(f"  X offset text position: {x_pos}, visible: {ax.xaxis.offsetText.get_visible()}")
++        print(f"  Y offset text position: {y_pos}, visible: {ax.yaxis.offsetText.get_visible()}")
++
++# Test the expected initial state
++print("=== Initial state ===")
++fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++check_offset_positions(axs)
++
++print("\n=== After plotting ===")
++for ax in axs.flatten():
++    ax.plot([0, 1], [0, 1])
++check_offset_positions(axs)
++
++print("\n=== After clear() ===")
++for ax in axs.flatten():
++    ax.clear()
++    ax.plot([0, 1], [0, 1])
++check_offset_positions(axs)
++
++plt.close(fig)
+
+--- a/debug_cla_timing.py
++++ b/debug_cla_timing.py
+@@ -0,0 +1,31 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++# Create axes and see what happens during clear
++fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++
++print("=== After initial setup ===")
++for i, ax in enumerate(axs.flatten()):
++    print(f"Axis {i}: Y offset visible = {ax.yaxis.offsetText.get_visible()}")
++
++# Let's manually step through what cla() does
++ax0 = axs[0, 0]
++print(f"\n=== Before cla() on axis 0 ===")
++print(f"Y offset visible: {ax0.yaxis.offsetText.get_visible()}")
++
++# Call the parts of cla that matter to offset text
++print("\n=== After yaxis.clear() ===")
++ax0.yaxis.clear()
++print(f"Y offset visible: {ax0.yaxis.offsetText.get_visible()}")
++
++# Reset the subplot 
++fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++ax0 = axs[0, 0]
++
++# Check what spines.clear() does
++print("\n=== After spine clear() ===")
++for name, spine in ax0.spines.items():
++    spine.clear()
++print(f"Y offset visible: {ax0.yaxis.offsetText.get_visible()}")
++
++plt.close(fig)
+
+--- a/debug_subplot_position.py
++++ b/debug_subplot_position.py
+@@ -0,0 +1,20 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++
++print("=== Initial subplot positions ===")
++for i, ax in enumerate(axs.flatten()):
++    ss = ax.get_subplotspec()
++    print(f"Axis {i}: is_first_col={ss.is_first_col()}, is_last_col={ss.is_last_col()}")
++    print(f"         is_first_row={ss.is_first_row()}, is_last_row={ss.is_last_row()}")
++
++print("\n=== After clear() ===")
++for i, ax in enumerate(axs.flatten()):
++    ax.clear()
++    ax.plot([0, 1], [0, 1])
++    ss = ax.get_subplotspec()
++    print(f"Axis {i}: is_first_col={ss.is_first_col()}, is_last_col={ss.is_last_col()}")
++    print(f"         is_first_row={ss.is_first_row()}, is_last_row={ss.is_last_row()}")
++
++plt.close(fig)
+
+--- a/debug_offset_position_detail.py
++++ b/debug_offset_position_detail.py
+@@ -0,0 +1,55 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++# Hook into the cla method to debug
++import matplotlib.axes._base as base_module
++
++original_cla = base_module._AxesBase.cla
++
++def debug_cla(self):
++    print(f"\n=== CLA called on subplot {getattr(self, '_subplot_position', 'unknown')} ===")
++    
++    if hasattr(self, '_subplotspec') and self._subplotspec is not None:
++        ss = self.get_subplotspec()
++        print(f"Position: row={ss.rowspan}, col={ss.colspan}")
++        print(f"is_first_col: {ss.is_first_col()}")
++    
++    # Store the Y offset text visibility before clear
++    if hasattr(self, 'yaxis'):
++        print(f"Y offset visible before clear: {self.yaxis.offsetText.get_visible()}")
++        print(f"Y offset position before clear: {self.yaxis.offsetText.get_position()}")
++    
++    # Call the original cla method
++    result = original_cla(self)
++    
++    if hasattr(self, 'yaxis'):
++        print(f"Y offset visible after clear: {self.yaxis.offsetText.get_visible()}")
++        print(f"Y offset position after clear: {self.yaxis.offsetText.get_position()}")
++    
++    return result
++
++# Monkey patch for debugging
++base_module._AxesBase.cla = debug_cla
++
++try:
++    fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++    
++    # Track which subplot is which for debugging
++    for i, ax in enumerate(axs.flatten()):
++        ax._subplot_position = i
++    
++    print("=== Initial state ===")
++    for i, ax in enumerate(axs.flatten()):
++        print(f"Axis {i}: Y offset visible = {ax.yaxis.offsetText.get_visible()}")
++    
++    print("\n=== Calling clear() on each axis ===")
++    for i, ax in enumerate(axs.flatten()):
++        print(f"\nClearing axis {i}...")
++        ax.clear()
++        ax.plot([0, 1], [0, 1])  # Add some content
++        
++finally:
++    # Restore the original method
++    base_module._AxesBase.cla = original_cla
++    
++plt.close(fig)
+
+--- a/debug_yaxis_clear.py
++++ b/debug_yaxis_clear.py
+@@ -0,0 +1,14 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++
++ax0 = axs[0, 0]  # Should have visible Y offset text
++print(f"Initial Y offset visible: {ax0.yaxis.offsetText.get_visible()}")
++
++# Let's see what yaxis.clear() does
++print(f"Before yaxis.clear(): {ax0.yaxis.offsetText.get_visible()}")
++ax0.yaxis.clear()
++print(f"After yaxis.clear(): {ax0.yaxis.offsetText.get_visible()}")
++
++plt.close(fig)
+
+--- a/debug_fresh_axis.py
++++ b/debug_fresh_axis.py
+@@ -0,0 +1,14 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++# Create a fresh axis and see what the default visibility is
++fig, ax = plt.subplots()
++print(f"Fresh axis Y offset visible: {ax.yaxis.offsetText.get_visible()}")
++
++# Create shared axes
++fig2, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++for i, ax in enumerate(axs.flatten()):
++    print(f"Shared axis {i} Y offset visible: {ax.yaxis.offsetText.get_visible()}")
++
++plt.close(fig)
++plt.close(fig2)
+
+--- a/debug_default_offset_visibility.py
++++ b/debug_default_offset_visibility.py
+@@ -0,0 +1,66 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++# Create subplots but prevent the outer labeling from happening
++# by intercepting the gridspec.subplots method
++
++from matplotlib import gridspec
++original_subplots = gridspec.GridSpec.subplots
++
++def debug_subplots(self, *, sharex=False, sharey=False, squeeze=True, subplot_kw=None):
++    # Call the original method but stop before the outer labeling
++    figure = self.figure
++    if figure is None:
++        raise ValueError("GridSpec.subplots() only works for GridSpecs created with a parent figure")
++
++    if isinstance(sharex, bool):
++        sharex = "all" if sharex else "none"
++    if isinstance(sharey, bool):
++        sharey = "all" if sharey else "none"
++        
++    if subplot_kw is None:
++        subplot_kw = {}
++    subplot_kw = subplot_kw.copy()
++
++    # Create array to hold all axes.
++    axarr = np.empty((self._nrows, self._ncols), dtype=object)
++    for row in range(self._nrows):
++        for col in range(self._ncols):
++            shared_with = {"none": None, "all": axarr[0, 0],
++                           "row": axarr[row, 0], "col": axarr[0, col]}
++            subplot_kw["sharex"] = shared_with[sharex]
++            subplot_kw["sharey"] = shared_with[sharey]
++            axarr[row, col] = figure.add_subplot(self[row, col], **subplot_kw)
++
++    print("=== After axis creation but before outer labeling ===")
++    for i, ax in enumerate(axarr.flat):
++        print(f"Axis {i}: Y offset visible = {ax.yaxis.offsetText.get_visible()}")
++    
++    # Apply the outer labeling (this is what normally happens)
++    if all(ax.name == "rectilinear" for ax in axarr.flat):
++        if sharex in ["col", "all"]:
++            for ax in axarr.flat:
++                ax._label_outer_xaxis()
++        if sharey in ["row", "all"]:
++            for ax in axarr.flat:
++                ax._label_outer_yaxis()
++                
++    print("=== After outer labeling ===")
++    for i, ax in enumerate(axarr.flat):
++        print(f"Axis {i}: Y offset visible = {ax.yaxis.offsetText.get_visible()}")
++
++    if squeeze:
++        return axarr.item() if axarr.size == 1 else axarr.squeeze()
++    else:
++        return axarr
++
++# Monkey patch
++gridspec.GridSpec.subplots = debug_subplots
++
++try:
++    fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++finally:
++    # Restore
++    gridspec.GridSpec.subplots = original_subplots
++
++plt.close(fig)
+
+--- a/debug_fix_execution.py
++++ b/debug_fix_execution.py
+@@ -0,0 +1,47 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++# Hook into the cla method to debug my fix
++import matplotlib.axes._base as base_module
++
++original_cla = base_module._AxesBase.cla
++
++def debug_cla(self):
++    print(f"\n=== CLA called ===")
++    
++    # Call the original cla method (which includes my fix)
++    result = original_cla(self)
++    
++    # Check the final state
++    if hasattr(self, 'yaxis'):
++        print(f"Final Y offset visible: {self.yaxis.offsetText.get_visible()}")
++        if hasattr(self, '_subplotspec') and self._subplotspec is not None:
++            ss = self.get_subplotspec()
++            print(f"  is_first_col: {ss.is_first_col()}")
++            x_shared = len(self._shared_axes["x"].get_siblings(self)) > 1
++            y_shared = len(self._shared_axes["y"].get_siblings(self)) > 1
++            print(f"  x_shared: {x_shared}, y_shared: {y_shared}")
++        else:
++            print("  No subplot spec")
++    
++    return result
++
++# Monkey patch for debugging
++base_module._AxesBase.cla = debug_cla
++
++try:
++    fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++    
++    print("=== Initial state ===")
++    for i, ax in enumerate(axs.flatten()):
++        print(f"Axis {i}: Y offset visible = {ax.yaxis.offsetText.get_visible()}")
++    
++    print("\n=== Calling clear() on axis 0 ===")
++    axs[0, 0].clear()
++    axs[0, 0].plot([0, 1], [0, 1])
++        
++finally:
++    # Restore the original method
++    base_module._AxesBase.cla = original_cla
++    
++plt.close(fig)
+
+--- a/debug_label_outer_yaxis.py
++++ b/debug_label_outer_yaxis.py
+@@ -0,0 +1,60 @@
++import numpy as np
++import matplotlib.pyplot as plt
++
++# Monkey patch _label_outer_yaxis to debug it
++import matplotlib.axes._subplots as subplots_module
++
++original_label_outer_yaxis = subplots_module.SubplotBase._label_outer_yaxis
++
++def debug_label_outer_yaxis(self):
++    print(f"\n=== _label_outer_yaxis called ===")
++    ss = self.get_subplotspec()
++    label_position = self.yaxis.get_label_position()
++    
++    print(f"  Subplot position: row={ss.rowspan}, col={ss.colspan}")
++    print(f"  is_first_col: {ss.is_first_col()}, is_last_col: {ss.is_last_col()}")
++    print(f"  label_position: {label_position}")
++    print(f"  Y offset position: {self.yaxis.offsetText.get_position()}")
++    print(f"  Y offset visible before: {self.yaxis.offsetText.get_visible()}")
++    
++    if not ss.is_first_col():  # Remove left label/ticklabels/offsettext.
++        print(f"  Not first col - hiding left elements")
++        if label_position == "left":
++            self.set_ylabel("")
++        self.yaxis.set_tick_params(which="both", labelleft=False)
++        if self.yaxis.offsetText.get_position()[0] == 0:
++            print(f"    Y offset at x=0, hiding it")
++            self.yaxis.offsetText.set_visible(False)
++    else:
++        print(f"  Is first col - not hiding left elements")
++        
++    if not ss.is_last_col():  # Remove right label/ticklabels/offsettext.
++        print(f"  Not last col - hiding right elements")
++        if label_position == "right":
++            self.set_ylabel("")
++        self.yaxis.set_tick_params(which="both", labelright=False)
++        if self.yaxis.offsetText.get_position()[0] == 1:
++            print(f"    Y offset at x=1, hiding it")
++            self.yaxis.offsetText.set_visible(False)
++        else:
++            print(f"    Y offset not at x=1, keeping it visible")
++    else:
++        print(f"  Is last col - not hiding right elements")
++    
++    print(f"  Y offset visible after: {self.yaxis.offsetText.get_visible()}")
++
++# Monkey patch
++subplots_module.SubplotBase._label_outer_yaxis = debug_label_outer_yaxis
++
++try:
++    fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++    
++    print("=== Calling clear() on axis 0 ===")
++    axs[0, 0].clear()
++    axs[0, 0].plot([0, 1], [0, 1])
++    
++finally:
++    # Restore
++    subplots_module.SubplotBase._label_outer_yaxis = original_label_outer_yaxis
++
++plt.close(fig)
+
+--- a/debug_offsettext_calls.py
++++ b/debug_offsettext_calls.py
+@@ -0,0 +1,35 @@
++import numpy as np
++import matplotlib.pyplot as plt
++import matplotlib.text as mtext
++
++# Monkey patch the offsetText set_visible method to trace calls
++original_set_visible = mtext.Text.set_visible
++
++def debug_set_visible(self, b):
++    # Check if this is an offset text
++    if hasattr(self, '_text') and self._text == '':
++        # This is likely an offset text - let's check if it's associated with an axis
++        import traceback
++        print(f"\n=== set_visible({b}) called on Text object ===")
++        print(f"Position: {self.get_position()}")
++        print("Call stack:")
++        for line in traceback.format_stack()[-5:]:  # Show last 5 stack frames
++            print(line.strip())
++    
++    return original_set_visible(self, b)
++
++# Monkey patch
++mtext.Text.set_visible = debug_set_visible
++
++try:
++    fig, axs = plt.subplots(2, 2, sharex=True, sharey=True)
++    
++    print("=== Calling clear() on axis 0 ===")
++    axs[0, 0].clear()
++    axs[0, 0].plot([0, 1], [0, 1])
++    
++finally:
++    # Restore
++    mtext.Text.set_visible = original_set_visible
++
++plt.close(fig)

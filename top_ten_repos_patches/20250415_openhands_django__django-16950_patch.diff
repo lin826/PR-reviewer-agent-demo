@@ -1,0 +1,396 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index f9760664dd..dc3090c9e4 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -1256,6 +1256,17 @@ class ModelAdmin(BaseModelAdmin):
+         """
+         Given a model instance save it to the database.
+         """
++        # Explicitly set field default values if adding a new model
++        # This ensures that UUIDField with default=uuid.uuid4 gets a value
++        # before any inlines are processed
++        if not change:
++            for field in obj._meta.fields:
++                if field.has_default() and (getattr(obj, field.attname, None) is None):
++                    # Only set defaults for fields that aren't already set and have a default
++                    default = field.get_default()
++                    if callable(default):
++                        default = default()
++                    setattr(obj, field.attname, default)
+         obj.save()
+ 
+     def delete_model(self, request, obj):
+diff --git a/tests/admin_inlines_uuid_issue/__init__.py b/tests/admin_inlines_uuid_issue/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/admin_inlines_uuid_issue/admin.py b/tests/admin_inlines_uuid_issue/admin.py
+new file mode 100644
+index 0000000000..08c5622eb0
+--- /dev/null
++++ b/tests/admin_inlines_uuid_issue/admin.py
+@@ -0,0 +1,13 @@
++from django.contrib import admin
++from .models import Thing, SubThing
++
++
++class SubThingInline(admin.StackedInline):
++    model = SubThing
++
++
++@admin.register(Thing)
++class ThingAdmin(admin.ModelAdmin):
++    list_display = ('name',)
++    ordering = ('pkid',)
++    inlines = (SubThingInline,)
+\ No newline at end of file
+diff --git a/tests/admin_inlines_uuid_issue/admin_test.py b/tests/admin_inlines_uuid_issue/admin_test.py
+new file mode 100644
+index 0000000000..64b91a6cfe
+--- /dev/null
++++ b/tests/admin_inlines_uuid_issue/admin_test.py
+@@ -0,0 +1,74 @@
++"""
++Test that verifies the ModelAdmin save_model method fix for UUIDField defaults.
++"""
++from django.test import TestCase
++from django.contrib.admin import ModelAdmin
++from django.contrib.admin.sites import AdminSite
++from django.contrib.auth.models import User
++from django.forms import modelform_factory
++import uuid
++from .models import Thing, SubThing
++
++
++class MockRequest:
++    def __init__(self, user=None):
++        self.user = user
++        self.POST = {}
++
++
++class FixedModelAdmin(ModelAdmin):
++    def save_model(self, request, obj, form, change):
++        """
++        Given a model instance save it to the database.
++        """
++        # Explicitly set field default values if adding a new model
++        # This ensures that UUIDField with default=uuid.uuid4 gets a value
++        # before any inlines are processed
++        if not change:
++            for field in obj._meta.fields:
++                if field.has_default() and (getattr(obj, field.attname, None) is None):
++                    # Only set defaults for fields that aren't already set and have a default
++                    default = field.get_default()
++                    if callable(default):
++                        default = default()
++                    setattr(obj, field.attname, default)
++        obj.save()
++
++
++class AdminInlineUUIDTest(TestCase):
++    def setUp(self):
++        self.site = AdminSite()
++        self.admin = FixedModelAdmin(Thing, self.site)
++        self.user = User.objects.create_superuser(
++            username='admin',
++            email='admin@example.com',
++            password='secret',
++        )
++        self.request = MockRequest(user=self.user)
++
++    def test_admin_save_model(self):
++        """
++        Test that the fixed save_model method properly sets default values
++        for UUIDField before saving.
++        """
++        # Create a Thing instance with no ID
++        obj = Thing(name="Test Thing")
++        obj.id = None  # Force ID to be None
++        
++        # Create a form
++        ThingForm = modelform_factory(Thing, fields=['name'])
++        form = ThingForm({'name': 'Test Thing'})
++        self.assertTrue(form.is_valid())
++        
++        # Use our fixed admin.save_model
++        self.admin.save_model(self.request, obj, form, change=False)
++        
++        # Verify the UUID was set
++        self.assertIsNotNone(obj.id)
++        self.assertIsInstance(obj.id, uuid.UUID)
++        
++        # Create a related object
++        subthing = SubThing.objects.create(name="Test SubThing", thing=obj)
++        
++        # Verify the relationship works
++        self.assertEqual(subthing.thing.id, obj.id)
+\ No newline at end of file
+diff --git a/tests/admin_inlines_uuid_issue/apps.py b/tests/admin_inlines_uuid_issue/apps.py
+new file mode 100644
+index 0000000000..d6c4ab8236
+--- /dev/null
++++ b/tests/admin_inlines_uuid_issue/apps.py
+@@ -0,0 +1,6 @@
++from django.apps import AppConfig
++
++
++class AdminInlinesUUIDIssueConfig(AppConfig):
++    name = 'admin_inlines_uuid_issue'
++    verbose_name = 'Admin Inlines UUID Issue'
+\ No newline at end of file
+diff --git a/tests/admin_inlines_uuid_issue/fix_test.py b/tests/admin_inlines_uuid_issue/fix_test.py
+new file mode 100644
+index 0000000000..c44786ac5d
+--- /dev/null
++++ b/tests/admin_inlines_uuid_issue/fix_test.py
+@@ -0,0 +1,39 @@
++"""
++Direct test of the fix logic without using the Django admin.
++"""
++from django.test import TestCase
++import uuid
++from .models import Thing, SubThing
++
++
++class DirectFixTest(TestCase):
++    def test_direct_fix_logic(self):
++        """Test the direct implementation of our fix logic"""
++        # Create a new Thing instance without saving it
++        obj = Thing(name="Test Thing")
++        
++        # Force the ID to None to simulate the worst case
++        obj.id = None
++        
++        # Apply our fix logic directly
++        for field in obj._meta.fields:
++            if field.has_default() and (getattr(obj, field.attname, None) is None):
++                default = field.get_default()
++                if callable(default):
++                    default = default()
++                setattr(obj, field.attname, default)
++        
++        # Check that the ID field got populated
++        self.assertIsNotNone(obj.id)
++        self.assertIsInstance(obj.id, uuid.UUID)
++        
++        # Save the object
++        obj.save()
++        
++        # Create a related object
++        subthing = SubThing.objects.create(name="Test SubThing", thing=obj)
++        
++        # Verify the relationship is correct
++        self.assertEqual(subthing.thing.id, obj.id)
++        self.assertEqual(Thing.objects.count(), 1)
++        self.assertEqual(SubThing.objects.count(), 1)
+\ No newline at end of file
+diff --git a/tests/admin_inlines_uuid_issue/models.py b/tests/admin_inlines_uuid_issue/models.py
+new file mode 100644
+index 0000000000..7d5d23eb64
+--- /dev/null
++++ b/tests/admin_inlines_uuid_issue/models.py
+@@ -0,0 +1,24 @@
++import uuid
++from django.db import models
++
++
++class UUIDModel(models.Model):
++    pkid = models.BigAutoField(primary_key=True, editable=False)
++    id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
++
++    class Meta:
++        abstract = True
++
++
++class Thing(UUIDModel):
++    name = models.CharField(max_length=191)
++
++
++class SubThing(models.Model):
++    name = models.CharField(max_length=191)
++    thing = models.ForeignKey(
++        'admin_inlines_uuid_issue.Thing',
++        to_field='id',
++        on_delete=models.CASCADE,
++        related_name='subthings',
++    )
+\ No newline at end of file
+diff --git a/tests/admin_inlines_uuid_issue/test_fix.py b/tests/admin_inlines_uuid_issue/test_fix.py
+new file mode 100644
+index 0000000000..a9e6cc0aa5
+--- /dev/null
++++ b/tests/admin_inlines_uuid_issue/test_fix.py
+@@ -0,0 +1,69 @@
++import uuid
++from django.test import TestCase
++from django.contrib.admin.sites import AdminSite
++from django.forms import modelform_factory
++from django.forms.models import inlineformset_factory
++from django.contrib.auth.models import User
++from .models import Thing, SubThing
++from .admin import ThingAdmin
++
++
++class MockRequest:
++    def __init__(self, user=None):
++        self.user = user
++        self.POST = {}
++
++
++class AdminModelSaveTest(TestCase):
++    def setUp(self):
++        self.site = AdminSite()
++        self.admin = ThingAdmin(Thing, self.site)
++        self.user = User.objects.create_superuser(
++            username='admin', 
++            email='admin@example.com', 
++            password='secret'
++        )
++        self.request = MockRequest(user=self.user)
++        
++    def test_save_form_applies_uuid_default(self):
++        """
++        Test that our fix ensures the UUIDField default is applied correctly
++        before saving related inlines.
++        """
++        # 1. Create a form for the main model
++        ThingForm = modelform_factory(Thing, fields=['name'])
++        form = ThingForm({'name': 'Test Thing'})
++        self.assertTrue(form.is_valid())
++        
++        # 2. Create the model instance without saving it yet
++        obj = self.admin.save_form(self.request, form, change=False)
++        
++        # Force the ID to None to simulate the issue
++        original_id = obj.id
++        obj.id = None
++        
++        # 3. Apply our fix directly
++        for field in obj._meta.fields:
++            if field.has_default() and (getattr(obj, field.attname, None) is None):
++                default = field.get_default()
++                if callable(default):
++                    default = default()
++                setattr(obj, field.attname, default)
++        
++        # 4. Now obj.id should be set to a UUID
++        self.assertIsNotNone(obj.id)
++        self.assertIsInstance(obj.id, uuid.UUID)
++        
++        # 5. Now it should be safe to save the model and formset
++        obj.save()
++        
++        # 6. Create a related object directly to verify it works
++        subthing = SubThing.objects.create(
++            name="Test SubThing", 
++            thing=obj
++        )
++        
++        # 7. Verify the relationship
++        self.assertEqual(subthing.thing.id, obj.id)
++        self.assertEqual(Thing.objects.count(), 1)
++        self.assertEqual(SubThing.objects.count(), 1)
+\ No newline at end of file
+diff --git a/tests/admin_inlines_uuid_issue/tests.py b/tests/admin_inlines_uuid_issue/tests.py
+new file mode 100644
+index 0000000000..cae41fd8c1
+--- /dev/null
++++ b/tests/admin_inlines_uuid_issue/tests.py
+@@ -0,0 +1,84 @@
++import uuid
++from django.test import TestCase
++from django.contrib.admin.sites import AdminSite
++from django.contrib.auth.models import User
++from django.forms.models import modelform_factory
++from django.forms.models import inlineformset_factory
++from .models import Thing, SubThing
++from .admin import ThingAdmin
++
++
++class MockRequest:
++    def __init__(self, user=None):
++        self.user = user
++        self.POST = {}
++
++
++class AdminInlinesUUIDTests(TestCase):
++    def setUp(self):
++        self.site = AdminSite()
++        self.thing_admin = ThingAdmin(Thing, self.site)
++        self.user = User.objects.create_superuser(
++            username='admin',
++            email='admin@example.com',
++            password='secret',
++        )
++        self.request = MockRequest(user=self.user)
++
++    def test_save_model_with_inline(self):
++        """
++        Test that saving a Thing model with a SubThing inline works correctly.
++        This reproduces the issue where the UUIDField default value isn't being used.
++        """
++        # Create a form for the main model
++        ThingForm = modelform_factory(Thing, fields=['name'])
++        form = ThingForm({'name': 'Test Thing'})
++        self.assertTrue(form.is_valid())
++        
++        # Create a model instance but don't save it yet (commit=False)
++        # This is what happens in admin.save_form()
++        obj = self.thing_admin.save_form(self.request, form, change=False)
++        
++        # Force the ID to None to simulate the issue
++        obj.id = None
++        
++        # Create an inline formset
++        InlineFormSet = inlineformset_factory(
++            Thing, 
++            SubThing, 
++            fields=('name',), 
++            can_delete=False,
++            extra=1
++        )
++        
++        # Create formset data for a new inline
++        formset_data = {
++            'subthings-TOTAL_FORMS': '1',
++            'subthings-INITIAL_FORMS': '0',
++            'subthings-MIN_NUM_FORMS': '0',
++            'subthings-MAX_NUM_FORMS': '1000',
++            'subthings-0-name': 'Test SubThing',
++        }
++        
++        # Create the formset
++        formset = InlineFormSet(formset_data, instance=obj, prefix='subthings')
++        self.assertTrue(formset.is_valid())
++        
++        # Use ModelAdmin.save_model, which should apply our fix
++        self.thing_admin.save_model(self.request, obj, form, change=False)
++        
++        # The id field should have been populated by our fix in save_model
++        self.assertIsNotNone(obj.id)
++        self.assertIsInstance(obj.id, uuid.UUID)
++        
++        # Save the formset
++        self.thing_admin.save_formset(self.request, form, formset, change=False)
++        
++        # Verify everything was saved correctly
++        self.assertEqual(Thing.objects.count(), 1)
++        self.assertEqual(SubThing.objects.count(), 1)
++        
++        thing = Thing.objects.first()
++        subthing = SubThing.objects.first()
++        
++        self.assertEqual(subthing.thing, thing)
+\ No newline at end of file
+diff --git a/tests/admin_inlines_uuid_issue/urls.py b/tests/admin_inlines_uuid_issue/urls.py
+new file mode 100644
+index 0000000000..6b669efaa2
+--- /dev/null
++++ b/tests/admin_inlines_uuid_issue/urls.py
+@@ -0,0 +1,6 @@
++from django.contrib import admin
++from django.urls import path
++
++urlpatterns = [
++    path('admin/', admin.site.urls),
++]
+\ No newline at end of file

@@ -1,0 +1,845 @@
+diff --git a/check_values.py b/check_values.py
+new file mode 100644
+index 0000000000..dbef5571c5
+--- /dev/null
++++ b/check_values.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python
++"""
++Check the actual values for the test.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window, DecimalField
++from django.db.models.functions import Coalesce
++
++class TestModel(models.Model):
++    date = models.DateField()
++    value = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test data
++TestModel.objects.create(date='2023-01-01', value=100.00)
++TestModel.objects.create(date='2023-01-02', value=200.00)
++TestModel.objects.create(date='2023-01-03', value=150.00)
++
++# Check the window function values
++queryset = TestModel.objects.annotate(
++    cumul_value=Window(Sum("value"), order_by=F("date").asc())
++).order_by('date')
++
++print("Individual records with cumulative values:")
++for obj in queryset:
++    print(f"Date: {obj.date}, Value: {obj.value}, Cumulative: {obj.cumul_value}")
++
++print("\nSum of individual values:", sum(obj.value for obj in queryset))
++print("Sum of cumulative values:", sum(obj.cumul_value for obj in queryset))
++
++# Check the aggregate result
++result = queryset.aggregate(
++    total_value=Sum("value"),
++    cumul_total=Sum("cumul_value")
++)
++print("\nAggregate result:", result)
+\ No newline at end of file
+diff --git a/debug_sql.py b/debug_sql.py
+new file mode 100644
+index 0000000000..83ad8ca9ac
+--- /dev/null
++++ b/debug_sql.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python
++"""
++Debug script to understand the SQL generation for window function aggregates.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window, DecimalField
++from django.db.models.functions import Coalesce
++from django.db.models.sql.query import Query
++
++# Define a simple model for testing
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++print("=== Debugging SQL Generation ===")
++
++# Create the queryset with window function
++queryset = TestModel.objects.annotate(
++    cumul_DJR=Coalesce(
++        Window(Sum("DJR"), order_by=F("date").asc()), 
++        0.0,
++        output_field=DecimalField(max_digits=10, decimal_places=2)
++    )
++)
++
++print("1. Window annotation SQL:")
++print(queryset.query)
++print()
++
++# Now let's see what happens when we try to aggregate
++print("2. Trying to get aggregation SQL...")
++aggregate_exprs = {
++    'DJR_total': Sum("DJR"),
++    'cumul_DJR_total': Sum("cumul_DJR")
++}
++
++# Create the table first
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Insert some test data
++TestModel.objects.create(date='2023-01-01', DJR=100.00)
++TestModel.objects.create(date='2023-01-02', DJR=200.00)
++TestModel.objects.create(date='2023-01-03', DJR=150.00)
++
++try:
++    # Let's manually call get_aggregation to see what happens
++    query = queryset.query.clone()
++    print("Original query annotations:", list(query.annotations.keys()))
++    
++    # This is where the issue should occur
++    print("Calling get_aggregation...")
++    result = query.get_aggregation('default', aggregate_exprs)
++    print("Aggregation result:", result)
++    
++except Exception as e:
++    print(f"ERROR during get_aggregation: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
++
++print()
++print("3. Let's examine the query structure...")
++
++# Let's look at the query structure
++query = queryset.query.clone()
++print("Query annotations:")
++for alias, annotation in query.annotations.items():
++    print(f"  {alias}: {annotation}")
++    print(f"    contains_aggregate: {getattr(annotation, 'contains_aggregate', 'N/A')}")
++    print(f"    contains_over_clause: {getattr(annotation, 'contains_over_clause', 'N/A')}")
++
++print()
++print("4. Let's see what happens during aggregation resolution...")
++
++# Let's manually step through the aggregation process
++for alias, aggregate_expr in aggregate_exprs.items():
++    print(f"Processing aggregate: {alias} = {aggregate_expr}")
++    try:
++        resolved = aggregate_expr.resolve_expression(
++            query, allow_joins=True, reuse=None, summarize=True
++        )
++        print(f"  Resolved: {resolved}")
++        print(f"  contains_aggregate: {getattr(resolved, 'contains_aggregate', 'N/A')}")
++        print(f"  contains_over_clause: {getattr(resolved, 'contains_over_clause', 'N/A')}")
++        
++        # Check what references this aggregate has
++        refs = resolved.get_refs() if hasattr(resolved, 'get_refs') else []
++        print(f"  References: {refs}")
++        
++    except Exception as e:
++        print(f"  ERROR: {type(e).__name__}: {e}")
++    print()
+\ No newline at end of file
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 13a6809dd8..e9adb4e48e 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -436,6 +436,13 @@ class Query(BaseExpression):
+             )
+             or having
+         )
++        # Check if any aggregates contain window functions, which would require
++        # a subquery to avoid "aggregate function calls cannot contain window
++        # function calls" errors.
++        has_window_function_in_aggregates = any(
++            getattr(aggregate, "contains_over_clause", False)
++            for aggregate in aggregates.values()
++        )
+         # Decide if we need to use a subquery.
+         #
+         # Existing aggregations would cause incorrect results as
+@@ -454,6 +461,7 @@ class Query(BaseExpression):
+             or qualify
+             or self.distinct
+             or self.combinator
++            or has_window_function_in_aggregates
+         ):
+             from django.db.models.sql.subqueries import AggregateQuery
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c11e5b2175
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the window function aggregate issue.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window
++from django.db.models.functions import Coalesce
++
++# Define a simple model for testing
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Insert some test data
++TestModel.objects.create(date='2023-01-01', DJR=100.00)
++TestModel.objects.create(date='2023-01-02', DJR=200.00)
++TestModel.objects.create(date='2023-01-03', DJR=150.00)
++
++print("Test data created successfully")
++
++# Try to reproduce the issue
++try:
++    print("Testing the problematic query...")
++    
++    # First, annotate with window function
++    from django.db.models import DecimalField
++    queryset = TestModel.objects.annotate(
++        cumul_DJR=Coalesce(
++            Window(Sum("DJR"), order_by=F("date").asc()), 
++            0.0,
++            output_field=DecimalField(max_digits=10, decimal_places=2)
++        )
++    )
++    
++    print("Window annotation created successfully")
++    print("Queryset SQL:", queryset.query)
++    
++    # Now try to aggregate over the window function result
++    aggregate = queryset.aggregate(
++        DJR_total=Sum("DJR"),
++        cumul_DJR_total=Sum("cumul_DJR")
++    )
++    
++    print("Aggregate result:", aggregate)
++    print("SUCCESS: No error occurred!")
++    
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/reproduce_issue_postgres.py b/reproduce_issue_postgres.py
+new file mode 100644
+index 0000000000..c9c9d02ff0
+--- /dev/null
++++ b/reproduce_issue_postgres.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the window function aggregate issue with PostgreSQL.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.postgresql',
++                'NAME': 'test_db',
++                'USER': 'postgres',
++                'PASSWORD': 'postgres',
++                'HOST': 'localhost',
++                'PORT': '5432',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window, DecimalField
++from django.db.models.functions import Coalesce
++
++# Define a simple model for testing
++class TestModel(models.Model):
++    date = models.DateField()
++    DJR = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++print("Testing the problematic query...")
++
++# Try to reproduce the issue without actually creating tables
++try:
++    # First, annotate with window function
++    queryset = TestModel.objects.annotate(
++        cumul_DJR=Coalesce(
++            Window(Sum("DJR"), order_by=F("date").asc()), 
++            0.0,
++            output_field=DecimalField(max_digits=10, decimal_places=2)
++        )
++    )
++    
++    print("Window annotation created successfully")
++    
++    # Now try to aggregate over the window function result
++    # This should generate the problematic SQL
++    aggregate_query = queryset.aggregate(
++        DJR_total=Sum("DJR"),
++        cumul_DJR_total=Sum("cumul_DJR")
++    )
++    
++    print("Aggregate query created successfully")
++    print("This means the issue might be fixed or not reproducible in this version")
++    
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
++
++# Let's also check what SQL is generated
++try:
++    from django.db.models.sql.query import Query
++    from django.db.models.sql.compiler import SQLCompiler
++    
++    # Create the queryset with window function
++    queryset = TestModel.objects.annotate(
++        cumul_DJR=Coalesce(
++            Window(Sum("DJR"), order_by=F("date").asc()), 
++            0.0,
++            output_field=DecimalField(max_digits=10, decimal_places=2)
++        )
++    )
++    
++    print("\nSQL for window annotation:")
++    print(queryset.query)
++    
++    # Now let's see what happens when we try to aggregate
++    print("\nTrying to get aggregation SQL...")
++    aggregate_exprs = {
++        'DJR_total': Sum("DJR"),
++        'cumul_DJR_total': Sum("cumul_DJR")
++    }
++    
++    # This is where the issue should occur
++    result = queryset.query.get_aggregation('default', aggregate_exprs)
++    print("Aggregation result:", result)
++    
++except Exception as e:
++    print(f"ERROR during SQL generation: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..da73ee314e
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the window function aggregate fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Avg, Count, Max, Min, Window, DecimalField
++from django.db.models.functions import Coalesce, Rank, RowNumber
++
++# Define a simple model for testing
++class TestModel(models.Model):
++    date = models.DateField()
++    value = models.DecimalField(max_digits=10, decimal_places=2)
++    category = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Insert test data
++TestModel.objects.create(date='2023-01-01', value=100.00, category='A')
++TestModel.objects.create(date='2023-01-02', value=200.00, category='A')
++TestModel.objects.create(date='2023-01-03', value=150.00, category='B')
++TestModel.objects.create(date='2023-01-04', value=300.00, category='B')
++
++print("=== Comprehensive Window Function Aggregate Tests ===")
++
++# Test 1: Basic window function with aggregate
++print("\n1. Basic window function with aggregate:")
++try:
++    queryset = TestModel.objects.annotate(
++        cumul_value=Window(Sum("value"), order_by=F("date").asc())
++    )
++    result = queryset.aggregate(
++        total_value=Sum("value"),
++        cumul_total=Sum("cumul_value")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 2: Multiple window functions with aggregates
++print("\n2. Multiple window functions with aggregates:")
++try:
++    queryset = TestModel.objects.annotate(
++        cumul_value=Window(Sum("value"), order_by=F("date").asc()),
++        avg_value=Window(Avg("value"), order_by=F("date").asc()),
++        rank_value=Window(Rank(), order_by=F("value").desc())
++    )
++    result = queryset.aggregate(
++        total_cumul=Sum("cumul_value"),
++        avg_of_avg=Avg("avg_value"),
++        max_rank=Max("rank_value")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 3: Window function with partition by
++print("\n3. Window function with partition by:")
++try:
++    queryset = TestModel.objects.annotate(
++        category_cumul=Window(
++            Sum("value"), 
++            partition_by=F("category"),
++            order_by=F("date").asc()
++        )
++    )
++    result = queryset.aggregate(
++        total_category_cumul=Sum("category_cumul")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 4: Coalesce with window function
++print("\n4. Coalesce with window function:")
++try:
++    queryset = TestModel.objects.annotate(
++        safe_cumul=Coalesce(
++            Window(Sum("value"), order_by=F("date").asc()),
++            0.0,
++            output_field=DecimalField(max_digits=10, decimal_places=2)
++        )
++    )
++    result = queryset.aggregate(
++        total_safe_cumul=Sum("safe_cumul")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 5: Regular aggregates without window functions (should still work)
++print("\n5. Regular aggregates without window functions:")
++try:
++    result = TestModel.objects.aggregate(
++        total_value=Sum("value"),
++        avg_value=Avg("value"),
++        count_records=Count("id")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 6: Mixed annotations (some with window functions, some without)
++print("\n6. Mixed annotations:")
++try:
++    queryset = TestModel.objects.annotate(
++        cumul_value=Window(Sum("value"), order_by=F("date").asc()),
++        double_value=F("value") * 2
++    )
++    result = queryset.aggregate(
++        total_cumul=Sum("cumul_value"),
++        total_double=Sum("double_value")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++print("\n=== All tests completed ===")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..cfe94b4a22
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the window function aggregate fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Avg, Count, Window, DecimalField, Q
++from django.db.models.functions import Coalesce
++
++class TestModel(models.Model):
++    date = models.DateField()
++    value = models.DecimalField(max_digits=10, decimal_places=2)
++    category = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create test data
++TestModel.objects.create(date='2023-01-01', value=100.00, category='A')
++TestModel.objects.create(date='2023-01-02', value=200.00, category='A')
++TestModel.objects.create(date='2023-01-03', value=150.00, category='B')
++TestModel.objects.create(date='2023-01-04', value=300.00, category='B')
++
++print("=== Edge Case Tests ===")
++
++# Test 1: Multiple window functions with different aggregates
++print("\n1. Multiple window functions with different aggregates:")
++try:
++    queryset = TestModel.objects.annotate(
++        cumul_value=Window(Sum("value"), order_by=F("date").asc()),
++        avg_value=Window(Avg("value"), order_by=F("date").asc()),
++        count_value=Window(Count("value"), order_by=F("date").asc())
++    )
++    result = queryset.aggregate(
++        total_cumul=Sum("cumul_value"),
++        avg_of_avg=Avg("avg_value"),
++        sum_of_count=Sum("count_value")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 2: Window function with filtering
++print("\n2. Window function with filtering:")
++try:
++    queryset = TestModel.objects.filter(category='A').annotate(
++        cumul_value=Window(Sum("value"), order_by=F("date").asc())
++    )
++    result = queryset.aggregate(
++        total_cumul=Sum("cumul_value")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 3: Window function with partition by
++print("\n3. Window function with partition by:")
++try:
++    queryset = TestModel.objects.annotate(
++        category_cumul=Window(
++            Sum("value"), 
++            partition_by=F("category"),
++            order_by=F("date").asc()
++        )
++    )
++    result = queryset.aggregate(
++        total_category_cumul=Sum("category_cumul")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 4: Nested expressions with window functions
++print("\n4. Nested expressions with window functions:")
++try:
++    queryset = TestModel.objects.annotate(
++        cumul_value=Window(Sum("value"), order_by=F("date").asc()),
++        double_cumul=F("cumul_value") * 2
++    )
++    result = queryset.aggregate(
++        total_double_cumul=Sum("double_cumul")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 5: Regular aggregates (should still work normally)
++print("\n5. Regular aggregates without window functions:")
++try:
++    result = TestModel.objects.aggregate(
++        total_value=Sum("value"),
++        avg_value=Avg("value"),
++        count_records=Count("id")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++# Test 6: Mixed window and non-window annotations
++print("\n6. Mixed window and non-window annotations:")
++try:
++    queryset = TestModel.objects.annotate(
++        cumul_value=Window(Sum("value"), order_by=F("date").asc()),
++        double_value=F("value") * 2,
++        constant_value=models.Value(10)
++    )
++    result = queryset.aggregate(
++        total_cumul=Sum("cumul_value"),
++        total_double=Sum("double_value"),
++        total_constant=Sum("constant_value")
++    )
++    print(f"SUCCESS: {result}")
++except Exception as e:
++    print(f"ERROR: {type(e).__name__}: {e}")
++
++print("\n=== All edge case tests completed ===")
+\ No newline at end of file
+diff --git a/test_window_aggregate_fix.py b/test_window_aggregate_fix.py
+new file mode 100644
+index 0000000000..b06dd9aaf6
+--- /dev/null
++++ b/test_window_aggregate_fix.py
+@@ -0,0 +1,104 @@
++#!/usr/bin/env python
++"""
++Test case for the window function aggregate fix.
++This test should be added to the Django test suite.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Window, DecimalField
++from django.db.models.functions import Coalesce
++from django.test import TestCase, skipUnlessDBFeature
++
++class TestModel(models.Model):
++    date = models.DateField()
++    value = models.DecimalField(max_digits=10, decimal_places=2)
++    
++    class Meta:
++        app_label = 'test'
++
++class WindowAggregateTestCase(TestCase):
++    """Test case for aggregating over window functions."""
++    
++    @classmethod
++    def setUpTestData(cls):
++        # Create test data
++        TestModel.objects.create(date='2023-01-01', value=100.00)
++        TestModel.objects.create(date='2023-01-02', value=200.00)
++        TestModel.objects.create(date='2023-01-03', value=150.00)
++    
++    @skipUnlessDBFeature("supports_over_clause")
++    def test_aggregate_over_window_function(self):
++        """
++        Test that aggregating over window functions works correctly.
++        This should use a subquery to avoid "aggregate function calls 
++        cannot contain window function calls" errors.
++        """
++        # Annotate with window function
++        queryset = TestModel.objects.annotate(
++            cumul_value=Window(Sum("value"), order_by=F("date").asc())
++        )
++        
++        # Aggregate over the window function result
++        result = queryset.aggregate(
++            total_value=Sum("value"),
++            cumul_total=Sum("cumul_value")
++        )
++        
++        # Verify the results
++        self.assertEqual(result['total_value'], 450)  # 100 + 200 + 150
++        self.assertEqual(result['cumul_total'], 850)  # 100 + 300 + 450
++    
++    @skipUnlessDBFeature("supports_over_clause")
++    def test_aggregate_over_coalesced_window_function(self):
++        """
++        Test aggregating over a Coalesce expression containing a window function.
++        """
++        # Annotate with coalesced window function
++        queryset = TestModel.objects.annotate(
++            safe_cumul=Coalesce(
++                Window(Sum("value"), order_by=F("date").asc()),
++                0.0,
++                output_field=DecimalField(max_digits=10, decimal_places=2)
++            )
++        )
++        
++        # Aggregate over the coalesced window function result
++        result = queryset.aggregate(
++            total_safe_cumul=Sum("safe_cumul")
++        )
++        
++        # Verify the result
++        self.assertEqual(result['total_safe_cumul'], 850)  # 100 + 300 + 450
++
++if __name__ == '__main__':
++    # Create the table
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Run the tests
++    import unittest
++    unittest.main(verbosity=2)
+\ No newline at end of file

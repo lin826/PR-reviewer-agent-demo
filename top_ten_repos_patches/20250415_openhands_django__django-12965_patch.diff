@@ -1,0 +1,94 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 07d6ffd4ca..375657df44 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -741,6 +741,13 @@ class QuerySet:
+         del_query.query.select_for_update = False
+         del_query.query.select_related = False
+         del_query.query.clear_ordering(force_empty=True)
++        # Mark whether this is a full table delete (all() with no filters)
++        # This will be used by the SQL compiler to generate simple DELETE FROM syntax
++        # without a subquery for better performance and MySQL LOCK TABLES compatibility
++        del_query.query._is_delete_all = (
++            not del_query.query.where.children and
++            not del_query.query.is_sliced
++        )
+
+         collector = Collector(using=del_query.db)
+         collector.collect(del_query)
+@@ -760,6 +767,11 @@ class QuerySet:
+         """
+         query = self.query.clone()
+         query.__class__ = sql.DeleteQuery
++
++        # Pass through the _is_delete_all flag if it exists
++        if hasattr(self.query, '_is_delete_all'):
++            query._is_delete_all = self.query._is_delete_all
++
+         cursor = query.get_compiler(using).execute_sql(CURSOR)
+         if cursor:
+             with cursor:
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 29e33c075f..63d87543ab 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1425,6 +1425,17 @@ class SQLDeleteCompiler(SQLCompiler):
+         """
+         if self.single_alias:
+             return self._as_sql(self.query)
++
++        # Check if this is a "delete all" query (Model.objects.all().delete())
++        # For better performance and MySQL LOCK TABLES compatibility, we use a
++        # simple DELETE FROM query without a subquery for delete all operations.
++        # This restores the Django < 3.1 behavior.
++        if hasattr(self.query, '_is_delete_all') and self.query._is_delete_all:
++            table = self.query.get_meta().db_table
++            sql = 'DELETE FROM %s' % self.connection.ops.quote_name(table)
++            return sql, ()
++
++        # Otherwise use subquery approach for filtered deletes
+         innerq = self.query.clone()
+         innerq.__class__ = Query
+         innerq.clear_select_clause()
+diff --git a/run_delete_tests.py b/run_delete_tests.py
+new file mode 100644
+index 0000000000..fd2a67c179
+--- /dev/null
++++ b/run_delete_tests.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python
++import os
++import sys
++from django.conf import settings
++from django.test.utils import get_runner
++
++# Add test directory to Python path
++sys.path.append('.')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'tests.delete',
++            'tests.delete_regress',
++        ],
++        ROOT_URLCONF='tests.urls',
++        STATIC_URL='/static/',
++        SECRET_KEY='this-is-just-for-tests-so-not-secure',
++    )
++
++import django
++django.setup()
++
++# Run tests
++TestRunner = get_runner(settings)
++test_runner = TestRunner(verbosity=2, interactive=True)
++failures = test_runner.run_tests(['tests.delete'])
++sys.exit(bool(failures))
+\ No newline at end of file

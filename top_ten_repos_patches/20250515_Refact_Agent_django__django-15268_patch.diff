@@ -1,0 +1,76 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index c120f5d32d..82d88c3926 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -497,6 +497,12 @@ class AlterTogetherOptionOperation(ModelOptionOperation):
+             self.name_lower,
+             {self.option_name: self.option_value},
+         )
++        
++    def reduce(self, operation, app_label):
++        if (isinstance(operation, self.__class__) and 
++                self.name_lower == operation.name_lower):
++            return [operation]
++        return super().reduce(operation, app_label)
+ 
+     def database_forwards(self, app_label, schema_editor, from_state, to_state):
+         new_model = to_state.apps.get_model(app_label, self.name)
+diff --git a/django/db/migrations/optimizer.py b/django/db/migrations/optimizer.py
+index ee20f62af2..5db4a2c9cf 100644
+--- a/django/db/migrations/optimizer.py
++++ b/django/db/migrations/optimizer.py
+@@ -29,6 +29,10 @@ class MigrationOptimizer:
+         # Internal tracking variable for test assertions about # of loops
+         if app_label is None:
+             raise TypeError('app_label must be a str.')
++        
++        # Pre-process AlterTogetherOptionOperation operations
++        operations = self.optimize_alter_foo_together(operations)
++        
+         self._iterations = 0
+         while True:
+             result = self.optimize_inner(operations, app_label)
+@@ -36,6 +40,43 @@ class MigrationOptimizer:
+             if result == operations:
+                 return result
+             operations = result
++            
++    def optimize_alter_foo_together(self, operations):
++        """
++        Pre-process AlterTogetherOptionOperation operations to optimize sequences like:
++        
++        AlterUniqueTogether(empty) -> AlterIndexTogether(empty) -> 
++        AlterUniqueTogether(values) -> AlterIndexTogether(values)
++        
++        into:
++        
++        AlterUniqueTogether(values) -> AlterIndexTogether(values)
++        """
++        from django.db.migrations.operations.models import AlterTogetherOptionOperation
++        
++        # Group operations by model and class
++        model_operations = {}
++        for i, operation in enumerate(operations):
++            if isinstance(operation, AlterTogetherOptionOperation):
++                key = (operation.name_lower, operation.__class__)
++                if key not in model_operations:
++                    model_operations[key] = []
++                model_operations[key].append((i, operation))
++        
++        # If we have multiple operations for the same model and class, keep only the last one
++        if not model_operations:
++            return operations
++            
++        # Create a new list with optimized operations
++        result = list(operations)
++        for operations_list in model_operations.values():
++            if len(operations_list) > 1:
++                # Keep only the last operation
++                for i, _ in operations_list[:-1]:
++                    result[i] = None
++        
++        # Remove None entries
++        return [op for op in result if op is not None]
+ 
+     def optimize_inner(self, operations, app_label):
+         """Inner optimization loop."""

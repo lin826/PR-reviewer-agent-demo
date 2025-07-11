@@ -1,0 +1,380 @@
+diff --git a/django/db/backends/postgresql/client.py b/django/db/backends/postgresql/client.py
+index 4c9bd63546..3b5ddafaca 100644
+--- a/django/db/backends/postgresql/client.py
++++ b/django/db/backends/postgresql/client.py
+@@ -32,9 +32,9 @@ class DatabaseClient(BaseDatabaseClient):
+             args += ["-h", host]
+         if port:
+             args += ["-p", str(port)]
++        args.extend(parameters)
+         if dbname:
+             args += [dbname]
+-        args.extend(parameters)
+ 
+         env = {}
+         if passwd:
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..70a6588cec
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++"""
++Final verification that the issue described in the GitHub issue is resolved.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++from django.db.backends.postgresql.client import DatabaseClient
++
++
++def test_original_issue():
++    """Test the exact scenario described in the GitHub issue."""
++    
++    print("Final Verification: Original Issue Scenario")
++    print("=" * 50)
++    
++    # Simulate the exact command from the issue:
++    # ./manage.py dbshell -- -c "select * from some_table;"
++    
++    # This would typically use the database settings from Django settings,
++    # but for testing we'll use a representative database configuration
++    settings_dict = {
++        "NAME": "some_database",  # This matches the issue description
++        "USER": "postgres",
++        "HOST": "localhost",
++        "PORT": "5432",
++    }
++    
++    # These are the parameters that would be passed after "--"
++    parameters = ["-c", "select * from some_table;"]
++    
++    print(f"Database settings: {settings_dict}")
++    print(f"Additional parameters: {parameters}")
++    print()
++    
++    # Generate the command that would be executed
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings_dict, parameters)
++    
++    print("Generated psql command:")
++    print(" ".join(args))
++    print()
++    
++    # Verify the structure
++    print("Command structure analysis:")
++    print(f"Full args list: {args}")
++    
++    # Find key positions
++    psql_index = args.index("psql")
++    c_index = args.index("-c") if "-c" in args else None
++    sql_index = args.index("select * from some_table;") if "select * from some_table;" in args else None
++    db_index = args.index("some_database") if "some_database" in args else None
++    
++    print(f"psql at index: {psql_index}")
++    print(f"-c parameter at index: {c_index}")
++    print(f"SQL command at index: {sql_index}")
++    print(f"Database name at index: {db_index}")
++    print()
++    
++    # Verify correct ordering
++    if c_index is not None and db_index is not None:
++        if c_index < db_index:
++            print("✅ SUCCESS: -c parameter comes before database name")
++            print("   This means psql will NOT show the warning:")
++            print("   'psql: warning: extra command-line argument \"-c\" ignored'")
++        else:
++            print("❌ FAILURE: Database name comes before -c parameter")
++            print("   This would cause psql to show warnings about ignored arguments")
++    
++    print()
++    
++    # Show the before/after comparison
++    print("Before fix (incorrect):")
++    print("psql -U postgres -h localhost -p 5432 some_database -c 'select * from some_table;'")
++    print("                                      ^^^^^^^^^^^^^ ^^^ (database before parameters)")
++    print()
++    
++    print("After fix (correct):")
++    print(" ".join(args))
++    print("                                      ^^^ ^^^^^^^^^^^^^ (parameters before database)")
++    print()
++    
++    print("This matches psql's expected format: psql [OPTIONS] [DBNAME]")
++
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file
+diff --git a/test_dbshell_issue.py b/test_dbshell_issue.py
+new file mode 100644
+index 0000000000..8e466af025
+--- /dev/null
++++ b/test_dbshell_issue.py
+@@ -0,0 +1,166 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the PostgreSQL dbshell parameter ordering issue.
++
++This script tests the current behavior and verifies the fix for the issue where
++additional parameters should be passed before the database name in PostgreSQL.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++from django.db.backends.postgresql.client import DatabaseClient
++
++
++def test_parameter_ordering():
++    """Test that parameters come before database name in PostgreSQL dbshell."""
++    
++    print("Testing PostgreSQL dbshell parameter ordering...")
++    print("=" * 60)
++    
++    # Test case 1: Basic case with -c parameter
++    settings_dict = {
++        "NAME": "test_db",
++        "USER": "testuser",
++        "HOST": "localhost",
++        "PORT": "5432",
++    }
++    parameters = ["-c", "SELECT * FROM test_table;"]
++    
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings_dict, parameters)
++    
++    print("Test case 1: -c parameter")
++    print(f"Settings: {settings_dict}")
++    print(f"Parameters: {parameters}")
++    print(f"Generated args: {args}")
++    print()
++    
++    # Check if database name comes before parameters (current incorrect behavior)
++    dbname_index = None
++    param_index = None
++    
++    for i, arg in enumerate(args):
++        if arg == "test_db":
++            dbname_index = i
++        elif arg == "-c":
++            param_index = i
++    
++    if dbname_index is not None and param_index is not None:
++        if dbname_index < param_index:
++            print("❌ ISSUE CONFIRMED: Database name comes before parameters")
++            print(f"   Database name at index {dbname_index}, -c parameter at index {param_index}")
++        else:
++            print("✅ FIXED: Parameters come before database name")
++            print(f"   -c parameter at index {param_index}, database name at index {dbname_index}")
++    else:
++        print("⚠️  Could not find both database name and -c parameter in args")
++    
++    print()
++    
++    # Test case 2: Multiple parameters
++    parameters2 = ["-c", "SELECT 1;", "--quiet"]
++    args2, env2 = DatabaseClient.settings_to_cmd_args_env(settings_dict, parameters2)
++    
++    print("Test case 2: Multiple parameters")
++    print(f"Parameters: {parameters2}")
++    print(f"Generated args: {args2}")
++    
++    # Find positions
++    dbname_index2 = None
++    first_param_index2 = None
++    
++    for i, arg in enumerate(args2):
++        if arg == "test_db":
++            dbname_index2 = i
++        elif arg in ["-c", "--quiet"] and first_param_index2 is None:
++            first_param_index2 = i
++    
++    if dbname_index2 is not None and first_param_index2 is not None:
++        if dbname_index2 < first_param_index2:
++            print("❌ ISSUE CONFIRMED: Database name comes before parameters")
++        else:
++            print("✅ FIXED: Parameters come before database name")
++    
++    print()
++    
++    # Test case 3: No database name (service connection)
++    settings_dict3 = {"OPTIONS": {"service": "django_test"}}
++    parameters3 = ["-c", "SELECT version();"]
++    
++    args3, env3 = DatabaseClient.settings_to_cmd_args_env(settings_dict3, parameters3)
++    
++    print("Test case 3: Service connection (no database name)")
++    print(f"Settings: {settings_dict3}")
++    print(f"Parameters: {parameters3}")
++    print(f"Generated args: {args3}")
++    print()
++    
++    # Test case 4: No parameters
++    args4, env4 = DatabaseClient.settings_to_cmd_args_env(settings_dict, [])
++    
++    print("Test case 4: No additional parameters")
++    print(f"Generated args: {args4}")
++    print()
++    
++    # Test case 5: Empty database name but with parameters
++    settings_dict5 = {
++        "NAME": "",
++        "USER": "testuser",
++    }
++    parameters5 = ["-l"]  # List databases
++    
++    args5, env5 = DatabaseClient.settings_to_cmd_args_env(settings_dict5, parameters5)
++    
++    print("Test case 5: Empty database name with parameters")
++    print(f"Settings: {settings_dict5}")
++    print(f"Parameters: {parameters5}")
++    print(f"Generated args: {args5}")
++    
++    # Should default to 'postgres' database and put it at the end
++    if 'postgres' in args5 and '-l' in args5:
++        postgres_index = args5.index('postgres')
++        l_index = args5.index('-l')
++        if l_index < postgres_index:
++            print("✅ FIXED: Parameters come before default database name")
++        else:
++            print("❌ ISSUE: Default database name comes before parameters")
++    print()
++    
++    # Test case 6: Complex parameters with quotes and spaces
++    parameters6 = ["-c", "SELECT 'hello world';", "--echo-queries"]
++    args6, env6 = DatabaseClient.settings_to_cmd_args_env(settings_dict, parameters6)
++    
++    print("Test case 6: Complex parameters with quotes")
++    print(f"Parameters: {parameters6}")
++    print(f"Generated args: {args6}")
++    
++    # Check ordering
++    dbname_index6 = args6.index("test_db") if "test_db" in args6 else None
++    c_index6 = args6.index("-c") if "-c" in args6 else None
++    
++    if dbname_index6 is not None and c_index6 is not None:
++        if c_index6 < dbname_index6:
++            print("✅ FIXED: Complex parameters come before database name")
++        else:
++            print("❌ ISSUE: Database name comes before complex parameters")
++    print()
++    
++    return args, args2, args3, args4, args5, args6
++
++
++def test_psql_command_structure():
++    """Test what the correct psql command structure should be."""
++    print("Expected psql command structure:")
++    print("=" * 40)
++    print("Correct:   psql [OPTIONS] [DBNAME]")
++    print("Example:   psql -c 'SELECT 1;' mydb")
++    print("Incorrect: psql mydb -c 'SELECT 1;'")
++    print()
++
++
++if __name__ == "__main__":
++    test_psql_command_structure()
++    test_parameter_ordering()
+\ No newline at end of file
+diff --git a/verify_psql_structure.py b/verify_psql_structure.py
+new file mode 100644
+index 0000000000..5659a01d0f
+--- /dev/null
++++ b/verify_psql_structure.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python
++"""
++Verify that our fix produces the correct psql command structure.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++from django.db.backends.postgresql.client import DatabaseClient
++
++
++def verify_psql_structure():
++    """Verify that the generated command matches psql's expected structure."""
++    
++    print("Verifying psql command structure...")
++    print("=" * 50)
++    
++    # Test the exact case from the issue description
++    settings_dict = {"NAME": "some_database"}
++    parameters = ["-c", "select * from some_table;"]
++    
++    args, env = DatabaseClient.settings_to_cmd_args_env(settings_dict, parameters)
++    
++    print("Issue example:")
++    print(f"Command: ./manage.py dbshell -- -c \"select * from some_table;\"")
++    print(f"Generated args: {args}")
++    print()
++    
++    # Verify structure: psql [OPTIONS] [DBNAME]
++    expected_structure = ["psql", "-c", "select * from some_table;", "some_database"]
++    
++    if args == expected_structure:
++        print("✅ CORRECT: Command structure matches psql expectations")
++        print(f"   Expected: {expected_structure}")
++        print(f"   Generated: {args}")
++    else:
++        print("❌ INCORRECT: Command structure doesn't match psql expectations")
++        print(f"   Expected: {expected_structure}")
++        print(f"   Generated: {args}")
++    
++    print()
++    
++    # Test with more complex case
++    settings_dict2 = {
++        "NAME": "mydb",
++        "USER": "user",
++        "HOST": "localhost",
++        "PORT": "5432"
++    }
++    parameters2 = ["-c", "SELECT version();", "--quiet"]
++    
++    args2, env2 = DatabaseClient.settings_to_cmd_args_env(settings_dict2, parameters2)
++    
++    print("Complex example:")
++    print(f"Generated args: {args2}")
++    
++    # Check that all parameters come before database name
++    dbname_index = args2.index("mydb")
++    param_indices = []
++    for param in ["-c", "SELECT version();", "--quiet"]:
++        if param in args2:
++            param_indices.append(args2.index(param))
++    
++    if all(idx < dbname_index for idx in param_indices):
++        print("✅ CORRECT: All parameters come before database name")
++    else:
++        print("❌ INCORRECT: Some parameters come after database name")
++    
++    print()
++    
++    # Test the failing test case to understand the difference
++    test_settings = {"NAME": "dbname"}
++    test_parameters = ["--help"]
++    
++    test_args, test_env = DatabaseClient.settings_to_cmd_args_env(test_settings, test_parameters)
++    
++    print("Test case from failing test:")
++    print(f"Settings: {test_settings}")
++    print(f"Parameters: {test_parameters}")
++    print(f"Generated args: {test_args}")
++    print(f"Old expected: ['psql', 'dbname', '--help']")
++    print(f"New result:   {test_args}")
++    
++    if test_args == ["psql", "--help", "dbname"]:
++        print("✅ CORRECT: Parameters come before database name (psql standard)")
++    else:
++        print("❌ INCORRECT: Unexpected result")
++
++
++if __name__ == "__main__":
++    verify_psql_structure()
+\ No newline at end of file

@@ -1,0 +1,327 @@
+diff --git a/django/db/models/manager.py b/django/db/models/manager.py
+index e37e56cd17..426c9c1092 100644
+--- a/django/db/models/manager.py
++++ b/django/db/models/manager.py
+@@ -1,4 +1,5 @@
+ import copy
++import functools
+ import inspect
+ from importlib import import_module
+ 
+@@ -81,11 +82,10 @@ class BaseManager:
+     @classmethod
+     def _get_queryset_methods(cls, queryset_class):
+         def create_method(name, method):
++            @functools.wraps(method)
+             def manager_method(self, *args, **kwargs):
+                 return getattr(self.get_queryset(), name)(*args, **kwargs)
+ 
+-            manager_method.__name__ = method.__name__
+-            manager_method.__doc__ = method.__doc__
+             return manager_method
+ 
+         new_methods = {}
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..07ff4c20f7
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the inspect.signature issue with Django manager methods.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++import inspect
++from django.db import models
++
++class Person(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_manager_signature():
++    """Test that manager methods have correct signatures."""
++    print("Testing inspect.signature on manager methods...")
++    
++    # Test bulk_create signature
++    print("\n1. Testing bulk_create:")
++    signature = inspect.signature(Person.objects.bulk_create)
++    print(f"   Current signature: {signature}")
++    
++    # Get the actual QuerySet method signature for comparison
++    from django.db.models.query import QuerySet
++    qs_signature = inspect.signature(QuerySet.bulk_create)
++    print(f"   Expected signature: {qs_signature}")
++    
++    # Check if they match (manager signature should be QuerySet signature without 'self')
++    expected_manager_sig = str(qs_signature).replace('(self, ', '(').replace('(self)', '()')
++    if str(signature) == expected_manager_sig:
++        print("   ✓ PASS: Signatures match!")
++    else:
++        print("   ✗ FAIL: Signatures don't match!")
++        print(f"   Expected manager signature: {expected_manager_sig}")
++    
++    # Test a few more methods
++    print("\n2. Testing filter:")
++    filter_signature = inspect.signature(Person.objects.filter)
++    qs_filter_signature = inspect.signature(QuerySet.filter)
++    print(f"   Manager signature: {filter_signature}")
++    print(f"   QuerySet signature: {qs_filter_signature}")
++    
++    print("\n3. Testing get:")
++    get_signature = inspect.signature(Person.objects.get)
++    qs_get_signature = inspect.signature(QuerySet.get)
++    print(f"   Manager signature: {get_signature}")
++    print(f"   QuerySet signature: {qs_get_signature}")
++    
++    # Test method metadata preservation
++    print("\n4. Testing metadata preservation:")
++    manager_method = Person.objects.bulk_create
++    queryset_method = QuerySet.bulk_create
++    
++    print(f"   Manager method __name__: {getattr(manager_method, '__name__', 'MISSING')}")
++    print(f"   QuerySet method __name__: {getattr(queryset_method, '__name__', 'MISSING')}")
++    
++    print(f"   Manager method __doc__: {getattr(manager_method, '__doc__', 'MISSING')[:50] if getattr(manager_method, '__doc__', None) else 'MISSING'}...")
++    print(f"   QuerySet method __doc__: {getattr(queryset_method, '__doc__', 'MISSING')[:50] if getattr(queryset_method, '__doc__', None) else 'MISSING'}...")
++    
++    print(f"   Manager method __annotations__: {getattr(manager_method, '__annotations__', 'MISSING')}")
++    print(f"   QuerySet method __annotations__: {getattr(queryset_method, '__annotations__', 'MISSING')}")
++    
++    print(f"   Manager method __wrapped__: {getattr(manager_method, '__wrapped__', 'MISSING')}")
++    print(f"   QuerySet method __wrapped__: {getattr(queryset_method, '__wrapped__', 'MISSING')}")
++
++if __name__ == '__main__':
++    test_manager_signature()
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..e50ede2c6b
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the inspect.signature fix works for various manager methods.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++import inspect
++from django.db import models
++from django.db.models.query import QuerySet
++
++class Person(models.Model):
++    name = models.CharField(max_length=100)
++    age = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = 'test'
++
++def test_method_signature(method_name):
++    """Test a specific method's signature."""
++    print(f"\nTesting {method_name}:")
++    
++    # Get manager method
++    manager_method = getattr(Person.objects, method_name)
++    manager_signature = inspect.signature(manager_method)
++    
++    # Get QuerySet method
++    queryset_method = getattr(QuerySet, method_name)
++    queryset_signature = inspect.signature(queryset_method)
++    
++    print(f"   Manager signature:  {manager_signature}")
++    print(f"   QuerySet signature: {queryset_signature}")
++    
++    # Expected manager signature (QuerySet signature without 'self')
++    expected_manager_sig = str(queryset_signature).replace('(self, ', '(').replace('(self)', '()')
++    
++    if str(manager_signature) == expected_manager_sig:
++        print("   ✓ PASS: Signatures match!")
++        return True
++    else:
++        print("   ✗ FAIL: Signatures don't match!")
++        print(f"   Expected: {expected_manager_sig}")
++        return False
++
++def test_metadata_preservation():
++    """Test that metadata is properly preserved."""
++    print("\nTesting metadata preservation:")
++    
++    manager_method = Person.objects.bulk_create
++    queryset_method = QuerySet.bulk_create
++    
++    # Test __wrapped__ attribute
++    wrapped = getattr(manager_method, '__wrapped__', None)
++    if wrapped is queryset_method:
++        print("   ✓ PASS: __wrapped__ attribute correctly set")
++    else:
++        print(f"   ✗ FAIL: __wrapped__ attribute incorrect. Got: {wrapped}")
++    
++    # Test __name__
++    if manager_method.__name__ == queryset_method.__name__:
++        print("   ✓ PASS: __name__ attribute correctly copied")
++    else:
++        print(f"   ✗ FAIL: __name__ mismatch. Manager: {manager_method.__name__}, QuerySet: {queryset_method.__name__}")
++    
++    # Test __doc__
++    if manager_method.__doc__ == queryset_method.__doc__:
++        print("   ✓ PASS: __doc__ attribute correctly copied")
++    else:
++        print("   ✗ FAIL: __doc__ mismatch")
++
++def main():
++    """Run comprehensive tests."""
++    print("Running comprehensive signature tests...")
++    
++    # Test methods with specific signatures
++    methods_to_test = [
++        'bulk_create',
++        'bulk_update', 
++        'get_or_create',
++        'update_or_create',
++        'count',
++        'exists',
++        'filter',  # This has *args, **kwargs
++        'exclude', # This has *args, **kwargs
++        'get',     # This has *args, **kwargs
++    ]
++    
++    passed = 0
++    total = len(methods_to_test)
++    
++    for method_name in methods_to_test:
++        if hasattr(QuerySet, method_name):
++            if test_method_signature(method_name):
++                passed += 1
++        else:
++            print(f"\nSkipping {method_name}: not found in QuerySet")
++            total -= 1
++    
++    test_metadata_preservation()
++    
++    print(f"\n\nSummary: {passed}/{total} signature tests passed")
++    
++    if passed == total:
++        print("🎉 All tests passed! The fix is working correctly.")
++        return True
++    else:
++        print("❌ Some tests failed. The fix needs more work.")
++        return False
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..1c86040e55
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python
++"""
++Test the exact example from the original issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++import inspect
++from django.db import models
++
++class Person(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Test the exact example from the issue
++print("Testing the original issue example:")
++print("inspect.signature(Person.objects.bulk_create)")
++
++signature = inspect.signature(Person.objects.bulk_create)
++print(f"Result: {signature}")
++
++# Check if it matches the expected signature
++expected = "(objs, batch_size=None, ignore_conflicts=False, update_conflicts=False, update_fields=None, unique_fields=None)"
++actual = str(signature)
++
++print(f"Expected: {expected}")
++print(f"Actual:   {actual}")
++
++if actual == expected:
++    print("✅ SUCCESS: The issue has been fixed!")
++else:
++    print("❌ FAILURE: The issue is not fixed.")
++    sys.exit(1)
+\ No newline at end of file

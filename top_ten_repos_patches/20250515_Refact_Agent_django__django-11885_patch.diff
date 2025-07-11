@@ -1,0 +1,60 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index ae82d26340..ecbf3a306d 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -280,6 +280,42 @@ class Collector:
+                 return
+         self.data = {model: self.data[model] for model in sorted_models}
+ 
++    def _do_fast_delete(self, deleted_counter):
++        """
++        Execute the fast-delete querysets in the most efficient way possible:
++
++        1. Regroup them by the concrete database table
++        2. Within every table, OR the querysets together when they differ
++           only by the foreign-key column
++        """
++        # Group querysets by table name
++        by_table = {}
++        for qs in self.fast_deletes:
++            by_table.setdefault(qs.model._meta.db_table, []).append(qs)
++
++        # Process each table's querysets
++        for qlist in by_table.values():
++            if len(qlist) == 1:
++                # Only one queryset for this table, no need to combine
++                qs = qlist[0]
++                count = qs._raw_delete(using=self.using)
++                deleted_counter[qs.model._meta.label] += count
++            else:
++                # Combine querysets for the same table using OR
++                combined = qlist[0]
++                for extra in qlist[1:]:
++                    # QuerySet | QuerySet returns a new queryset with an
++                    # OR-combined WHERE clause
++                    combined = combined | extra
++
++                # Execute the combined queryset once
++                deleted = combined._raw_delete(using=self.using)
++
++                # Attribute the count to all models in the table
++                # (keeping the same semantics as before)
++                for qs in qlist:
++                    deleted_counter[qs.model._meta.label] += deleted
++    
+     def delete(self):
+         # sort instance collections
+         for model, instances in self.data.items():
+@@ -309,10 +345,8 @@ class Collector:
+                         sender=model, instance=obj, using=self.using
+                     )
+ 
+-            # fast deletes
+-            for qs in self.fast_deletes:
+-                count = qs._raw_delete(using=self.using)
+-                deleted_counter[qs.model._meta.label] += count
++            # Process fast deletes with combined queries where possible
++            self._do_fast_delete(deleted_counter)
+ 
+             # update fields
+             for model, instances_for_fieldvalues in self.field_updates.items():

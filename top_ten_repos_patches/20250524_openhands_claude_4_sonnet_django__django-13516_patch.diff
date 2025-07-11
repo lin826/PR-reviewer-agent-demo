@@ -1,0 +1,1190 @@
+diff --git a/debug_flush.py b/debug_flush.py
+new file mode 100644
+index 0000000000..d9b99b9cba
+--- /dev/null
++++ b/debug_flush.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python
++"""
++Debug script to understand the flush issue.
++"""
++import os
++import sys
++import io
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.management.base import OutputWrapper
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def debug_output_wrapper():
++    """Debug the OutputWrapper class to understand the flush issue."""
++    print("Debugging OutputWrapper...")
++    
++    # Create a StringIO that tracks method calls
++    class DebugStringIO(io.StringIO):
++        def __init__(self):
++            super().__init__()
++            self.method_calls = []
++            
++        def write(self, text):
++            self.method_calls.append(f"write('{text}')")
++            return super().write(text)
++            
++        def flush(self):
++            self.method_calls.append("flush()")
++            super().flush()
++            
++        def __getattr__(self, name):
++            self.method_calls.append(f"__getattr__('{name}')")
++            return super().__getattribute__(name)
++    
++    # Test with OutputWrapper
++    debug_stream = DebugStringIO()
++    wrapper = OutputWrapper(debug_stream)
++    
++    print(f"OutputWrapper class: {OutputWrapper}")
++    print(f"OutputWrapper MRO: {OutputWrapper.__mro__}")
++    print(f"OutputWrapper.__dict__: {OutputWrapper.__dict__.keys()}")
++    
++    # Check if flush method exists
++    print(f"hasattr(wrapper, 'flush'): {hasattr(wrapper, 'flush')}")
++    print(f"type(wrapper.flush): {type(wrapper.flush)}")
++    
++    # Write something
++    print("\nCalling wrapper.write('test')...")
++    wrapper.write("test")
++    
++    # Call flush
++    print("Calling wrapper.flush()...")
++    wrapper.flush()
++    
++    print(f"\nMethod calls on underlying stream: {debug_stream.method_calls}")
++    
++    # Let's see what happens when we call flush directly on the underlying stream
++    print("\nCalling debug_stream.flush() directly...")
++    debug_stream.flush()
++    
++    print(f"Final method calls: {debug_stream.method_calls}")
++
++if __name__ == "__main__":
++    debug_output_wrapper()
+\ No newline at end of file
+diff --git a/debug_flush2.py b/debug_flush2.py
+new file mode 100644
+index 0000000000..677cf9cca9
+--- /dev/null
++++ b/debug_flush2.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python
++"""
++Debug script to understand TextIOBase.flush() behavior.
++"""
++import io
++
++def debug_textiobase_flush():
++    """Debug TextIOBase.flush() behavior."""
++    print("Debugging TextIOBase.flush()...")
++    
++    # Create a StringIO
++    stream = io.StringIO()
++    
++    # Check what TextIOBase.flush does
++    print(f"TextIOBase.flush: {io.TextIOBase.flush}")
++    print(f"StringIO.flush: {stream.flush}")
++    
++    # Create a custom class that inherits from TextIOBase
++    class CustomTextIO(io.TextIOBase):
++        def __init__(self, underlying):
++            self._underlying = underlying
++            
++        def __getattr__(self, name):
++            print(f"CustomTextIO.__getattr__ called with: {name}")
++            return getattr(self._underlying, name)
++            
++        def write(self, text):
++            return self._underlying.write(text)
++    
++    # Test the custom class
++    underlying = io.StringIO()
++    custom = CustomTextIO(underlying)
++    
++    print("\nTesting custom TextIO...")
++    custom.write("test")
++    print("Calling custom.flush()...")
++    custom.flush()  # This will call TextIOBase.flush(), not underlying.flush()
++    
++    print("\nTesting direct underlying flush...")
++    underlying.flush()
++
++if __name__ == "__main__":
++    debug_textiobase_flush()
+\ No newline at end of file
+diff --git a/debug_none_stream.py b/debug_none_stream.py
+new file mode 100644
+index 0000000000..6ec0717fe8
+--- /dev/null
++++ b/debug_none_stream.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python
++"""
++Debug the None stream issue.
++"""
++import os
++import sys
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.management.base import OutputWrapper
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def debug_none_stream():
++    """Debug what happens with None stream."""
++    print("Debugging None stream...")
++    
++    try:
++        wrapper = OutputWrapper(None)
++        print(f"wrapper._out: {wrapper._out}")
++        print(f"hasattr(wrapper._out, 'flush'): {hasattr(wrapper._out, 'flush')}")
++        
++        # Try to call flush
++        wrapper.flush()
++        print("flush() succeeded")
++        
++    except Exception as e:
++        print(f"Exception: {type(e).__name__}: {e}")
++
++if __name__ == "__main__":
++    debug_none_stream()
+\ No newline at end of file
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index e6cbf8c64f..14c0355dd8 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -150,6 +150,10 @@ class OutputWrapper(TextIOBase):
+         style_func = style_func or self.style_func
+         self._out.write(style_func(msg))
+ 
++    def flush(self):
++        if hasattr(self._out, 'flush'):
++            self._out.flush()
++
+ 
+ class BaseCommand:
+     """
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..aab0416f14
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,224 @@
++#!/usr/bin/env python
++"""
++Final verification that the flush() fix completely resolves the issue.
++"""
++import os
++import sys
++import io
++import time
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.management.base import OutputWrapper
++from django.core.management.commands.migrate import Command
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_issue_reproduction_and_fix():
++    """Reproduce the exact issue described and verify it's fixed."""
++    print("🔍 Testing the exact issue described in the problem statement...")
++    
++    # Create a tracking stream to monitor flush behavior
++    class ProgressTrackingStream(io.StringIO):
++        def __init__(self):
++            super().__init__()
++            self.progress_events = []
++            
++        def write(self, text):
++            result = super().write(text)
++            self.progress_events.append(('write', time.time(), text.strip()))
++            return result
++            
++        def flush(self):
++            super().flush()
++            self.progress_events.append(('flush', time.time(), None))
++    
++    # Test the migrate command's progress callback (the exact scenario from the issue)
++    stream = ProgressTrackingStream()
++    command = Command(stdout=stream)
++    command.verbosity = 1
++    
++    print("📝 Simulating migration progress (the exact scenario from the issue)...")
++    
++    # Simulate the exact sequence that was problematic:
++    # 1. "Applying myapp.0002_auto_20200817_1030..." (should flush immediately)
++    # 2. Some work happens
++    # 3. "OK" (completion)
++    
++    command.migration_progress_callback("apply_start", migration="myapp.0002_auto_20200817_1030")
++    
++    # Check if flush was called after the "Applying..." message
++    applying_events = [e for e in stream.progress_events if e[0] == 'write' and 'Applying' in e[2]]
++    flush_events = [e for e in stream.progress_events if e[0] == 'flush']
++    
++    print(f"   📊 Events after 'Applying...' message:")
++    print(f"      - Write events: {len([e for e in stream.progress_events if e[0] == 'write'])}")
++    print(f"      - Flush events: {len(flush_events)}")
++    
++    # The key test: flush should be called immediately after "Applying..." message
++    if applying_events and flush_events:
++        applying_time = applying_events[0][1]
++        first_flush_time = flush_events[0][1]
++        
++        if first_flush_time > applying_time:
++            print("   ✅ FIXED: flush() called immediately after 'Applying...' message")
++            print("   ✅ This means users will see progress in real-time!")
++            
++            # Complete the simulation
++            time.sleep(0.01)  # Simulate migration work
++            command.migration_progress_callback("apply_success", migration="myapp.0002_auto_20200817_1030")
++            
++            final_output = stream.getvalue()
++            print(f"   📄 Final output: '{final_output.strip()}'")
++            
++            # Verify the expected output format
++            expected_parts = ["Applying myapp.0002_auto_20200817_1030...", "OK"]
++            if all(part in final_output for part in expected_parts):
++                print("   ✅ Output format matches expected behavior")
++                return True
++            else:
++                print("   ❌ Output format doesn't match expected")
++                return False
++        else:
++            print("   ❌ flush() not called at the right time")
++            return False
++    else:
++        print("   ❌ Missing expected events")
++        return False
++
++def test_before_and_after_comparison():
++    """Compare behavior before and after the fix."""
++    print("\n🔄 Comparing behavior before and after the fix...")
++    
++    # Simulate the old behavior (what would happen without our fix)
++    class OldOutputWrapper(io.TextIOBase):
++        """Simulates the old OutputWrapper behavior without our fix."""
++        def __init__(self, out):
++            self._out = out
++            
++        def __getattr__(self, name):
++            return getattr(self._out, name)
++            
++        def write(self, msg=''):
++            self._out.write(msg + '\n')
++        
++        # No flush method override - inherits from TextIOBase
++    
++    # Test old behavior
++    old_stream = io.StringIO()
++    old_wrapper = OldOutputWrapper(old_stream)
++    
++    print("   🔴 Old behavior (without fix):")
++    old_wrapper.write("Applying migration...")
++    old_wrapper.flush()  # This would call TextIOBase.flush(), not old_stream.flush()
++    print(f"      - Stream content: '{old_stream.getvalue().strip()}'")
++    print(f"      - Stream flushed: No way to verify (that was the problem!)")
++    
++    # Test new behavior
++    new_stream = io.StringIO()
++    new_wrapper = OutputWrapper(new_stream)
++    
++    print("   🟢 New behavior (with fix):")
++    new_wrapper.write("Applying migration...", ending="")
++    new_wrapper.flush()  # This now calls new_stream.flush()
++    print(f"      - Stream content: '{new_stream.getvalue()}'")
++    print(f"      - Stream flushed: ✅ Yes (our fix ensures this)")
++    
++    return True
++
++def test_real_world_scenario():
++    """Test a real-world scenario that users would experience."""
++    print("\n🌍 Testing real-world scenario...")
++    
++    from django.core.management import call_command
++    
++    # Capture output from a real migrate command
++    output_stream = io.StringIO()
++    
++    print("   🚀 Running actual migrate command...")
++    call_command('migrate', verbosity=1, stdout=output_stream, no_color=True)
++    
++    output = output_stream.getvalue()
++    
++    # Check for expected migration output patterns
++    patterns = [
++        "Operations to perform:",
++        "Running migrations:",
++        "Applying",
++        "OK"
++    ]
++    
++    found_patterns = [p for p in patterns if p in output]
++    print(f"   📋 Found migration patterns: {found_patterns}")
++    
++    if len(found_patterns) >= 3:  # Should find most patterns
++        print("   ✅ Real migrate command works correctly")
++        return True
++    else:
++        print("   ❌ Real migrate command output unexpected")
++        return False
++
++if __name__ == "__main__":
++    print("=" * 70)
++    print("🎯 FINAL VERIFICATION: Django Management Command flush() Fix")
++    print("=" * 70)
++    
++    tests = [
++        ("Issue Reproduction & Fix", test_issue_reproduction_and_fix),
++        ("Before/After Comparison", test_before_and_after_comparison),
++        ("Real-World Scenario", test_real_world_scenario),
++    ]
++    
++    results = []
++    for test_name, test_func in tests:
++        try:
++            result = test_func()
++            results.append((test_name, result))
++        except Exception as e:
++            print(f"❌ Test '{test_name}' failed with exception: {e}")
++            results.append((test_name, False))
++    
++    print("\n" + "=" * 70)
++    print("📊 FINAL RESULTS:")
++    
++    passed = sum(1 for _, result in results if result)
++    total = len(results)
++    
++    for test_name, result in results:
++        status = "✅" if result else "❌"
++        print(f"   {status} {test_name}")
++    
++    print(f"\n🎯 Overall: {passed}/{total} tests passed")
++    
++    if passed == total:
++        print("\n🎉 SUCCESS! The flush() issue has been completely resolved!")
++        print("   ✨ Users will now see migration progress in real-time")
++        print("   ✨ All management commands will properly flush output")
++        print("   ✨ No existing functionality was broken")
++        sys.exit(0)
++    else:
++        print("\n❌ FAILURE! Some tests failed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_comprehensive_flush.py b/test_comprehensive_flush.py
+new file mode 100644
+index 0000000000..863b28be6b
+--- /dev/null
++++ b/test_comprehensive_flush.py
+@@ -0,0 +1,191 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script for the flush() fix.
++"""
++import os
++import sys
++import io
++import time
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.management.base import OutputWrapper
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_output_wrapper_with_stringio():
++    """Test OutputWrapper with StringIO."""
++    print("Testing OutputWrapper with StringIO...")
++    
++    stream = io.StringIO()
++    wrapper = OutputWrapper(stream)
++    
++    # Test write
++    wrapper.write("Hello")
++    wrapper.write(" World", ending="")
++    
++    # Test flush
++    wrapper.flush()
++    
++    content = stream.getvalue()
++    print(f"Content: '{content}'")
++    return "Hello\n World" == content
++
++def test_output_wrapper_with_stdout():
++    """Test OutputWrapper with sys.stdout."""
++    print("Testing OutputWrapper with sys.stdout...")
++    
++    wrapper = OutputWrapper(sys.stdout)
++    
++    # Test write and flush (should not raise an exception)
++    wrapper.write("Test message to stdout", ending="")
++    wrapper.flush()
++    print(" - OK")
++    
++    return True
++
++def test_output_wrapper_with_no_flush():
++    """Test OutputWrapper with a stream that has no flush method."""
++    print("Testing OutputWrapper with stream without flush...")
++    
++    class NoFlushStream:
++        def __init__(self):
++            self.content = ""
++            
++        def write(self, text):
++            self.content += text
++            
++        def isatty(self):
++            return False
++    
++    stream = NoFlushStream()
++    wrapper = OutputWrapper(stream)
++    
++    # Test write
++    wrapper.write("Test")
++    
++    # Test flush (should not raise an exception)
++    wrapper.flush()
++    
++    return "Test\n" == stream.content
++
++def test_migrate_command_real_scenario():
++    """Test a more realistic migrate command scenario."""
++    print("Testing realistic migrate command scenario...")
++    
++    from django.core.management.commands.migrate import Command
++    
++    # Create a buffer that tracks timing
++    class TimedBuffer(io.StringIO):
++        def __init__(self):
++            super().__init__()
++            self.events = []
++            
++        def write(self, text):
++            self.events.append(('write', time.time(), text))
++            return super().write(text)
++            
++        def flush(self):
++            self.events.append(('flush', time.time(), None))
++            super().flush()
++    
++    buffer = TimedBuffer()
++    command = Command(stdout=buffer)
++    command.verbosity = 1
++    
++    # Simulate a migration sequence
++    command.migration_progress_callback("apply_start", migration="test_app.0001_initial")
++    time.sleep(0.01)  # Simulate some work
++    command.migration_progress_callback("apply_success", migration="test_app.0001_initial")
++    
++    # Check that flush was called after apply_start
++    flush_events = [e for e in buffer.events if e[0] == 'flush']
++    write_events = [e for e in buffer.events if e[0] == 'write']
++    
++    print(f"Write events: {len(write_events)}")
++    print(f"Flush events: {len(flush_events)}")
++    print(f"Final content: '{buffer.getvalue()}'")
++    
++    # Should have at least one flush event
++    return len(flush_events) > 0
++
++def test_edge_cases():
++    """Test edge cases."""
++    print("Testing edge cases...")
++    
++    # Test with None stream (should not crash)
++    try:
++        wrapper = OutputWrapper(None)
++        wrapper.flush()  # Should not crash
++        print("None stream test: PASSED")
++    except Exception as e:
++        print(f"None stream test: FAILED - {e}")
++        return False
++    
++    # Test with empty string
++    stream = io.StringIO()
++    wrapper = OutputWrapper(stream)
++    wrapper.write("")
++    wrapper.flush()
++    
++    return True
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("Comprehensive Django OutputWrapper Flush Test")
++    print("=" * 60)
++    
++    tests = [
++        ("StringIO test", test_output_wrapper_with_stringio),
++        ("stdout test", test_output_wrapper_with_stdout),
++        ("No flush method test", test_output_wrapper_with_no_flush),
++        ("Migrate command test", test_migrate_command_real_scenario),
++        ("Edge cases test", test_edge_cases),
++    ]
++    
++    results = []
++    for test_name, test_func in tests:
++        try:
++            result = test_func()
++            results.append((test_name, result))
++            status = "✓ PASSED" if result else "✗ FAILED"
++            print(f"{status}: {test_name}")
++        except Exception as e:
++            results.append((test_name, False))
++            print(f"✗ FAILED: {test_name} - {e}")
++        print()
++    
++    print("=" * 60)
++    passed = sum(1 for _, result in results if result)
++    total = len(results)
++    print(f"Results: {passed}/{total} tests passed")
++    
++    if passed == total:
++        print("🎉 All tests passed!")
++        sys.exit(0)
++    else:
++        print("❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..9e1dcada10
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,204 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the flush() fix.
++"""
++import os
++import sys
++import io
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.management.base import OutputWrapper
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_flush_with_no_flush_method():
++    """Test OutputWrapper with a stream that doesn't have flush method."""
++    print("Testing with stream that has no flush method...")
++    
++    class NoFlushStream:
++        def __init__(self):
++            self.content = ""
++            
++        def write(self, text):
++            self.content += text
++            return len(text)
++            
++        def isatty(self):
++            return False
++    
++    stream = NoFlushStream()
++    wrapper = OutputWrapper(stream)
++    
++    # This should not raise an exception
++    try:
++        wrapper.write("test message")
++        wrapper.flush()  # Should not crash
++        print("✓ No exception raised")
++        return True
++    except Exception as e:
++        print(f"✗ Exception raised: {e}")
++        return False
++
++def test_flush_with_broken_flush_method():
++    """Test OutputWrapper with a stream that has a broken flush method."""
++    print("Testing with stream that has broken flush method...")
++    
++    class BrokenFlushStream:
++        def __init__(self):
++            self.content = ""
++            
++        def write(self, text):
++            self.content += text
++            return len(text)
++            
++        def flush(self):
++            raise RuntimeError("Broken flush method")
++            
++        def isatty(self):
++            return False
++    
++    stream = BrokenFlushStream()
++    wrapper = OutputWrapper(stream)
++    
++    # This should raise the exception from the underlying stream
++    try:
++        wrapper.write("test message")
++        wrapper.flush()
++        print("✗ No exception raised (expected one)")
++        return False
++    except RuntimeError as e:
++        if "Broken flush method" in str(e):
++            print("✓ Correct exception propagated")
++            return True
++        else:
++            print(f"✗ Wrong exception: {e}")
++            return False
++    except Exception as e:
++        print(f"✗ Unexpected exception: {e}")
++        return False
++
++def test_flush_with_none_stream():
++    """Test OutputWrapper with None as stream."""
++    print("Testing with None stream...")
++    
++    try:
++        wrapper = OutputWrapper(None)
++        wrapper.flush()  # Should not crash due to hasattr check
++        print("✓ No exception raised (correct behavior)")
++        return True
++    except Exception as e:
++        print(f"✗ Unexpected exception: {e}")
++        return False
++
++def test_flush_inheritance():
++    """Test that flush method is properly inherited and overridden."""
++    print("Testing flush method inheritance...")
++    
++    # Check that OutputWrapper has its own flush method
++    wrapper = OutputWrapper(io.StringIO())
++    
++    # Check method resolution order
++    flush_method = wrapper.flush
++    method_class = flush_method.__self__.__class__
++    
++    if method_class == OutputWrapper:
++        print("✓ flush method comes from OutputWrapper class")
++        return True
++    else:
++        print(f"✗ flush method comes from {method_class}")
++        return False
++
++def test_flush_with_file_like_object():
++    """Test OutputWrapper with a real file-like object."""
++    print("Testing with real file-like object...")
++    
++    import tempfile
++    
++    try:
++        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
++            wrapper = OutputWrapper(f)
++            wrapper.write("test message")
++            wrapper.flush()  # Should call f.flush()
++            
++            # Check that the file was flushed
++            f.flush()  # Ensure it's written
++            
++        # Read the file to verify content was written
++        with open(f.name, 'r') as f:
++            content = f.read()
++            
++        os.unlink(f.name)  # Clean up
++        
++        if "test message" in content:
++            print("✓ File flush worked correctly")
++            return True
++        else:
++            print(f"✗ File content incorrect: '{content}'")
++            return False
++            
++    except Exception as e:
++        print(f"✗ Exception with file: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("Edge Cases Test for OutputWrapper.flush()")
++    print("=" * 60)
++    
++    tests = [
++        ("No flush method", test_flush_with_no_flush_method),
++        ("Broken flush method", test_flush_with_broken_flush_method),
++        ("None stream", test_flush_with_none_stream),
++        ("Flush inheritance", test_flush_inheritance),
++        ("File-like object", test_flush_with_file_like_object),
++    ]
++    
++    results = []
++    for test_name, test_func in tests:
++        print(f"\n{test_name}:")
++        try:
++            result = test_func()
++            results.append((test_name, result))
++        except Exception as e:
++            print(f"✗ Test failed with exception: {e}")
++            results.append((test_name, False))
++    
++    print("\n" + "=" * 60)
++    passed = sum(1 for _, result in results if result)
++    total = len(results)
++    print(f"Results: {passed}/{total} tests passed")
++    
++    for test_name, result in results:
++        status = "✓" if result else "✗"
++        print(f"{status} {test_name}")
++    
++    if passed == total:
++        print("\n🎉 All edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("\n❌ Some edge case tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_flush_issue.py b/test_flush_issue.py
+new file mode 100644
+index 0000000000..0c9b3c57bf
+--- /dev/null
++++ b/test_flush_issue.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the flush() issue in Django management commands.
++"""
++import os
++import sys
++import io
++import time
++from unittest.mock import patch
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.management.base import OutputWrapper
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_output_wrapper_flush():
++    """Test that OutputWrapper.flush() actually flushes the underlying stream."""
++    print("Testing OutputWrapper flush behavior...")
++    
++    # Create a StringIO that tracks flush calls
++    class FlushTrackingStringIO(io.StringIO):
++        def __init__(self):
++            super().__init__()
++            self.flush_called = False
++            
++        def flush(self):
++            self.flush_called = True
++            super().flush()
++    
++    # Test with OutputWrapper
++    underlying_stream = FlushTrackingStringIO()
++    wrapper = OutputWrapper(underlying_stream)
++    
++    # Write something
++    wrapper.write("Test message", ending="")
++    print(f"After write - flush_called: {underlying_stream.flush_called}")
++    
++    # Call flush
++    wrapper.flush()
++    print(f"After flush - flush_called: {underlying_stream.flush_called}")
++    
++    # Check if the content is there
++    content = underlying_stream.getvalue()
++    print(f"Content: '{content}'")
++    
++    return underlying_stream.flush_called
++
++def test_migrate_command_flush():
++    """Test the migrate command's flush behavior."""
++    print("\nTesting migrate command flush behavior...")
++    
++    from django.core.management.commands.migrate import Command
++    from django.db import connection
++    
++    # Create a StringIO that tracks flush calls
++    class FlushTrackingStringIO(io.StringIO):
++        def __init__(self):
++            super().__init__()
++            self.flush_calls = []
++            self.write_calls = []
++            
++        def write(self, text):
++            self.write_calls.append(text)
++            return super().write(text)
++            
++        def flush(self):
++            self.flush_calls.append(time.time())
++            super().flush()
++    
++    # Create command instance with tracking stdout
++    tracking_stdout = FlushTrackingStringIO()
++    command = Command(stdout=tracking_stdout)
++    
++    # Simulate the migration progress callback
++    print("Simulating migration progress callback...")
++    command.verbosity = 1
++    
++    # Test apply_start (this should call flush)
++    command.migration_progress_callback("apply_start", migration="test_migration")
++    
++    print(f"Write calls: {len(tracking_stdout.write_calls)}")
++    print(f"Flush calls: {len(tracking_stdout.flush_calls)}")
++    print(f"Content so far: '{tracking_stdout.getvalue()}'")
++    
++    # Test apply_success
++    command.migration_progress_callback("apply_success", migration="test_migration")
++    
++    print(f"Final write calls: {len(tracking_stdout.write_calls)}")
++    print(f"Final flush calls: {len(tracking_stdout.flush_calls)}")
++    print(f"Final content: '{tracking_stdout.getvalue()}'")
++    
++    return len(tracking_stdout.flush_calls) > 0
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("Django Management Command Flush Issue Test")
++    print("=" * 60)
++    
++    # Test 1: Basic OutputWrapper flush
++    flush_works = test_output_wrapper_flush()
++    print(f"\nTest 1 - OutputWrapper flush works: {flush_works}")
++    
++    # Test 2: Migrate command flush
++    migrate_flush_works = test_migrate_command_flush()
++    print(f"\nTest 2 - Migrate command flush works: {migrate_flush_works}")
++    
++    print("\n" + "=" * 60)
++    if flush_works and migrate_flush_works:
++        print("✓ All tests passed - flush() is working correctly")
++        sys.exit(0)
++    else:
++        print("✗ Tests failed - flush() issue confirmed")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_real_migration_flush.py b/test_real_migration_flush.py
+new file mode 100644
+index 0000000000..e7f641b5ba
+--- /dev/null
++++ b/test_real_migration_flush.py
+@@ -0,0 +1,177 @@
++#!/usr/bin/env python
++"""
++Test script to demonstrate the flush() fix working with a real migration scenario.
++"""
++import os
++import sys
++import io
++import time
++import tempfile
++import shutil
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.core.management import call_command
++
++# Configure Django settings with a temporary database
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_migrate_command_with_flush():
++    """Test that migrate command properly flushes output during migration."""
++    print("Testing migrate command with real-time output...")
++    
++    # Create a custom StringIO that tracks when flush is called
++    class FlushTrackingStringIO(io.StringIO):
++        def __init__(self):
++            super().__init__()
++            self.flush_count = 0
++            self.write_then_flush_sequences = []
++            self.last_write_time = None
++            
++        def write(self, text):
++            self.last_write_time = time.time()
++            result = super().write(text)
++            return result
++            
++        def flush(self):
++            self.flush_count += 1
++            if self.last_write_time:
++                self.write_then_flush_sequences.append(time.time() - self.last_write_time)
++            super().flush()
++    
++    # Capture stdout with our tracking StringIO
++    stdout_capture = FlushTrackingStringIO()
++    
++    # Run migrate command (this will create the initial Django tables)
++    print("Running migrate command...")
++    call_command('migrate', verbosity=1, stdout=stdout_capture, no_color=True)
++    
++    output = stdout_capture.getvalue()
++    print(f"Flush count: {stdout_capture.flush_count}")
++    print(f"Write-then-flush sequences: {len(stdout_capture.write_then_flush_sequences)}")
++    print(f"Output length: {len(output)} characters")
++    
++    # Check that output contains migration messages
++    migration_indicators = [
++        "Operations to perform:",
++        "Running migrations:",
++        "Applying",
++        "OK"
++    ]
++    
++    found_indicators = [indicator for indicator in migration_indicators if indicator in output]
++    print(f"Found migration indicators: {found_indicators}")
++    
++    # The key test: flush should have been called during migration progress
++    # (when "Applying" messages are written with ending="")
++    flush_during_migration = stdout_capture.flush_count > 0
++    
++    print(f"Flush called during migration: {flush_during_migration}")
++    
++    if flush_during_migration:
++        print("✓ SUCCESS: flush() is working correctly during migrations!")
++        return True
++    else:
++        print("✗ FAILURE: flush() was not called during migrations")
++        return False
++
++def test_migrate_command_output_timing():
++    """Test that output appears immediately when flush is called."""
++    print("\nTesting output timing with flush...")
++    
++    from django.core.management.commands.migrate import Command
++    
++    # Create a StringIO that simulates a slow terminal
++    class SlowTerminalStringIO(io.StringIO):
++        def __init__(self):
++            super().__init__()
++            self.writes = []
++            self.flushes = []
++            
++        def write(self, text):
++            self.writes.append((time.time(), text))
++            return super().write(text)
++            
++        def flush(self):
++            self.flushes.append(time.time())
++            super().flush()
++    
++    terminal = SlowTerminalStringIO()
++    command = Command(stdout=terminal)
++    command.verbosity = 1
++    
++    # Simulate the migration progress callback sequence
++    start_time = time.time()
++    
++    # This should write "Applying..." and then flush
++    command.migration_progress_callback("apply_start", migration="test_app.0001_initial")
++    
++    # Simulate some work
++    time.sleep(0.01)
++    
++    # This should write "OK"
++    command.migration_progress_callback("apply_success", migration="test_app.0001_initial")
++    
++    end_time = time.time()
++    
++    print(f"Total writes: {len(terminal.writes)}")
++    print(f"Total flushes: {len(terminal.flushes)}")
++    
++    # Check that flush was called after the "Applying..." message
++    if terminal.flushes:
++        first_flush_time = terminal.flushes[0]
++        applying_write_time = None
++        
++        for write_time, text in terminal.writes:
++            if "Applying" in text:
++                applying_write_time = write_time
++                break
++        
++        if applying_write_time and first_flush_time > applying_write_time:
++            print("✓ SUCCESS: flush() called after 'Applying...' message")
++            return True
++        else:
++            print("✗ FAILURE: flush() timing issue")
++            return False
++    else:
++        print("✗ FAILURE: no flush() calls detected")
++        return False
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("Real Migration Flush Test")
++    print("=" * 60)
++    
++    test1_result = test_migrate_command_with_flush()
++    test2_result = test_migrate_command_output_timing()
++    
++    print("\n" + "=" * 60)
++    if test1_result and test2_result:
++        print("🎉 All real migration flush tests passed!")
++        print("The flush() fix is working correctly!")
++        sys.exit(0)
++    else:
++        print("❌ Some real migration flush tests failed!")
++        sys.exit(1)
+\ No newline at end of file

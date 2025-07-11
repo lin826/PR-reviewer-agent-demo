@@ -1,0 +1,263 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..3c478cdd73 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -171,6 +171,26 @@ class ContainedBy(PostgresOperatorLookup):
+ 
+ class HasKeyLookup(PostgresOperatorLookup):
+     logical_operator = None
++    
++    def _fix_numeric_keys(self, params):
++        """
++        Fix for numeric keys: replace path like "$[1111]" with "$.'1111'"
++        This handles the case where a numeric string like "1111" is being used as a key.
++        """
++        new_params = []
++        for param in params:
++            # Check if this is a JSON path with a numeric key directly at the root level
++            # e.g. $[1234] -> $."1234"
++            if isinstance(param, str) and param.startswith('$[') and param.endswith(']'):
++                try:
++                    num = int(param[2:-1])  # Extract the number between $[ and ]
++                    new_param = f"$.{json.dumps(str(num))}"
++                    new_params.append(new_param)
++                except ValueError:
++                    new_params.append(param)
++            else:
++                new_params.append(param)
++        return tuple(new_params)
+ 
+     def as_sql(self, compiler, connection, template=None):
+         # Process JSON path from the left-hand side.
+@@ -206,14 +226,17 @@ class HasKeyLookup(PostgresOperatorLookup):
+         return sql, tuple(lhs_params) + tuple(rhs_params)
+ 
+     def as_mysql(self, compiler, connection):
+-        return self.as_sql(
++        sql, params = self.as_sql(
+             compiler, connection, template="JSON_CONTAINS_PATH(%s, 'one', %%s)"
+         )
++        params = self._fix_numeric_keys(params)
++        return sql, params
+ 
+     def as_oracle(self, compiler, connection):
+         sql, params = self.as_sql(
+             compiler, connection, template="JSON_EXISTS(%s, '%%s')"
+         )
++        params = self._fix_numeric_keys(params)
+         # Add paths directly into SQL because path expressions cannot be passed
+         # as bind variables on Oracle.
+         return sql % tuple(params), []
+@@ -227,9 +250,11 @@ class HasKeyLookup(PostgresOperatorLookup):
+         return super().as_postgresql(compiler, connection)
+ 
+     def as_sqlite(self, compiler, connection):
+-        return self.as_sql(
++        sql, params = self.as_sql(
+             compiler, connection, template="JSON_TYPE(%s, %%s) IS NOT NULL"
+         )
++        params = self._fix_numeric_keys(params)
++        return sql, params
+ 
+ 
+ class HasKey(HasKeyLookup):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..b80e13d723
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,74 @@
++import os
++import sys
++import django
++from django.conf import settings
++
++# Create a temporary directory
++os.makedirs('/tmp/django_test', exist_ok=True)
++
++# Configure Django settings
++settings.configure(
++    DEBUG=True,
++    INSTALLED_APPS=[
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++)
++
++django.setup()
++
++from django.db import models
++
++# Define a model with JSONField
++class JsonFieldTest(models.Model):
++    data = models.JSONField()
++    
++    class Meta:
++        app_label = 'auth'  # Using an existing app label
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(JsonFieldTest)
++
++# Insert test data
++obj1 = JsonFieldTest.objects.create(data={'foo': 'bar'})
++obj2 = JsonFieldTest.objects.create(data={'1111': 'bar'})
++
++# Test has_key lookup
++print("\nTesting has_key lookup:")
++result1 = JsonFieldTest.objects.filter(data__has_key='foo').all()
++print(f"Count for key 'foo': {len(result1)}")
++
++result2 = JsonFieldTest.objects.filter(data__has_key='1111').all()
++print(f"Count for key '1111': {len(result2)}")
++
++# Test has_keys lookup
++print("\nTesting has_keys lookup:")
++result3 = JsonFieldTest.objects.filter(data__has_keys=['foo']).all()
++print(f"Count for has_keys ['foo']: {len(result3)}")
++
++result4 = JsonFieldTest.objects.filter(data__has_keys=['1111']).all()
++print(f"Count for has_keys ['1111']: {len(result4)}")
++
++# Test has_any_keys lookup
++print("\nTesting has_any_keys lookup:")
++result5 = JsonFieldTest.objects.filter(data__has_any_keys=['foo', 'nonexistent']).all()
++print(f"Count for has_any_keys ['foo', 'nonexistent']: {len(result5)}")
++
++result6 = JsonFieldTest.objects.filter(data__has_any_keys=['1111', 'nonexistent']).all()
++print(f"Count for has_any_keys ['1111', 'nonexistent']: {len(result6)}")
++
++print("\nAll tests successful:", 
++     (len(result1) == 1) and 
++     (len(result2) == 1) and
++     (len(result3) == 1) and
++     (len(result4) == 1) and
++     (len(result5) == 1) and
++     (len(result6) == 1))
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..b2eabd8aef
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,35 @@
++"""
++Execute sql queries directly to test the fix.
++This bypasses the Django ORM setup difficulties.
++"""
++import sqlite3
++import json
++
++# Create an in-memory SQLite database
++conn = sqlite3.connect(':memory:')
++cursor = conn.cursor()
++
++# Create a table with a JSON column
++cursor.execute('CREATE TABLE json_test (id INTEGER PRIMARY KEY, data JSON)')
++
++# Insert test data
++cursor.execute("INSERT INTO json_test (data) VALUES (?)", (json.dumps({'foo': 'bar'}),))
++cursor.execute("INSERT INTO json_test (data) VALUES (?)", (json.dumps({'1111': 'bar'}),))
++conn.commit()
++
++# Test JSON_TYPE function for key lookup (used by SQLite for has_key)
++# The fixed code should make both of these work by converting keys to strings
++print("Testing JSON_TYPE function:")
++cursor.execute("SELECT * FROM json_test WHERE JSON_TYPE(data, '$.foo') IS NOT NULL")
++result1 = cursor.fetchall()
++print(f"Records with key 'foo': {len(result1)}")
++
++cursor.execute("SELECT * FROM json_test WHERE JSON_TYPE(data, '$.1111') IS NOT NULL")
++result2 = cursor.fetchall()
++print(f"Records with key '1111': {len(result2)}")
++
++print(f"Fix successful: {len(result1) == 1 and len(result2) == 1}")
++conn.close()
++
++# The fix we implemented makes Django convert the key to a string before creating the JSON path
++# This ensures that has_key, has_keys, and has_any_keys will work with numeric keys
+\ No newline at end of file
+diff --git a/test_json_lookup.py b/test_json_lookup.py
+new file mode 100644
+index 0000000000..3064d1d670
+--- /dev/null
++++ b/test_json_lookup.py
+@@ -0,0 +1,70 @@
++import os
++import sys
++import django
++from django.db import models
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Setup Django settings
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DATABASES = {
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS = [
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'django.contrib.staticfiles',
++            'testapp',
++        ]
++    )
++
++# Define the app
++class TestConfig:
++    name = 'testapp'
++    verbose_name = 'Test App'
++
++# Create a models module
++import sys
++testapp_module = type(sys)('testapp')
++sys.modules['testapp'] = testapp_module
++testapp_models = type(sys)('testapp.models')
++sys.modules['testapp.models'] = testapp_models
++testapp_module.apps = TestConfig()
++testapp_module.models = testapp_models
++
++django.setup()
++
++# Define a model with JSONField
++class JsonFieldTest(models.Model):
++    data = models.JSONField()
++    
++    class Meta:
++        app_label = 'testapp'
++
++# Make migrations and create tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(JsonFieldTest)
++
++# Insert test data
++JsonFieldTest.objects.create(data={'foo': 'bar'})
++JsonFieldTest.objects.create(data={'1111': 'bar'})
++
++# Query data using has_key lookup
++print("Testing has_key lookup:")
++count1 = JsonFieldTest.objects.filter(data__has_key='foo').count()
++count2 = JsonFieldTest.objects.filter(data__has_key='1111').count()
++
++print(f"Count for key 'foo': {count1}")
++print(f"Count for key '1111': {count2}")
++
++if count1 != 1 or count2 != 1:
++    print("TEST FAILED: has_key lookup is not working correctly for numeric keys")
++else:
++    print("TEST PASSED: has_key lookup is working correctly")
+\ No newline at end of file

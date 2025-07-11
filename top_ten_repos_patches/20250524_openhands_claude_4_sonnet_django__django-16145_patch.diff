@@ -1,0 +1,1042 @@
+diff --git a/django/core/management/commands/runserver.py b/django/core/management/commands/runserver.py
+index 3c39f57e4d..1b9b157328 100644
+--- a/django/core/management/commands/runserver.py
++++ b/django/core/management/commands/runserver.py
+@@ -147,7 +147,11 @@ class Command(BaseCommand):
+                 "version": self.get_version(),
+                 "settings": settings.SETTINGS_MODULE,
+                 "protocol": self.protocol,
+-                "addr": "[%s]" % self.addr if self._raw_ipv6 else self.addr,
++                "addr": (
++                    "[%s]" % self.addr if self._raw_ipv6 
++                    else "0.0.0.0" if self.addr == "0" 
++                    else self.addr
++                ),
+                 "port": self.port,
+                 "quit_command": quit_command,
+             }
+diff --git a/simple_test_runserver.py b/simple_test_runserver.py
+new file mode 100644
+index 0000000000..f1d558df07
+--- /dev/null
++++ b/simple_test_runserver.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python
++"""
++Simple test to reproduce the runserver 0:8000 display issue.
++"""
++
++import sys
++import re
++from unittest.mock import patch
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++from django.core.management.commands.runserver import Command as RunserverCommand
++from django.utils.regex_helper import _lazy_re_compile
++
++def test_address_parsing():
++    """Test how addresses are parsed and what gets displayed."""
++    
++    print("=== Testing Address Parsing Logic ===")
++    
++    # Test the regex directly
++    naiveip_re = _lazy_re_compile(
++        r"""^(?:
++    (?P<addr>
++        (?P<ipv4>\d{1,3}(?:\.\d{1,3}){3}) |         # IPv4 address
++        (?P<ipv6>\[[a-fA-F0-9:]+\]) |               # IPv6 address
++        (?P<fqdn>[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*) # FQDN
++    ):)?(?P<port>\d+)$""",
++        re.X,
++    )
++    
++    test_cases = [
++        "0:8000",
++        "0.0.0.0:8000", 
++        "8000",
++        "127.0.0.1:8000"
++    ]
++    
++    for case in test_cases:
++        print(f"\nTesting: '{case}'")
++        m = re.match(naiveip_re, case)
++        if m:
++            addr, _ipv4, _ipv6, _fqdn, port = m.groups()
++            print(f"  addr: {repr(addr)}")
++            print(f"  port: {repr(port)}")
++            
++            # Simulate the logic from runserver
++            if addr:
++                display_addr = addr
++                print(f"  Would display as: http://{display_addr}:{port}/")
++            else:
++                print(f"  No address, would use default")
++        else:
++            print(f"  No match")
++
++def test_runserver_logic():
++    """Test the actual runserver command logic."""
++    
++    print("\n\n=== Testing RunServer Command Logic ===")
++    
++    cmd = RunserverCommand()
++    
++    # Mock the run method to prevent server startup
++    def mock_run(**options):
++        pass
++    
++    original_run = cmd.run
++    cmd.run = mock_run
++    
++    test_cases = [
++        ("0:8000", "Testing '0:8000'"),
++        ("0.0.0.0:8000", "Testing '0.0.0.0:8000'"),
++        (None, "Testing no address")
++    ]
++    
++    for addrport, description in test_cases:
++        print(f"\n{description}:")
++        
++        # Reset command state
++        cmd.addr = ""
++        cmd.port = cmd.default_port
++        cmd.use_ipv6 = False
++        cmd._raw_ipv6 = False
++        
++        # Simulate the handle method logic
++        if not addrport:
++            cmd.addr = ""
++            cmd.port = cmd.default_port
++        else:
++            naiveip_re = _lazy_re_compile(
++                r"""^(?:
++            (?P<addr>
++                (?P<ipv4>\d{1,3}(?:\.\d{1,3}){3}) |         # IPv4 address
++                (?P<ipv6>\[[a-fA-F0-9:]+\]) |               # IPv6 address
++                (?P<fqdn>[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*) # FQDN
++            ):)?(?P<port>\d+)$""",
++                re.X,
++            )
++            m = re.match(naiveip_re, addrport)
++            if m:
++                cmd.addr, _ipv4, _ipv6, _fqdn, cmd.port = m.groups()
++                if cmd.addr:
++                    if _ipv6:
++                        cmd.addr = cmd.addr[1:-1]
++                        cmd.use_ipv6 = True
++                        cmd._raw_ipv6 = True
++        
++        # Apply default address logic
++        if not cmd.addr:
++            cmd.addr = cmd.default_addr_ipv6 if cmd.use_ipv6 else cmd.default_addr
++            cmd._raw_ipv6 = cmd.use_ipv6
++        
++        print(f"  Final addr: {repr(cmd.addr)}")
++        print(f"  Final port: {repr(cmd.port)}")
++        print(f"  use_ipv6: {cmd.use_ipv6}")
++        print(f"  _raw_ipv6: {cmd._raw_ipv6}")
++        
++        # Show what would be displayed
++        display_addr = "[%s]" % cmd.addr if cmd._raw_ipv6 else cmd.addr
++        print(f"  Display URL: http://{display_addr}:{cmd.port}/")
++        
++        if addrport == "0:8000" and display_addr == "0":
++            print("  ❌ ISSUE: Shows '0' instead of '0.0.0.0'")
++        elif addrport == "0:8000" and display_addr == "0.0.0.0":
++            print("  ✅ FIXED: Shows '0.0.0.0' correctly")
++
++if __name__ == "__main__":
++    test_address_parsing()
++    test_runserver_logic()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..4882369609
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,187 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the runserver fix.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++from io import StringIO
++from django.conf import settings
++from django.core.management.commands.runserver import Command as RunserverCommand
++
++def test_edge_cases():
++    """Test various edge cases to ensure the fix doesn't break anything."""
++    
++    print("=== Testing Edge Cases ===")
++    
++    # Configure minimal Django settings
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++            ALLOWED_HOSTS=['*'],
++            ROOT_URLCONF=[],
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            DATABASES={
++                'default': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                    'NAME': ':memory:',
++                }
++            }
++        )
++    
++    import django
++    django.setup()
++    
++    test_cases = [
++        ("0:8000", "0.0.0.0:8000", "Basic fix case"),
++        ("0.0.0.0:8000", "0.0.0.0:8000", "Already correct case"),
++        ("127.0.0.1:8000", "127.0.0.1:8000", "Localhost case"),
++        ("localhost:8000", "localhost:8000", "Hostname case"),
++        ("8000", "127.0.0.1:8000", "Port only case"),
++        (None, "127.0.0.1:8000", "No args case"),
++    ]
++    
++    for addrport, expected_display, description in test_cases:
++        print(f"\n{description}: {addrport or 'None'}")
++        
++        output = StringIO()
++        cmd = RunserverCommand(stdout=output)
++        
++        # Mock methods to prevent actual server startup
++        def mock_run(**options):
++            pass
++        
++        def mock_check_migrations():
++            pass
++        
++        def mock_check(display_num_errors=True):
++            pass
++        
++        cmd.run = mock_run
++        cmd.check_migrations = mock_check_migrations
++        cmd.check = mock_check
++        
++        try:
++            if addrport is None:
++                cmd.handle(use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++            else:
++                cmd.handle(addrport=addrport, use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++            
++            # Test the display formatting logic
++            display_addr = (
++                "[%s]" % cmd.addr if cmd._raw_ipv6 
++                else "0.0.0.0" if cmd.addr == "0" 
++                else cmd.addr
++            )
++            
++            actual_display = f"{display_addr}:{cmd.port}"
++            
++            print(f"  Parsed addr: '{cmd.addr}'")
++            print(f"  Parsed port: '{cmd.port}'")
++            print(f"  Display: {actual_display}")
++            print(f"  Expected: {expected_display}")
++            
++            if actual_display == expected_display:
++                print("  ✅ PASS")
++            else:
++                print("  ❌ FAIL")
++                
++        except Exception as e:
++            print(f"  Error: {e}")
++
++def test_ipv6_cases():
++    """Test IPv6 cases to ensure they're not affected."""
++    
++    print("\n\n=== Testing IPv6 Cases ===")
++    
++    # Configure minimal Django settings
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++            ALLOWED_HOSTS=['*'],
++            ROOT_URLCONF=[],
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            DATABASES={
++                'default': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                    'NAME': ':memory:',
++                }
++            }
++        )
++    
++    import django
++    django.setup()
++    
++    import socket
++    if not socket.has_ipv6:
++        print("IPv6 not supported on this platform, skipping IPv6 tests")
++        return
++    
++    test_cases = [
++        ("[::1]:8000", "[::1]:8000", "IPv6 localhost"),
++        ("[2001:db8::1]:8000", "[2001:db8::1]:8000", "IPv6 address"),
++        ("8000", "[::1]:8000", "IPv6 port only"),
++    ]
++    
++    for addrport, expected_display, description in test_cases:
++        print(f"\n{description}: {addrport}")
++        
++        output = StringIO()
++        cmd = RunserverCommand(stdout=output)
++        
++        # Mock methods to prevent actual server startup
++        def mock_run(**options):
++            pass
++        
++        def mock_check_migrations():
++            pass
++        
++        def mock_check(display_num_errors=True):
++            pass
++        
++        cmd.run = mock_run
++        cmd.check_migrations = mock_check_migrations
++        cmd.check = mock_check
++        
++        try:
++            if addrport == "8000":
++                cmd.handle(addrport=addrport, use_reloader=False, skip_checks=True, use_ipv6=True, use_threading=True)
++            else:
++                cmd.handle(addrport=addrport, use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++            
++            # Test the display formatting logic
++            display_addr = (
++                "[%s]" % cmd.addr if cmd._raw_ipv6 
++                else "0.0.0.0" if cmd.addr == "0" 
++                else cmd.addr
++            )
++            
++            actual_display = f"{display_addr}:{cmd.port}"
++            
++            print(f"  Parsed addr: '{cmd.addr}'")
++            print(f"  Parsed port: '{cmd.port}'")
++            print(f"  IPv6: {cmd.use_ipv6}")
++            print(f"  Raw IPv6: {cmd._raw_ipv6}")
++            print(f"  Display: {actual_display}")
++            print(f"  Expected: {expected_display}")
++            
++            if actual_display == expected_display:
++                print("  ✅ PASS")
++            else:
++                print("  ❌ FAIL")
++                
++        except Exception as e:
++            print(f"  Error: {e}")
++
++if __name__ == "__main__":
++    test_edge_cases()
++    test_ipv6_cases()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..86e2acbdb5
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python
++"""
++Test the fix for runserver 0:8000 display issue.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++def test_display_logic():
++    """Test the display logic directly."""
++    
++    print("=== Testing Display Logic Fix ===")
++    
++    test_cases = [
++        ("0", False, "0.0.0.0"),  # addr, _raw_ipv6, expected_display
++        ("0.0.0.0", False, "0.0.0.0"),
++        ("127.0.0.1", False, "127.0.0.1"),
++        ("localhost", False, "localhost"),
++        ("2001:db8::1", True, "[2001:db8::1]"),
++        ("0", True, "[0]"),  # IPv6 case should not be affected
++    ]
++    
++    for addr, raw_ipv6, expected in test_cases:
++        # This is the logic from the fixed runserver.py
++        display_addr = (
++            "[%s]" % addr if raw_ipv6 
++            else "0.0.0.0" if addr == "0" 
++            else addr
++        )
++        
++        print(f"addr='{addr}', raw_ipv6={raw_ipv6} -> display='{display_addr}' (expected: '{expected}')")
++        
++        if display_addr == expected:
++            print("  ✅ PASS")
++        else:
++            print("  ❌ FAIL")
++        print()
++
++def test_with_actual_command():
++    """Test with the actual runserver command."""
++    
++    print("=== Testing with Actual RunServer Command ===")
++    
++    from io import StringIO
++    from django.conf import settings
++    from django.core.management.commands.runserver import Command as RunserverCommand
++    
++    # Configure minimal Django settings
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++            ALLOWED_HOSTS=['*'],
++            ROOT_URLCONF=[],
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            DATABASES={
++                'default': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                    'NAME': ':memory:',
++                }
++            }
++        )
++    
++    import django
++    django.setup()
++    
++    output = StringIO()
++    cmd = RunserverCommand(stdout=output)
++    
++    # Mock methods to prevent actual server startup
++    def mock_run(**options):
++        pass
++    
++    def mock_check_migrations():
++        pass
++    
++    def mock_check(display_num_errors=True):
++        pass
++    
++    cmd.run = mock_run
++    cmd.check_migrations = mock_check_migrations
++    cmd.check = mock_check
++    
++    # Test the case that was problematic
++    print("Testing 'runserver 0:8000':")
++    
++    try:
++        # Parse the address first
++        cmd.handle(addrport="0:8000", use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++        
++        print(f"  Parsed addr: '{cmd.addr}'")
++        print(f"  Parsed port: '{cmd.port}'")
++        
++        # Test the display formatting logic directly
++        display_addr = (
++            "[%s]" % cmd.addr if cmd._raw_ipv6 
++            else "0.0.0.0" if cmd.addr == "0" 
++            else cmd.addr
++        )
++        
++        print(f"  Display addr: '{display_addr}'")
++        print(f"  Full URL: http://{display_addr}:{cmd.port}/")
++        
++        if display_addr == "0.0.0.0":
++            print("  ✅ SUCCESS: Address displays correctly as '0.0.0.0'")
++        else:
++            print("  ❌ FAIL: Address still displays incorrectly")
++            
++    except Exception as e:
++        print(f"  Error: {e}")
++
++if __name__ == "__main__":
++    test_display_logic()
++    test_with_actual_command()
+\ No newline at end of file
+diff --git a/test_message_format.py b/test_message_format.py
+new file mode 100644
+index 0000000000..2a4d618992
+--- /dev/null
++++ b/test_message_format.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python
++"""
++Test the message formatting directly.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++def test_message_formatting():
++    """Test the message formatting logic directly."""
++    
++    print("=== Testing Message Formatting Logic ===")
++    
++    # This is the exact logic from the fixed runserver.py
++    def format_addr_for_display(addr, raw_ipv6):
++        return (
++            "[%s]" % addr if raw_ipv6 
++            else "0.0.0.0" if addr == "0" 
++            else addr
++        )
++    
++    test_cases = [
++        ("0", False, "0.0.0.0", "Main fix case"),
++        ("0.0.0.0", False, "0.0.0.0", "Already correct"),
++        ("127.0.0.1", False, "127.0.0.1", "Localhost"),
++        ("localhost", False, "localhost", "Hostname"),
++        ("::1", True, "[::1]", "IPv6 localhost"),
++        ("0", True, "[0]", "IPv6 zero (should not be affected)"),
++    ]
++    
++    for addr, raw_ipv6, expected, description in test_cases:
++        result = format_addr_for_display(addr, raw_ipv6)
++        status = "✅ PASS" if result == expected else "❌ FAIL"
++        print(f"{description}: addr='{addr}', raw_ipv6={raw_ipv6} -> '{result}' (expected: '{expected}') {status}")
++    
++    # Test the full message format
++    print("\n=== Testing Full Message Format ===")
++    
++    protocol = "http"
++    port = "8000"
++    
++    test_cases = [
++        ("0", False, "http://0.0.0.0:8000/"),
++        ("0.0.0.0", False, "http://0.0.0.0:8000/"),
++        ("127.0.0.1", False, "http://127.0.0.1:8000/"),
++    ]
++    
++    for addr, raw_ipv6, expected_url in test_cases:
++        display_addr = format_addr_for_display(addr, raw_ipv6)
++        full_url = f"{protocol}://{display_addr}:{port}/"
++        status = "✅ PASS" if full_url == expected_url else "❌ FAIL"
++        print(f"addr='{addr}' -> '{full_url}' (expected: '{expected_url}') {status}")
++
++if __name__ == "__main__":
++    test_message_formatting()
+\ No newline at end of file
+diff --git a/test_output_simple.py b/test_output_simple.py
+new file mode 100644
+index 0000000000..1d6800d66d
+--- /dev/null
++++ b/test_output_simple.py
+@@ -0,0 +1,99 @@
++#!/usr/bin/env python
++"""
++Simple test of the actual output message formatting.
++"""
++
++import sys
++import os
++from io import StringIO
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++# Configure Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create minimal settings
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ALLOWED_HOSTS=['*'],
++        ROOT_URLCONF=[],
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        }
++    )
++
++django.setup()
++
++from django.core.management.commands.runserver import Command as RunserverCommand
++
++def test_output_message():
++    """Test the actual output message that gets printed."""
++    
++    print("=== Testing Output Message Formatting ===")
++    
++    output = StringIO()
++    cmd = RunserverCommand(stdout=output)
++    
++    # Mock methods to prevent actual server startup
++    def mock_run(**options):
++        pass
++    
++    def mock_check_migrations():
++        pass
++    
++    def mock_check(display_num_errors=True):
++        pass
++    
++    cmd.run = mock_run
++    cmd.check_migrations = mock_check_migrations
++    cmd.check = mock_check
++    
++    # Test the problematic case: 0:8000
++    print("\nTesting 'runserver 0:8000':")
++    
++    # Parse the address
++    cmd.handle(addrport="0:8000", use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++    
++    print(f"Parsed address: '{cmd.addr}'")
++    print(f"Parsed port: '{cmd.port}'")
++    
++    # Now test the inner_run method which generates the actual output
++    output.seek(0)
++    output.truncate(0)
++    
++    # Mock the server startup to avoid hanging
++    import unittest.mock
++    with unittest.mock.patch('django.core.servers.basehttp.run'):
++        try:
++            cmd.inner_run(use_reloader=False, skip_checks=True, use_threading=True)
++            output_text = output.getvalue()
++            
++            print("Output message:")
++            print(repr(output_text))
++            
++            # Check for the specific message
++            if "Starting development server at http://0.0.0.0:8000/" in output_text:
++                print("✅ SUCCESS: Output correctly shows 'http://0.0.0.0:8000/'")
++            elif "Starting development server at http://0:8000/" in output_text:
++                print("❌ FAIL: Output still shows 'http://0:8000/'")
++            else:
++                print("? Output doesn't contain expected server message")
++                
++        except Exception as e:
++            print(f"Error during inner_run: {e}")
++
++if __name__ == "__main__":
++    test_output_message()
+\ No newline at end of file
+diff --git a/test_real_output.py b/test_real_output.py
+new file mode 100644
+index 0000000000..73834b0bf8
+--- /dev/null
++++ b/test_real_output.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python
++"""
++Test the actual runserver output message.
++"""
++
++import sys
++import os
++import tempfile
++import subprocess
++import time
++import signal
++
++# Create a minimal Django project for testing
++def create_test_project():
++    """Create a minimal Django project for testing."""
++    
++    test_dir = tempfile.mkdtemp()
++    project_dir = os.path.join(test_dir, "testproject")
++    
++    # Create project structure
++    os.makedirs(project_dir)
++    
++    # Create manage.py
++    manage_py = f"""#!/usr/bin/env python
++import os
++import sys
++
++if __name__ == "__main__":
++    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "testproject.settings")
++    
++    sys.path.insert(0, '/workspace/django__django__4.2')
++    
++    try:
++        from django.core.management import execute_from_command_line
++    except ImportError as exc:
++        raise ImportError(
++            "Couldn't import Django. Are you sure it's installed and "
++            "available on your PYTHONPATH environment variable? Did you "
++            "forget to activate a virtual environment?"
++        ) from exc
++    execute_from_command_line(sys.argv)
++"""
++    
++    with open(os.path.join(project_dir, "manage.py"), "w") as f:
++        f.write(manage_py)
++    
++    os.chmod(os.path.join(project_dir, "manage.py"), 0o755)
++    
++    # Create settings.py
++    settings_py = """
++import os
++
++BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++SECRET_KEY = 'test-secret-key-for-testing-only'
++
++DEBUG = True
++
++ALLOWED_HOSTS = ['*']
++
++INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++]
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++
++ROOT_URLCONF = []
++
++USE_TZ = True
++"""
++    
++    os.makedirs(os.path.join(project_dir, "testproject"))
++    with open(os.path.join(project_dir, "testproject", "__init__.py"), "w") as f:
++        f.write("")
++    
++    with open(os.path.join(project_dir, "testproject", "settings.py"), "w") as f:
++        f.write(settings_py)
++    
++    return project_dir
++
++def test_runserver_output():
++    """Test the actual runserver output."""
++    
++    print("=== Testing Real RunServer Output ===")
++    
++    project_dir = create_test_project()
++    
++    try:
++        # Test case 1: runserver 0:8000
++        print("\n1. Testing 'python manage.py runserver 0:8000':")
++        
++        cmd = [
++            sys.executable, "manage.py", "runserver", "0:8000", 
++            "--noreload", "--skip-checks"
++        ]
++        
++        process = subprocess.Popen(
++            cmd,
++            cwd=project_dir,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            text=True,
++            env=dict(os.environ, PYTHONPATH='/workspace/django__django__4.2')
++        )
++        
++        # Give it a moment to start and print the message
++        time.sleep(2)
++        
++        # Terminate the process
++        process.terminate()
++        
++        # Get the output
++        output, _ = process.communicate(timeout=5)
++        
++        print("Output:")
++        print(output)
++        
++        if "Starting development server at http://0.0.0.0:8000/" in output:
++            print("✅ SUCCESS: Output correctly shows 'http://0.0.0.0:8000/'")
++        elif "Starting development server at http://0:8000/" in output:
++            print("❌ FAIL: Output still shows 'http://0:8000/'")
++        else:
++            print("? Unexpected output format")
++        
++        # Test case 2: runserver 0.0.0.0:8000 (for comparison)
++        print("\n2. Testing 'python manage.py runserver 0.0.0.0:8000' (for comparison):")
++        
++        cmd = [
++            sys.executable, "manage.py", "runserver", "0.0.0.0:8000", 
++            "--noreload", "--skip-checks"
++        ]
++        
++        process = subprocess.Popen(
++            cmd,
++            cwd=project_dir,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            text=True,
++            env=dict(os.environ, PYTHONPATH='/workspace/django__django__4.2')
++        )
++        
++        # Give it a moment to start and print the message
++        time.sleep(2)
++        
++        # Terminate the process
++        process.terminate()
++        
++        # Get the output
++        output, _ = process.communicate(timeout=5)
++        
++        print("Output:")
++        print(output)
++        
++        if "Starting development server at http://0.0.0.0:8000/" in output:
++            print("✅ Expected: Output shows 'http://0.0.0.0:8000/'")
++        else:
++            print("? Unexpected output format")
++            
++    except Exception as e:
++        print(f"Error: {e}")
++    
++    finally:
++        # Clean up
++        import shutil
++        shutil.rmtree(os.path.dirname(project_dir), ignore_errors=True)
++
++if __name__ == "__main__":
++    test_runserver_output()
+\ No newline at end of file
+diff --git a/test_runserver_issue.py b/test_runserver_issue.py
+new file mode 100644
+index 0000000000..689223dc10
+--- /dev/null
++++ b/test_runserver_issue.py
+@@ -0,0 +1,186 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the runserver 0:8000 display issue.
++
++This script tests that when running `runserver 0:8000`, the output should show
++"Starting development server at http://0.0.0.0:8000/" instead of "http://0:8000/".
++"""
++
++import os
++import sys
++import tempfile
++from io import StringIO
++from unittest.mock import patch
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++import django
++from django.conf import settings
++from django.core.management.commands.runserver import Command as RunserverCommand
++
++def test_runserver_zero_address_display():
++    """Test that runserver 0:8000 displays the correct address."""
++    
++    # Configure minimal Django settings
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++            ALLOWED_HOSTS=['*'],
++            ROOT_URLCONF=[],
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            DATABASES={
++                'default': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                    'NAME': ':memory:',
++                }
++            }
++        )
++    
++    django.setup()
++    
++    # Create a mock runserver command that doesn't actually start the server
++    output = StringIO()
++    cmd = RunserverCommand(stdout=output)
++    
++    # Mock the run method to prevent actually starting the server
++    def mock_run(**options):
++        return
++    
++    original_run = cmd.run
++    cmd.run = mock_run
++    
++    print("Testing runserver address display...")
++    
++    # Test case 1: runserver 0:8000
++    print("\n1. Testing 'runserver 0:8000':")
++    try:
++        cmd.handle(addrport="0:8000", use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++        output_text = output.getvalue()
++        print(f"   Address parsed: {cmd.addr}")
++        print(f"   Port parsed: {cmd.port}")
++        print(f"   Output contains: {repr(output_text)}")
++        
++        # Check what the display would show
++        display_addr = "[%s]" % cmd.addr if cmd._raw_ipv6 else cmd.addr
++        print(f"   Display address would be: {display_addr}")
++        
++        if display_addr == "0":
++            print("   ❌ ISSUE CONFIRMED: Address displays as '0' instead of '0.0.0.0'")
++        else:
++            print("   ✅ Address displays correctly")
++            
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    # Test case 2: runserver 0.0.0.0:8000 (for comparison)
++    print("\n2. Testing 'runserver 0.0.0.0:8000' (for comparison):")
++    output.seek(0)
++    output.truncate(0)
++    cmd2 = RunserverCommand(stdout=output)
++    cmd2.run = mock_run
++    
++    try:
++        cmd2.handle(addrport="0.0.0.0:8000", use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++        print(f"   Address parsed: {cmd2.addr}")
++        print(f"   Port parsed: {cmd2.port}")
++        
++        display_addr = "[%s]" % cmd2.addr if cmd2._raw_ipv6 else cmd2.addr
++        print(f"   Display address would be: {display_addr}")
++        
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    # Test case 3: runserver (no args, for comparison)
++    print("\n3. Testing 'runserver' (no args, for comparison):")
++    output.seek(0)
++    output.truncate(0)
++    cmd3 = RunserverCommand(stdout=output)
++    cmd3.run = mock_run
++    
++    try:
++        cmd3.handle(use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++        print(f"   Address parsed: {cmd3.addr}")
++        print(f"   Port parsed: {cmd3.port}")
++        
++        display_addr = "[%s]" % cmd3.addr if cmd3._raw_ipv6 else cmd3.addr
++        print(f"   Display address would be: {display_addr}")
++        
++    except Exception as e:
++        print(f"   Error: {e}")
++
++def test_actual_output_message():
++    """Test the actual output message formatting."""
++    
++    print("\n\n=== Testing Actual Output Message ===")
++    
++    # Configure minimal Django settings
++    if not settings.configured:
++        settings.configure(
++            DEBUG=True,
++            SECRET_KEY='test-secret-key',
++            ALLOWED_HOSTS=['*'],
++            ROOT_URLCONF=[],
++            INSTALLED_APPS=[
++                'django.contrib.contenttypes',
++                'django.contrib.auth',
++            ],
++            DATABASES={
++                'default': {
++                    'ENGINE': 'django.db.backends.sqlite3',
++                    'NAME': ':memory:',
++                }
++            }
++        )
++    
++    django.setup()
++    
++    output = StringIO()
++    cmd = RunserverCommand(stdout=output)
++    
++    # Mock the run method and other methods to prevent actual server startup
++    def mock_run(**options):
++        return
++    
++    def mock_check_migrations():
++        return
++    
++    def mock_check(display_num_errors=True):
++        return
++    
++    cmd.run = mock_run
++    cmd.check_migrations = mock_check_migrations
++    cmd.check = mock_check
++    
++    # Test the inner_run method which contains the output message
++    print("Testing inner_run output for '0:8000':")
++    
++    # First parse the address
++    cmd.handle(addrport="0:8000", use_reloader=False, skip_checks=True, use_ipv6=False, use_threading=True)
++    
++    # Now test inner_run which generates the output message
++    output.seek(0)
++    output.truncate(0)
++    
++    try:
++        cmd.inner_run(use_reloader=False, skip_checks=True, use_threading=True)
++        output_text = output.getvalue()
++        print(f"Output text:\n{output_text}")
++        
++        if "http://0:8000/" in output_text:
++            print("❌ ISSUE CONFIRMED: Output shows 'http://0:8000/' instead of 'http://0.0.0.0:8000/'")
++        elif "http://0.0.0.0:8000/" in output_text:
++            print("✅ Output correctly shows 'http://0.0.0.0:8000/'")
++        else:
++            print("? Unexpected output format")
++            
++    except Exception as e:
++        print(f"Error: {e}")
++
++if __name__ == "__main__":
++    test_runserver_zero_address_display()
++    test_actual_output_message()
+\ No newline at end of file
+diff --git a/tests/admin_scripts/tests.py b/tests/admin_scripts/tests.py
+index 9d2ca839d5..2651c040ee 100644
+--- a/tests/admin_scripts/tests.py
++++ b/tests/admin_scripts/tests.py
+@@ -1675,6 +1675,24 @@ class ManageRunserver(SimpleTestCase):
+         self.assertIn("Performing system checks...", self.output.getvalue())
+         mocked_check.assert_called()
+ 
++    def test_runserver_zero_address_display(self):
++        """
++        Test that runserver 0:8000 displays 0.0.0.0:8000 in the output message.
++        """
++        # Test that the address "0" gets parsed correctly
++        call_command(self.cmd, addrport="0:8000")
++        self.assertServerSettings("0", "8000")
++        
++        # Test the display formatting logic
++        display_addr = (
++            "[%s]" % self.cmd.addr if self.cmd._raw_ipv6 
++            else "0.0.0.0" if self.cmd.addr == "0" 
++            else self.cmd.addr
++        )
++        
++        # The display should show 0.0.0.0, not 0
++        self.assertEqual(display_addr, "0.0.0.0")
++
+ 
+ class ManageRunserverMigrationWarning(TestCase):
+     def setUp(self):

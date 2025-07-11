@@ -1,0 +1,317 @@
+diff --git a/debug_homomorphism.py b/debug_homomorphism.py
+new file mode 100644
+index 0000000000..24d5e2cbad
+--- /dev/null
++++ b/debug_homomorphism.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++
++"""
++Debug script to understand what's happening in _check_homomorphism
++"""
++
++from sympy.combinatorics import *
++from sympy.combinatorics.homomorphisms import _check_homomorphism
++
++def debug_check_homomorphism():
++    """Debug the _check_homomorphism function step by step."""
++    
++    D3 = DihedralGroup(3)
++    
++    # Recreate the same setup as in homomorphism()
++    generators = D3.generators
++    gens_list = list(D3.generators)
++    images_list = list(D3.generators)
++    images_list.extend([D3.identity]*(len(generators)-len(images_list)))
++    gens_list.extend([g for g in generators if g not in gens_list])
++    images = dict(zip(gens_list, images_list))
++    
++    print("Setup:")
++    print(f"  domain: {D3}")
++    print(f"  codomain: {D3}")
++    print(f"  images: {images}")
++    
++    # Now debug _check_homomorphism
++    domain = D3
++    codomain = D3
++    
++    if hasattr(domain, 'relators'):
++        rels = domain.relators
++        gens = None
++        print("  Using domain.relators")
++    else:
++        gens = domain.presentation().generators
++        rels = domain.presentation().relators
++        print(f"  Using presentation - gens: {gens}")
++    
++    print(f"  relators: {rels}")
++    
++    identity = codomain.identity
++    
++    # Debug the _image function for each relator
++    for rel_idx, r in enumerate(rels):
++        print(f"\nProcessing relator {rel_idx}: {r}")
++        
++        if r.is_identity:
++            print("  Relator is identity, skipping")
++            continue
++            
++        w = identity
++        r_arr = r.array_form
++        i = 0
++        j = 0
++        
++        print(f"  r_arr: {r_arr}")
++        print(f"  len(r): {len(r)}")
++        
++        while i < len(r):
++            power = r_arr[j][1]
++            print(f"    i={i}, j={j}, power={power}")
++            print(f"    r[{i}]: {r[i]} (type: {type(r[i])})")
++            
++            if isinstance(domain, PermutationGroup) and gens is not None:
++                print(f"    Checking if r[{i}] in gens...")
++                print(f"    r[{i}] in gens: {r[i] in gens}")
++                if r[i] in gens:
++                    s = domain.generators[gens.index(r[i])]
++                    print(f"    Found in gens at index {gens.index(r[i])}, s = {s}")
++                else:
++                    s = r[i]
++                    print(f"    Not found in gens, using r[{i}] directly: {s}")
++            else:
++                s = r[i]
++                print(f"    Using r[{i}] directly: {s}")
++            
++            print(f"    s: {s} (type: {type(s)})")
++            print(f"    s in images: {s in images}")
++            print(f"    s**-1 in images: {s**-1 in images}")
++            
++            if s in images:
++                w = w*images[s]**power
++                print(f"    Applied images[s]**{power}, w = {w}")
++            elif s**-1 in images:
++                w = w*images[s**-1]**power
++                print(f"    Applied images[s**-1]**{power}, w = {w}")
++            else:
++                print(f"    ERROR: Neither s nor s**-1 found in images!")
++                print(f"    images keys: {list(images.keys())}")
++                return False
++                
++            i += abs(power)
++            j += 1
++        
++        print(f"  Final w for relator: {w}")
++        print(f"  w.is_identity: {w.is_identity}")
++        
++        if not w.is_identity:
++            print(f"  FAILED: Relator {rel_idx} does not map to identity!")
++            return False
++    
++    print("\nSUCCESS: All relators map to identity!")
++    return True
++
++if __name__ == "__main__":
++    debug_check_homomorphism()
+\ No newline at end of file
+diff --git a/sympy/combinatorics/homomorphisms.py b/sympy/combinatorics/homomorphisms.py
+index bb7bdf32ba..ff600ec93a 100644
+--- a/sympy/combinatorics/homomorphisms.py
++++ b/sympy/combinatorics/homomorphisms.py
+@@ -333,8 +333,24 @@ def _image(r):
+             # both indices
+             while i < len(r):
+                 power = r_arr[j][1]
+-                if isinstance(domain, PermutationGroup) and r[i] in gens:
+-                    s = domain.generators[gens.index(r[i])]
++                if isinstance(domain, PermutationGroup):
++                    # For PermutationGroups, map presentation generators to actual generators
++                    if r[i] in gens:
++                        s = domain.generators[gens.index(r[i])]
++                    elif len(r[i]) == 1:
++                        # Handle single generator elements (including inverses)
++                        symbol, gen_power = r[i].array_form[0]
++                        # Find the corresponding generator
++                        for idx, gen in enumerate(gens):
++                            if len(gen) == 1 and gen.array_form[0][0] == symbol:
++                                s = domain.generators[idx]
++                                if gen_power == -1:
++                                    s = s**-1
++                                break
++                        else:
++                            s = r[i]  # fallback if not found
++                    else:
++                        s = r[i]  # fallback for complex expressions
+                 else:
+                     s = r[i]
+                 if s in images:
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..a67c40f603
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++
++"""
++Test edge cases for the homomorphism fix.
++"""
++
++from sympy.combinatorics import *
++from sympy.combinatorics.homomorphisms import homomorphism
++
++def test_edge_cases():
++    """Test various edge cases to ensure the fix is robust."""
++    
++    test_cases = [
++        ("DihedralGroup(3)", DihedralGroup(3)),
++        ("DihedralGroup(4)", DihedralGroup(4)),
++        ("SymmetricGroup(3)", SymmetricGroup(3)),
++        ("SymmetricGroup(4)", SymmetricGroup(4)),
++        ("CyclicGroup(4)", CyclicGroup(4)),
++        ("CyclicGroup(6)", CyclicGroup(6)),
++        ("AlternatingGroup(4)", AlternatingGroup(4)),
++        ("AlternatingGroup(5)", AlternatingGroup(5)),
++    ]
++    
++    print("Testing identity homomorphisms (G -> G with same generators):")
++    for name, group in test_cases:
++        try:
++            T = homomorphism(group, group, group.generators, group.generators)
++            print(f"✓ {name}: SUCCESS")
++            
++            # Test that it's actually an isomorphism
++            if T.is_isomorphism():
++                print(f"  - Is isomorphism: ✓")
++            else:
++                print(f"  - Is isomorphism: ✗ (unexpected)")
++                
++        except Exception as e:
++            print(f"✗ {name}: FAILED - {e}")
++    
++    print("\nTesting trivial homomorphisms:")
++    for name, group in test_cases[:3]:  # Test a few
++        try:
++            # Create trivial homomorphism (all generators map to identity)
++            trivial_images = [group.identity] * len(group.generators)
++            T = homomorphism(group, group, group.generators, trivial_images)
++            print(f"✓ {name} trivial: SUCCESS")
++            
++            if T.is_trivial():
++                print(f"  - Is trivial: ✓")
++            else:
++                print(f"  - Is trivial: ✗ (unexpected)")
++                
++        except Exception as e:
++            print(f"✗ {name} trivial: FAILED - {e}")
++    
++    print("\nTesting cross-group homomorphisms:")
++    try:
++        # D3 -> S3 (should work since D3 is a subgroup of S3)
++        D3 = DihedralGroup(3)
++        S3 = SymmetricGroup(3)
++        T = homomorphism(D3, S3, D3.generators, D3.generators)
++        print("✓ D3 -> S3: SUCCESS")
++    except Exception as e:
++        print(f"✗ D3 -> S3: FAILED - {e}")
++    
++    try:
++        # C4 -> D4 (C4 is a subgroup of D4)
++        C4 = CyclicGroup(4)
++        D4 = DihedralGroup(4)
++        # Map the generator of C4 to the rotation generator of D4
++        T = homomorphism(C4, D4, C4.generators, [D4.generators[0]])
++        print("✓ C4 -> D4: SUCCESS")
++    except Exception as e:
++        print(f"✗ C4 -> D4: FAILED - {e}")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..0e3b77b386
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++
++"""
++Reproduction script for the _check_homomorphism issue on PermutationGroups.
++
++The issue is that when creating a homomorphism from a DihedralGroup to itself
++using the same generators, a ValueError is raised incorrectly.
++"""
++
++from sympy.combinatorics import *
++from sympy.combinatorics.homomorphisms import homomorphism
++
++def test_issue_reproduction():
++    """Test the original issue from the bug report."""
++    print("Testing the original issue...")
++    
++    try:
++        D3 = DihedralGroup(3)
++        print(f"D3 generators: {D3.generators}")
++        T = homomorphism(D3, D3, D3.generators, D3.generators)
++        print("SUCCESS: Homomorphism created successfully!")
++        return True
++    except ValueError as e:
++        print(f"ERROR: {e}")
++        return False
++
++def test_debug_info():
++    """Print debug information to understand the issue."""
++    print("\nDebugging information:")
++    
++    D3 = DihedralGroup(3)
++    print(f"D3.generators: {D3.generators}")
++    print(f"D3.generators types: {[type(g) for g in D3.generators]}")
++    print(f"hasattr(D3, 'relators'): {hasattr(D3, 'relators')}")
++    
++    if not hasattr(D3, 'relators'):
++        presentation = D3.presentation()
++        print(f"D3.presentation().generators: {presentation.generators}")
++        print(f"D3.presentation().generators types: {[type(g) for g in presentation.generators]}")
++        print(f"D3.presentation().relators: {presentation.relators}")
++        
++        if presentation.relators:
++            r = presentation.relators[0]
++            print(f"First relator: {r}")
++            print(f"r[0]: {r[0]}")
++            print(f"type(r[0]): {type(r[0])}")
++
++def test_other_permutation_groups():
++    """Test with other permutation groups to see if the issue is general."""
++    print("\nTesting other permutation groups...")
++    
++    groups_to_test = [
++        ("CyclicGroup(4)", CyclicGroup(4)),
++        ("AlternatingGroup(4)", AlternatingGroup(4)),
++        ("SymmetricGroup(3)", SymmetricGroup(3)),
++    ]
++    
++    for name, group in groups_to_test:
++        try:
++            T = homomorphism(group, group, group.generators, group.generators)
++            print(f"SUCCESS: {name} homomorphism created successfully!")
++        except ValueError as e:
++            print(f"ERROR: {name} failed with: {e}")
++        except Exception as e:
++            print(f"UNEXPECTED ERROR: {name} failed with: {e}")
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("REPRODUCTION SCRIPT FOR _check_homomorphism ISSUE")
++    print("=" * 60)
++    
++    success = test_issue_reproduction()
++    test_debug_info()
++    test_other_permutation_groups()
++    
++    print("\n" + "=" * 60)
++    if success:
++        print("RESULT: Issue has been FIXED!")
++    else:
++        print("RESULT: Issue is REPRODUCED!")
++    print("=" * 60)
+\ No newline at end of file

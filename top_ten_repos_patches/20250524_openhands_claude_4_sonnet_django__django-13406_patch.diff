@@ -1,0 +1,407 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index b48d0df9c0..8ff8633441 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -211,6 +211,13 @@ class QuerySet:
+     @query.setter
+     def query(self, value):
+         self._query = value
++        # If the query has values_select, it's a values() or values_list() query
++        # and we need to set the appropriate iterable class
++        if hasattr(value, 'values_select') and value.values_select:
++            # Default to ValuesIterable for values() queries. For values_list()
++            # queries, this will return dictionaries instead of the original flat/named
++            # behavior, but it's better than broken model instances.
++            self._iterable_class = ValuesIterable
+ 
+     def as_manager(cls):
+         # Address the circular dependency between `Queryset` and `Manager`.
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..fd4fab7db3
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python
++"""
++Final test to verify the fix works correctly.
++"""
++
++import os
++import sys
++
++# Add the tests directory to the path so we can use existing test models
++sys.path.insert(0, '/workspace/django__django__3.2/tests')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'queryset_pickle',  # Use existing test app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++import pickle
++from django.db import models
++from django.db.models import Sum
++
++# Use existing test model
++from queryset_pickle.models import Group
++
++# Define our own model for the test
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++    
++    class Meta:
++        app_label = 'queryset_pickle'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++def test_issue():
++    print("=== Testing the original issue ===")
++    
++    # Create test data
++    Toy.objects.create(name='foo', price=10, material='wood')
++    Toy.objects.create(name='bar', price=20, material='plastic')
++    Toy.objects.create(name='baz', price=100, material='wood')
++    
++    # Original query with values() and annotate()
++    prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++    print("Original query results:")
++    print(f"Type of first result: {type(prices[0])}")
++    print(f"Results: {list(prices)}")
++    
++    # Pickle and unpickle the query object
++    print("\n=== After pickling and unpickling query ===")
++    pickled_query = pickle.dumps(prices.query)
++    unpickled_query = pickle.loads(pickled_query)
++    
++    # Create new queryset and assign unpickled query
++    prices2 = Toy.objects.all()
++    prices2.query = unpickled_query
++    
++    print(f"Type of first result: {type(prices2[0])}")
++    print(f"Results: {list(prices2)}")
++    
++    # Verify the results are correct
++    original_results = list(prices)
++    unpickled_results = list(prices2)
++    
++    assert len(original_results) == len(unpickled_results), "Result count mismatch"
++    assert all(isinstance(r, dict) for r in original_results), "Original results should be dicts"
++    assert all(isinstance(r, dict) for r in unpickled_results), "Unpickled results should be dicts"
++    assert original_results == unpickled_results, "Results should be identical"
++    
++    print("✅ All assertions passed!")
++
++if __name__ == '__main__':
++    test_issue()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..8c92e57468
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,149 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the issue with pickled queries using values()/values_list().
++"""
++
++import os
++import sys
++
++# Add the tests directory to the path so we can use existing test models
++sys.path.insert(0, '/workspace/django__django__3.2/tests')
++
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'queryset_pickle',  # Use existing test app
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++import pickle
++from django.db import models
++from django.db.models import Sum
++
++# Use existing test model
++from queryset_pickle.models import Group
++
++# Define our own model for the test
++class Toy(models.Model):
++    name = models.CharField(max_length=16)
++    material = models.CharField(max_length=16)
++    price = models.PositiveIntegerField()
++    
++    class Meta:
++        app_label = 'queryset_pickle'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Toy)
++
++def test_issue():
++    print("=== Testing the issue ===")
++    
++    # Create test data
++    Toy.objects.create(name='foo', price=10, material='wood')
++    Toy.objects.create(name='bar', price=20, material='plastic')
++    Toy.objects.create(name='baz', price=100, material='wood')
++    
++    # Original query with values() and annotate()
++    prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++    print("Original query results:")
++    print(f"Type of first result: {type(prices[0])}")
++    print(f"Results: {list(prices)}")
++    
++    # Pickle and unpickle the query object
++    print("\n=== Pickling and unpickling query ===")
++    pickled_query = pickle.dumps(prices.query)
++    unpickled_query = pickle.loads(pickled_query)
++    
++    # Create new queryset and assign unpickled query
++    prices2 = Toy.objects.all()
++    prices2.query = unpickled_query
++    
++    print("After unpickling:")
++    print(f"Type of first result: {type(prices2[0])}")
++    
++    try:
++        print(f"Results: {list(prices2)}")
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print(f"Error type: {type(e)}")
++        import traceback
++        traceback.print_exc()
++
++def test_normal_pickle():
++    print("\n=== Testing normal QuerySet pickling (should work) ===")
++    
++    # Original query with values() and annotate()
++    prices = Toy.objects.values('material').annotate(total_price=Sum('price'))
++    
++    # Pickle and unpickle the entire QuerySet
++    pickled_qs = pickle.dumps(prices)
++    unpickled_qs = pickle.loads(pickled_qs)
++    
++    print(f"Type of first result: {type(unpickled_qs[0])}")
++    print(f"Results: {list(unpickled_qs)}")
++
++def test_values_list():
++    print("\n=== Testing values_list() with pickled query ===")
++    
++    # Original query with values_list() and annotate()
++    prices = Toy.objects.values_list('material').annotate(total_price=Sum('price'))
++    print("Original values_list() query results:")
++    print(f"Type of first result: {type(prices[0])}")
++    print(f"Results: {list(prices)}")
++    
++    # Pickle and unpickle the query object
++    print("\nAfter pickling query:")
++    pickled_query = pickle.dumps(prices.query)
++    unpickled_query = pickle.loads(pickled_query)
++    
++    # Create new queryset and assign unpickled query
++    prices2 = Toy.objects.all()
++    prices2.query = unpickled_query
++    
++    print(f"Type of first result: {type(prices2[0])}")
++    print(f"Results: {list(prices2)}")
++
++def test_values_list_flat():
++    print("\n=== Testing values_list(flat=True) with pickled query ===")
++    
++    # Original query with values_list(flat=True)
++    materials = Toy.objects.values_list('material', flat=True)
++    print("Original values_list(flat=True) query results:")
++    print(f"Type of first result: {type(materials[0])}")
++    print(f"Results: {list(materials)}")
++    
++    # Pickle and unpickle the query object
++    print("\nAfter pickling query:")
++    pickled_query = pickle.dumps(materials.query)
++    unpickled_query = pickle.loads(pickled_query)
++    
++    # Create new queryset and assign unpickled query
++    materials2 = Toy.objects.all()
++    materials2.query = unpickled_query
++    
++    print(f"Type of first result: {type(materials2[0])}")
++    print(f"Results: {list(materials2)}")
++
++if __name__ == '__main__':
++    test_issue()
++    test_normal_pickle()
++    test_values_list()
++    test_values_list_flat()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..2726f41a1a
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python
++"""
++Simple test to verify the fix works in the test environment.
++"""
++
++import os
++import sys
++import pickle
++
++# Add the tests directory to the path so we can use existing test models
++sys.path.insert(0, '/workspace/django__django__3.2/tests')
++
++import django
++from django.conf import settings
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'queryset_pickle',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import Count
++from queryset_pickle.models import Event, Group
++
++class TestPickledValuesQuery(TestCase):
++    def test_values_query_pickle(self):
++        """Test that values() queries work correctly when pickled and unpickled."""
++        # Create test data
++        group1 = Group.objects.create(name='Group 1')
++        group2 = Group.objects.create(name='Group 2')
++        Event.objects.create(title='Event 1', group=group1)
++        Event.objects.create(title='Event 2', group=group1)
++        Event.objects.create(title='Event 3', group=group2)
++
++        # Create a values() query
++        values_query = Event.objects.values('group__name').annotate(
++            event_count=Count('id')
++        ).order_by('group__name')
++
++        # Get the expected results
++        expected_results = list(values_query)
++        self.assertEqual(len(expected_results), 2)
++        self.assertIsInstance(expected_results[0], dict)
++
++        # Pickle and unpickle just the query object
++        dumped = pickle.dumps(values_query.query)
++        reloaded = pickle.loads(dumped)
++        reloaded_values = Event.objects.all()
++        
++        print(f"Before assignment: {reloaded_values._iterable_class}")
++        print(f"Reloaded query values_select: {reloaded.values_select}")
++        reloaded_values.query = reloaded
++        print(f"After assignment: {reloaded_values._iterable_class}")
++
++        # The reloaded query should return the same results as dictionaries
++        reloaded_results = list(reloaded_values)
++        self.assertEqual(len(reloaded_results), 2)
++        self.assertIsInstance(reloaded_results[0], dict)
++        self.assertEqual(reloaded_results, expected_results)
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/tests/queryset_pickle/tests.py b/tests/queryset_pickle/tests.py
+index a58e45caed..54acf8b607 100644
+--- a/tests/queryset_pickle/tests.py
++++ b/tests/queryset_pickle/tests.py
+@@ -297,3 +297,41 @@ class InLookupTests(TestCase):
+             reloaded_events.query = reloaded
+ 
+         self.assertSequenceEqual(reloaded_events, [self.e1])
++
++    def test_values_query_pickle(self):
++        """
++        Test that values() queries work correctly when the query is pickled
++        and unpickled. This addresses the issue where pickled values() queries
++        would return broken model instances instead of dictionaries.
++        """
++        # Create test data
++        group1 = Group.objects.create(name='Group 1')
++        group2 = Group.objects.create(name='Group 2')
++        Event.objects.create(title='Event 1', group=group1)
++        Event.objects.create(title='Event 2', group=group1)
++        Event.objects.create(title='Event 3', group=group2)
++
++        # Create a values() query
++        values_query = Event.objects.values('group__name').annotate(
++            event_count=models.Count('id')
++        ).order_by('group__name')
++
++        # Get the expected results
++        expected_results = list(values_query)
++        self.assertEqual(len(expected_results), 2)
++        self.assertIsInstance(expected_results[0], dict)
++
++        # Pickle and unpickle just the query object
++        with self.assertNumQueries(0):
++            dumped = pickle.dumps(values_query.query)
++
++        with self.assertNumQueries(0):
++            reloaded = pickle.loads(dumped)
++            reloaded_values = Event.objects.all()
++            reloaded_values.query = reloaded
++
++        # The reloaded query should return the same results as dictionaries
++        reloaded_results = list(reloaded_values)
++        self.assertEqual(len(reloaded_results), 2)
++        self.assertIsInstance(reloaded_results[0], dict)
++        self.assertEqual(reloaded_results, expected_results)

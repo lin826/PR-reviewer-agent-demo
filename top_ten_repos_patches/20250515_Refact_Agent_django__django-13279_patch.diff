@@ -1,0 +1,46 @@
+diff --git a/django/contrib/sessions/backends/base.py b/django/contrib/sessions/backends/base.py
+index b5453160a5..121c39080a 100644
+--- a/django/contrib/sessions/backends/base.py
++++ b/django/contrib/sessions/backends/base.py
+@@ -108,11 +108,40 @@ class SessionBase:
+ 
+     def encode(self, session_dict):
+         "Return the given session dictionary serialized and encoded as a string."
++        # Django ≥3.1 writes a *new* "signed JSON + timestamp" format.  That
++        # breaks mixed-version clusters where some pods still run ≤3.0 because
++        # those cannot read the new shape.  During the transition administrators
++        # are instructed to pin `DEFAULT_HASHING_ALGORITHM='sha1'`.  If we
++        # detect that pin we *also* fall back to writing the pre-3.1 (legacy)
++        # format so that every node – old and new – can read the cookie.
++        #
++        # RemovedInDjango40Warning: once support for the legacy reader is
++        # dropped this branch and the accompanying helpers can be deleted.
++        if settings.DEFAULT_HASHING_ALGORITHM.lower() == 'sha1':
++            return self._legacy_encode(session_dict)
++
+         return signing.dumps(
+-            session_dict, salt=self.key_salt, serializer=self.serializer,
++            session_dict,
++            salt=self.key_salt,
++            serializer=self.serializer,
+             compress=True,
+         )
+ 
++    # ------------------------------------------------------------------ #
++    # Legacy helpers – kept only to facilitate rolling upgrades.         #
++    # ------------------------------------------------------------------ #
++    def _legacy_encode(self, session_dict):
++        """
++        Encode *exactly* like Django ≤3.0 did:
++
++            base64( hex_hmac(value) + b':' + serialized_value )
++
++        where the HMAC uses the project ``SECRET_KEY`` and hard-coded SHA-1.
++        """
++        serialized = self.serializer().dumps(session_dict)
++        digest = self._hash(serialized).encode()
++        return base64.b64encode(digest + b':' + serialized).decode()
++
+     def decode(self, session_data):
+         try:
+             return signing.loads(session_data, salt=self.key_salt, serializer=self.serializer)

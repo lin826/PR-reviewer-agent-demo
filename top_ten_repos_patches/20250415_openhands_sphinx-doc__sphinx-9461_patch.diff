@@ -1,0 +1,115 @@
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index 1cecb1f79..4f234235e 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -2673,22 +2673,45 @@ class PropertyDocumenter(DocstringStripSignatureMixin, ClassLevelDocumenter):  #
+     def add_directive_header(self, sig: str) -> None:
+         super().add_directive_header(sig)
+         sourcename = self.get_sourcename()
+-        if inspect.isabstractmethod(self.object):
+-            self.add_line('   :abstractmethod:', sourcename)
++        
++        # Handle class properties (a classmethod decorated with property)
++        if isinstance(self.object, classmethod):
++            # Add classmethod directive for class properties
++            self.add_line('   :classmethod:', sourcename)
++            
++            # Check for abstractmethod in class property
++            if hasattr(self.object, '__func__') and inspect.isabstractmethod(self.object.__func__):
++                self.add_line('   :abstractmethod:', sourcename)
++                
++            # Handle typehints for class properties
++            if hasattr(self.object, '__func__') and hasattr(self.object.__func__, 'fget') and \
++               self.object.__func__.fget and self.config.autodoc_typehints != 'none':
++                try:
++                    signature = inspect.signature(self.object.__func__.fget,
++                                                 type_aliases=self.config.autodoc_type_aliases)
++                    if signature.return_annotation is not Parameter.empty:
++                        objrepr = stringify_typehint(signature.return_annotation)
++                        self.add_line('   :type: ' + objrepr, sourcename)
++                except (TypeError, ValueError):
++                    pass
++        else:
++            # Handle normal properties
++            if inspect.isabstractmethod(self.object):
++                self.add_line('   :abstractmethod:', sourcename)
+ 
+-        if safe_getattr(self.object, 'fget', None) and self.config.autodoc_typehints != 'none':
+-            try:
+-                signature = inspect.signature(self.object.fget,
+-                                              type_aliases=self.config.autodoc_type_aliases)
+-                if signature.return_annotation is not Parameter.empty:
+-                    objrepr = stringify_typehint(signature.return_annotation)
+-                    self.add_line('   :type: ' + objrepr, sourcename)
+-            except TypeError as exc:
+-                logger.warning(__("Failed to get a function signature for %s: %s"),
+-                               self.fullname, exc)
+-                return None
+-            except ValueError:
+-                return None
++            if safe_getattr(self.object, 'fget', None) and self.config.autodoc_typehints != 'none':
++                try:
++                    signature = inspect.signature(self.object.fget,
++                                                type_aliases=self.config.autodoc_type_aliases)
++                    if signature.return_annotation is not Parameter.empty:
++                        objrepr = stringify_typehint(signature.return_annotation)
++                        self.add_line('   :type: ' + objrepr, sourcename)
++                except TypeError as exc:
++                    logger.warning(__("Failed to get a function signature for %s: %s"),
++                                self.fullname, exc)
++                    return None
++                except ValueError:
++                    return None
+ 
+ 
+ class NewTypeAttributeDocumenter(AttributeDocumenter):
+diff --git a/sphinx/util/inspect.py b/sphinx/util/inspect.py
+index 23dd9e930..2843dfe84 100644
+--- a/sphinx/util/inspect.py
++++ b/sphinx/util/inspect.py
+@@ -389,8 +389,20 @@ def isproperty(obj: Any) -> bool:
+         from functools import cached_property  # cached_property is available since py3.8
+         if isinstance(obj, cached_property):
+             return True
+-
+-    return isinstance(obj, property)
++    
++    # Handle normal properties
++    if isinstance(obj, property):
++        return True
++        
++    # Handle class properties (classmethod decorated with property)
++    # Added for Python 3.9 support where classmethod can wrap property
++    if isinstance(obj, classmethod) and hasattr(obj, '__func__'):
++        func = obj.__func__
++        # Check if the function's return value is a property descriptor
++        if isinstance(func, property) or (hasattr(func, 'fget') and func.fget is not None):
++            return True
++            
++    return False
+ 
+ 
+ def isgenericalias(obj: Any) -> bool:
+@@ -836,8 +848,22 @@ def getdoc(obj: Any, attrgetter: Callable = safe_getattr,
+     * partial functions
+     * inherited docstring
+     * inherited decorated methods
++    * class properties (classmethod decorated with property)
+     """
+     doc = attrgetter(obj, '__doc__', None)
++    
++    # Handle classmethod decorated with property (class property)
++    # Added for Python 3.9 support where classmethod can wrap property
++    if doc is None or doc == classmethod.__doc__:
++        if isinstance(obj, classmethod) and hasattr(obj, '__func__'):
++            func = obj.__func__
++            if isinstance(func, property) or (hasattr(func, 'fget') and func.fget is not None):
++                # For class properties, get the docstring from the property
++                if hasattr(func, '__doc__') and func.__doc__:
++                    return func.__doc__
++                elif hasattr(func, 'fget') and func.fget is not None:
++                    return getattr(func.fget, '__doc__', None)
++    
+     if ispartial(obj) and doc == obj.__class__.__doc__:
+         return getdoc(obj.func)
+     elif doc is None and allow_inherited:

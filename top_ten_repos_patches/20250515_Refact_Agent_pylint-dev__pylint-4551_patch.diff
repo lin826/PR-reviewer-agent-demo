@@ -1,0 +1,248 @@
+diff --git a/Dockerfile b/Dockerfile
+index aafe62a6a..35d66e942 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,7 +1,30 @@
+-FROM python:3.9.0-alpine3.12
+ 
+-COPY ./ /tmp/build
+-WORKDIR /tmp/build
+-RUN python setup.py install && rm -rf /tmp/build
++FROM swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-4551:latest
+ 
+-ENTRYPOINT ["pylint"]
++WORKDIR /install
++# Install docker cli
++# Add Docker's official GPG key:
++RUN apt-get update
++RUN apt-get install -y ca-certificates curl
++RUN install -m 0755 -d /etc/apt/keyrings
++RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
++RUN chmod a+r /etc/apt/keyrings/docker.asc
++
++# Add the repository to Apt sources:
++RUN echo   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu   $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" |   tee /etc/apt/sources.list.d/docker.list > /dev/null
++RUN apt-get update && apt-get install -y docker-ce-cli
++
++# Install required dependencies for SWE-bench (verification)
++RUN apt-get install -y -V ca-certificates lsb-release wget
++RUN wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
++RUN apt-get update
++RUN apt-get install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
++
++# Install SWE repo
++RUN git clone https://github.com/princeton-nlp/SWE-bench.git /SWE-bench
++WORKDIR /SWE-bench
++RUN apt-get install -y python3-venv
++RUN python3 -m venv .venv
++RUN . .venv/bin/activate      &&     pip install --upgrade pip &&     pip install . 
++
++WORKDIR /testbed
+diff --git a/pylint/pyreverse/diagrams.py b/pylint/pyreverse/diagrams.py
+index bf9f67af6..f643d1f16 100644
+--- a/pylint/pyreverse/diagrams.py
++++ b/pylint/pyreverse/diagrams.py
+@@ -84,6 +84,39 @@ class ClassDiagram(Figure, FilterMixIn):
+             for n, m in node.items()
+             if isinstance(m, astroid.FunctionDef) and decorated_with_property(m)
+         ]
++        
++        # Find the __init__ method to extract parameter annotations and assignments
++        init_method = None
++        for method_name, method in node.items():
++            if method_name == '__init__' and isinstance(method, astroid.FunctionDef):
++                init_method = method
++                break
++        
++        # Build a mapping of parameter annotations and track parameter assignments
++        param_annotations = {}
++        param_to_attr = {}
++        
++        if init_method:
++            # Get parameter annotations
++            if hasattr(init_method, 'args') and hasattr(init_method.args, 'args'):
++                for arg in init_method.args.args:
++                    if arg.name != 'self' and hasattr(arg, 'annotation') and arg.annotation:
++                        param_annotations[arg.name] = arg.annotation
++            
++            # Find assignments of parameters to attributes
++            if hasattr(init_method, 'body'):
++                for statement in init_method.body:
++                    if isinstance(statement, astroid.Assign):
++                        # Look for assignments like self.attr = param
++                        if (isinstance(statement.targets[0], astroid.AssignAttr) and 
++                            hasattr(statement.targets[0], 'expr') and
++                            hasattr(statement.targets[0].expr, 'name') and
++                            statement.targets[0].expr.name == 'self' and
++                            isinstance(statement.value, astroid.Name)):
++                            attr_name = statement.targets[0].attrname
++                            param_name = statement.value.name
++                            param_to_attr[attr_name] = param_name
++        
+         for node_name, associated_nodes in (
+             list(node.instance_attrs_type.items())
+             + list(node.locals_type.items())
+@@ -91,10 +124,81 @@ class ClassDiagram(Figure, FilterMixIn):
+         ):
+             if not self.show_attr(node_name):
+                 continue
+-            names = self.class_names(associated_nodes)
+-            if names:
+-                node_name = "{} : {}".format(node_name, ", ".join(names))
+-            attrs.append(node_name)
++            
++            # First check if this attribute is from a parameter with an annotation
++            param_name = param_to_attr.get(node_name)
++            if param_name and param_name in param_annotations:
++                annotation = param_annotations[param_name]
++                if hasattr(annotation, 'name'):
++                    if annotation.name == 'str':
++                        attrs.append("{} : {}".format(node_name, 'String'))
++                    elif annotation.name == 'int':
++                        attrs.append("{} : {}".format(node_name, 'Integer'))
++                    elif annotation.name == 'float':
++                        attrs.append("{} : {}".format(node_name, 'Float'))
++                    elif annotation.name == 'bool':
++                        attrs.append("{} : {}".format(node_name, 'Boolean'))
++                    else:
++                        attrs.append("{} : {}".format(node_name, annotation.name))
++                elif hasattr(annotation, 'as_string'):
++                    annotation_str = annotation.as_string()
++                    if 'str' in annotation_str:
++                        attrs.append("{} : {}".format(node_name, 'String'))
++                    elif 'int' in annotation_str:
++                        attrs.append("{} : {}".format(node_name, 'Integer'))
++                    elif 'float' in annotation_str:
++                        attrs.append("{} : {}".format(node_name, 'Float'))
++                    elif 'bool' in annotation_str:
++                        attrs.append("{} : {}".format(node_name, 'Boolean'))
++                    else:
++                        attrs.append("{} : {}".format(node_name, annotation_str))
++                continue
++            
++            # If not from a parameter with annotation, check associated nodes
++            annotation_names = []
++            has_none_type = False
++            
++            for associated_node in associated_nodes:
++                if associated_node is astroid.Uninferable:
++                    continue
++                if hasattr(associated_node, 'name'):
++                    if associated_node.name == 'NoneType':
++                        has_none_type = True
++                        continue  # Skip NoneType for now
++                    
++                    if associated_node.name == 'str':
++                        annotation_names.append('String')
++                    elif associated_node.name == 'int':
++                        annotation_names.append('Integer')
++                    elif associated_node.name == 'float':
++                        annotation_names.append('Float')
++                    elif associated_node.name == 'bool':
++                        annotation_names.append('Boolean')
++                    elif associated_node.name == 'list':
++                        annotation_names.append('List')
++                    elif associated_node.name == 'dict':
++                        annotation_names.append('Dict')
++                    elif associated_node.name == 'tuple':
++                        annotation_names.append('Tuple')
++                    elif associated_node.name == 'set':
++                        annotation_names.append('Set')
++                    else:
++                        annotation_names.append(associated_node.name)
++            
++            # If we found annotation names, use them
++            if annotation_names:
++                attrs.append("{} : {}".format(node_name, ", ".join(annotation_names)))
++            elif has_none_type and not param_name:
++                # Only use NoneType if we have no other type information and it's not from a parameter
++                attrs.append("{} : {}".format(node_name, "NoneType"))
++            else:
++                # Otherwise fall back to class names
++                names = self.class_names(associated_nodes)
++                if names:
++                    attrs.append("{} : {}".format(node_name, ", ".join(names)))
++                else:
++                    attrs.append(node_name)
++        
+         return sorted(attrs)
+ 
+     def get_methods(self, node):
+diff --git a/pylint/pyreverse/inspector.py b/pylint/pyreverse/inspector.py
+index 8fa122022..6dc7b36c4 100644
+--- a/pylint/pyreverse/inspector.py
++++ b/pylint/pyreverse/inspector.py
+@@ -160,12 +160,14 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+             specializations = getattr(baseobj, "specializations", [])
+             specializations.append(node)
+             baseobj.specializations = specializations
++        
+         # resolve instance attributes
+         node.instance_attrs_type = collections.defaultdict(list)
+         for assignattrs in node.instance_attrs.values():
+             for assignattr in assignattrs:
+                 if not isinstance(assignattr, astroid.Unknown):
+                     self.handle_assignattr_type(assignattr, node)
++        
+         # resolve implemented interface
+         try:
+             node.implements = list(interfaces(node, self.inherited_interfaces))
+@@ -230,10 +232,56 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+         handle instance_attrs_type
+         """
+         try:
+-            values = set(node.infer())
++            # Create a custom node to represent annotations
++            class AnnotationNode:
++                def __init__(self, name):
++                    self.name = name
++            
++            values = set()
++            annotation_found = False
++            
++            # Check if this is a parameter assignment (self.attr = param)
++            if isinstance(node, astroid.AssignAttr) and hasattr(node, 'parent') and hasattr(node.parent, 'value'):
++                right_side = node.parent.value
++                if isinstance(right_side, astroid.Name) and hasattr(node.parent, 'scope'):
++                    scope = node.parent.scope()
++                    if isinstance(scope, astroid.FunctionDef) and hasattr(scope.args, 'args'):
++                        # Check if it's a parameter in a method
++                        for arg in scope.args.args:
++                            if arg.name == right_side.name:
++                                # Check if there's an annotation
++                                if hasattr(arg, 'annotation') and arg.annotation:
++                                    annotation_found = True
++                                    
++                                    # Extract the type name from the annotation
++                                    if hasattr(arg.annotation, 'name'):
++                                        values.add(AnnotationNode(arg.annotation.name))
++                                    elif hasattr(arg.annotation, 'as_string'):
++                                        # Try to get the name from the string representation
++                                        annotation_str = arg.annotation.as_string()
++                                        if 'str' in annotation_str:
++                                            values.add(AnnotationNode('str'))
++                                        elif 'int' in annotation_str:
++                                            values.add(AnnotationNode('int'))
++                                        elif 'float' in annotation_str:
++                                            values.add(AnnotationNode('float'))
++                                        elif 'bool' in annotation_str:
++                                            values.add(AnnotationNode('bool'))
++                                        else:
++                                            values.add(AnnotationNode(annotation_str))
++                                break
++            
++            # If we didn't find an annotation, fall back to inference
++            if not annotation_found:
++                try:
++                    values = set(node.infer())
++                except astroid.InferenceError:
++                    pass
++            
++            # Update the instance_attrs_type
+             current = set(parent.instance_attrs_type[node.attrname])
+             parent.instance_attrs_type[node.attrname] = list(current | values)
+-        except astroid.InferenceError:
++        except (AttributeError, TypeError):
+             pass
+ 
+     def visit_import(self, node):

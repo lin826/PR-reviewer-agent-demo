@@ -1,0 +1,400 @@
+diff --git a/django/db/models/functions/datetime.py b/django/db/models/functions/datetime.py
+index 90e6f41be0..92e688696c 100644
+--- a/django/db/models/functions/datetime.py
++++ b/django/db/models/functions/datetime.py
+@@ -6,6 +6,7 @@ from django.db.models.fields import (
+     DateField, DateTimeField, DurationField, Field, IntegerField, TimeField,
+ )
+ from django.db.models.lookups import (
++    IsoYearExact, IsoYearGt, IsoYearGte, IsoYearLt, IsoYearLte,
+     Transform, YearExact, YearGt, YearGte, YearLt, YearLte,
+ )
+ from django.utils import timezone
+@@ -164,11 +165,11 @@ ExtractYear.register_lookup(YearGte)
+ ExtractYear.register_lookup(YearLt)
+ ExtractYear.register_lookup(YearLte)
+ 
+-ExtractIsoYear.register_lookup(YearExact)
+-ExtractIsoYear.register_lookup(YearGt)
+-ExtractIsoYear.register_lookup(YearGte)
+-ExtractIsoYear.register_lookup(YearLt)
+-ExtractIsoYear.register_lookup(YearLte)
++ExtractIsoYear.register_lookup(IsoYearExact)
++ExtractIsoYear.register_lookup(IsoYearGt)
++ExtractIsoYear.register_lookup(IsoYearGte)
++ExtractIsoYear.register_lookup(IsoYearLt)
++ExtractIsoYear.register_lookup(IsoYearLte)
+ 
+ 
+ class Now(Func):
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 916478d075..f0845bf172 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -567,6 +567,19 @@ class YearLookup(Lookup):
+         raise NotImplementedError(
+             'subclasses of YearLookup must provide a get_bound_params() method'
+         )
++        
++        
++class IsoYearLookup(Lookup):
++    """
++    ISO-8601 year lookup, using EXTRACT SQL function instead of BETWEEN optimization.
++    ISO-8601 weeks start on Monday. The first week of a year contains Jan 4 of that year,
++    so dates early in January may be in the last week of the previous year, and 
++    dates late in December may be in the first week of the next year.
++    """
++    def as_sql(self, compiler, connection):
++        # Never use the BETWEEN date optimization for ISO year
++        # Always use the EXTRACT function
++        return super().as_sql(compiler, connection)
+ 
+ 
+ class YearExact(YearLookup, Exact):
+@@ -597,6 +610,26 @@ class YearLte(YearLookup, LessThanOrEqual):
+         return (finish,)
+ 
+ 
++class IsoYearExact(IsoYearLookup, Exact):
++    lookup_name = 'exact'
++
++
++class IsoYearGt(IsoYearLookup, GreaterThan):
++    lookup_name = 'gt'
++
++
++class IsoYearGte(IsoYearLookup, GreaterThanOrEqual):
++    lookup_name = 'gte'
++
++
++class IsoYearLt(IsoYearLookup, LessThan):
++    lookup_name = 'lt'
++
++
++class IsoYearLte(IsoYearLookup, LessThanOrEqual):
++    lookup_name = 'lte'
++
++
+ class UUIDTextMixin:
+     """
+     Strip hyphens from a value when filtering a UUIDField on backends without
+diff --git a/iso_year_fix_test.py b/iso_year_fix_test.py
+new file mode 100644
+index 0000000000..88085975bf
+--- /dev/null
++++ b/iso_year_fix_test.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python
++
++"""
++This is a simple test script to verify the fix for the iso_year lookup issue.
++It manually inspects the raw SQL generated for different query types.
++"""
++
++import os
++import sys
++import django
++from datetime import datetime
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++try:
++    django.setup()
++    from django.db import connection
++    from django.db.models import Model, DateField, DateTimeField, CharField
++    from django.db.models.functions import ExtractYear, ExtractIsoYear
++    
++    # Create a test model
++    class TestModel(Model):
++        name = CharField(max_length=100)
++        date = DateField()
++        datetime = DateTimeField()
++        
++        class Meta:
++            app_label = 'test_app'
++            
++    # Configure the database
++    connection.creation.create_test_db(verbosity=1)
++    
++    # Create the test table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Test queries
++    print("\nTesting queries after fix...\n")
++    
++    # 1. Test standard year lookup (should use BETWEEN optimization)
++    q1 = TestModel.objects.filter(date__year=2020)
++    sql1 = str(q1.query).lower()
++    print("Regular year lookup:")
++    print(sql1)
++    uses_between1 = "between" in sql1
++    uses_extract1 = "extract" in sql1
++    print(f"Uses BETWEEN: {uses_between1}, Uses EXTRACT: {uses_extract1}")
++    
++    # 2. Test iso_year lookup (should NOT use BETWEEN optimization)
++    q2 = TestModel.objects.filter(date__iso_year=2020)
++    sql2 = str(q2.query).lower()
++    print("\nISO year lookup:")
++    print(sql2)
++    uses_between2 = "between" in sql2
++    uses_extract2 = "extract" in sql2
++    print(f"Uses BETWEEN: {uses_between2}, Uses EXTRACT: {uses_extract2}")
++    
++    # 3. Test annotation with ExtractIsoYear
++    q3 = TestModel.objects.annotate(iso_year=ExtractIsoYear('date')).filter(iso_year=2020)
++    sql3 = str(q3.query).lower()
++    print("\nExtractIsoYear annotation:")
++    print(sql3)
++    uses_extract3 = "extract" in sql3
++    print(f"Uses EXTRACT: {uses_extract3}")
++    
++    # Summary
++    print("\nSUMMARY:")
++    print("Regular year lookup: " + 
++          ("✅ Uses BETWEEN (correct)" if uses_between1 and not uses_extract1 else "❌ Doesn't use BETWEEN (incorrect)"))
++    
++    print("ISO year lookup: " + 
++          ("✅ Uses EXTRACT (correct)" if not uses_between2 and uses_extract2 else "❌ Uses BETWEEN (incorrect)"))
++    
++    print("ISO year annotation: " + 
++          ("✅ Uses EXTRACT (correct)" if uses_extract3 else "❌ Doesn't use EXTRACT (incorrect)"))
++    
++    # Clean up
++    connection.creation.destroy_test_db(connection.settings_dict['NAME'], verbosity=1)
++    
++    print("\nTests completed successfully!")
++    
++except Exception as e:
++    print(f"Error during test: {e}")
++    import traceback
++    traceback.print_exc()
++    sys.exit(1)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100755
+index 0000000000..400ec13dc1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++
++"""
++Script to reproduce the issue with __iso_year lookup.
++"""
++
++import os
++import sys
++from datetime import datetime
++
++# Add the parent directory to the Python path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++os.environ.setdefault('DJANGO_TEST_MAIN', 'true')
++
++import django
++django.setup()
++
++# Create test models
++from django.db import models
++from django.db.models.functions import ExtractIsoYear
++
++# Define a simple test model
++class DTModel(models.Model):
++    name = models.CharField(max_length=100)
++    start_datetime = models.DateTimeField(null=True)
++    end_datetime = models.DateTimeField(null=True)
++    start_date = models.DateField(null=True)
++    end_date = models.DateField(null=True)
++    start_time = models.TimeField(null=True)
++    end_time = models.TimeField(null=True)
++    
++    class Meta:
++        app_label = 'reproduction'
++        
++# Configure Django settings
++from django.conf import settings
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['reproduction'],
++    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++)
++
++# Set up the database
++django.setup()
++from django.db import connection
++connection.creation.create_test_db(verbosity=0)
++from django.apps import apps
++apps.clear_cache()
++apps.populate(['reproduction'])
++from django.db import migrations
++executor = migrations.executor.MigrationExecutor(connection)
++from django.db import migrations
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.state import ProjectState
++
++# Create tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(DTModel)
++
++def reproduce_issue():
++    # Create test data
++    # Use dates near year boundaries that have different regular year and ISO year
++    week_52_day_2014 = datetime(2014, 12, 27, 13, 0)   # Sunday in 2014
++    week_1_day_2014_2015 = datetime(2014, 12, 31, 13, 0)  # Wednesday (belongs to 2015 ISO year)
++    
++    # These dates are at the year boundary where ISO year differs from regular year
++    # December 31, 2014 is part of ISO year 2015
++    DTModel.objects.all().delete()
++    obj1 = DTModel.objects.create(
++        name='test1',
++        start_datetime=week_52_day_2014,
++        end_datetime=week_52_day_2014,
++        start_date=week_52_day_2014.date(),
++        end_date=week_52_day_2014.date(),
++    )
++    obj2 = DTModel.objects.create(
++        name='test2',
++        start_datetime=week_1_day_2014_2015,
++        end_datetime=week_1_day_2014_2015,
++        start_date=week_1_day_2014_2015.date(),
++        end_date=week_1_day_2014_2015.date(),
++    )
++    
++    print("Created test objects:")
++    print(f"Object 1: {obj1.start_datetime} - Regular year: 2014")
++    print(f"Object 2: {obj2.start_datetime} - Regular year: 2014, ISO year: 2015")
++    
++    # Test 1: Extract using annotation (works correctly)
++    qs = DTModel.objects.annotate(extracted=ExtractIsoYear('start_date')).values('id', 'extracted', 'start_date')
++    print("\nTest 1 - Annotation (expected: Object 1->2014, Object 2->2015):")
++    for item in qs:
++        print(f"ID {item['id']}, Date: {item['start_date']}, ExtractIsoYear: {item['extracted']}")
++    
++    # Test 2: Filter using the annotation (works correctly)
++    count_2014_annotation = DTModel.objects.annotate(
++        iso_year=ExtractIsoYear('start_date')
++    ).filter(iso_year=2014).count()
++    
++    count_2015_annotation = DTModel.objects.annotate(
++        iso_year=ExtractIsoYear('start_date')
++    ).filter(iso_year=2015).count()
++    
++    print(f"\nTest 2 - Filter with annotation:")
++    print(f"ISO year 2014 count: {count_2014_annotation} (expected: 1)")
++    print(f"ISO year 2015 count: {count_2015_annotation} (expected: 1)")
++    
++    # Test 3: Use the lookup directly (broken - will use BETWEEN optimization)
++    count_2014_lookup = DTModel.objects.filter(start_date__iso_year=2014).count()
++    count_2015_lookup = DTModel.objects.filter(start_date__iso_year=2015).count()
++    
++    print(f"\nTest 3 - Filter with lookup (BROKEN - should match annotation):")
++    print(f"ISO year 2014 count: {count_2014_lookup} (expected: 1, but will be 2)")
++    print(f"ISO year 2015 count: {count_2015_lookup} (expected: 1, but will be 0)")
++    
++    print("\nQUERY ANALYSIS:")
++    print("Annotation query:")
++    print(DTModel.objects.annotate(iso_year=ExtractIsoYear('start_date')).filter(iso_year=2015).query)
++    print("\nLookup query (should use EXTRACT but incorrectly uses BETWEEN):")
++    print(DTModel.objects.filter(start_date__iso_year=2015).query)
++
++if __name__ == "__main__":
++    reproduce_issue()
+\ No newline at end of file
+diff --git a/tests/iso_year_test.py b/tests/iso_year_test.py
+new file mode 100644
+index 0000000000..e04adc2133
+--- /dev/null
++++ b/tests/iso_year_test.py
+@@ -0,0 +1,80 @@
++from datetime import datetime
++from django.db.models.functions import ExtractIsoYear
++from django.test import TestCase
++from tests.db_functions.models import DTModel
++
++class IsoYearLookupTestCase(TestCase):
++    def setUp(self):
++        # December 28, 2014 is in ISO week 52 of 2014
++        self.week_52_date_2014 = datetime(2014, 12, 28)
++        
++        # December 29-31, 2014 are in ISO week 1 of 2015
++        self.week_1_date_2014_2015 = datetime(2014, 12, 31)
++        
++        # Create test objects
++        DTModel.objects.create(
++            name="2014 week 52",
++            start_datetime=self.week_52_date_2014,
++            end_datetime=self.week_52_date_2014,
++            start_date=self.week_52_date_2014.date(),
++            end_date=self.week_52_date_2014.date(),
++        )
++        
++        DTModel.objects.create(
++            name="2014/2015 week 1",
++            start_datetime=self.week_1_date_2014_2015,
++            end_datetime=self.week_1_date_2014_2015,
++            start_date=self.week_1_date_2014_2015.date(),
++            end_date=self.week_1_date_2014_2015.date(),
++        )
++
++    def test_iso_year_annotation(self):
++        """Verify annotation works correctly"""
++        qs = DTModel.objects.annotate(iso_year=ExtractIsoYear('start_date')).order_by('id')
++        results = [(obj.name, obj.iso_year) for obj in qs]
++        
++        # Week 52 of 2014 should have ISO year 2014
++        # Week 1 of 2014/2015 (Dec 31, 2014) should have ISO year 2015
++        expected = [("2014 week 52", 2014), ("2014/2015 week 1", 2015)]
++        self.assertEqual(results, expected)
++
++    def test_iso_year_filter_annotation(self):
++        """Verify filtering on annotation works correctly"""
++        # Filter for ISO year 2014 
++        count_2014 = DTModel.objects.annotate(
++            iso_year=ExtractIsoYear('start_date')
++        ).filter(iso_year=2014).count()
++        self.assertEqual(count_2014, 1)
++        
++        # Filter for ISO year 2015
++        count_2015 = DTModel.objects.annotate(
++            iso_year=ExtractIsoYear('start_date')
++        ).filter(iso_year=2015).count()
++        self.assertEqual(count_2015, 1)
++    
++    def test_iso_year_lookup(self):
++        """Verify __iso_year lookup works correctly"""
++        # This should find only dates with ISO year 2014
++        count_2014 = DTModel.objects.filter(start_date__iso_year=2014).count()
++        self.assertEqual(count_2014, 1)
++        
++        # This should find only dates with ISO year 2015
++        count_2015 = DTModel.objects.filter(start_date__iso_year=2015).count()
++        self.assertEqual(count_2015, 1)
++        
++    def test_query_analysis(self):
++        """Verify that lookup correctly uses EXTRACT, not BETWEEN"""
++        # Get the raw query when using annotation filter
++        annotation_query = str(DTModel.objects.annotate(
++            iso_year=ExtractIsoYear('start_date')
++        ).filter(iso_year=2015).query).lower()
++        
++        # Get the raw query when using lookup
++        lookup_query = str(DTModel.objects.filter(
++            start_date__iso_year=2015
++        ).query).lower()
++        
++        # Both should use EXTRACT, not BETWEEN
++        self.assertIn('extract', annotation_query)
++        self.assertIn('extract', lookup_query)
++        self.assertNotIn('between', lookup_query)
+\ No newline at end of file

@@ -1,0 +1,118 @@
+--- a/astropy/utils/introspection.py
++++ b/astropy/utils/introspection.py
+@@ -6,7 +6,16 @@
+ import inspect
+ import types
+ import importlib
+-from distutils.version import LooseVersion
++
++# Try to import the best available version parsing library
++_version_parser = None
++try:
++    from packaging.version import Version as _version_parser
++except ImportError:
++    try:
++        from pkg_resources import parse_version as _version_parser
++    except ImportError:
++        from distutils.version import LooseVersion as _version_parser
+ 
+ 
+ __all__ = ['resolve_name', 'minversion', 'find_current_module',
+@@ -14,6 +23,62 @@
+ 
+ 
+ __doctest_skip__ = ['find_current_module']
++
++
++def _normalize_version_string(version_str):
++    """
++    Normalize a version string for comparison.
++    
++    This function attempts to parse version strings into comparable tuples,
++    handling common version formats including development versions.
++    
++    Parameters
++    ----------
++    version_str : str
++        Version string to normalize
++        
++    Returns
++    -------
++    tuple
++        Normalized version tuple that can be compared
++    """
++    import re
++    
++    # Convert to string if not already
++    version_str = str(version_str).strip()
++    
++    # Handle development versions (e.g., "1.14dev" -> "1.14.0dev")
++    dev_match = re.match(r'^(\d+(?:\.\d+)*)(.*)$', version_str)
++    if dev_match:
++        numeric_part, suffix = dev_match.groups()
++        
++        # Split numeric part into components
++        numeric_components = [int(x) for x in numeric_part.split('.')]
++        
++        # Handle different suffix types
++        if suffix.lower().startswith('dev'):
++            # Development versions are considered less than release versions
++            # e.g., "1.14dev" < "1.14.0"
++            suffix_weight = -1
++        elif suffix.lower().startswith('rc') or suffix.lower().startswith('alpha') or suffix.lower().startswith('beta'):
++            # Pre-release versions
++            suffix_weight = -0.5
++        elif suffix == '':
++            # Release version
++            suffix_weight = 0
++        else:
++            # Unknown suffix, treat as release
++            suffix_weight = 0
++            
++        return tuple(numeric_components + [suffix_weight])
++    
++    # Fallback: try to extract numbers and compare those
++    numbers = re.findall(r'\d+', version_str)
++    if numbers:
++        return tuple(int(x) for x in numbers)
++    
++    # Last resort: return the string itself for lexicographic comparison
++    return (version_str,)
+ 
+ 
+ def resolve_name(name, *additional_parts):
+@@ -139,10 +204,30 @@
+     else:
+         have_version = resolve_name(module.__name__, version_path)
+ 
+-    if inclusive:
+-        return LooseVersion(have_version) >= LooseVersion(version)
+-    else:
+-        return LooseVersion(have_version) > LooseVersion(version)
++    # Use the best available version parser
++    try:
++        if inclusive:
++            return _version_parser(have_version) >= _version_parser(version)
++        else:
++            return _version_parser(have_version) > _version_parser(version)
++    except (TypeError, ValueError):
++        # Handle cases where version comparison fails (e.g., LooseVersion bug)
++        # Fall back to string comparison if all else fails
++        try:
++            # Try a more robust approach by normalizing versions
++            have_parts = _normalize_version_string(have_version)
++            version_parts = _normalize_version_string(version)
++            
++            if inclusive:
++                return have_parts >= version_parts
++            else:
++                return have_parts > version_parts
++        except Exception:
++            # Last resort: simple string comparison (not ideal, but better than crashing)
++            if inclusive:
++                return str(have_version) >= str(version)
++            else:
++                return str(have_version) > str(version)
+ 
+ 
+ def find_current_module(depth=1, finddiff=False):

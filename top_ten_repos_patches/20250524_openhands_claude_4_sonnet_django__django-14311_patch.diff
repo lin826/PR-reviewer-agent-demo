@@ -1,0 +1,468 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index b6af5f5491..aba05f2f5c 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -223,8 +223,14 @@ def get_child_arguments():
+     # __spec__ is set when the server was started with the `-m` option,
+     # see https://docs.python.org/3/reference/import.html#main-spec
+     # __spec__ may not exist, e.g. when running in a Conda env.
+-    if getattr(__main__, '__spec__', None) is not None and __main__.__spec__.parent:
+-        args += ['-m', __main__.__spec__.parent]
++    if getattr(__main__, '__spec__', None) is not None and __main__.__spec__.name:
++        # For package modules (foo.bar.__main__), use parent (foo.bar)
++        # For direct modules (foo.bar.baz), use the full name (foo.bar.baz)
++        if __main__.__spec__.name.endswith('.__main__'):
++            module_name = __main__.__spec__.parent
++        else:
++            module_name = __main__.__spec__.name
++        args += ['-m', module_name]
+         args += sys.argv[1:]
+     elif not py_script.exists():
+         # sys.argv[0] may not exist for several reasons on Windows.
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..fd2deb9487
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python3
++"""
++Edge case tests for the autoreloader fix.
++"""
++
++import sys
++import os
++from unittest import mock
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++from django.utils import autoreload
++
++
++class MockSpec:
++    """Mock __spec__ object to simulate different module execution scenarios."""
++    def __init__(self, name, parent):
++        self.name = name
++        self.parent = parent
++
++
++class MockMainModule:
++    """Mock __main__ module with a __spec__ attribute."""
++    def __init__(self, spec, file_path):
++        self.__spec__ = spec
++        self.__file__ = file_path
++
++
++def test_nested_package():
++    """Test deeply nested package: python -m foo.bar.baz.qux"""
++    print("TEST: Deeply nested direct module (python -m foo.bar.baz.qux)")
++    
++    spec = MockSpec('foo.bar.baz.qux', 'foo.bar.baz')
++    main_module = MockMainModule(spec, '/path/to/foo/bar/baz/qux.py')
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', ['/path/to/foo/bar/baz/qux.py', 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'foo.bar.baz.qux', 'runserver']
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Correct:  {result == expected}")
++    return result == expected
++
++
++def test_nested_package_with_main():
++    """Test deeply nested package with __main__: python -m foo.bar.baz"""
++    print("\nTEST: Deeply nested package (python -m foo.bar.baz with __main__.py)")
++    
++    spec = MockSpec('foo.bar.baz.__main__', 'foo.bar.baz')
++    main_module = MockMainModule(spec, '/path/to/foo/bar/baz/__main__.py')
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', ['/path/to/foo/bar/baz/__main__.py', 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'foo.bar.baz', 'runserver']
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Correct:  {result == expected}")
++    return result == expected
++
++
++def test_single_module():
++    """Test single module: python -m mymodule"""
++    print("\nTEST: Single module (python -m mymodule)")
++    
++    spec = MockSpec('mymodule', '')
++    main_module = MockMainModule(spec, '/path/to/mymodule.py')
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', ['/path/to/mymodule.py', 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'mymodule', 'runserver']
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Correct:  {result == expected}")
++    return result == expected
++
++
++def test_module_with_main_in_name():
++    """Test module that has 'main' in its name but isn't __main__: python -m foo.mainmodule"""
++    print("\nTEST: Module with 'main' in name (python -m foo.mainmodule)")
++    
++    spec = MockSpec('foo.mainmodule', 'foo')
++    main_module = MockMainModule(spec, '/path/to/foo/mainmodule.py')
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', ['/path/to/foo/mainmodule.py', 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'foo.mainmodule', 'runserver']
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Correct:  {result == expected}")
++    return result == expected
++
++
++def main():
++    """Run all edge case tests."""
++    print("Testing edge cases for Django autoreloader fix")
++    print("=" * 60)
++    
++    test1_pass = test_nested_package()
++    test2_pass = test_nested_package_with_main()
++    test3_pass = test_single_module()
++    test4_pass = test_module_with_main_in_name()
++    
++    print("\n" + "=" * 60)
++    print("EDGE CASE SUMMARY")
++    print("=" * 60)
++    print(f"Deeply nested direct module:     {'PASS' if test1_pass else 'FAIL'}")
++    print(f"Deeply nested package:           {'PASS' if test2_pass else 'FAIL'}")
++    print(f"Single module:                   {'PASS' if test3_pass else 'FAIL'}")
++    print(f"Module with 'main' in name:      {'PASS' if test4_pass else 'FAIL'}")
++    
++    all_pass = all([test1_pass, test2_pass, test3_pass, test4_pass])
++    print(f"\nAll edge cases: {'PASS' if all_pass else 'FAIL'}")
++    return all_pass
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..688174da53
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++"""
++Final verification test for the autoreloader fix.
++
++This test specifically addresses the issue described in the GitHub issue:
++"Allow autoreloading of `python -m custom_module runserver`"
++
++The issue was that when running `python -m foo.bar.baz runserver` (where baz.py 
++is a module file under foo/bar), the autoreloader incorrectly converted it to 
++`-m foo.bar` instead of preserving the full module path `-m foo.bar.baz`.
++"""
++
++import sys
++import os
++from unittest import mock
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++from django.utils import autoreload
++
++
++class MockSpec:
++    """Mock __spec__ object to simulate different module execution scenarios."""
++    def __init__(self, name, parent):
++        self.name = name
++        self.parent = parent
++
++
++class MockMainModule:
++    """Mock __main__ module with a __spec__ attribute."""
++    def __init__(self, spec, file_path):
++        self.__spec__ = spec
++        self.__file__ = file_path
++
++
++def test_issue_reproduction():
++    """
++    Test the exact scenario described in the GitHub issue.
++    
++    Original issue: "When a dotted name for a module (for example, foo.bar.baz 
++    where baz.py resides under foo/bar) is specified like -m foo.bar.baz, the 
++    resulting arguments end up being -m foo.bar, which is uncalled for."
++    """
++    print("=" * 80)
++    print("FINAL VERIFICATION: GitHub Issue Reproduction")
++    print("=" * 80)
++    print("Issue: python -m foo.bar.baz should preserve full module path")
++    print("Before fix: -m foo.bar.baz → -m foo.bar (incorrect)")
++    print("After fix:  -m foo.bar.baz → -m foo.bar.baz (correct)")
++    print()
++    
++    # Test the exact scenario from the issue
++    spec = MockSpec('foo.bar.baz', 'foo.bar')  # baz.py under foo/bar
++    main_module = MockMainModule(spec, '/path/to/foo/bar/baz.py')
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', ['/path/to/foo/bar/baz.py', 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'foo.bar.baz', 'runserver']
++    
++    print(f"Input:    python -m foo.bar.baz runserver")
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Success:  {result == expected}")
++    
++    return result == expected
++
++
++def test_backward_compatibility():
++    """
++    Test that the fix doesn't break existing functionality.
++    
++    The original fix (commit ec6d2531c5) was designed to handle packages with
++    __main__.py files. This should still work correctly.
++    """
++    print("\n" + "=" * 80)
++    print("BACKWARD COMPATIBILITY: Original functionality")
++    print("=" * 80)
++    print("Ensuring packages with __main__.py still work correctly")
++    print()
++    
++    # Test package with __main__.py (original working case)
++    spec = MockSpec('foo.bar.__main__', 'foo.bar')  # __main__.py under foo/bar
++    main_module = MockMainModule(spec, '/path/to/foo/bar/__main__.py')
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', ['/path/to/foo/bar/__main__.py', 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'foo.bar', 'runserver']
++    
++    print(f"Input:    python -m foo.bar runserver (package with __main__.py)")
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Success:  {result == expected}")
++    
++    return result == expected
++
++
++def test_django_compatibility():
++    """
++    Test that Django's own module execution still works.
++    """
++    print("\n" + "=" * 80)
++    print("DJANGO COMPATIBILITY: Django module execution")
++    print("=" * 80)
++    print("Ensuring python -m django runserver still works")
++    print()
++    
++    import django.__main__
++    
++    # Test Django module (should use parent since it's django.__main__)
++    spec = MockSpec('django.__main__', 'django')
++    main_module = MockMainModule(spec, django.__main__.__file__)
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', [django.__main__.__file__, 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'django', 'runserver']
++    
++    print(f"Input:    python -m django runserver")
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Success:  {result == expected}")
++    
++    return result == expected
++
++
++def main():
++    """Run all verification tests."""
++    print("FINAL VERIFICATION OF AUTORELOADER FIX")
++    print("Addressing GitHub issue: Allow autoreloading of `python -m custom_module runserver`")
++    
++    test1_pass = test_issue_reproduction()
++    test2_pass = test_backward_compatibility()
++    test3_pass = test_django_compatibility()
++    
++    print("\n" + "=" * 80)
++    print("FINAL SUMMARY")
++    print("=" * 80)
++    print(f"Issue reproduction test:     {'✓ PASS' if test1_pass else '✗ FAIL'}")
++    print(f"Backward compatibility:      {'✓ PASS' if test2_pass else '✗ FAIL'}")
++    print(f"Django compatibility:        {'✓ PASS' if test3_pass else '✗ FAIL'}")
++    
++    all_pass = all([test1_pass, test2_pass, test3_pass])
++    print(f"\nOverall result: {'✓ ALL TESTS PASS' if all_pass else '✗ SOME TESTS FAILED'}")
++    
++    if all_pass:
++        print("\n🎉 The fix successfully addresses the GitHub issue!")
++        print("   - Direct modules (foo.bar.baz) now preserve full path")
++        print("   - Package modules (foo.bar.__main__) still work correctly")
++        print("   - Django's own execution remains compatible")
++    else:
++        print("\n❌ The fix needs further work.")
++    
++    return all_pass
++
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..136105c834
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the autoreloader issue with python -m custom_module runserver.
++
++This script tests the get_child_arguments() function to verify it correctly handles
++both package modules (with __main__.py) and direct module files.
++"""
++
++import sys
++import os
++import tempfile
++import shutil
++from unittest import mock
++from pathlib import Path
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++from django.utils import autoreload
++
++
++class MockSpec:
++    """Mock __spec__ object to simulate different module execution scenarios."""
++    def __init__(self, name, parent):
++        self.name = name
++        self.parent = parent
++
++
++class MockMainModule:
++    """Mock __main__ module with a __spec__ attribute."""
++    def __init__(self, spec, file_path):
++        self.__spec__ = spec
++        self.__file__ = file_path
++
++
++def test_package_module():
++    """Test case 1: python -m foo.bar (package with __main__.py)"""
++    print("=" * 60)
++    print("TEST 1: Package module (python -m foo.bar)")
++    print("=" * 60)
++    
++    # Create mock spec for package module
++    spec = MockSpec('foo.bar.__main__', 'foo.bar')
++    main_module = MockMainModule(spec, '/path/to/foo/bar/__main__.py')
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', ['/path/to/foo/bar/__main__.py', 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'foo.bar', 'runserver']
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Correct:  {result == expected}")
++    return result == expected
++
++
++def test_direct_module():
++    """Test case 2: python -m foo.bar.baz (direct module file)"""
++    print("\n" + "=" * 60)
++    print("TEST 2: Direct module (python -m foo.bar.baz)")
++    print("=" * 60)
++    
++    # Create mock spec for direct module
++    spec = MockSpec('foo.bar.baz', 'foo.bar')
++    main_module = MockMainModule(spec, '/path/to/foo/bar/baz.py')
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', ['/path/to/foo/bar/baz.py', 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'foo.bar.baz', 'runserver']
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Correct:  {result == expected}")
++    return result == expected
++
++
++def test_django_module():
++    """Test case 3: python -m django runserver (should still work)"""
++    print("\n" + "=" * 60)
++    print("TEST 3: Django module (python -m django)")
++    print("=" * 60)
++    
++    import django.__main__
++    
++    # Create mock spec for Django module
++    spec = MockSpec('django.__main__', 'django')
++    main_module = MockMainModule(spec, django.__main__.__file__)
++    
++    with mock.patch.dict(sys.modules, {'__main__': main_module}):
++        with mock.patch('sys.argv', [django.__main__.__file__, 'runserver']):
++            with mock.patch('sys.warnoptions', []):
++                result = autoreload.get_child_arguments()
++                
++    expected = [sys.executable, '-m', 'django', 'runserver']
++    print(f"Expected: {expected}")
++    print(f"Actual:   {result}")
++    print(f"Correct:  {result == expected}")
++    return result == expected
++
++
++def main():
++    """Run all tests and report results."""
++    print("Testing Django autoreloader get_child_arguments() function")
++    print("Issue: python -m foo.bar.baz should preserve full module path")
++    
++    test1_pass = test_package_module()
++    test2_pass = test_direct_module()  # This should fail with current implementation
++    test3_pass = test_django_module()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY")
++    print("=" * 60)
++    print(f"Test 1 (Package module):     {'PASS' if test1_pass else 'FAIL'}")
++    print(f"Test 2 (Direct module):      {'PASS' if test2_pass else 'FAIL'} <- Expected to fail before fix")
++    print(f"Test 3 (Django module):      {'PASS' if test3_pass else 'FAIL'}")
++    
++    if test1_pass and test3_pass and not test2_pass:
++        print("\nResult: Reproduction successful! Test 2 fails as expected.")
++        return True
++    else:
++        print("\nResult: Unexpected test results.")
++        return False
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file

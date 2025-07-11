@@ -1,0 +1,107 @@
+diff --git a/pylint/pyreverse/diagrams.py b/pylint/pyreverse/diagrams.py
+index bf9f67af6..f3de7e3c3 100644
+--- a/pylint/pyreverse/diagrams.py
++++ b/pylint/pyreverse/diagrams.py
+@@ -84,17 +84,44 @@ class ClassDiagram(Figure, FilterMixIn):
+             for n, m in node.items()
+             if isinstance(m, astroid.FunctionDef) and decorated_with_property(m)
+         ]
++        
++        # Track attributes that have been processed with annotations
++        processed_attrs = set()
++        
++        # First, process instance_attrs_type and locals_type to get annotations
+         for node_name, associated_nodes in (
+-            list(node.instance_attrs_type.items())
+-            + list(node.locals_type.items())
+-            + properties
++            list(node.instance_attrs_type.items()) + list(node.locals_type.items())
+         ):
+             if not self.show_attr(node_name):
+                 continue
++                
++            # Check for type annotations in the associated nodes
++            annotation_names = []
++            for associated_node in associated_nodes:
++                # If it's an annotation from a type hint
++                if isinstance(associated_node, (astroid.Name, astroid.Attribute, astroid.Subscript)):
++                    # Get the original type annotation string representation
++                    annotation_names.append(associated_node.as_string())
++                    processed_attrs.add(node_name)
++            
++            if annotation_names:
++                # Format with type hint
++                node_name = "{} : {}".format(node_name, ", ".join(annotation_names))
++                attrs.append(node_name)
++        
++        # Process the rest (for backward compatibility)
++        for node_name, associated_nodes in (
++            list(node.instance_attrs_type.items()) + list(node.locals_type.items()) + properties
++        ):
++            # Skip if we already processed it with annotations
++            if node_name in processed_attrs or not self.show_attr(node_name):
++                continue
++                
+             names = self.class_names(associated_nodes)
+             if names:
+                 node_name = "{} : {}".format(node_name, ", ".join(names))
+             attrs.append(node_name)
++            
+         return sorted(attrs)
+ 
+     def get_methods(self, node):
+diff --git a/pylint/pyreverse/inspector.py b/pylint/pyreverse/inspector.py
+index 8fa122022..44583c5dc 100644
+--- a/pylint/pyreverse/inspector.py
++++ b/pylint/pyreverse/inspector.py
+@@ -166,6 +166,49 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+             for assignattr in assignattrs:
+                 if not isinstance(assignattr, astroid.Unknown):
+                     self.handle_assignattr_type(assignattr, node)
++        
++        # Process type annotations in methods
++        for method in node.values():
++            if not isinstance(method, astroid.FunctionDef):
++                continue
++                
++            # Process parameter annotations that are assigned to attributes
++            if method.args and hasattr(method.args, 'annotations') and method.args.annotations:
++                if method.args.args is not None:  # Make sure args is not None
++                    for i, arg in enumerate(method.args.args):
++                        if i == 0 or not arg:  # Skip 'self'
++                            continue
++                        
++                        # Check if there's an annotation for this parameter
++                        if i < len(method.args.annotations) and method.args.annotations[i]:
++                            arg_name = arg.name
++                            annotation = method.args.annotations[i]
++                            
++                            # Look for assignments like self.attr = param in the method body
++                            for stmt in method.body:
++                                if not isinstance(stmt, astroid.Assign):
++                                    continue
++                                    
++                                for target in stmt.targets:
++                                    # Check if it's an attribute assignment (self.attr)
++                                    if hasattr(target, 'attrname'):
++                                        # Check if the value is the parameter
++                                        if (isinstance(stmt.value, astroid.Name) and 
++                                            stmt.value.name == arg_name):
++                                            # Store the annotation in instance_attrs_type
++                                            node.instance_attrs_type[target.attrname].append(annotation)
++            
++            # Process explicit attribute annotations in the method body
++            for stmt in method.body:
++                if not isinstance(stmt, astroid.AnnAssign):
++                    continue
++                
++                # Check if it's an attribute annotation (self.attr: type)
++                if hasattr(stmt.target, 'attrname'):
++                    attr_name = stmt.target.attrname
++                    annotation = stmt.annotation
++                    node.instance_attrs_type[attr_name].append(annotation)
++        
+         # resolve implemented interface
+         try:
+             node.implements = list(interfaces(node, self.inherited_interfaces))
+

@@ -1,0 +1,321 @@
+diff --git a/benchmark_escape.py b/benchmark_escape.py
+new file mode 100644
+index 0000000000..5d3a2fbd89
+--- /dev/null
++++ b/benchmark_escape.py
+@@ -0,0 +1,52 @@
++"""
++Benchmark script to compare the old and new implementation's performance.
++"""
++import html
++import time
++import sys
++sys.path.append('/workspace/django__django__3.0')
++
++from django.utils.functional import keep_lazy
++from django.utils.safestring import SafeString, mark_safe
++
++# Define the old implementation
++_html_escapes = {
++    ord('&'): '&amp;',
++    ord('<'): '&lt;',
++    ord('>'): '&gt;',
++    ord('"'): '&quot;',
++    ord("'"): '&#39;',
++}
++
++@keep_lazy(str, SafeString)
++def old_escape(text):
++    """Original Django escape implementation."""
++    return mark_safe(str(text).translate(_html_escapes))
++
++# Performance benchmark
++def benchmark():
++    iterations = 1000000
++    test_string = 'Text with all special chars: &<>"\''
++    
++    print(f"Performance benchmark ({iterations:,} iterations)")
++    print("-" * 60)
++    
++    # Benchmark original implementation
++    start = time.time()
++    for _ in range(iterations):
++        old_escape(test_string)
++    old_time = time.time() - start
++    
++    # Benchmark new implementation (just uses html.escape)
++    start = time.time()
++    for _ in range(iterations):
++        mark_safe(html.escape(str(test_string)))
++    new_time = time.time() - start
++    
++    print(f"Original implementation:  {old_time:.6f} seconds")
++    print(f"New implementation:       {new_time:.6f} seconds")
++    print(f"Speed improvement:        {old_time / new_time:.2f}x faster")
++    print("-" * 60)
++
++if __name__ == "__main__":
++    benchmark()
+\ No newline at end of file
+diff --git a/django/utils/html.py b/django/utils/html.py
+index 9c519978f5..5dae6fb518 100644
+--- a/django/utils/html.py
++++ b/django/utils/html.py
+@@ -1,5 +1,6 @@
+ """HTML utilities suitable for global use."""
+ 
++import html
+ import json
+ import re
+ from html.parser import HTMLParser
+@@ -24,15 +25,6 @@ word_split_re = re.compile(r'''([\s<>"']+)''')
+ simple_url_re = re.compile(r'^https?://\[?\w', re.IGNORECASE)
+ simple_url_2_re = re.compile(r'^www\.|^(?!http)\w[^@]+\.(com|edu|gov|int|mil|net|org)($|/.*)$', re.IGNORECASE)
+ 
+-_html_escapes = {
+-    ord('&'): '&amp;',
+-    ord('<'): '&lt;',
+-    ord('>'): '&gt;',
+-    ord('"'): '&quot;',
+-    ord("'"): '&#39;',
+-}
+-
+-
+ @keep_lazy(str, SafeString)
+ def escape(text):
+     """
+@@ -43,7 +35,7 @@ def escape(text):
+     This may result in double-escaping. If this is a concern, use
+     conditional_escape() instead.
+     """
+-    return mark_safe(str(text).translate(_html_escapes))
++    return mark_safe(html.escape(str(text)))
+ 
+ 
+ _js_escapes = {
+diff --git a/test_django_html_test.py b/test_django_html_test.py
+new file mode 100644
+index 0000000000..85dffa3fb0
+--- /dev/null
++++ b/test_django_html_test.py
+@@ -0,0 +1,58 @@
++"""
++Test script to check if Django's tests will still pass if we replace the escape function
++with a modified version that uses html.escape().
++"""
++import html
++import sys
++import unittest
++from unittest.mock import patch
++
++sys.path.append('/workspace/django__django__3.0')
++
++# Import the original test
++from tests.utils_tests.test_html import TestUtilsHtml
++
++def modified_escape(text):
++    """
++    A function that uses Python's html.escape() but replaces
++    &#x27; with &#39; to match Django's current behavior.
++    """
++    return html.escape(str(text)).replace('&#x27;', '&#39;')
++
++def html_escape_wrapper(text):
++    """
++    A function that directly uses Python's html.escape().
++    We use this to examine test failures.
++    """
++    return html.escape(str(text))
++
++
++class TestPatched(unittest.TestCase):
++    
++    def test_with_modified_escape(self):
++        """Test if Django's tests pass with a modified html.escape() that maintains compatibility."""
++        with patch('django.utils.html.escape', modified_escape):
++            suite = unittest.TestLoader().loadTestsFromTestCase(TestUtilsHtml)
++            result = unittest.TextTestRunner().run(suite)
++            self.assertEqual(result.failures, [])
++            self.assertEqual(result.errors, [])
++
++    def test_with_direct_html_escape(self):
++        """Test if Django's tests pass with the unmodified html.escape()."""
++        with patch('django.utils.html.escape', html_escape_wrapper):
++            suite = unittest.TestLoader().loadTestsFromTestCase(TestUtilsHtml)
++            result = unittest.TextTestRunner().run(suite)
++            if result.failures:
++                print("\nTest failures with unmodified html.escape():")
++                for test, error in result.failures:
++                    print(f"\n{test}")
++                    print(error)
++            if result.errors:
++                print("\nTest errors with unmodified html.escape():")
++                for test, error in result.errors:
++                    print(f"\n{test}")
++                    print(error)
++            
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_escape_functions.py b/test_escape_functions.py
+new file mode 100644
+index 0000000000..9102a4b024
+--- /dev/null
++++ b/test_escape_functions.py
+@@ -0,0 +1,60 @@
++"""
++Simplified test script to compare Django escape with a version using html.escape
++"""
++import html
++import sys
++sys.path.append('/workspace/django__django__3.0')
++
++from django.utils.html import escape as django_escape
++from django.utils.safestring import mark_safe, SafeString
++
++def html_escape(text):
++    """
++    A version of escape using Python's built-in html.escape
++    """
++    return mark_safe(html.escape(str(text)))
++
++# Test cases from Django's test suite (tests/utils_tests/test_html.py)
++test_cases = [
++    '&',
++    '<',
++    '>',
++    '"',
++    "'",
++    # Substitution patterns
++    "asdf&fdsa",
++    "&1",
++    "1&b",
++    # Repeated values
++    "&&",
++    # Verify it doesn't double replace &
++    '<&',
++]
++
++def run_tests():
++    print("Comparing Django's escape with html.escape:\n")
++    print("-" * 60)
++    print(f"{'Input':<15} | {'Django escape':<20} | {'html.escape':<20} | {'Match?':<10}")
++    print("-" * 60)
++    
++    all_match = True
++    for test_case in test_cases:
++        django_result = django_escape(test_case)
++        html_result = html_escape(test_case)
++        match = django_result == html_result
++        if not match:
++            all_match = False
++        print(f"{test_case[:15]:<15} | {django_result[:20]:<20} | {html_result[:20]:<20} | {match!s:<10}")
++    
++    print("-" * 60)
++    print(f"All results match: {all_match}")
++    
++    # Show the specific difference with single quotes
++    django_result = django_escape("'")
++    html_result = html_escape("'")
++    print(f"\nSpecific difference with single quote:")
++    print(f"Django escape: {repr(django_escape(chr(39)))}")
++    print(f"html.escape:   {repr(html_escape(chr(39)))}")
++
++if __name__ == "__main__":
++    run_tests()
+\ No newline at end of file
+diff --git a/test_html_escape.py b/test_html_escape.py
+new file mode 100644
+index 0000000000..0fe40508ab
+--- /dev/null
++++ b/test_html_escape.py
+@@ -0,0 +1,63 @@
++"""
++Test script to compare the performance and behavior of Django's escape() 
++with Python's html.escape().
++"""
++import html
++import time
++import sys
++sys.path.append('/workspace/django__django__3.0')
++
++from django.utils.html import escape as django_escape
++
++# Test strings
++TEST_STRINGS = [
++    'Plain text without any special characters',
++    'Text with ampersand: &',
++    'Text with less than: <',
++    'Text with greater than: >',
++    'Text with double quote: "',
++    'Text with single quote: \'',
++    'Text with all special chars: &<>"\''
++]
++
++def compare_output():
++    """Compare the output of Django's and Python's HTML escape functions."""
++    print("Comparing output...")
++    print('-' * 50)
++    for s in TEST_STRINGS:
++        django_result = django_escape(s)
++        python_result = html.escape(s)
++        print(f"Input: {s!r}")
++        print(f"Django: {django_result!r}")
++        print(f"Python: {python_result!r}")
++        print(f"Identical: {django_result == python_result}")
++        print('-' * 50)
++
++def benchmark():
++    """Benchmark the performance of both escape functions."""
++    iterations = 100000
++    test_string = 'Text with all special chars: &<>"\''
++    
++    print(f"\nPerformance test ({iterations} iterations):")
++    print('-' * 50)
++    
++    # Time Django's escape
++    start = time.time()
++    for _ in range(iterations):
++        django_escape(test_string)
++    django_time = time.time() - start
++    
++    # Time Python's html.escape
++    start = time.time()
++    for _ in range(iterations):
++        html.escape(test_string)
++    python_time = time.time() - start
++    
++    print(f"Django escape(): {django_time:.6f} seconds")
++    print(f"Python html.escape(): {python_time:.6f} seconds")
++    print(f"Speed improvement: {(django_time / python_time):.2f}x")
++    print('-' * 50)
++
++if __name__ == '__main__':
++    compare_output()
++    benchmark()
+\ No newline at end of file
+diff --git a/tests/utils_tests/test_html.py b/tests/utils_tests/test_html.py
+index d87927cdfe..94e86c99ab 100644
+--- a/tests/utils_tests/test_html.py
++++ b/tests/utils_tests/test_html.py
+@@ -27,7 +27,7 @@ class TestUtilsHtml(SimpleTestCase):
+             ('<', '&lt;'),
+             ('>', '&gt;'),
+             ('"', '&quot;'),
+-            ("'", '&#39;'),
++            ("'", '&#x27;'),
+         )
+         # Substitution patterns for testing the above items.
+         patterns = ("%s", "asdf%sfdsa", "%s1", "1%sb")
+@@ -68,8 +68,8 @@ class TestUtilsHtml(SimpleTestCase):
+ 
+     def test_strip_tags(self):
+         items = (
+-            ('<p>See: &#39;&eacute; is an apostrophe followed by e acute</p>',
+-             'See: &#39;&eacute; is an apostrophe followed by e acute'),
++            ('<p>See: &#x27;&eacute; is an apostrophe followed by e acute</p>',
++             'See: &#x27;&eacute; is an apostrophe followed by e acute'),
+             ('<adf>a', 'a'),
+             ('</adf>a', 'a'),
+             ('<asdf><asdf>e', 'e'),

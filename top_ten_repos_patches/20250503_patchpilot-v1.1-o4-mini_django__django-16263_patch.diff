@@ -1,0 +1,122 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index de49e1c58c..a096f651d0 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -2645,4 +2645,4 @@ def get_related_populators(klass_info, select, db):
+     for rel_klass_info in related_klass_infos:
+         rel_cls = RelatedPopulator(rel_klass_info, select, db)
+         iterators.append(rel_cls)
+-    return iterators
++    return iterators
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 170bde1d42..c9b4dba344 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -2043,4 +2043,4 @@ def cursor_iter(cursor, sentinel, col_count, itersize):
+         for rows in iter((lambda: cursor.fetchmany(itersize)), sentinel):
+             yield rows if col_count is None else [r[:col_count] for r in rows]
+     finally:
+-        cursor.close()
++        cursor.close()
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 9735ce10c8..70e79b6a3d 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -549,10 +549,90 @@ class Query(BaseExpression):
+         """
+         Perform a COUNT() query using the current filter constraints.
+         """
++
+         obj = self.clone()
+-        obj.add_annotation(Count("*"), alias="__count", is_summary=True)
++        # Strip unused annotations that are not referenced by filters,
++        # other annotations, or ordering to speed up the COUNT() query.
++        if obj.annotations:
++            required_aliases = set()
++
++            def _collect_from_expression(expression):
++
++                if isinstance(expression, Ref):
++                    required_aliases.add(expression.refs)
++                elif isinstance(expression, Col):
++                    required_aliases.add(expression.alias)
++                if not hasattr(expression, "get_source_expressions"):
++
++                    return
++                for sub_expr in expression.get_source_expressions():
++                    _collect_from_expression(sub_expr)
++
++            def _collect_from_where_node(node):
++                for child in getattr(node, "children", []):
++                    # WhereNode stores condition tuples (obj, lookup) pairs.
++                    if isinstance(child, tuple):
++                        child = child[0]
++                    if hasattr(child, "get_source_expressions"):
++                        _collect_from_expression(child)
++                    elif hasattr(child, "children"):
++                        _collect_from_where_node(child)
++
++            # 1. Collect aliases referenced from WHERE conditions.
++            _collect_from_where_node(obj.where)
++
++            # 2. Collect aliases referenced from ORDER BY clauses.
++            for order_expr in obj.order_by or ():
++                if isinstance(order_expr, str):
++                    required_aliases.add(order_expr.lstrip("-"))
++                elif hasattr(order_expr, "expression"):
++                    _collect_from_expression(order_expr)
++                elif hasattr(order_expr, "get_source_expressions"):
++                    _collect_from_expression(order_expr)
++
++            # 3. Propagate dependencies through annotation chain.
++            prev_len = -1
++            while prev_len != len(required_aliases):
++                prev_len = len(required_aliases)
++                for alias, expr in obj.annotations.items():
++                    if alias in required_aliases:
++                        _collect_from_expression(expr)
++
++            # 4. Remove annotations not required for the COUNT() query.
++            obj.annotations = {
++                alias: expr
++                for alias, expr in obj.annotations.items()
++                if alias in required_aliases
++            }
++            obj.set_annotation_mask(required_aliases)
++
++
++        # Optimize the COUNT() query by removing unneeded JOINs and, when
++        # required, counting distinct primary keys to avoid duplicate rows.
++        if "required_aliases" not in locals():
++            required_aliases = set()
++
++        base_alias = obj.get_initial_alias()
++        extra_aliases = set(obj.alias_map) - {base_alias}
++
++        if extra_aliases and extra_aliases.isdisjoint(required_aliases):
++            # The additional JOINs are not required for this count, so collapse
++            # the query down to the base table.
++            obj.alias_map = {base_alias: obj.alias_map[base_alias]}
++            obj.alias_refcount = {base_alias: 1}
++            obj.group_by = None
++            extra_aliases = set()
++
++        count_expr = (
++            Count(obj.model._meta.pk.name, distinct=True)
++            if extra_aliases
++            else Count("*")
++        )
++        obj.add_annotation(count_expr, alias="__count", is_summary=True)
++
+         return obj.get_aggregation(using, ["__count"])["__count"]
+ 
++
+     def has_filters(self):
+         return self.where
+ 
+@@ -2668,4 +2748,4 @@ class JoinPromoter:
+             # and again we could safely demote to INNER.
+         query.promote_joins(to_promote)
+         query.demote_joins(to_demote)
+-        return to_demote
++        return to_demote

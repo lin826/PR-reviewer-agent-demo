@@ -1,0 +1,241 @@
+diff --git a/django/forms/formsets.py b/django/forms/formsets.py
+index 75b0646512..b6961aa7aa 100644
+--- a/django/forms/formsets.py
++++ b/django/forms/formsets.py
+@@ -63,6 +63,8 @@ class BaseFormSet(RenderableFormMixin):
+     template_name_p = 'django/forms/formsets/p.html'
+     template_name_table = 'django/forms/formsets/table.html'
+     template_name_ul = 'django/forms/formsets/ul.html'
++    
++    can_create = True
+ 
+     def __init__(self, data=None, files=None, auto_id='id_%s', prefix=None,
+                  initial=None, error_class=ErrorList, form_kwargs=None,
+@@ -171,10 +173,12 @@ class BaseFormSet(RenderableFormMixin):
+     def forms(self):
+         """Instantiate forms at first property access."""
+         # DoS protection is included in total_form_count()
+-        return [
+-            self._construct_form(i, **self.get_form_kwargs(i))
+-            for i in range(self.total_form_count())
+-        ]
++        forms = []
++        for i in range(self.total_form_count()):
++            form = self._construct_form(i, **self.get_form_kwargs(i))
++            if form is not None:  # Allow _construct_form to skip forms
++                forms.append(form)
++        return forms
+ 
+     def get_form_kwargs(self, index):
+         """
+@@ -478,7 +482,7 @@ class BaseFormSet(RenderableFormMixin):
+ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+                     can_delete=False, max_num=None, validate_max=False,
+                     min_num=None, validate_min=False, absolute_max=None,
+-                    can_delete_extra=True, renderer=None):
++                    can_delete_extra=True, can_create=True, renderer=None):
+     """Return a FormSet for the given form class."""
+     if min_num is None:
+         min_num = DEFAULT_MIN_NUM
+@@ -499,6 +503,7 @@ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+         'can_order': can_order,
+         'can_delete': can_delete,
+         'can_delete_extra': can_delete_extra,
++        'can_create': can_create,
+         'min_num': min_num,
+         'max_num': max_num,
+         'absolute_max': absolute_max,
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 7effb202e3..e4b27a4da6 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -582,6 +582,12 @@ class BaseModelFormSet(BaseFormSet):
+         """Return the number of forms that are required in this FormSet."""
+         if not self.is_bound:
+             return len(self.get_queryset())
++        # When can_create is False, we need to ensure the real number of initial forms
++        # is returned, even if the client tampers with the management form
++        if getattr(self, 'can_create', True) is False:
++            # Make sure we have the actual number of initial forms, not what was 
++            # potentially tampered with in the POST data
++            return len(self.get_queryset())
+         return super().initial_form_count()
+ 
+     def _existing_object(self, pk):
+@@ -599,6 +605,11 @@ class BaseModelFormSet(BaseFormSet):
+         return field.to_python
+ 
+     def _construct_form(self, i, **kwargs):
++        # When can_create is False, all forms beyond the queryset length should have an instance
++        # to prevent them from being used to create new objects
++        if not getattr(self, 'can_create', True) and i >= self.initial_form_count():
++            return None  # Skip creation of forms that would be extra
++        
+         pk_required = i < self.initial_form_count()
+         if pk_required:
+             if self.is_bound:
+@@ -813,6 +824,10 @@ class BaseModelFormSet(BaseFormSet):
+ 
+     def save_new_objects(self, commit=True):
+         self.new_objects = []
++        # If the formset has can_create=False, don't add any new objects
++        if not getattr(self, 'can_create', True):
++            return self.new_objects
++            
+         for form in self.extra_forms:
+             if not form.has_changed():
+                 continue
+@@ -875,7 +890,8 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                          widgets=None, validate_max=False, localized_fields=None,
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False, field_classes=None,
+-                         absolute_max=None, can_delete_extra=True, renderer=None):
++                         absolute_max=None, can_delete_extra=True, can_create=True, 
++                         renderer=None):
+     """Return a FormSet class for the given Django model class."""
+     meta = getattr(form, 'Meta', None)
+     if (getattr(meta, 'fields', fields) is None and
+@@ -894,7 +910,7 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                               can_order=can_order, can_delete=can_delete,
+                               validate_min=validate_min, validate_max=validate_max,
+                               absolute_max=absolute_max, can_delete_extra=can_delete_extra,
+-                              renderer=renderer)
++                              can_create=can_create, renderer=renderer)
+     FormSet.model = model
+     return FormSet
+ 
+diff --git a/docs/ref/forms/models.txt b/docs/ref/forms/models.txt
+index c0f0757b3e..f4b00531de 100644
+--- a/docs/ref/forms/models.txt
++++ b/docs/ref/forms/models.txt
+@@ -52,7 +52,7 @@ Model Form API reference. For introductory material about model forms, see the
+ ``modelformset_factory``
+ ========================
+ 
+-.. function:: modelformset_factory(model, form=ModelForm, formfield_callback=None, formset=BaseModelFormSet, extra=1, can_delete=False, can_order=False, max_num=None, fields=None, exclude=None, widgets=None, validate_max=False, localized_fields=None, labels=None, help_texts=None, error_messages=None, min_num=None, validate_min=False, field_classes=None, absolute_max=None, can_delete_extra=True, renderer=None)
++.. function:: modelformset_factory(model, form=ModelForm, formfield_callback=None, formset=BaseModelFormSet, extra=1, can_delete=False, can_order=False, max_num=None, fields=None, exclude=None, widgets=None, validate_max=False, localized_fields=None, labels=None, help_texts=None, error_messages=None, min_num=None, validate_min=False, field_classes=None, absolute_max=None, can_delete_extra=True, can_create=True, renderer=None)
+ 
+     Returns a ``FormSet`` class for the given ``model`` class.
+ 
+diff --git a/docs/topics/forms/formsets.txt b/docs/topics/forms/formsets.txt
+index a549a047cd..5e044e1875 100644
+--- a/docs/topics/forms/formsets.txt
++++ b/docs/topics/forms/formsets.txt
+@@ -680,6 +680,28 @@ Default: ``True``
+ While setting ``can_delete=True``, specifying ``can_delete_extra=False`` will
+ remove the option to delete extra forms.
+ 
++``can_create``
++--------------
++
++.. attribute:: BaseFormSet.can_create
++
++Default: ``True``
++
++Allows or prevents creation of new objects when used with model formsets. 
++When set to ``False``, no new objects will be created from forms that weren't pre-filled 
++with an existing model instance. This provides a way to create "edit only" formsets where
++users can modify existing objects but cannot create new ones.
++
++Example::
++
++    >>> from django.forms import modelformset_factory
++    >>> from myapp.models import Author
++    >>> AuthorFormSet = modelformset_factory(Author, fields=('name',), can_create=False)
++    >>> formset = AuthorFormSet(queryset=Author.objects.all())
++
++With ``can_create=False``, even if a user manipulates the POST data to add new forms, no
++new objects will be created in the database when the formset is saved.
++
+ Adding additional fields to a formset
+ =====================================
+ 
+diff --git a/tests/model_formsets/test_can_create.py b/tests/model_formsets/test_can_create.py
+new file mode 100644
+index 0000000000..7623835d47
+--- /dev/null
++++ b/tests/model_formsets/test_can_create.py
+@@ -0,0 +1,82 @@
++from django import forms
++from django.forms.formsets import formset_factory
++from django.forms.models import BaseModelFormSet, modelformset_factory
++from django.test import TestCase
++
++from .models import Poet
++
++
++class CanCreateTestCase(TestCase):
++    def test_can_create_false_prevents_new_objects(self):
++        # Create some initial Poet objects
++        poet1 = Poet.objects.create(name='Poet 1')
++        poet2 = Poet.objects.create(name='Poet 2')
++        
++        # Create a formset with can_create=False
++        PoetFormset = modelformset_factory(
++            Poet, 
++            fields="__all__",
++            extra=0,  # No extra forms
++            can_create=False  # This should prevent new object creation
++        )
++        
++        # Submit data with existing objects modified
++        data = {
++            'form-TOTAL_FORMS': '3',  # We're sending 3 forms (2 existing + 1 new)
++            'form-INITIAL_FORMS': '2',  # 2 initial forms
++            'form-MAX_NUM_FORMS': '1000',
++            # Existing objects
++            'form-0-id': str(poet1.pk),
++            'form-0-name': 'Modified Poet 1',  # Changed name
++            'form-1-id': str(poet2.pk),
++            'form-1-name': 'Modified Poet 2',  # Changed name
++            # New object attempt
++            'form-2-id': '',  # No ID - new object
++            'form-2-name': 'New Poet',  # This should be ignored if can_create=False works
++        }
++        
++        formset = PoetFormset(data, queryset=Poet.objects.all())
++        self.assertTrue(formset.is_valid())
++        formset.save()
++        
++        # We should have only 2 poets in the database (the modified ones)
++        # The new poet should not have been created
++        self.assertEqual(Poet.objects.count(), 2)
++        self.assertEqual(Poet.objects.filter(name='Modified Poet 1').count(), 1)
++        self.assertEqual(Poet.objects.filter(name='Modified Poet 2').count(), 1)
++        self.assertEqual(Poet.objects.filter(name='New Poet').count(), 0)
++        
++    def test_formset_ignores_management_form_validation(self):
++        # Create a poet
++        poet = Poet.objects.create(name='Original Poet')
++        
++        # Create a formset with can_create=False and no extra forms
++        PoetFormset = modelformset_factory(
++            Poet,
++            fields="__all__", 
++            extra=0,
++            can_create=False
++        )
++        
++        # Submit data with INITIAL_FORMS != actual initial forms
++        # This simulates a client-side attack
++        data = {
++            'form-TOTAL_FORMS': '2',
++            'form-INITIAL_FORMS': '0',  # Should be 1, client is trying to trick us
++            'form-MAX_NUM_FORMS': '1000',
++            # Existing object
++            'form-0-id': str(poet.pk),
++            'form-0-name': 'Modified Poet',
++            # New object
++            'form-1-id': '',
++            'form-1-name': 'Sneaky New Poet',
++        }
++        
++        formset = PoetFormset(data, queryset=Poet.objects.all())
++        self.assertTrue(formset.is_valid())
++        formset.save()
++        
++        # We should still have only 1 poet (the modified one)
++        # The sneaky new poet should not have been created
++        self.assertEqual(Poet.objects.count(), 1)
++        self.assertEqual(Poet.objects.get().name, 'Modified Poet')
+\ No newline at end of file

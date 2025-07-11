@@ -1,0 +1,111 @@
+--- a/sphinx/domains/std.py
++++ b/sphinx/domains/std.py
+@@ -305,7 +305,20 @@
+         term['ids'].append(node_id)
+ 
+     std = cast(StandardDomain, env.get_domain('std'))
+-    std.note_object('term', termtext.lower(), node_id, location=term)
++    # Store term with original case for proper duplicate detection
++    std.note_object('term', termtext, node_id, location=term)
++    
++    # Also store in case-insensitive mapping for cross-reference resolution
++    termtext_lower = termtext.lower()
++    if termtext_lower in std.term_case_insensitive:
++        # Check if it's pointing to a different term (case-insensitive conflict)
++        existing_original, existing_docname, existing_labelid = std.term_case_insensitive[termtext_lower]
++        if existing_original != termtext:
++            # This is a case-insensitive duplicate, but we allow it since they're different terms
++            # We'll keep the first one in the case-insensitive mapping for resolution
++            pass
++    else:
++        std.term_case_insensitive[termtext_lower] = (termtext, env.docname, node_id)
+ 
+     # add an index entry too
+     indexnode = addnodes.index()
+@@ -582,6 +595,7 @@
+     initial_data = {
+         'progoptions': {},      # (program, name) -> docname, labelid
+         'objects': {},          # (type, name) -> docname, labelid
++        'term_case_insensitive': {},  # lowercase_termname -> (original_termname, docname, labelid)
+         'labels': {             # labelname -> docname, labelid, sectionname
+             'genindex': ('genindex', '', _('Index')),
+             'modindex': ('py-modindex', '', _('Module Index')),
+@@ -674,6 +688,10 @@
+     @property
+     def anonlabels(self) -> Dict[str, Tuple[str, str]]:
+         return self.data.setdefault('anonlabels', {})  # labelname -> docname, labelid
++
++    @property
++    def term_case_insensitive(self) -> Dict[str, Tuple[str, str, str]]:
++        return self.data.setdefault('term_case_insensitive', {})  # lowercase -> (original, docname, labelid)
+ 
+     def clear_doc(self, docname: str) -> None:
+         key = None  # type: Any
+@@ -689,6 +707,9 @@
+         for key, (fn, _l) in list(self.anonlabels.items()):
+             if fn == docname:
+                 del self.anonlabels[key]
++        for key, (_original, fn, _l) in list(self.term_case_insensitive.items()):
++            if fn == docname:
++                del self.term_case_insensitive[key]
+ 
+     def merge_domaindata(self, docnames: List[str], otherdata: Dict) -> None:
+         # XXX duplicates?
+@@ -704,6 +725,9 @@
+         for key, data in otherdata['anonlabels'].items():
+             if data[0] in docnames:
+                 self.anonlabels[key] = data
++        for key, data in otherdata.get('term_case_insensitive', {}).items():
++            if data[1] in docnames:  # data[1] is docname
++                self.term_case_insensitive[key] = data
+ 
+     def process_doc(self, env: "BuildEnvironment", docname: str, document: nodes.document) -> None:  # NOQA
+         for name, explicit in document.nametypes.items():
+@@ -928,9 +952,16 @@
+                           node: pending_xref, contnode: Element) -> Element:
+         objtypes = self.objtypes_for_role(typ) or []
+         for objtype in objtypes:
+-            if (objtype, target) in self.objects:
+-                docname, labelid = self.objects[objtype, target]
+-                break
++            if objtype == 'term':
++                # For terms, use case-insensitive lookup
++                target_lower = target.lower()
++                if target_lower in self.term_case_insensitive:
++                    original_term, docname, labelid = self.term_case_insensitive[target_lower]
++                    break
++            else:
++                if (objtype, target) in self.objects:
++                    docname, labelid = self.objects[objtype, target]
++                    break
+         else:
+             docname, labelid = '', ''
+         if not docname:
+@@ -951,14 +982,20 @@
+                 results.append(('std:' + role, res))
+         # all others
+         for objtype in self.object_types:
+-            key = (objtype, target)
+             if objtype == 'term':
+-                key = (objtype, ltarget)
+-            if key in self.objects:
+-                docname, labelid = self.objects[key]
+-                results.append(('std:' + self.role_for_objtype(objtype),
+-                                make_refnode(builder, fromdocname, docname,
+-                                             labelid, contnode)))
++                # Use case-insensitive lookup for terms
++                if ltarget in self.term_case_insensitive:
++                    original_term, docname, labelid = self.term_case_insensitive[ltarget]
++                    results.append(('std:' + self.role_for_objtype(objtype),
++                                    make_refnode(builder, fromdocname, docname,
++                                                 labelid, contnode)))
++            else:
++                key = (objtype, target)
++                if key in self.objects:
++                    docname, labelid = self.objects[key]
++                    results.append(('std:' + self.role_for_objtype(objtype),
++                                    make_refnode(builder, fromdocname, docname,
++                                                 labelid, contnode)))
+         return results
+ 
+     def get_objects(self) -> Iterator[Tuple[str, str, str, str, str, int]]:

@@ -1,0 +1,668 @@
+diff --git a/debug_fix.py b/debug_fix.py
+new file mode 100644
+index 0000000000..2536b9dc50
+--- /dev/null
++++ b/debug_fix.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand why the fix isn't working.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Simple Django setup without full configuration
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-reproduction',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++import re
++from django.contrib.admindocs.utils import named_group_matcher
++
++def debug_replace_named_groups(pattern):
++    """Debug version of replace_named_groups with print statements."""
++    
++    print(f"Input pattern: {pattern}")
++    
++    named_group_indices = [
++        (m.start(0), m.end(0), m.group(1))
++        for m in named_group_matcher.finditer(pattern)
++    ]
++    print(f"Named group indices: {named_group_indices}")
++    
++    # Tuples of (named capture group pattern, group name).
++    group_pattern_and_name = []
++    # Loop over the groups and their start and end indices.
++    for start, end, group_name in named_group_indices:
++        print(f"\nProcessing group: {group_name}, start={start}, end={end}")
++        print(f"Pattern slice to search: '{pattern[end:]}'")
++        
++        # Handle nested parentheses, e.g. '^(?P<a>(x|y))/b'.
++        unmatched_open_brackets, prev_char = 1, None
++        found_closing = False
++        for idx, val in enumerate(pattern[end:]):
++            print(f"  idx={idx}, val='{val}', unmatched_open_brackets={unmatched_open_brackets}")
++            
++            # Check for unescaped `(` and `)`. They mark the start and end of a
++            # nested group.
++            if val == '(' and prev_char != '\\':
++                unmatched_open_brackets += 1
++            elif val == ')' and prev_char != '\\':
++                unmatched_open_brackets -= 1
++            
++            print(f"  After processing '{val}': unmatched_open_brackets={unmatched_open_brackets}")
++            
++            # If brackets are balanced, the end of the string for the current
++            # named capture group pattern has been reached.
++            if unmatched_open_brackets == 0:
++                group_pattern_and_name.append((pattern[start:end + idx + 1], group_name))
++                print(f"  Found closing bracket! Group pattern: '{pattern[start:end + idx + 1]}'")
++                found_closing = True
++                break
++            prev_char = val
++        else:
++            # If we've reached the end of the pattern and still have an unmatched
++            # opening bracket, it means the named group extends to the end.
++            print(f"  Reached end of pattern, unmatched_open_brackets={unmatched_open_brackets}")
++            if unmatched_open_brackets == 1:
++                group_pattern_and_name.append((pattern[start:], group_name))
++                print(f"  Added final group! Group pattern: '{pattern[start:]}'")
++                found_closing = True
++        
++        if not found_closing:
++            print(f"  ERROR: No closing bracket found for group {group_name}")
++
++    print(f"\nFinal group_pattern_and_name: {group_pattern_and_name}")
++    
++    # Replace the string for named capture groups with their group names.
++    for group_pattern, group_name in group_pattern_and_name:
++        print(f"Replacing '{group_pattern}' with '{group_name}'")
++        pattern = pattern.replace(group_pattern, group_name)
++    
++    print(f"Final result: {pattern}")
++    return pattern
++
++if __name__ == "__main__":
++    # Test the problematic pattern
++    test_pattern = r'(?P<a>\w+)/b/(?P<c>\w+)'
++    debug_replace_named_groups(test_pattern)
+\ No newline at end of file
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..30f00e4ddd
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand why simplify_regex works but replace_named_groups doesn't.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Simple Django setup without full configuration
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-reproduction',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++from django.contrib.admindocs.utils import replace_named_groups, replace_unnamed_groups
++
++def debug_simplify_regex_steps(pattern):
++    """Debug each step of simplify_regex to see what's happening."""
++    
++    print(f"Original pattern: {pattern}")
++    
++    # Step 1: replace_named_groups
++    step1 = replace_named_groups(pattern)
++    print(f"After replace_named_groups: {step1}")
++    
++    # Step 2: replace_unnamed_groups  
++    step2 = replace_unnamed_groups(step1)
++    print(f"After replace_unnamed_groups: {step2}")
++    
++    # Step 3: clean up regex characters
++    step3 = step2.replace('^', '').replace('$', '').replace('?', '')
++    print(f"After cleanup: {step3}")
++    
++    # Step 4: add leading slash if needed
++    if not step3.startswith('/'):
++        step3 = '/' + step3
++    print(f"Final result: {step3}")
++    
++    return step3
++
++if __name__ == "__main__":
++    print("Debugging simplify_regex steps:")
++    print("=" * 50)
++    
++    # Test the problematic pattern
++    pattern = r'^(?P<a>\w+)/b/(?P<c>\w+)$'
++    result = debug_simplify_regex_steps(pattern)
++    print()
++    
++    # Test pattern without $ at the end
++    print("Testing pattern without $ at the end:")
++    print("=" * 50)
++    pattern2 = r'^(?P<a>\w+)/b/(?P<c>\w+)'
++    result2 = debug_simplify_regex_steps(pattern2)
+\ No newline at end of file
+diff --git a/django/contrib/admindocs/utils.py b/django/contrib/admindocs/utils.py
+index 1ce4594501..a78bec344e 100644
+--- a/django/contrib/admindocs/utils.py
++++ b/django/contrib/admindocs/utils.py
+@@ -167,19 +167,24 @@ def replace_named_groups(pattern):
+         # Handle nested parentheses, e.g. '^(?P<a>(x|y))/b'.
+         unmatched_open_brackets, prev_char = 1, None
+         for idx, val in enumerate(pattern[end:]):
+-            # If brackets are balanced, the end of the string for the current
+-            # named capture group pattern has been reached.
+-            if unmatched_open_brackets == 0:
+-                group_pattern_and_name.append((pattern[start:end + idx], group_name))
+-                break
+-
+             # Check for unescaped `(` and `)`. They mark the start and end of a
+             # nested group.
+             if val == '(' and prev_char != '\\':
+                 unmatched_open_brackets += 1
+             elif val == ')' and prev_char != '\\':
+                 unmatched_open_brackets -= 1
++            
++            # If brackets are balanced, the end of the string for the current
++            # named capture group pattern has been reached.
++            if unmatched_open_brackets == 0:
++                group_pattern_and_name.append((pattern[start:end + idx + 1], group_name))
++                break
+             prev_char = val
++        else:
++            # If we've reached the end of the pattern and still have an unmatched
++            # opening bracket, it means the named group extends to the end.
++            if unmatched_open_brackets == 1:
++                group_pattern_and_name.append((pattern[start:], group_name))
+ 
+     # Replace the string for named capture groups with their group names.
+     for group_pattern, group_name in group_pattern_and_name:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9b586e530d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the simplify_regexp() issue.
++The issue is that replace_named_groups() fails to replace the final named group 
++if the urlpattern is missing a trailing '/'.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Simple Django setup without full configuration
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-reproduction',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++from django.contrib.admindocs.utils import replace_named_groups
++from django.contrib.admindocs.views import simplify_regex
++
++def test_replace_named_groups():
++    """Test the replace_named_groups function with various patterns."""
++    
++    print("Testing replace_named_groups function:")
++    print("=" * 50)
++    
++    test_cases = [
++        # Pattern from the issue description
++        (r'entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)', 
++         'entries/<pk>/relationships/<related_field>'),
++        
++        # Pattern with trailing slash (should work)
++        (r'entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)/', 
++         'entries/<pk>/relationships/<related_field>/'),
++        
++        # Simple case with trailing group
++        (r'(?P<a>\w+)/b/(?P<c>\w+)', '<a>/b/<c>'),
++        
++        # Simple case with trailing group and slash
++        (r'(?P<a>\w+)/b/(?P<c>\w+)/', '<a>/b/<c>/'),
++        
++        # Pattern with trailing characters after last group
++        (r'(?P<a>\w+)/b/(?P<c>\w+)ab', '<a>/b/<c>ab'),
++        
++        # Single trailing group
++        (r'test/(?P<id>\w+)', 'test/<id>'),
++        
++        # Multiple trailing groups
++        (r'(?P<a>\w+)/(?P<b>\w+)', '<a>/<b>'),
++    ]
++    
++    for i, (pattern, expected) in enumerate(test_cases, 1):
++        result = replace_named_groups(pattern)
++        status = "✓ PASS" if result == expected else "✗ FAIL"
++        print(f"Test {i}: {status}")
++        print(f"  Pattern:  {pattern}")
++        print(f"  Expected: {expected}")
++        print(f"  Got:      {result}")
++        if result != expected:
++            print(f"  ERROR: Final named group not replaced!")
++        print()
++
++def test_simplify_regex():
++    """Test the simplify_regex function with various patterns."""
++    
++    print("Testing simplify_regex function:")
++    print("=" * 50)
++    
++    test_cases = [
++        # Pattern from the issue description
++        (r'^entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)$', 
++         '/entries/<pk>/relationships/<related_field>'),
++        
++        # Pattern with trailing slash (should work)
++        (r'^entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)/$', 
++         '/entries/<pk>/relationships/<related_field>/'),
++        
++        # From existing tests
++        (r'^(?P<a>\w+)/b/(?P<c>\w+)$', '/<a>/b/<c>'),
++        (r'^(?P<a>\w+)/b/(?P<c>\w+)/$', '/<a>/b/<c>/'),
++    ]
++    
++    for i, (pattern, expected) in enumerate(test_cases, 1):
++        result = simplify_regex(pattern)
++        status = "✓ PASS" if result == expected else "✗ FAIL"
++        print(f"Test {i}: {status}")
++        print(f"  Pattern:  {pattern}")
++        print(f"  Expected: {expected}")
++        print(f"  Got:      {result}")
++        if result != expected:
++            print(f"  ERROR: Final named group not replaced!")
++        print()
++
++if __name__ == "__main__":
++    test_replace_named_groups()
++    test_simplify_regex()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..7d174b4317
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the replace_named_groups fix.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Simple Django setup without full configuration
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-reproduction',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++from django.contrib.admindocs.utils import replace_named_groups
++from django.contrib.admindocs.views import simplify_regex
++
++def test_edge_cases():
++    """Test edge cases for the replace_named_groups function."""
++    
++    print("Testing edge cases:")
++    print("=" * 50)
++    
++    test_cases = [
++        # Empty pattern
++        ('', ''),
++        
++        # No named groups
++        ('test/path', 'test/path'),
++        
++        # Single named group at start
++        ('(?P<id>\w+)', '<id>'),
++        
++        # Single named group at end
++        ('test/(?P<id>\w+)', 'test/<id>'),
++        
++        # Nested parentheses in named group
++        ('(?P<complex>(a|b)+)', '<complex>'),
++        
++        # Multiple nested parentheses
++        ('(?P<nested>((a|b)+))', '<nested>'),
++        
++        # Named group with escaped parentheses
++        ('(?P<escaped>\\(test\\))', '<escaped>'),
++        
++        # Multiple trailing named groups
++        ('(?P<a>\w+)/(?P<b>\w+)/(?P<c>\w+)', '<a>/<b>/<c>'),
++        
++        # Named groups with complex patterns
++        ('(?P<year>[0-9]{4})/(?P<month>[0-9]{2})/(?P<day>[0-9]{2})', '<year>/<month>/<day>'),
++        
++        # Mixed named and unnamed groups at end
++        ('(?P<a>\w+)/(\w+)/(?P<c>\w+)', '<a>/(\w+)/<c>'),
++    ]
++    
++    for i, (pattern, expected) in enumerate(test_cases, 1):
++        result = replace_named_groups(pattern)
++        status = "✓ PASS" if result == expected else "✗ FAIL"
++        print(f"Test {i}: {status}")
++        print(f"  Pattern:  {pattern}")
++        print(f"  Expected: {expected}")
++        print(f"  Got:      {result}")
++        if result != expected:
++            print(f"  ERROR: Unexpected result!")
++        print()
++
++def test_simplify_regex_edge_cases():
++    """Test edge cases for the simplify_regex function."""
++    
++    print("Testing simplify_regex edge cases:")
++    print("=" * 50)
++    
++    test_cases = [
++        # Complex nested patterns
++        (r'^(?P<year>[0-9]{4})/(?P<month>[0-9]{2})/(?P<day>[0-9]{2})$', 
++         '/<year>/<month>/<day>'),
++        
++        # Pattern with escaped characters
++        (r'^(?P<path>[\w\-\.]+)$', '/<path>'),
++        
++        # Pattern with character classes
++        (r'^(?P<slug>[a-zA-Z0-9_-]+)$', '/<slug>'),
++    ]
++    
++    for i, (pattern, expected) in enumerate(test_cases, 1):
++        result = simplify_regex(pattern)
++        status = "✓ PASS" if result == expected else "✗ FAIL"
++        print(f"Test {i}: {status}")
++        print(f"  Pattern:  {pattern}")
++        print(f"  Expected: {expected}")
++        print(f"  Got:      {result}")
++        if result != expected:
++            print(f"  ERROR: Unexpected result!")
++        print()
++
++if __name__ == "__main__":
++    test_edge_cases()
++    test_simplify_regex_edge_cases()
+\ No newline at end of file
+diff --git a/test_existing_cases.py b/test_existing_cases.py
+new file mode 100644
+index 0000000000..f57db6fbe6
+--- /dev/null
++++ b/test_existing_cases.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Test the existing test cases from Django's test suite to ensure they still pass.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Simple Django setup without full configuration
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-reproduction',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++from django.contrib.admindocs.views import simplify_regex
++
++def test_existing_cases():
++    """Test the existing test cases from Django's test suite."""
++    
++    print("Testing existing Django test cases:")
++    print("=" * 50)
++    
++    # These are the exact test cases from Django's test suite
++    tests = (
++        (r'^a', '/a'),
++        (r'^(?P<a>\w+)/b/(?P<c>\w+)/$', '/<a>/b/<c>/'),
++        (r'^(?P<a>\w+)/b/(?P<c>\w+)$', '/<a>/b/<c>'),
++        (r'^(?P<a>\w+)/b/(\w+)$', '/<a>/b/<var>'),
++        (r'^(?P<a>\w+)/b/((x|y)\w+)$', '/<a>/b/<var>'),
++        (r'^(?P<a>(x|y))/b/(?P<c>\w+)$', '/<a>/b/<c>'),
++        (r'^(?P<a>(x|y))/b/(?P<c>\w+)ab', '/<a>/b/<c>ab'),
++        (r'^(?P<a>(x|y)(\(|\)))/b/(?P<c>\w+)ab', '/<a>/b/<c>ab'),
++        (r'^a/?$', '/a/'),
++    )
++    
++    all_pass = True
++    for i, (pattern, expected) in enumerate(tests, 1):
++        result = simplify_regex(pattern)
++        status = "✓ PASS" if result == expected else "✗ FAIL"
++        if result != expected:
++            all_pass = False
++        
++        print(f"Test {i}: {status}")
++        print(f"  Pattern:  {pattern}")
++        print(f"  Expected: {expected}")
++        print(f"  Got:      {result}")
++        if result != expected:
++            print(f"  ERROR: Test case from Django's test suite failed!")
++        print()
++    
++    print("=" * 50)
++    print(f"OVERALL RESULT: {'✓ ALL EXISTING TESTS PASS' if all_pass else '✗ SOME EXISTING TESTS FAILED'}")
++    
++    return all_pass
++
++if __name__ == "__main__":
++    test_existing_cases()
+\ No newline at end of file
+diff --git a/test_issue_fix.py b/test_issue_fix.py
+new file mode 100644
+index 0000000000..198bba38c0
+--- /dev/null
++++ b/test_issue_fix.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python3
++"""
++Test the specific issue described in the bug report.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Simple Django setup without full configuration
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-reproduction',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++from django.contrib.admindocs.utils import replace_named_groups
++from django.contrib.admindocs.views import simplify_regex
++
++def test_issue_fix():
++    """Test the specific issue from the bug report."""
++    
++    print("Testing the specific issue from the bug report:")
++    print("=" * 60)
++    
++    # The exact pattern from the issue description
++    issue_pattern = r'entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)'
++    
++    print(f"Original issue pattern: {issue_pattern}")
++    
++    # Test replace_named_groups directly
++    result_replace = replace_named_groups(issue_pattern)
++    expected_replace = 'entries/<pk>/relationships/<related_field>'
++    
++    print(f"replace_named_groups result: {result_replace}")
++    print(f"Expected: {expected_replace}")
++    print(f"Status: {'✓ PASS' if result_replace == expected_replace else '✗ FAIL'}")
++    print()
++    
++    # Test with the workaround (trailing slash)
++    workaround_pattern = r'entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)/'
++    result_workaround = replace_named_groups(workaround_pattern)
++    expected_workaround = 'entries/<pk>/relationships/<related_field>/'
++    
++    print(f"Workaround pattern: {workaround_pattern}")
++    print(f"replace_named_groups result: {result_workaround}")
++    print(f"Expected: {expected_workaround}")
++    print(f"Status: {'✓ PASS' if result_workaround == expected_workaround else '✗ FAIL'}")
++    print()
++    
++    # Test simplify_regex with full pattern (with ^ and $)
++    full_pattern = r'^entries/(?P<pk>[^/.]+)/relationships/(?P<related_field>\w+)$'
++    result_simplify = simplify_regex(full_pattern)
++    expected_simplify = '/entries/<pk>/relationships/<related_field>'
++    
++    print(f"Full pattern for simplify_regex: {full_pattern}")
++    print(f"simplify_regex result: {result_simplify}")
++    print(f"Expected: {expected_simplify}")
++    print(f"Status: {'✓ PASS' if result_simplify == expected_simplify else '✗ FAIL'}")
++    print()
++    
++    # Summary
++    all_pass = (
++        result_replace == expected_replace and
++        result_workaround == expected_workaround and
++        result_simplify == expected_simplify
++    )
++    
++    print("=" * 60)
++    print(f"OVERALL RESULT: {'✓ ALL TESTS PASS' if all_pass else '✗ SOME TESTS FAILED'}")
++    print("The issue has been fixed!" if all_pass else "The issue still exists!")
++
++if __name__ == "__main__":
++    test_issue_fix()
+\ No newline at end of file
+diff --git a/test_malformed.py b/test_malformed.py
+new file mode 100644
+index 0000000000..7ca9c64051
+--- /dev/null
++++ b/test_malformed.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Test malformed regex patterns to ensure the fix doesn't break on edge cases.
++"""
++
++import sys
++import os
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Simple Django setup without full configuration
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key-for-reproduction',
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++from django.contrib.admindocs.utils import replace_named_groups
++
++def test_malformed_patterns():
++    """Test malformed regex patterns."""
++    
++    print("Testing malformed patterns:")
++    print("=" * 50)
++    
++    test_cases = [
++        # Missing closing parenthesis (should not crash)
++        ('(?P<id>\w+', '(?P<id>\w+'),
++        
++        # Extra opening parenthesis
++        ('(?P<id>\w+))', '(?P<id>\w+))'),
++        
++        # Incomplete named group
++        ('(?P<id', '(?P<id'),
++        
++        # Empty named group name
++        ('(?P<>\w+)', '(?P<>\w+)'),
++    ]
++    
++    for i, (pattern, expected) in enumerate(test_cases, 1):
++        try:
++            result = replace_named_groups(pattern)
++            status = "✓ PASS" if result == expected else "✗ FAIL"
++            print(f"Test {i}: {status}")
++            print(f"  Pattern:  {pattern}")
++            print(f"  Expected: {expected}")
++            print(f"  Got:      {result}")
++            if result != expected:
++                print(f"  ERROR: Unexpected result!")
++        except Exception as e:
++            print(f"Test {i}: ✗ EXCEPTION")
++            print(f"  Pattern:  {pattern}")
++            print(f"  Exception: {e}")
++        print()
++
++if __name__ == "__main__":
++    test_malformed_patterns()
+\ No newline at end of file

@@ -1,0 +1,562 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..55318e1cdb 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -118,6 +118,7 @@ class ForwardManyToOneDescriptor:
+         return self.field.remote_field.model._base_manager.db_manager(hints=hints).all()
+ 
+     def get_prefetch_queryset(self, instances, queryset=None):
++
+         if queryset is None:
+             queryset = self.get_queryset()
+         queryset._add_hints(instance=instances[0])
+@@ -363,6 +364,7 @@ class ReverseOneToOneDescriptor:
+         return self.related.related_model._base_manager.db_manager(hints=hints).all()
+ 
+     def get_prefetch_queryset(self, instances, queryset=None):
++
+         if queryset is None:
+             queryset = self.get_queryset()
+         queryset._add_hints(instance=instances[0])
+@@ -377,6 +379,28 @@ class ReverseOneToOneDescriptor:
+         # we must manage the reverse relation cache manually.
+         for rel_obj in queryset:
+             instance = instances_dict[rel_obj_attr(rel_obj)]
++            
++            # Before setting the forward cache, check if there's already a cached value
++            # that might have better field loading (e.g., from a prefetch).
++            # If there's already a cached value, we should update the current
++            # instance with any additional fields that were loaded.
++            try:
++                existing_cached = self.related.field.get_cached_value(rel_obj)
++                if existing_cached is not instance:
++                    # There's a different cached instance. We should update the current
++                    # instance with any fields that were loaded in the cached instance.
++                    existing_deferred = existing_cached.get_deferred_fields() if hasattr(existing_cached, 'get_deferred_fields') else set()
++                    current_deferred = instance.get_deferred_fields() if hasattr(instance, 'get_deferred_fields') else set()
++                    
++                    # Copy fields that are loaded in existing_cached but deferred in instance
++                    fields_to_copy = current_deferred - existing_deferred
++                    for field_name in fields_to_copy:
++                        if hasattr(existing_cached, field_name) and field_name in existing_cached.__dict__:
++                            instance.__dict__[field_name] = existing_cached.__dict__[field_name]
++            except KeyError:
++                # No existing cached value, safe to set
++                pass
++            
+             self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+ 
+@@ -414,6 +438,28 @@ class ReverseOneToOneDescriptor:
+                     # Set the forward accessor cache on the related object to
+                     # the current instance to avoid an extra SQL query if it's
+                     # accessed later on.
++                    # 
++                    # However, we need to be careful not to overwrite a cached value
++                    # that might have better field loading (e.g., from a prefetch).
++                    # If there's already a cached value, we should update the current
++                    # instance with any additional fields that were loaded.
++                    try:
++                        existing_cached = self.related.field.get_cached_value(rel_obj)
++                        if existing_cached is not instance:
++                            # There's a different cached instance. We should update the current
++                            # instance with any fields that were loaded in the cached instance.
++                            existing_deferred = existing_cached.get_deferred_fields() if hasattr(existing_cached, 'get_deferred_fields') else set()
++                            current_deferred = instance.get_deferred_fields() if hasattr(instance, 'get_deferred_fields') else set()
++                            
++                            # Copy fields that are loaded in existing_cached but deferred in instance
++                            fields_to_copy = current_deferred - existing_deferred
++                            for field_name in fields_to_copy:
++                                if hasattr(existing_cached, field_name) and field_name in existing_cached.__dict__:
++                                    instance.__dict__[field_name] = existing_cached.__dict__[field_name]
++                    except KeyError:
++                        # No existing cached value, safe to set
++                        pass
++                    
+                     self.related.field.set_cached_value(rel_obj, instance)
+             self.related.set_cached_value(instance, rel_obj)
+ 
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fb6639793a..d927ad34ca 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1934,7 +1934,6 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+     for obj in instances:
+         instance_attr_val = instance_attr(obj)
+         vals = rel_obj_cache.get(instance_attr_val, [])
+-
+         if single:
+             val = vals[0] if vals else None
+             if as_attr:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..e8bbb2518b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the deferred fields issue with prefetch_related.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test.utils import get_runner
++from django.test import TestCase
++from django.db.models import Prefetch
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Define models
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create tables
++from django.db import connection
++
++tables = connection.introspection.table_names()
++
++# Create tables if they don't exist
++if '__main___user' not in tables:
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Profile)
++
++class TestDeferredFieldsIssue(TestCase):
++    def setUp(self):
++        self.user = User.objects.create(
++            email="test@example.com",
++            kind="ADMIN",
++        )
++        self.profile = Profile.objects.create(user=self.user, full_name="Test Tester")
++
++    def test_only_related_queryset(self):
++        """Test case that reproduces the issue."""
++        print("=== Testing deferred fields issue ===")
++        
++        queryset = User.objects.only("email").prefetch_related(
++            Prefetch(
++                "profile",
++                queryset=Profile.objects.prefetch_related(
++                    Prefetch("user", queryset=User.objects.only("kind"))
++                ),
++            )
++        )
++        
++        # Execute the main queryset
++        print("Executing main queryset...")
++        with self.assertNumQueries(3):
++            user = queryset.first()
++        
++        print(f"User email: {user.email}")
++        print(f"User ID: {id(user)}")
++        print(f"User deferred fields: {user.get_deferred_fields()}")
++        print(f"Profile user ID: {id(user.profile.user)}")
++        print(f"Profile user deferred fields: {user.profile.user.get_deferred_fields()}")
++        print(f"Are they the same object? {user is user.profile.user}")
++        
++        # This should not trigger additional queries since 'kind' was explicitly included
++        print("Accessing user.profile.user.kind...")
++        with self.assertNumQueries(0):
++            kind = user.profile.user.kind
++            print(f"Kind: {kind}")
++
++if __name__ == '__main__':
++    # Run the test
++    test = TestDeferredFieldsIssue()
++    test.setUp()
++    try:
++        test.test_only_related_queryset()
++        print("✓ Test passed!")
++    except Exception as e:
++        print(f"✗ Test failed: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..121b8722de
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,245 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the deferred fields fix with prefetch_related.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test.utils import get_runner
++from django.test import TestCase
++from django.db.models import Prefetch
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Define models
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    bio = models.TextField()
++    
++    class Meta:
++        app_label = '__main__'
++
++class Company(models.Model):
++    name = models.CharField(max_length=100)
++    users = models.ManyToManyField(User, related_name='companies')
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create tables
++from django.db import connection
++
++tables = connection.introspection.table_names()
++
++# Create tables if they don't exist
++if '__main___user' not in tables:
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Profile)
++        schema_editor.create_model(Company)
++
++class TestDeferredFieldsComprehensive(TestCase):
++    def setUp(self):
++        self.user = User.objects.create(
++            email="test@example.com",
++            kind="ADMIN",
++            name="Test User"
++        )
++        self.profile = Profile.objects.create(
++            user=self.user, 
++            full_name="Test Tester",
++            bio="Test bio"
++        )
++        self.company = Company.objects.create(name="Test Company")
++        self.company.users.add(self.user)
++
++    def test_onetoone_forward_prefetch(self):
++        """Test OneToOneField forward prefetch with deferred fields."""
++        print("=== Testing OneToOneField forward prefetch ===")
++        
++        queryset = Profile.objects.only("full_name").prefetch_related(
++            Prefetch("user", queryset=User.objects.only("kind"))
++        )
++        
++        with self.assertNumQueries(3):  # Profile query + Profile prefetch + User prefetch
++            profile = queryset.first()
++        
++        print(f"Profile deferred fields: {profile.get_deferred_fields()}")
++        print(f"User deferred fields: {profile.user.get_deferred_fields()}")
++        
++        # Should not trigger additional queries
++        with self.assertNumQueries(0):
++            kind = profile.user.kind
++            self.assertEqual(kind, "ADMIN")
++
++    def test_onetoone_reverse_prefetch(self):
++        """Test OneToOneField reverse prefetch with deferred fields."""
++        print("=== Testing OneToOneField reverse prefetch ===")
++        
++        queryset = User.objects.only("email").prefetch_related(
++            Prefetch("profile", queryset=Profile.objects.only("bio"))
++        )
++        
++        with self.assertNumQueries(3):  # User query + Profile prefetch + Profile reverse lookup
++            user = queryset.first()
++        
++        print(f"User deferred fields: {user.get_deferred_fields()}")
++        print(f"Profile deferred fields: {user.profile.get_deferred_fields()}")
++        
++        # Should not trigger additional queries
++        with self.assertNumQueries(0):
++            bio = user.profile.bio
++            self.assertEqual(bio, "Test bio")
++
++    def test_nested_prefetch_original_issue(self):
++        """Test the original issue from the bug report."""
++        print("=== Testing original issue ===")
++        
++        queryset = User.objects.only("email").prefetch_related(
++            Prefetch(
++                "profile",
++                queryset=Profile.objects.prefetch_related(
++                    Prefetch("user", queryset=User.objects.only("kind"))
++                ),
++            )
++        )
++        
++        with self.assertNumQueries(3):
++            user = queryset.first()
++        
++        print(f"User deferred fields: {user.get_deferred_fields()}")
++        print(f"Profile user deferred fields: {user.profile.user.get_deferred_fields()}")
++        
++        # This should not trigger additional queries
++        with self.assertNumQueries(0):
++            kind = user.profile.user.kind
++            self.assertEqual(kind, "ADMIN")
++
++    def test_multiple_field_combinations(self):
++        """Test various combinations of deferred fields."""
++        print("=== Testing multiple field combinations ===")
++        
++        # Test case where outer queryset has more fields than inner
++        queryset = User.objects.only("email", "name").prefetch_related(
++            Prefetch(
++                "profile",
++                queryset=Profile.objects.prefetch_related(
++                    Prefetch("user", queryset=User.objects.only("kind"))
++                ),
++            )
++        )
++        
++        with self.assertNumQueries(3):
++            user = queryset.first()
++        
++        # User should have all fields loaded (email, name from outer + kind from inner)
++        self.assertEqual(user.get_deferred_fields(), set())
++        
++        # Should not trigger additional queries for any field
++        with self.assertNumQueries(0):
++            email = user.email
++            name = user.name
++            kind = user.profile.user.kind
++            self.assertEqual(email, "test@example.com")
++            self.assertEqual(name, "Test User")
++            self.assertEqual(kind, "ADMIN")
++
++    def test_foreignkey_relationship(self):
++        """Test that the fix also works with ForeignKey relationships."""
++        print("=== Testing ForeignKey relationship ===")
++        
++        # Create a model with ForeignKey instead of OneToOneField
++        class Post(models.Model):
++            title = models.CharField(max_length=100)
++            author = models.ForeignKey(User, on_delete=models.CASCADE)
++            content = models.TextField()
++            
++            class Meta:
++                app_label = '__main__'
++        
++        # Create table
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(Post)
++        
++        post = Post.objects.create(
++            title="Test Post",
++            author=self.user,
++            content="Test content"
++        )
++        
++        queryset = User.objects.only("email").prefetch_related(
++            Prefetch(
++                "post_set",
++                queryset=Post.objects.prefetch_related(
++                    Prefetch("author", queryset=User.objects.only("kind"))
++                ),
++            )
++        )
++        
++        with self.assertNumQueries(3):
++            user = queryset.first()
++        
++        # Should not trigger additional queries
++        with self.assertNumQueries(0):
++            kind = user.post_set.all()[0].author.kind
++            self.assertEqual(kind, "ADMIN")
++
++if __name__ == '__main__':
++    # Run the tests
++    test = TestDeferredFieldsComprehensive()
++    test.setUp()
++    
++    try:
++        test.test_onetoone_forward_prefetch()
++        print("✓ OneToOneField forward prefetch test passed!")
++        
++        test.test_onetoone_reverse_prefetch()
++        print("✓ OneToOneField reverse prefetch test passed!")
++        
++        test.test_nested_prefetch_original_issue()
++        print("✓ Original issue test passed!")
++        
++        test.test_multiple_field_combinations()
++        print("✓ Multiple field combinations test passed!")
++        
++        test.test_foreignkey_relationship()
++        print("✓ ForeignKey relationship test passed!")
++        
++        print("\n🎉 All tests passed!")
++        
++    except Exception as e:
++        print(f"✗ Test failed: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 0000000000..8fd3513f3c
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python
++"""
++Test that exactly reproduces the issue from the bug report.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test.utils import get_runner
++from django.test import TestCase
++from django.db.models import Prefetch
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Define models exactly as in the issue
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create tables
++from django.db import connection
++
++tables = connection.introspection.table_names()
++
++# Create tables if they don't exist
++if '__main___user' not in tables:
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(User)
++        schema_editor.create_model(Profile)
++
++class TestExactIssue(TestCase):
++    def test_only_related_queryset(self):
++        """Exact test case from the issue description."""
++        user = User.objects.create(
++            email="test@example.com",
++            kind="ADMIN",
++        )
++        Profile.objects.create(user=user, full_name="Test Tester")
++        queryset = User.objects.only("email").prefetch_related(
++            Prefetch(
++                "profile",
++                queryset=Profile.objects.prefetch_related(
++                    Prefetch("user", queryset=User.objects.only("kind"))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            user = queryset.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(user.profile.user.kind, "ADMIN")
++
++if __name__ == '__main__':
++    # Run the test
++    test = TestExactIssue()
++    test.setUp()
++    try:
++        test.test_only_related_queryset()
++        print("✓ Exact issue test passed!")
++    except Exception as e:
++        print(f"✗ Test failed: {e}")
++        import traceback
++        traceback.print_exc()
+\ No newline at end of file

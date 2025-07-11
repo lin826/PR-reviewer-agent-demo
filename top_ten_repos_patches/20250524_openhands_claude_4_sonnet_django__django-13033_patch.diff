@@ -1,0 +1,788 @@
+diff --git a/debug_ordering.py b/debug_ordering.py
+new file mode 100644
+index 0000000000..10b09bb5ca
+--- /dev/null
++++ b/debug_ordering.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python
++"""
++Script to debug the ordering issue by adding print statements.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    class Meta:
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
++
++def debug_ordering():
++    """Debug the ordering issue by patching the find_ordering_name method."""
++    
++    from django.db import connection
++    from django.db.models.sql.compiler import SQLCompiler
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(OneModel)
++        schema_editor.create_model(TwoModel)
++    
++    # Patch the find_ordering_name method to add debugging
++    original_find_ordering_name = SQLCompiler.find_ordering_name
++    
++    def debug_find_ordering_name(self, name, opts, alias=None, default_order='ASC', already_seen=None):
++        # Only debug the first call, not recursive calls
++        if already_seen is None:
++            print(f"\n=== find_ordering_name called ===")
++            print(f"name: {name}")
++            print(f"opts.model: {opts.model}")
++            print(f"default_order: {default_order}")
++            
++            from django.db.models.sql.compiler import get_order_dir, LOOKUP_SEP
++            
++            name_clean, order = get_order_dir(name, default_order)
++            descending = order == 'DESC'
++            pieces = name_clean.split(LOOKUP_SEP)
++            
++            print(f"name_clean: {name_clean}")
++            print(f"order: {order}")
++            print(f"pieces: {pieces}")
++            
++            # Let's see what happens during setup_joins
++            try:
++                field, targets, alias, joins, path, opts_after, transform_function = self._setup_joins(pieces, opts, alias)
++                
++                print(f"field: {field}")
++                print(f"field.name: {field.name}")
++                print(f"field.is_relation: {field.is_relation}")
++                if hasattr(field, 'attname'):
++                    print(f"field.attname: {field.attname}")
++                print(f"opts_after.ordering: {opts_after.ordering}")
++                print(f"targets: {targets}")
++                
++                # Check the condition that causes the issue (NEW FIXED VERSION)
++                condition = field.is_relation and opts_after.ordering and getattr(field, 'attname', None) != pieces[-1] and pieces[-1] != 'pk'
++                print(f"Condition result: {condition}")
++                print(f"  field.is_relation: {field.is_relation}")
++                print(f"  opts_after.ordering: {opts_after.ordering}")
++                print(f"  getattr(field, 'attname', None): {getattr(field, 'attname', None)}")
++                print(f"  pieces[-1]: {pieces[-1]}")
++                print(f"  getattr(field, 'attname', None) != pieces[-1]: {getattr(field, 'attname', None) != pieces[-1]}")
++                print(f"  pieces[-1] != 'pk': {pieces[-1] != 'pk'}")
++                
++                # Check what the last piece is
++                if len(pieces) > 1:
++                    print(f"Last piece: {pieces[-1]}")
++                    print(f"Field attname: {getattr(field, 'attname', None)}")
++                    print(f"Last piece == field.attname: {pieces[-1] == getattr(field, 'attname', None)}")
++                
++            except Exception as e:
++                print(f"Error during setup_joins: {e}")
++        
++        return original_find_ordering_name(self, name, opts, alias, default_order, already_seen)
++    
++    SQLCompiler.find_ordering_name = debug_find_ordering_name
++    
++    print("=== Testing problematic query: order_by('record__root_id') ===")
++    qs = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs = qs.order_by("record__root_id")
++    print("SQL Query:")
++    print(str(qs.query))
++    
++    print("\n=== Testing working query: order_by('record__root__id') ===")
++    qs2 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs2 = qs2.order_by("record__root__id")
++    print("SQL Query:")
++    print(str(qs2.query))
++
++if __name__ == "__main__":
++    debug_ordering()
+\ No newline at end of file
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index abbb1e37cb..edc283d94c 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -727,7 +727,7 @@ class SQLCompiler:
+         # If we get to this point and the field is a relation to another model,
+         # append the default ordering for that model unless it is the pk
+         # shortcut or the attribute name of the field that is specified.
+-        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != name and name != 'pk':
++        if field.is_relation and opts.ordering and getattr(field, 'attname', None) != pieces[-1] and pieces[-1] != 'pk':
+             # Firstly, avoid infinite loops.
+             already_seen = already_seen or set()
+             join_tuple = tuple(getattr(self.query.alias_map[j], 'join_cols', None) for j in joins)
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..48533dc41b
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python
++"""
++Final verification that exactly matches the issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++# Exact models from the issue description
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    class Meta:
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
++
++def verify_fix():
++    """Verify the fix matches the exact issue description."""
++    
++    from django.db import connection
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(OneModel)
++        schema_editor.create_model(TwoModel)
++    
++    print("=== Verifying Fix Against Original Issue ===\n")
++    
++    # Exact problematic query from issue description
++    print("PROBLEMATIC QUERY (from issue description):")
++    qs = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs = qs.order_by("record__root_id")
++    sql = str(qs.query)
++    print(f"SQL: {sql}")
++    
++    # Check for the issues mentioned in the description
++    has_left_outer_join = "LEFT OUTER JOIN" in sql
++    has_desc_ordering = "DESC" in sql and "ASC" not in sql
++    has_unnecessary_joins = sql.count("JOIN") > 1
++    
++    print(f"\nISSUE ANALYSIS:")
++    print(f"❌ Has unexpected DESCENDING sort: {has_desc_ordering}")
++    print(f"❌ Has unnecessary extra join: {has_left_outer_join}")
++    print(f"❌ Has two JOINs: {has_unnecessary_joins}")
++    
++    # What we expect after the fix
++    expected_asc = "ASC" in sql and "DESC" not in sql
++    expected_single_join = sql.count("JOIN") == 1
++    expected_direct_column = "root_id" in sql
++    
++    print(f"\nFIX VERIFICATION:")
++    print(f"✅ Now has ASCENDING sort: {expected_asc}")
++    print(f"✅ Now has single INNER JOIN: {expected_single_join}")
++    print(f"✅ Uses direct column reference: {expected_direct_column}")
++    
++    # Test the working query from issue description
++    print(f"\nWORKING QUERY (from issue description):")
++    qs2 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs2 = qs2.order_by("record__root__id")
++    sql2 = str(qs2.query)
++    print(f"SQL: {sql2}")
++    
++    # Test inverted query from issue description
++    print(f"\nINVERTED QUERY (from issue description):")
++    qs3 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs3 = qs3.order_by("-record__root_id")
++    sql3 = str(qs3.query)
++    print(f"SQL: {sql3}")
++    
++    # Verify inverted query behavior
++    inverted_has_desc = "DESC" in sql3 and "ASC" not in sql3
++    inverted_single_join = sql3.count("JOIN") == 1
++    
++    print(f"\nINVERTED QUERY VERIFICATION:")
++    print(f"✅ Respects explicit DESC: {inverted_has_desc}")
++    print(f"✅ Has single INNER JOIN: {inverted_single_join}")
++    
++    # Final summary
++    print(f"\n=== FINAL SUMMARY ===")
++    all_fixed = (expected_asc and expected_single_join and expected_direct_column and 
++                inverted_has_desc and inverted_single_join)
++    print(f"🎉 All issues from the bug report are FIXED: {all_fixed}")
++    
++    if all_fixed:
++        print("\n✅ The fix successfully resolves:")
++        print("   1. Unexpected DESCENDING sort → Now uses correct ASC ordering")
++        print("   2. Unnecessary extra JOIN → Now uses single INNER JOIN")
++        print("   3. Ignores explicit ordering → Now respects explicit DESC when specified")
++        print("   4. Self-referencing FK issue → Now handles _id suffix correctly")
++    else:
++        print("\n❌ Some issues remain unresolved")
++
++if __name__ == "__main__":
++    verify_fix()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..11a333c93c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the self-referencing foreign key ordering issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    class Meta:
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
++
++def test_ordering_issue():
++    """Test the ordering issue with self-referencing foreign keys."""
++    
++    print("=== Testing Self-Referencing Foreign Key Ordering Issue ===\n")
++    
++    # Create tables
++    from django.db import connection
++    
++    # Create the tables manually
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(OneModel)
++        schema_editor.create_model(TwoModel)
++    
++    print("1. Testing problematic query: order_by('record__root_id')")
++    qs = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs = qs.order_by("record__root_id")
++    print("SQL Query:")
++    print(str(qs.query))
++    print()
++    
++    print("2. Testing working query: order_by('record__root__id')")
++    qs2 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs2 = qs2.order_by("record__root__id")
++    print("SQL Query:")
++    print(str(qs2.query))
++    print()
++    
++    print("3. Testing inverted problematic query: order_by('-record__root_id')")
++    qs3 = TwoModel.objects.filter(record__oneval__in=[1,2,3])
++    qs3 = qs3.order_by("-record__root_id")
++    print("SQL Query:")
++    print(str(qs3.query))
++    print()
++    
++    # Analyze the differences
++    print("=== Analysis ===")
++    query1_str = str(qs.query)
++    query2_str = str(qs2.query)
++    query3_str = str(qs3.query)
++    
++    print("Query 1 (problematic) has LEFT OUTER JOIN:", "LEFT OUTER JOIN" in query1_str)
++    print("Query 1 (problematic) has DESC ordering:", "DESC" in query1_str)
++    print("Query 2 (working) has LEFT OUTER JOIN:", "LEFT OUTER JOIN" in query2_str)
++    print("Query 2 (working) has DESC ordering:", "DESC" in query2_str)
++    print("Query 3 (inverted problematic) has LEFT OUTER JOIN:", "LEFT OUTER JOIN" in query3_str)
++    print("Query 3 (inverted problematic) has ASC ordering:", "ASC" in query3_str)
++
++if __name__ == "__main__":
++    test_ordering_issue()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1c9cf47390
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python
++"""
++Test edge cases to ensure the fix doesn't break existing functionality.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    class Meta:
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
++
++class ThirdModel(models.Model):
++    class Meta:
++        ordering = ("name",)
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    name = models.CharField(max_length=100)
++
++class FourthModel(models.Model):
++    class Meta:
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    third = models.ForeignKey(ThirdModel, on_delete=models.CASCADE)
++    one = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++
++def test_edge_cases():
++    """Test edge cases to ensure no regressions."""
++    
++    from django.db import connection
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(OneModel)
++        schema_editor.create_model(TwoModel)
++        schema_editor.create_model(ThirdModel)
++        schema_editor.create_model(FourthModel)
++    
++    print("=== Testing Edge Cases ===\n")
++    
++    # Test 1: Non-self-referencing foreign key with _id suffix
++    print("1. Non-self-referencing FK with _id suffix:")
++    qs1 = FourthModel.objects.order_by("third_id")
++    sql1 = str(qs1.query)
++    print(f"   SQL: {sql1}")
++    third_id_col = '"third_id"'
++    print(f"   Uses direct column: {third_id_col in sql1}")
++    print(f"   No extra joins: {'LEFT OUTER JOIN' not in sql1}")
++    print()
++    
++    # Test 2: Non-self-referencing foreign key without _id suffix
++    print("2. Non-self-referencing FK without _id suffix:")
++    qs2 = FourthModel.objects.order_by("third")
++    sql2 = str(qs2.query)
++    print(f"   SQL: {sql2}")
++    print(f"   Has joins for default ordering: {'LEFT OUTER JOIN' in sql2}")
++    print(f"   Uses default ordering: {'ASC' in sql2}")  # ThirdModel has ordering=("name",)
++    print()
++    
++    # Test 3: Self-referencing FK with multiple levels
++    print("3. Self-referencing FK with multiple levels:")
++    qs3 = TwoModel.objects.order_by("record__root__root_id")
++    sql3 = str(qs3.query)
++    print(f"   SQL: {sql3}")
++    root_id_col = '"root_id"'
++    print(f"   Uses direct column: {root_id_col in sql3}")
++    print()
++    
++    # Test 4: Mixed foreign keys
++    print("4. Mixed foreign keys:")
++    qs4 = FourthModel.objects.order_by("one__root_id")
++    sql4 = str(qs4.query)
++    print(f"   SQL: {sql4}")
++    print(f"   Uses direct column: {root_id_col in sql4}")
++    print(f"   No extra joins: {'T3' not in sql4}")  # Should not have extra joins
++    print()
++    
++    # Test 5: Primary key ordering
++    print("5. Primary key ordering:")
++    qs5 = TwoModel.objects.order_by("record__pk")
++    sql5 = str(qs5.query)
++    print(f"   SQL: {sql5}")
++    id_col = '"id"'
++    print(f"   Uses direct column: {id_col in sql5}")
++    print()
++    
++    # Test 6: Ensure regular field ordering still works
++    print("6. Regular field ordering:")
++    qs6 = TwoModel.objects.order_by("record__oneval")
++    sql6 = str(qs6.query)
++    print(f"   SQL: {sql6}")
++    oneval_col = '"oneval"'
++    print(f"   Uses direct column: {oneval_col in sql6}")
++    print(f"   No extra joins: {'LEFT OUTER JOIN' not in sql6}")
++    print()
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_fix_final.py b/test_fix_final.py
+new file mode 100644
+index 0000000000..e1657c4c03
+--- /dev/null
++++ b/test_fix_final.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python
++"""
++Final test to verify the fix is working correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class OneModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    root = models.ForeignKey("OneModel", on_delete=models.CASCADE, null=True)
++    oneval = models.BigIntegerField(null=True)
++
++class TwoModel(models.Model):
++    class Meta:
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    record = models.ForeignKey(OneModel, on_delete=models.CASCADE)
++    twoval = models.BigIntegerField(null=True)
++
++def test_fix():
++    """Test that the fix is working correctly."""
++    
++    from django.db import connection
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(OneModel)
++        schema_editor.create_model(TwoModel)
++    
++    print("=== Testing Fix for Self-Referencing Foreign Key Ordering ===\n")
++    
++    # Test 1: The previously problematic query
++    print("1. order_by('record__root_id') - should now work correctly:")
++    qs1 = TwoModel.objects.filter(record__oneval__in=[1,2,3]).order_by("record__root_id")
++    sql1 = str(qs1.query)
++    print(f"   SQL: {sql1}")
++    print(f"   Has LEFT OUTER JOIN: {'LEFT OUTER JOIN' in sql1}")
++    print(f"   Has DESC ordering: {'DESC' in sql1}")
++    print(f"   Has ASC ordering: {'ASC' in sql1}")
++    print()
++    
++    # Test 2: The working query (should remain unchanged)
++    print("2. order_by('record__root__id') - should still work:")
++    qs2 = TwoModel.objects.filter(record__oneval__in=[1,2,3]).order_by("record__root__id")
++    sql2 = str(qs2.query)
++    print(f"   SQL: {sql2}")
++    print(f"   Has LEFT OUTER JOIN: {'LEFT OUTER JOIN' in sql2}")
++    print(f"   Has DESC ordering: {'DESC' in sql2}")
++    print(f"   Has ASC ordering: {'ASC' in sql2}")
++    print()
++    
++    # Test 3: Inverted ordering
++    print("3. order_by('-record__root_id') - should respect the minus sign:")
++    qs3 = TwoModel.objects.filter(record__oneval__in=[1,2,3]).order_by("-record__root_id")
++    sql3 = str(qs3.query)
++    print(f"   SQL: {sql3}")
++    print(f"   Has LEFT OUTER JOIN: {'LEFT OUTER JOIN' in sql3}")
++    print(f"   Has DESC ordering: {'DESC' in sql3}")
++    print(f"   Has ASC ordering: {'ASC' in sql3}")
++    print()
++    
++    # Test 4: Edge case - ordering by pk
++    print("4. order_by('record__root') - should use default ordering:")
++    qs4 = TwoModel.objects.filter(record__oneval__in=[1,2,3]).order_by("record__root")
++    sql4 = str(qs4.query)
++    print(f"   SQL: {sql4}")
++    print(f"   Has LEFT OUTER JOIN: {'LEFT OUTER JOIN' in sql4}")
++    print(f"   Has DESC ordering: {'DESC' in sql4}")
++    print()
++    
++    # Verify the fix
++    print("=== Fix Verification ===")
++    column_ref = '__main___onemodel"."root_id"'
++    print(f"✓ Query 1 now uses direct column reference: {column_ref in sql1}")
++    print(f"✓ Query 1 has correct ASC ordering: {'ASC' in sql1 and 'DESC' not in sql1}")
++    print(f"✓ Query 1 has no unnecessary joins: {'LEFT OUTER JOIN' not in sql1}")
++    print(f"✓ Query 3 respects explicit DESC: {'DESC' in sql3 and 'ASC' not in sql3}")
++    print(f"✓ Query 4 still applies default ordering: {'DESC' in sql4}")
++
++if __name__ == "__main__":
++    test_fix()
+\ No newline at end of file
+diff --git a/test_self_referencing_ordering.py b/test_self_referencing_ordering.py
+new file mode 100644
+index 0000000000..91f0ffc3b7
+--- /dev/null
++++ b/test_self_referencing_ordering.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python
++"""
++Test case for the self-referencing foreign key ordering fix.
++This test should be added to the Django test suite.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++
++class SelfReferencingModel(models.Model):
++    class Meta:
++        ordering = ("-id",)
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    parent = models.ForeignKey("SelfReferencingModel", on_delete=models.CASCADE, null=True)
++    name = models.CharField(max_length=100)
++
++class RelatedModel(models.Model):
++    class Meta:
++        app_label = '__main__'
++    
++    id = models.BigAutoField(primary_key=True)
++    self_ref = models.ForeignKey(SelfReferencingModel, on_delete=models.CASCADE)
++    value = models.IntegerField()
++
++class SelfReferencingOrderingTest(TestCase):
++    """Test ordering by self-referencing foreign key _id fields."""
++    
++    def test_self_referencing_fk_id_ordering(self):
++        """Test that ordering by self-referencing FK _id field works correctly."""
++        # Create test data
++        parent = SelfReferencingModel.objects.create(name="parent")
++        child = SelfReferencingModel.objects.create(name="child", parent=parent)
++        
++        related1 = RelatedModel.objects.create(self_ref=parent, value=1)
++        related2 = RelatedModel.objects.create(self_ref=child, value=2)
++        
++        # Test ordering by self-referencing FK _id field
++        qs = RelatedModel.objects.filter(value__in=[1, 2]).order_by("self_ref__parent_id")
++        sql = str(qs.query)
++        
++        # Should use direct column reference, not extra joins
++        self.assertIn('"parent_id"', sql)
++        self.assertNotIn('LEFT OUTER JOIN', sql)
++        
++        # Should use ASC ordering by default
++        self.assertIn('ASC', sql)
++        self.assertNotIn('DESC', sql)
++        
++    def test_self_referencing_fk_id_ordering_desc(self):
++        """Test that explicit DESC ordering works correctly."""
++        qs = RelatedModel.objects.order_by("-self_ref__parent_id")
++        sql = str(qs.query)
++        
++        # Should use direct column reference
++        self.assertIn('"parent_id"', sql)
++        self.assertNotIn('LEFT OUTER JOIN', sql)
++        
++        # Should use DESC ordering when explicitly specified
++        self.assertIn('DESC', sql)
++        
++    def test_self_referencing_fk_without_id_suffix(self):
++        """Test that ordering without _id suffix still applies default ordering."""
++        qs = RelatedModel.objects.order_by("self_ref__parent")
++        sql = str(qs.query)
++        
++        # Should create joins for default ordering
++        self.assertIn('LEFT OUTER JOIN', sql)
++        
++        # Should use the related model's default ordering (DESC)
++        self.assertIn('DESC', sql)
++        
++    def test_self_referencing_fk_double_underscore_id(self):
++        """Test that ordering by __id (double underscore) works correctly."""
++        qs = RelatedModel.objects.order_by("self_ref__parent__id")
++        sql = str(qs.query)
++        
++        # Should use direct column reference
++        self.assertIn('"parent_id"', sql)
++        
++        # Should use ASC ordering by default
++        self.assertIn('ASC', sql)
++
++def run_tests():
++    """Run the tests."""
++    from django.db import connection
++    
++    # Create the tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SelfReferencingModel)
++        schema_editor.create_model(RelatedModel)
++    
++    # Run the test
++    test = SelfReferencingOrderingTest()
++    test.test_self_referencing_fk_id_ordering()
++    test.test_self_referencing_fk_id_ordering_desc()
++    test.test_self_referencing_fk_without_id_suffix()
++    test.test_self_referencing_fk_double_underscore_id()
++    
++    print("All tests passed!")
++
++if __name__ == "__main__":
++    run_tests()
+\ No newline at end of file

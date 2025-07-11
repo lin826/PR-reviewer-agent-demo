@@ -1,0 +1,104 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index be0deb90b0..2342d4aed8 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -6,6 +6,7 @@ import copy
+ import operator
+ import warnings
+ from itertools import chain, islice
++from operator import attrgetter
+ 
+ from asgiref.sync import sync_to_async
+ 
+@@ -2160,7 +2161,11 @@ class Prefetch:
+                 lookup.split(LOOKUP_SEP)[:-1] + [to_attr]
+             )
+ 
+-        self.queryset = queryset
++        # If queryset is sliced, evaluate it immediately and store the results
++        if queryset is not None and queryset.query.is_sliced:
++            self.queryset = list(queryset)
++        else:
++            self.queryset = queryset
+         self.to_attr = to_attr
+ 
+     def __getstate__(self):
+@@ -2188,6 +2193,9 @@ class Prefetch:
+ 
+     def get_current_queryset(self, level):
+         if self.get_current_prefetch_to(level) == self.prefetch_to:
++            # If it's already a list (evaluated sliced queryset), return it directly
++            if isinstance(self.queryset, list):
++                return self.queryset
+             return self.queryset
+         return None
+ 
+@@ -2448,29 +2456,44 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+     # The 'values to be matched' must be hashable as they will be used
+     # in a dictionary.
+ 
+-    (
+-        rel_qs,
+-        rel_obj_attr,
+-        instance_attr,
+-        single,
+-        cache_name,
+-        is_descriptor,
+-    ) = prefetcher.get_prefetch_queryset(instances, lookup.get_current_queryset(level))
+-    # We have to handle the possibility that the QuerySet we just got back
+-    # contains some prefetch_related lookups. We don't want to trigger the
+-    # prefetch_related functionality by evaluating the query. Rather, we need
+-    # to merge in the prefetch_related lookups.
+-    # Copy the lookups in case it is a Prefetch object which could be reused
+-    # later (happens in nested prefetch_related).
+-    additional_lookups = [
+-        copy.copy(additional_lookup)
+-        for additional_lookup in getattr(rel_qs, "_prefetch_related_lookups", ())
+-    ]
+-    if additional_lookups:
+-        # Don't need to clone because the manager should have given us a fresh
+-        # instance, so we access an internal instead of using public interface
+-        # for performance reasons.
+-        rel_qs._prefetch_related_lookups = ()
++    current_queryset = lookup.get_current_queryset(level)
++    
++    # Handle case where queryset is already a list (from a sliced queryset)
++    if isinstance(current_queryset, list):
++        # For already evaluated querysets (lists), use standard attributes
++        rel_qs = current_queryset
++        rel_obj_attr = attrgetter("pk")
++        instance_attr = attrgetter("pk")
++        single = False
++        cache_name = lookup.prefetch_to
++        is_descriptor = False
++        additional_lookups = []
++    else:
++        # Normal case with a queryset
++        (
++            rel_qs,
++            rel_obj_attr,
++            instance_attr,
++            single,
++            cache_name,
++            is_descriptor,
++        ) = prefetcher.get_prefetch_queryset(instances, current_queryset)
++        
++        # We have to handle the possibility that the QuerySet we just got back
++        # contains some prefetch_related lookups. We don't want to trigger the
++        # prefetch_related functionality by evaluating the query. Rather, we need
++        # to merge in the prefetch_related lookups.
++        # Copy the lookups in case it is a Prefetch object which could be reused
++        # later (happens in nested prefetch_related).
++        additional_lookups = [
++            copy.copy(additional_lookup)
++            for additional_lookup in getattr(rel_qs, "_prefetch_related_lookups", ())
++        ]
++        if additional_lookups:
++            # Don't need to clone because the manager should have given us a fresh
++            # instance, so we access an internal instead of using public interface
++            # for performance reasons.
++            rel_qs._prefetch_related_lookups = ()
+ 
+     all_related_objects = list(rel_qs)
+ 
+

@@ -1,0 +1,117 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 3ce711f3f1..f25ea7e010 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1706,7 +1706,11 @@ class Model(metaclass=ModelBase):
+         for field in related_fields:
+             _cls = cls
+             fld = None
+-            for part in field.split(LOOKUP_SEP):
++            parts = field.split(LOOKUP_SEP)
++            for i, part in enumerate(parts):
++                # Skip the last part if it is 'pk' - this is always valid
++                if i == len(parts) - 1 and part == 'pk':
++                    break
+                 try:
+                     fld = _cls._meta.get_field(part)
+                     if fld.is_relation:
+diff --git a/test_issue.py b/test_issue.py
+new file mode 100644
+index 0000000000..129e093fcd
+--- /dev/null
++++ b/test_issue.py
+@@ -0,0 +1,60 @@
++import os
++import sys
++import django
++from django.conf import settings
++from django.core.checks import Error
++from django.db import models
++
++# Configure Django settings
++settings.configure(
++    DEBUG=True,
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++    ],
++)
++django.setup()
++
++# Define models to reproduce the issue
++class Option(models.Model):
++    name = models.CharField(max_length=100)
++    class Meta:
++        app_label = 'test_app'
++
++class SomeModel(models.Model):
++    option = models.ForeignKey(Option, on_delete=models.CASCADE)
++    class Meta:
++        app_label = 'test_app'
++        # This is the issue - ordering by a related field's pk
++        ordering = ['option__pk']
++
++class InvalidModel(models.Model):
++    option = models.ForeignKey(Option, on_delete=models.CASCADE)
++    class Meta:
++        app_label = 'test_app'
++        # This should still raise an error - nonexistent field
++        ordering = ['option__nonexistent']
++
++# Test 1: The main issue - ordering by related field's pk
++errors1 = SomeModel.check()
++has_pk_error = any(e.id == 'models.E015' and 'option__pk' in e.msg for e in errors1)
++
++# Test 2: Invalid ordering - ordering by a nonexistent field
++errors2 = InvalidModel.check()
++has_invalid_error = any(e.id == 'models.E015' and 'option__nonexistent' in e.msg for e in errors2)
++
++# Print results
++print("TEST RESULTS:")
++print(f"1. Test with 'option__pk': {'FAILED - Error incorrectly raised' if has_pk_error else 'PASSED - No error raised'}")
++print(f"2. Test with 'option__nonexistent': {'PASSED - Error correctly raised' if has_invalid_error else 'FAILED - Error not raised'}")
++
++# Print error details for debugging
++print("\nError details:")
++print("For SomeModel:")
++for error in errors1:
++    if error.id != 'fields.E300':  # Skip the expected error about model not installed
++        print(f"  {error.id} - {error.msg}")
++
++print("For InvalidModel:")
++for error in errors2:
++    if error.id != 'fields.E300':  # Skip the expected error about model not installed
++        print(f"  {error.id} - {error.msg}")
+\ No newline at end of file
+diff --git a/tests/invalid_models_tests/test_models.py b/tests/invalid_models_tests/test_models.py
+index 0f1d1e4dc3..800b20f492 100644
+--- a/tests/invalid_models_tests/test_models.py
++++ b/tests/invalid_models_tests/test_models.py
+@@ -747,7 +747,7 @@ class OtherModelTests(SimpleTestCase):
+ 
+             class Meta:
+                 ordering = ('missing_related__id',)
+-
++        
+         self.assertEqual(Model.check(), [
+             Error(
+                 "'ordering' refers to the nonexistent field, related field, "
+@@ -756,6 +756,19 @@ class OtherModelTests(SimpleTestCase):
+                 id='models.E015',
+             )
+         ])
++                
++    def test_ordering_pointing_to_related_pk_field(self):
++        class ParentModel(models.Model):
++            pass
++
++        class ChildModel(models.Model):
++            parent = models.ForeignKey(ParentModel, on_delete=models.CASCADE)
++
++            class Meta:
++                ordering = ('parent__pk',)
++
++        # No errors should be raised for ordering on a related model's pk
++        self.assertEqual(ChildModel.check(), [])
+ 
+     def test_ordering_pointing_to_missing_related_model_field(self):
+         class Parent(models.Model):

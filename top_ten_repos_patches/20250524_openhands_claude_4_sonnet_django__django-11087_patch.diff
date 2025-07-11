@@ -1,0 +1,1246 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 3a462f1c4c..2406fafaf1 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -232,9 +232,21 @@ class Collector:
+         """
+         Get a QuerySet of objects related to `objs` via the relation `related`.
+         """
+-        return related.related_model._base_manager.using(self.using).filter(
++        qs = related.related_model._base_manager.using(self.using).filter(
+             **{"%s__in" % related.field.name: objs}
+         )
++        
++        # For deletion, we only need the primary key and foreign keys to parent models.
++        # This avoids fetching unnecessary fields that might contain invalid data
++        # and improves performance.
++        only_fields = [related.related_model._meta.pk.name]
++        
++        # Add foreign key fields that point to parent models (needed for inheritance)
++        for parent_link in related.related_model._meta.parents.values():
++            if parent_link:
++                only_fields.append(parent_link.name)
++        
++        return qs.only(*only_fields)
+ 
+     def instances_with_model(self):
+         for model, instances in self.data.items():
+diff --git a/test_comprehensive_deletion.py b/test_comprehensive_deletion.py
+new file mode 100644
+index 0000000000..5ecc66b240
+--- /dev/null
++++ b/test_comprehensive_deletion.py
+@@ -0,0 +1,306 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the deletion optimization works in various scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models.deletion import Collector
++
++
++# Test models for various scenarios
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++    data = models.TextField()  # Could contain problematic data
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class RelatedToSimple(models.Model):
++    simple = models.ForeignKey(SimpleModel, on_delete=models.CASCADE)
++    description = models.TextField()  # Could contain problematic data
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class ParentModel(models.Model):
++    parent_field = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class ChildModel(ParentModel):
++    child_field = models.CharField(max_length=100)
++    problematic_data = models.TextField()  # Could contain problematic data
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class RelatedToChild(models.Model):
++    child = models.ForeignKey(ChildModel, on_delete=models.CASCADE)
++    more_data = models.TextField()  # Could contain problematic data
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def create_tables():
++    """Create all test tables."""
++    with connection.schema_editor() as schema_editor:
++        models_to_create = [SimpleModel, RelatedToSimple, ParentModel, ChildModel, RelatedToChild]
++        table_names = connection.introspection.table_names()
++        
++        for model in models_to_create:
++            if model._meta.db_table not in table_names:
++                schema_editor.create_model(model)
++
++
++def test_simple_model_deletion():
++    """Test deletion optimization with simple models."""
++    print("Testing simple model deletion optimization...")
++    
++    # Create test data
++    simple = SimpleModel.objects.create(
++        name="Test Simple",
++        data="This could contain problematic UTF-8 data"
++    )
++    
++    related = RelatedToSimple.objects.create(
++        simple=simple,
++        description="This could also contain problematic UTF-8 data"
++    )
++    
++    # Test collector behavior
++    collector = Collector(using='default')
++    
++    # Find the relation from SimpleModel to RelatedToSimple
++    for field in SimpleModel._meta.get_fields():
++        if hasattr(field, 'related_model') and field.related_model == RelatedToSimple:
++            related_objs = collector.related_objects(field, [simple])
++            query_str = str(related_objs.query)
++            print(f"Simple model query: {query_str}")
++            
++            # Should only include primary key
++            if 'description' in query_str:
++                print("✗ Problematic field 'description' found in query")
++                return False
++            else:
++                print("✓ Problematic field 'description' NOT found in query")
++            
++            # Test execution
++            try:
++                list(related_objs)
++                print("✓ Query executed successfully")
++            except Exception as e:
++                print(f"✗ Query execution failed: {e}")
++                return False
++            
++            break
++    
++    # Test actual deletion
++    try:
++        simple.delete()
++        print("✓ Deletion completed successfully")
++        return True
++    except Exception as e:
++        print(f"✗ Deletion failed: {e}")
++        return False
++
++
++def test_inheritance_model_deletion():
++    """Test deletion optimization with inherited models."""
++    print("\nTesting inheritance model deletion optimization...")
++    
++    # Create test data
++    child = ChildModel.objects.create(
++        parent_field="Parent Field Value",
++        child_field="Child Field Value",
++        problematic_data="This could contain problematic UTF-8 data"
++    )
++    
++    related = RelatedToChild.objects.create(
++        child=child,
++        more_data="This could also contain problematic UTF-8 data"
++    )
++    
++    # Test collector behavior
++    collector = Collector(using='default')
++    
++    # Find the relation from ChildModel to RelatedToChild
++    for field in ChildModel._meta.get_fields():
++        if hasattr(field, 'related_model') and field.related_model == RelatedToChild:
++            related_objs = collector.related_objects(field, [child])
++            query_str = str(related_objs.query)
++            print(f"Inheritance model query: {query_str}")
++            
++            # Should only include primary key (and parent links if needed)
++            if 'more_data' in query_str:
++                print("✗ Problematic field 'more_data' found in query")
++                return False
++            else:
++                print("✓ Problematic field 'more_data' NOT found in query")
++            
++            # Test execution
++            try:
++                list(related_objs)
++                print("✓ Query executed successfully")
++            except Exception as e:
++                print(f"✗ Query execution failed: {e}")
++                return False
++            
++            break
++    
++    # Test actual deletion
++    try:
++        child.delete()
++        print("✓ Deletion completed successfully")
++        return True
++    except Exception as e:
++        print(f"✗ Deletion failed: {e}")
++        return False
++
++
++def test_field_selection_logic():
++    """Test the field selection logic directly."""
++    print("\nTesting field selection logic...")
++    
++    # Test with simple model
++    simple_fields = [SimpleModel._meta.pk.name]
++    for parent_link in SimpleModel._meta.parents.values():
++        if parent_link:
++            simple_fields.append(parent_link.name)
++    
++    print(f"SimpleModel fields: {simple_fields}")
++    
++    # Test with inherited model
++    child_fields = [ChildModel._meta.pk.name]
++    for parent_link in ChildModel._meta.parents.values():
++        if parent_link:
++            child_fields.append(parent_link.name)
++    
++    print(f"ChildModel fields: {child_fields}")
++    print(f"ChildModel parents: {ChildModel._meta.parents}")
++    
++    # Verify the logic works
++    if len(simple_fields) == 1:  # Only primary key
++        print("✓ Simple model has only primary key")
++    else:
++        print(f"⚠ Simple model has additional fields: {simple_fields}")
++    
++    if len(child_fields) >= 1:  # Primary key and possibly parent links
++        print("✓ Child model has primary key and parent links")
++    else:
++        print(f"✗ Child model missing required fields: {child_fields}")
++    
++    return True
++
++
++def test_performance_comparison():
++    """Compare query performance between old and new approaches."""
++    print("\nTesting performance comparison...")
++    
++    create_tables()
++    
++    # Create test data
++    simple = SimpleModel.objects.create(name="Perf Test", data="Large data field" * 100)
++    for i in range(10):
++        RelatedToSimple.objects.create(
++            simple=simple,
++            description=f"Large description field {i}" * 50
++        )
++    
++    # Test old approach (fetch all fields)
++    old_query = RelatedToSimple.objects.filter(simple=simple)
++    old_sql = str(old_query.query)
++    print(f"Old approach SQL: {old_sql}")
++    
++    # Test new approach (fetch only required fields)
++    collector = Collector(using='default')
++    for field in SimpleModel._meta.get_fields():
++        if hasattr(field, 'related_model') and field.related_model == RelatedToSimple:
++            new_query = collector.related_objects(field, [simple])
++            new_sql = str(new_query.query)
++            print(f"New approach SQL: {new_sql}")
++            
++            # Count fields in each query
++            old_field_count = old_sql.count('",')
++            new_field_count = new_sql.count('",')
++            
++            print(f"Old approach field count: ~{old_field_count + 1}")
++            print(f"New approach field count: ~{new_field_count + 1}")
++            
++            if new_field_count < old_field_count:
++                print("✓ New approach fetches fewer fields")
++                return True
++            else:
++                print("⚠ New approach doesn't reduce field count significantly")
++                return True  # Still valid if it works correctly
++    
++    return False
++
++
++if __name__ == '__main__':
++    print("Comprehensive Deletion Optimization Test")
++    print("="*50)
++    
++    create_tables()
++    
++    # Run all tests
++    tests = [
++        ("Simple Model Deletion", test_simple_model_deletion),
++        ("Inheritance Model Deletion", test_inheritance_model_deletion),
++        ("Field Selection Logic", test_field_selection_logic),
++        ("Performance Comparison", test_performance_comparison),
++    ]
++    
++    results = []
++    for test_name, test_func in tests:
++        try:
++            result = test_func()
++            results.append((test_name, result))
++        except Exception as e:
++            print(f"✗ {test_name} failed with exception: {e}")
++            results.append((test_name, False))
++    
++    print("\n" + "="*50)
++    print("Summary:")
++    all_passed = True
++    for test_name, result in results:
++        status = "✓ Passed" if result else "✗ Failed"
++        print(f"{test_name}: {status}")
++        if not result:
++            all_passed = False
++    
++    print("\n" + "="*50)
++    if all_passed:
++        print("✓ All tests passed! The deletion optimization is working correctly.")
++    else:
++        print("✗ Some tests failed. The optimization may need adjustment.")
+\ No newline at end of file
+diff --git a/test_inheritance_deletion.py b/test_inheritance_deletion.py
+new file mode 100644
+index 0000000000..348c31e77d
+--- /dev/null
++++ b/test_inheritance_deletion.py
+@@ -0,0 +1,237 @@
++#!/usr/bin/env python
++"""
++Test script to verify that the deletion optimization works correctly with model inheritance.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models.deletion import Collector
++
++
++# Test models with inheritance
++class BaseModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class ChildModel(BaseModel):
++    extra_field = models.CharField(max_length=100)
++    problematic_field = models.TextField()  # This could contain invalid UTF-8
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class RelatedModel(models.Model):
++    child = models.ForeignKey(ChildModel, on_delete=models.CASCADE)
++    description = models.TextField()  # Another field that could be problematic
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def create_tables():
++    """Create the test tables."""
++    with connection.schema_editor() as schema_editor:
++        table_names = connection.introspection.table_names()
++        if BaseModel._meta.db_table not in table_names:
++            schema_editor.create_model(BaseModel)
++        if ChildModel._meta.db_table not in table_names:
++            schema_editor.create_model(ChildModel)
++        if RelatedModel._meta.db_table not in table_names:
++            schema_editor.create_model(RelatedModel)
++
++
++def test_inheritance_deletion():
++    """Test deletion with model inheritance."""
++    print("Testing deletion optimization with model inheritance...")
++    
++    create_tables()
++    
++    # Create test data
++    child = ChildModel.objects.create(
++        name="Test Child",
++        extra_field="Extra data",
++        problematic_field="This could contain invalid UTF-8"
++    )
++    
++    related = RelatedModel.objects.create(
++        child=child,
++        description="This could also contain invalid UTF-8"
++    )
++    
++    print(f"Created child model: {child}")
++    print(f"Created related model: {related}")
++    
++    # Test the collector behavior
++    collector = Collector(using='default')
++    
++    # Find the relation from ChildModel to RelatedModel
++    child_meta = ChildModel._meta
++    related_relation = None
++    
++    for field in child_meta.get_fields():
++        if hasattr(field, 'related_model') and field.related_model == RelatedModel:
++            related_relation = field
++            break
++    
++    if related_relation:
++        print(f"Found relation: {related_relation}")
++        
++        # Test the related_objects method
++        related_objs = collector.related_objects(related_relation, [child])
++        print(f"Related objects query: {related_objs.query}")
++        
++        # Check what fields are being fetched
++        query_str = str(related_objs.query)
++        
++        # The query should only include the primary key and parent foreign keys
++        expected_fields = ['id']  # Primary key
++        
++        # Check for parent foreign keys
++        for parent_link in RelatedModel._meta.parents.values():
++            if parent_link:
++                expected_fields.append(parent_link.name)
++        
++        print(f"Expected fields in query: {expected_fields}")
++        
++        # Verify that problematic fields are NOT in the query
++        problematic_fields = ['description']  # Fields that could contain invalid UTF-8
++        
++        for field in problematic_fields:
++            if field in query_str:
++                print(f"✗ Problematic field '{field}' found in query")
++                return False
++            else:
++                print(f"✓ Problematic field '{field}' NOT in query")
++        
++        # Verify that required fields ARE in the query
++        for field in expected_fields:
++            if field in query_str:
++                print(f"✓ Required field '{field}' found in query")
++            else:
++                print(f"⚠ Required field '{field}' not found in query (may be aliased)")
++        
++        # Test that the query actually works
++        try:
++            result = list(related_objs)
++            print(f"✓ Query executed successfully, found {len(result)} objects")
++            
++            # Test deletion
++            child.delete()
++            print("✓ Deletion completed successfully")
++            
++            return True
++            
++        except Exception as e:
++            print(f"✗ Error executing query or deletion: {e}")
++            return False
++    else:
++        print("✗ Could not find relation from ChildModel to RelatedModel")
++        return False
++
++
++def test_parent_field_inclusion():
++    """Test that parent foreign key fields are included when needed."""
++    print("\n" + "="*50)
++    print("Testing parent foreign key field inclusion...")
++    
++    # Check ChildModel's parent relationships
++    child_parents = ChildModel._meta.parents
++    print(f"ChildModel parents: {child_parents}")
++    
++    if child_parents:
++        print("✓ ChildModel has parent relationships")
++        for parent, link in child_parents.items():
++            print(f"  Parent: {parent}, Link: {link}")
++            if link:
++                print(f"  Link field name: {link.name}")
++    else:
++        print("ℹ ChildModel has no parent relationships")
++    
++    # Test with a model that has parents
++    collector = Collector(using='default')
++    
++    # Create a fake relation to test parent field inclusion
++    class FakeRelation:
++        def __init__(self, related_model):
++            self.related_model = related_model
++            self.field = type('FakeField', (), {'name': 'fake_field'})()
++    
++    fake_relation = FakeRelation(ChildModel)
++    
++    # Test the related_objects method with ChildModel (which inherits from BaseModel)
++    try:
++        # We need to create some fake objects to test with
++        create_tables()
++        child = ChildModel.objects.create(
++            name="Test for parent fields",
++            extra_field="Extra",
++            problematic_field="Problematic"
++        )
++        
++        # This should include parent foreign key fields
++        related_objs = collector.related_objects(fake_relation, [child])
++        query_str = str(related_objs.query)
++        print(f"Query for model with parents: {query_str}")
++        
++        # Check if parent link fields are included
++        for parent_link in ChildModel._meta.parents.values():
++            if parent_link:
++                if parent_link.name in query_str:
++                    print(f"✓ Parent link field '{parent_link.name}' included in query")
++                else:
++                    print(f"⚠ Parent link field '{parent_link.name}' not found in query")
++        
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error testing parent field inclusion: {e}")
++        return False
++
++
++if __name__ == '__main__':
++    print("Django Deletion Optimization with Inheritance Test")
++    print("="*50)
++    
++    # Test basic inheritance deletion
++    success1 = test_inheritance_deletion()
++    
++    # Test parent field inclusion
++    success2 = test_parent_field_inclusion()
++    
++    print("\n" + "="*50)
++    print("Summary:")
++    print(f"Inheritance deletion test: {'✓ Passed' if success1 else '✗ Failed'}")
++    print(f"Parent field inclusion test: {'✓ Passed' if success2 else '✗ Failed'}")
++    
++    if success1 and success2:
++        print("\n✓ All tests passed! The optimization works correctly with inheritance.")
++    else:
++        print("\n✗ Some tests failed. The optimization may need adjustment.")
+\ No newline at end of file
+diff --git a/test_parent_fields.py b/test_parent_fields.py
+new file mode 100644
+index 0000000000..45fbfb2b05
+--- /dev/null
++++ b/test_parent_fields.py
+@@ -0,0 +1,210 @@
++#!/usr/bin/env python
++"""
++Test script to verify that parent foreign key fields are included in deletion queries.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models.deletion import Collector
++
++
++# Test models with inheritance
++class Parent(models.Model):
++    parent_name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Child(Parent):
++    child_name = models.CharField(max_length=100)
++    problematic_field = models.TextField()  # This could contain invalid UTF-8
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def create_tables():
++    """Create the test tables."""
++    with connection.schema_editor() as schema_editor:
++        table_names = connection.introspection.table_names()
++        if Parent._meta.db_table not in table_names:
++            schema_editor.create_model(Parent)
++        if Child._meta.db_table not in table_names:
++            schema_editor.create_model(Child)
++
++
++def test_parent_field_inclusion():
++    """Test that parent foreign key fields are included in deletion queries."""
++    print("Testing parent foreign key field inclusion...")
++    
++    create_tables()
++    
++    # Create test data
++    child = Child.objects.create(
++        parent_name="Parent Name",
++        child_name="Child Name", 
++        problematic_field="This could contain invalid UTF-8"
++    )
++    
++    print(f"Created child: {child}")
++    print(f"Child parents: {Child._meta.parents}")
++    
++    # Test the collector with Child model
++    collector = Collector(using='default')
++    
++    # Create a mock relation that points to Child
++    class MockRelation:
++        def __init__(self):
++            self.related_model = Child
++            self.field = type('MockField', (), {'name': 'child'})()
++    
++    mock_relation = MockRelation()
++    
++    # Test the related_objects method
++    try:
++        related_objs = collector.related_objects(mock_relation, [child])
++        query_str = str(related_objs.query)
++        print(f"Query: {query_str}")
++        
++        # Check what fields are being selected
++        # For Child model with inheritance, we should see:
++        # 1. Primary key (id)
++        # 2. Parent foreign key (parent_ptr or similar)
++        
++        # Check if parent link is included
++        parent_links = Child._meta.parents
++        print(f"Parent links: {parent_links}")
++        
++        for parent_model, parent_link in parent_links.items():
++            if parent_link:
++                print(f"Parent link field: {parent_link.name}")
++                # The parent link field should be included in the query
++                if parent_link.name in query_str or f'"{parent_link.name}"' in query_str:
++                    print(f"✓ Parent link field '{parent_link.name}' found in query")
++                else:
++                    print(f"⚠ Parent link field '{parent_link.name}' not explicitly found in query")
++                    # It might be included implicitly or with a different name
++        
++        # Verify problematic fields are NOT included
++        if 'problematic_field' in query_str:
++            print("✗ Problematic field found in query")
++            return False
++        else:
++            print("✓ Problematic field NOT found in query")
++        
++        # Test that the query works
++        result = list(related_objs)
++        print(f"✓ Query executed successfully, found {len(result)} objects")
++        
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error: {e}")
++        return False
++
++
++def test_only_fields_logic():
++    """Test the logic for determining which fields to include."""
++    print("\n" + "="*50)
++    print("Testing only_fields logic...")
++    
++    # Test with Child model
++    model = Child
++    print(f"Testing with model: {model}")
++    print(f"Primary key: {model._meta.pk.name}")
++    print(f"Parents: {model._meta.parents}")
++    
++    # Simulate the logic from our fix
++    only_fields = [model._meta.pk.name]
++    print(f"Initial only_fields: {only_fields}")
++    
++    # Add foreign key fields that point to parent models
++    for parent_link in model._meta.parents.values():
++        if parent_link:
++            only_fields.append(parent_link.name)
++            print(f"Added parent link: {parent_link.name}")
++    
++    print(f"Final only_fields: {only_fields}")
++    
++    # Test creating a query with these fields
++    try:
++        create_tables()
++        child = Child.objects.create(
++            parent_name="Test Parent",
++            child_name="Test Child",
++            problematic_field="Test problematic"
++        )
++        
++        # Create a queryset with only the required fields
++        qs = Child.objects.filter(id=child.id).only(*only_fields)
++        query_str = str(qs.query)
++        print(f"Test query: {query_str}")
++        
++        # Execute the query
++        result = list(qs)
++        print(f"✓ Query with only_fields executed successfully, found {len(result)} objects")
++        
++        # Verify we can access the required fields
++        obj = result[0]
++        print(f"Object ID: {obj.id}")
++        
++        # Try to access parent link if it exists
++        for parent_link in model._meta.parents.values():
++            if parent_link:
++                try:
++                    parent_value = getattr(obj, parent_link.name)
++                    print(f"✓ Can access parent link {parent_link.name}: {parent_value}")
++                except Exception as e:
++                    print(f"⚠ Cannot access parent link {parent_link.name}: {e}")
++        
++        return True
++        
++    except Exception as e:
++        print(f"✗ Error testing only_fields logic: {e}")
++        return False
++
++
++if __name__ == '__main__':
++    print("Django Parent Field Inclusion Test")
++    print("="*50)
++    
++    # Test parent field inclusion
++    success1 = test_parent_field_inclusion()
++    
++    # Test only_fields logic
++    success2 = test_only_fields_logic()
++    
++    print("\n" + "="*50)
++    print("Summary:")
++    print(f"Parent field inclusion test: {'✓ Passed' if success1 else '✗ Failed'}")
++    print(f"Only fields logic test: {'✓ Passed' if success2 else '✗ Failed'}")
++    
++    if success1 and success2:
++        print("\n✓ All tests passed! Parent fields are handled correctly.")
++    else:
++        print("\n✗ Some tests failed. Parent field handling may need review.")
+\ No newline at end of file
+diff --git a/test_unicode_deletion.py b/test_unicode_deletion.py
+new file mode 100644
+index 0000000000..17a3a291d0
+--- /dev/null
++++ b/test_unicode_deletion.py
+@@ -0,0 +1,213 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the Unicode deletion issue.
++
++This script creates models with cascade relationships and inserts data with
++invalid UTF-8 sequences to reproduce the UnicodeDecodeError during deletion.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models.deletion import Collector
++
++
++# Test models that simulate the issue
++class Job(models.Model):
++    guid = models.CharField(max_length=50, unique=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TextLogError(models.Model):
++    job = models.ForeignKey(Job, on_delete=models.CASCADE)
++    line = models.TextField()  # This field will contain invalid UTF-8
++    line_number = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def create_tables():
++    """Create the test tables."""
++    with connection.schema_editor() as schema_editor:
++        # Check if tables exist first
++        table_names = connection.introspection.table_names()
++        if Job._meta.db_table not in table_names:
++            schema_editor.create_model(Job)
++        if TextLogError._meta.db_table not in table_names:
++            schema_editor.create_model(TextLogError)
++
++
++def insert_test_data():
++    """Insert test data including invalid UTF-8 in the line field."""
++    # Create a job (or get existing one)
++    job, created = Job.objects.get_or_create(
++        guid='test-job-guid', 
++        defaults={'name': 'Test Job'}
++    )
++    
++    # Create a text log error with invalid UTF-8 data
++    # This simulates the problematic data mentioned in the issue
++    invalid_utf8_bytes = b'Some text with invalid UTF-8: \xed\xa0\x80'
++    
++    # In Python 3, we need to simulate how this invalid data might end up in the database
++    # We'll use a string that would cause issues when decoded
++    try:
++        # This will create a string that contains problematic characters
++        invalid_text = invalid_utf8_bytes.decode('utf-8', errors='replace')
++        # Add some replacement characters to simulate the issue
++        invalid_text = "Some log text with problematic chars: \ufffd\ufffd"
++    except UnicodeDecodeError:
++        invalid_text = "Some log text with problematic chars"
++    
++    # Only create if it doesn't exist
++    if not TextLogError.objects.filter(job=job, line_number=1).exists():
++        TextLogError.objects.create(
++            job=job,
++            line=invalid_text,
++            line_number=1
++        )
++    
++    return job
++
++
++def test_deletion_with_unicode_issue():
++    """Test deletion that would trigger the Unicode issue."""
++    print("Creating test tables...")
++    create_tables()
++    
++    print("Inserting test data...")
++    job = insert_test_data()
++    
++    print("Testing deletion...")
++    try:
++        # This should trigger the cascade deletion that fetches all fields
++        # including the problematic 'line' field
++        job.delete()
++        print("✓ Deletion completed successfully")
++        return True
++    except UnicodeDecodeError as e:
++        print(f"✗ UnicodeDecodeError occurred: {e}")
++        return False
++    except Exception as e:
++        print(f"✗ Other error occurred: {e}")
++        return False
++
++
++def test_collector_directly():
++    """Test the Collector class directly to see field fetching behavior."""
++    print("\n" + "="*50)
++    print("Testing Collector behavior directly...")
++    
++    create_tables()
++    job = insert_test_data()
++    
++    # Create a collector and test the related_objects method
++    collector = Collector(using='default')
++    
++    # Get the related field from Job to TextLogError
++    job_meta = Job._meta
++    text_log_error_relation = None
++    
++    for field in job_meta.get_fields():
++        if hasattr(field, 'related_model') and field.related_model == TextLogError:
++            text_log_error_relation = field
++            break
++    
++    if text_log_error_relation:
++        print(f"Found relation: {text_log_error_relation}")
++        
++        # Test the related_objects method
++        try:
++            related_objs = collector.related_objects(text_log_error_relation, [job])
++            print(f"Related objects query: {related_objs.query}")
++            
++            # This is where the issue occurs - when the QuerySet is evaluated
++            print("Evaluating QuerySet (this may trigger the Unicode error)...")
++            list(related_objs)  # Force evaluation
++            print("✓ QuerySet evaluation completed successfully")
++            
++        except UnicodeDecodeError as e:
++            print(f"✗ UnicodeDecodeError in related_objects: {e}")
++        except Exception as e:
++            print(f"✗ Other error in related_objects: {e}")
++    else:
++        print("Could not find the reverse relation from Job to TextLogError")
++
++
++def test_optimized_related_objects():
++    """Test what fields are actually needed for deletion."""
++    print("\n" + "="*50)
++    print("Testing optimized field selection...")
++    
++    create_tables()
++    job = insert_test_data()
++    
++    # Test fetching only required fields
++    text_log_errors = TextLogError.objects.filter(job=job)
++    
++    print("Original query (all fields):")
++    print(f"  SQL: {text_log_errors.query}")
++    
++    # Test with only primary key
++    text_log_errors_pk_only = TextLogError.objects.filter(job=job).only('pk')
++    print("Optimized query (pk only):")
++    print(f"  SQL: {text_log_errors_pk_only.query}")
++    
++    # Test with pk and foreign key
++    text_log_errors_minimal = TextLogError.objects.filter(job=job).only('pk', 'job')
++    print("Optimized query (pk + fk):")
++    print(f"  SQL: {text_log_errors_minimal.query}")
++    
++    try:
++        print("Evaluating optimized QuerySet...")
++        list(text_log_errors_minimal)
++        print("✓ Optimized QuerySet evaluation completed successfully")
++    except Exception as e:
++        print(f"✗ Error in optimized QuerySet: {e}")
++
++
++if __name__ == '__main__':
++    print("Django Unicode Deletion Issue Reproduction Script")
++    print("="*50)
++    
++    # Test the deletion issue
++    success = test_deletion_with_unicode_issue()
++    
++    # Test collector behavior
++    test_collector_directly()
++    
++    # Test optimized approach
++    test_optimized_related_objects()
++    
++    print("\n" + "="*50)
++    if success:
++        print("All tests passed - no Unicode issue detected")
++    else:
++        print("Unicode issue reproduced successfully")
+\ No newline at end of file
+diff --git a/test_unicode_issue_mysql.py b/test_unicode_issue_mysql.py
+new file mode 100644
+index 0000000000..d0491653cb
+--- /dev/null
++++ b/test_unicode_issue_mysql.py
+@@ -0,0 +1,218 @@
++#!/usr/bin/env python
++"""
++Test script to simulate the MySQL Unicode deletion issue.
++
++This script simulates the exact issue described in the bug report by
++mocking the MySQL behavior that causes UnicodeDecodeError.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from unittest.mock import patch, MagicMock
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models.deletion import Collector
++
++
++# Test models that simulate the issue
++class Job(models.Model):
++    guid = models.CharField(max_length=50, unique=True)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TextLogError(models.Model):
++    job = models.ForeignKey(Job, on_delete=models.CASCADE)
++    line = models.TextField()  # This field will contain invalid UTF-8
++    line_number = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def create_tables():
++    """Create the test tables."""
++    with connection.schema_editor() as schema_editor:
++        # Check if tables exist first
++        table_names = connection.introspection.table_names()
++        if Job._meta.db_table not in table_names:
++            schema_editor.create_model(Job)
++        if TextLogError._meta.db_table not in table_names:
++            schema_editor.create_model(TextLogError)
++
++
++def insert_test_data():
++    """Insert test data."""
++    # Create a job (or get existing one)
++    job, created = Job.objects.get_or_create(
++        guid='test-job-guid', 
++        defaults={'name': 'Test Job'}
++    )
++    
++    # Only create if it doesn't exist
++    if not TextLogError.objects.filter(job=job, line_number=1).exists():
++        TextLogError.objects.create(
++            job=job,
++            line="Some log text that would cause Unicode issues in MySQL",
++            line_number=1
++        )
++    
++    return job
++
++
++def mock_unicode_error(*args, **kwargs):
++    """Mock function that raises UnicodeDecodeError to simulate MySQL issue."""
++    raise UnicodeDecodeError(
++        'utf-8', 
++        b'\xed\xa0\x80', 
++        78, 
++        79, 
++        'invalid continuation byte'
++    )
++
++
++def test_current_deletion_behavior():
++    """Test current deletion behavior that fetches all fields."""
++    print("Testing current deletion behavior (fetches all fields)...")
++    
++    create_tables()
++    job = insert_test_data()
++    
++    # Mock the cursor.execute to raise UnicodeDecodeError when all fields are fetched
++    with patch('django.db.backends.utils.CursorWrapper.execute') as mock_execute:
++        def selective_unicode_error(sql, params=None):
++            # Only raise error if the SQL query includes the 'line' field
++            if 'line' in sql and 'SELECT' in sql.upper():
++                print(f"SQL query that would cause Unicode error: {sql}")
++                raise UnicodeDecodeError(
++                    'utf-8', 
++                    b'\xed\xa0\x80', 
++                    78, 
++                    79, 
++                    'invalid continuation byte'
++                )
++            # For other queries, call the real execute
++            return mock_execute.wraps(connection.cursor().execute)(sql, params)
++        
++        mock_execute.side_effect = selective_unicode_error
++        
++        try:
++            job.delete()
++            print("✓ Deletion completed (no Unicode error)")
++            return True
++        except UnicodeDecodeError as e:
++            print(f"✗ UnicodeDecodeError occurred: {e}")
++            return False
++
++
++def test_optimized_deletion_behavior():
++    """Test optimized deletion behavior that fetches only required fields."""
++    print("\nTesting optimized deletion behavior (fetches only required fields)...")
++    
++    # We'll test this by manually using the optimized approach
++    create_tables()
++    job = insert_test_data()
++    
++    # Simulate what the optimized related_objects method would do
++    collector = Collector(using='default')
++    
++    # Get the related field
++    job_meta = Job._meta
++    text_log_error_relation = None
++    
++    for field in job_meta.get_fields():
++        if hasattr(field, 'related_model') and field.related_model == TextLogError:
++            text_log_error_relation = field
++            break
++    
++    if text_log_error_relation:
++        # Current approach (fetches all fields)
++        current_query = collector.related_objects(text_log_error_relation, [job])
++        print(f"Current query: {current_query.query}")
++        
++        # Optimized approach (fetches only required fields)
++        optimized_query = collector.related_objects(text_log_error_relation, [job]).only('pk')
++        print(f"Optimized query: {optimized_query.query}")
++        
++        # Mock to only raise error for queries that include 'line' field
++        with patch('django.db.backends.utils.CursorWrapper.execute') as mock_execute:
++            def selective_unicode_error(sql, params=None):
++                if 'line' in sql and 'SELECT' in sql.upper():
++                    print(f"SQL query that would cause Unicode error: {sql}")
++                    raise UnicodeDecodeError(
++                        'utf-8', 
++                        b'\xed\xa0\x80', 
++                        78, 
++                        79, 
++                        'invalid continuation byte'
++                    )
++                # For optimized queries without 'line' field, succeed
++                print(f"Safe SQL query: {sql}")
++                return []  # Return empty result
++            
++            mock_execute.side_effect = selective_unicode_error
++            
++            try:
++                print("Testing current approach...")
++                list(current_query)  # This should fail
++                print("✓ Current approach succeeded (unexpected)")
++            except UnicodeDecodeError:
++                print("✗ Current approach failed with UnicodeDecodeError (expected)")
++            
++            try:
++                print("Testing optimized approach...")
++                list(optimized_query)  # This should succeed
++                print("✓ Optimized approach succeeded (expected)")
++                return True
++            except UnicodeDecodeError:
++                print("✗ Optimized approach failed with UnicodeDecodeError (unexpected)")
++                return False
++    
++    return False
++
++
++if __name__ == '__main__':
++    print("Django Unicode Deletion Issue Simulation")
++    print("="*50)
++    
++    # Test current behavior
++    current_success = test_current_deletion_behavior()
++    
++    # Test optimized behavior
++    optimized_success = test_optimized_deletion_behavior()
++    
++    print("\n" + "="*50)
++    print("Summary:")
++    print(f"Current approach: {'✓ Passed' if current_success else '✗ Failed (Unicode error)'}")
++    print(f"Optimized approach: {'✓ Passed' if optimized_success else '✗ Failed'}")
++    
++    if not current_success and optimized_success:
++        print("\n✓ Optimization successfully avoids the Unicode issue!")
++    elif current_success:
++        print("\n⚠ Unicode issue not reproduced (may be environment-specific)")
++    else:
++        print("\n✗ Both approaches failed")
+\ No newline at end of file

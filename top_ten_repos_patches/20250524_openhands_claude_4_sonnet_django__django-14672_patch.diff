@@ -1,0 +1,507 @@
+diff --git a/django/db/models/fields/reverse_related.py b/django/db/models/fields/reverse_related.py
+index ccc2223a5f..65950590e2 100644
+--- a/django/db/models/fields/reverse_related.py
++++ b/django/db/models/fields/reverse_related.py
+@@ -310,7 +310,7 @@ class ManyToManyRel(ForeignObjectRel):
+     def identity(self):
+         return super().identity + (
+             self.through,
+-            self.through_fields,
++            make_hashable(self.through_fields),
+             self.db_constraint,
+         )
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c3362b403a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the ManyToManyRel through_fields hashable issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++
++# Define the models from the issue description
++class Parent(models.Model):
++    name = models.CharField(max_length=256)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ProxyParent(Parent):
++    class Meta:
++        proxy = True
++        app_label = '__main__'
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE)
++    many_to_many_field = models.ManyToManyField(
++        to=Parent,
++        through="ManyToManyModel",
++        through_fields=['child', 'parent'],
++        related_name="something"
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManyToManyModel(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE, related_name='+')
++    child = models.ForeignKey(Child, on_delete=models.CASCADE, related_name='+')
++    second_child = models.ForeignKey(Child, on_delete=models.CASCADE, null=True, default=None)
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_issue():
++    """Test that reproduces the issue."""
++    print("Testing ManyToManyRel through_fields hashable issue...")
++    
++    try:
++        # This should trigger the model checks that cause the error
++        from django.core.management import call_command
++        call_command('check', verbosity=0)
++        print("✓ Model checks passed - issue is fixed!")
++        return True
++    except TypeError as e:
++        if "unhashable type: 'list'" in str(e):
++            print(f"✗ Issue reproduced: {e}")
++            return False
++        else:
++            print(f"✗ Unexpected error: {e}")
++            return False
++    except Exception as e:
++        print(f"✗ Unexpected error: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_issue()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..14ca9094b2
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,221 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the ManyToManyRel through_fields hashable fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++        DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++    )
++
++django.setup()
++
++from django.db import models
++
++# Test case 1: Original issue - list through_fields
++class Parent1(models.Model):
++    name = models.CharField(max_length=256)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ProxyParent1(Parent1):
++    class Meta:
++        proxy = True
++        app_label = '__main__'
++
++class Child1(models.Model):
++    parent = models.ForeignKey(Parent1, on_delete=models.CASCADE)
++    many_to_many_field = models.ManyToManyField(
++        to=Parent1,
++        through="ManyToManyModel1",
++        through_fields=['child', 'parent'],  # List
++        related_name="something1"
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManyToManyModel1(models.Model):
++    parent = models.ForeignKey(Parent1, on_delete=models.CASCADE, related_name='+')
++    child = models.ForeignKey(Child1, on_delete=models.CASCADE, related_name='+')
++    second_child = models.ForeignKey(Child1, on_delete=models.CASCADE, null=True, default=None)
++    
++    class Meta:
++        app_label = '__main__'
++
++# Test case 2: Tuple through_fields (should work before and after fix)
++class Parent2(models.Model):
++    name = models.CharField(max_length=256)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Child2(models.Model):
++    parent = models.ForeignKey(Parent2, on_delete=models.CASCADE)
++    many_to_many_field = models.ManyToManyField(
++        to=Parent2,
++        through="ManyToManyModel2",
++        through_fields=('child', 'parent'),  # Tuple
++        related_name="something2"
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManyToManyModel2(models.Model):
++    parent = models.ForeignKey(Parent2, on_delete=models.CASCADE, related_name='+')
++    child = models.ForeignKey(Child2, on_delete=models.CASCADE, related_name='+')
++    
++    class Meta:
++        app_label = '__main__'
++
++# Test case 3: None through_fields (should work before and after fix)
++class Parent3(models.Model):
++    name = models.CharField(max_length=256)
++    
++    class Meta:
++        app_label = '__main__'
++
++class Child3(models.Model):
++    parent = models.ForeignKey(Parent3, on_delete=models.CASCADE)
++    many_to_many_field = models.ManyToManyField(
++        to=Parent3,
++        through="ManyToManyModel3",
++        through_fields=None,  # None
++        related_name="something3"
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManyToManyModel3(models.Model):
++    parent = models.ForeignKey(Parent3, on_delete=models.CASCADE, related_name='+')
++    child = models.ForeignKey(Child3, on_delete=models.CASCADE, related_name='+')
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_hash_consistency():
++    """Test that ManyToManyRel objects can be hashed consistently."""
++    print("Testing hash consistency...")
++    
++    # Get the ManyToManyRel objects
++    m2m_field1 = Child1._meta.get_field('many_to_many_field')
++    m2m_field2 = Child2._meta.get_field('many_to_many_field')
++    m2m_field3 = Child3._meta.get_field('many_to_many_field')
++    
++    rel1 = m2m_field1.remote_field
++    rel2 = m2m_field2.remote_field
++    rel3 = m2m_field3.remote_field
++    
++    # Test that they can be hashed
++    try:
++        hash1 = hash(rel1)
++        hash2 = hash(rel2)
++        hash3 = hash(rel3)
++        print(f"✓ All ManyToManyRel objects can be hashed: {hash1}, {hash2}, {hash3}")
++        
++        # Test that hashing is consistent
++        assert hash(rel1) == hash(rel1), "Hash should be consistent"
++        assert hash(rel2) == hash(rel2), "Hash should be consistent"
++        assert hash(rel3) == hash(rel3), "Hash should be consistent"
++        print("✓ Hash consistency verified")
++        
++        # Test that they can be used in sets (which requires hashability)
++        rel_set = {rel1, rel2, rel3}
++        print(f"✓ ManyToManyRel objects can be used in sets: {len(rel_set)} unique objects")
++        
++        return True
++    except Exception as e:
++        print(f"✗ Hash test failed: {e}")
++        return False
++
++def test_identity_property():
++    """Test that the identity property works correctly."""
++    print("Testing identity property...")
++    
++    try:
++        m2m_field1 = Child1._meta.get_field('many_to_many_field')
++        rel1 = m2m_field1.remote_field
++        
++        # Test that identity can be accessed and contains expected elements
++        identity = rel1.identity
++        print(f"✓ Identity property accessible: {len(identity)} elements")
++        
++        # Verify that through_fields is properly converted to hashable form
++        # The identity tuple should contain the hashable version of through_fields
++        through_fields_in_identity = identity[10]  # through_fields is the 11th element (index 10)
++        print(f"✓ through_fields in identity: {through_fields_in_identity} (type: {type(through_fields_in_identity)})")
++        
++        # Should be a tuple now, not a list
++        assert isinstance(through_fields_in_identity, tuple), f"Expected tuple, got {type(through_fields_in_identity)}"
++        assert through_fields_in_identity == ('child', 'parent'), f"Expected ('child', 'parent'), got {through_fields_in_identity}"
++        
++        return True
++    except Exception as e:
++        print(f"✗ Identity test failed: {e}")
++        return False
++
++def test_model_checks():
++    """Test that Django model checks pass."""
++    print("Testing Django model checks...")
++    
++    try:
++        from django.core.management import call_command
++        call_command('check', verbosity=0)
++        print("✓ All model checks passed")
++        return True
++    except Exception as e:
++        print(f"✗ Model checks failed: {e}")
++        return False
++
++def main():
++    """Run all tests."""
++    print("Running comprehensive tests for ManyToManyRel through_fields fix...\n")
++    
++    tests = [
++        test_model_checks,
++        test_hash_consistency,
++        test_identity_property,
++    ]
++    
++    results = []
++    for test in tests:
++        print(f"\n--- {test.__name__} ---")
++        results.append(test())
++    
++    print(f"\n--- SUMMARY ---")
++    passed = sum(results)
++    total = len(results)
++    print(f"Tests passed: {passed}/{total}")
++    
++    if passed == total:
++        print("✓ All tests passed! The fix is working correctly.")
++        return True
++    else:
++        print("✗ Some tests failed.")
++        return False
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_proxy_specific.py b/test_proxy_specific.py
+new file mode 100644
+index 0000000000..dee8506e43
+--- /dev/null
++++ b/test_proxy_specific.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python
++"""
++Test specifically for proxy models with ManyToManyField through_fields.
++This reproduces the exact scenario from the issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++        DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++    )
++
++django.setup()
++
++from django.db import models
++
++# Exact models from the issue description
++class Parent(models.Model):
++    name = models.CharField(max_length=256)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ProxyParent(Parent):
++    class Meta:
++        proxy = True
++        app_label = '__main__'
++
++class Child(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE)
++    many_to_many_field = models.ManyToManyField(
++        to=Parent,
++        through="ManyToManyModel",
++        through_fields=['child', 'parent'],
++        related_name="something"
++    )
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManyToManyModel(models.Model):
++    parent = models.ForeignKey(Parent, on_delete=models.CASCADE, related_name='+')
++    child = models.ForeignKey(Child, on_delete=models.CASCADE, related_name='+')
++    second_child = models.ForeignKey(Child, on_delete=models.CASCADE, null=True, default=None)
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_proxy_model_checks():
++    """Test that proxy models with ManyToMany through_fields work correctly."""
++    print("Testing proxy model with ManyToMany through_fields...")
++    
++    try:
++        # This should trigger the model checks that previously failed
++        from django.core.management import call_command
++        call_command('check', verbosity=2)
++        print("✓ Model checks passed for proxy models!")
++        return True
++    except Exception as e:
++        print(f"✗ Model checks failed: {e}")
++        return False
++
++def test_field_name_clashes():
++    """Test the specific _check_field_name_clashes method that was failing."""
++    print("Testing field name clashes check...")
++    
++    try:
++        # This specifically tests the _check_field_name_clashes method
++        errors = ProxyParent.check()
++        print(f"✓ ProxyParent.check() completed with {len(errors)} errors")
++        
++        # Should not have any errors related to hashing
++        for error in errors:
++            if "unhashable" in str(error):
++                print(f"✗ Found unhashable error: {error}")
++                return False
++        
++        return True
++    except Exception as e:
++        print(f"✗ Field name clashes check failed: {e}")
++        return False
++
++def test_hash_operations():
++    """Test that ManyToManyRel objects can be hashed and used in sets."""
++    print("Testing hash operations on ManyToManyRel...")
++    
++    try:
++        # Get the ManyToManyRel object
++        m2m_field = Child._meta.get_field('many_to_many_field')
++        rel = m2m_field.remote_field
++        
++        # Test hashing
++        hash_value = hash(rel)
++        print(f"✓ ManyToManyRel hash: {hash_value}")
++        
++        # Test using in set (requires hashability)
++        rel_set = {rel}
++        print(f"✓ ManyToManyRel can be used in sets: {len(rel_set)} items")
++        
++        # Test identity property
++        identity = rel.identity
++        print(f"✓ Identity property accessible with {len(identity)} elements")
++        
++        # Verify through_fields is properly converted
++        through_fields_in_identity = identity[10]  # through_fields position
++        print(f"✓ through_fields in identity: {through_fields_in_identity} (type: {type(through_fields_in_identity)})")
++        
++        if not isinstance(through_fields_in_identity, tuple):
++            print(f"✗ Expected tuple, got {type(through_fields_in_identity)}")
++            return False
++            
++        return True
++    except Exception as e:
++        print(f"✗ Hash operations failed: {e}")
++        return False
++
++def main():
++    """Run all tests."""
++    print("Running proxy model specific tests...\n")
++    
++    tests = [
++        test_proxy_model_checks,
++        test_field_name_clashes,
++        test_hash_operations,
++    ]
++    
++    results = []
++    for test in tests:
++        print(f"\n--- {test.__name__} ---")
++        results.append(test())
++    
++    print(f"\n--- SUMMARY ---")
++    passed = sum(results)
++    total = len(results)
++    print(f"Tests passed: {passed}/{total}")
++    
++    if passed == total:
++        print("✓ All proxy model tests passed! The issue is fixed.")
++        return True
++    else:
++        print("✗ Some proxy model tests failed.")
++        return False
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

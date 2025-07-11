@@ -1,0 +1,242 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 28374272f4..30c6a9771d 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -516,17 +516,47 @@ class Field(RegisterLookupMixin):
+     def __eq__(self, other):
+         # Needed for @total_ordering
+         if isinstance(other, Field):
++            # Different field types sharing the same model should still be considered different
++            if self.__class__ is not other.__class__:
++                return False
++
++            # Fields from different models should be considered different
++            if hasattr(self, 'model') and hasattr(other, 'model'):
++                if self.model is not other.model:
++                    return False
++
+             return self.creation_counter == other.creation_counter
+         return NotImplemented
+
+     def __lt__(self, other):
+         # This is needed because bisect does not take a comparison function.
+         if isinstance(other, Field):
+-            return self.creation_counter < other.creation_counter
++            # Order by creation_counter first to preserve existing ordering
++            if self.creation_counter != other.creation_counter:
++                return self.creation_counter < other.creation_counter
++
++            # Compare field types for consistency with __eq__ and __hash__
++            if self.__class__ is not other.__class__:
++                return self.__class__.__name__ < other.__class__.__name__
++
++            # If creation_counter and type are the same, use model as tertiary ordering key
++            if hasattr(self, 'model') and hasattr(other, 'model'):
++                if self.model is not other.model:
++                    return id(self.model) < id(other.model)
++
++            return False
+         return NotImplemented
+
+     def __hash__(self):
+-        return hash(self.creation_counter)
++        # Include field class in the hash
++        field_class_hash = hash(self.__class__)
++
++        # Include model ID if available
++        model_hash = 0
++        if hasattr(self, 'model'):
++            model_hash = id(self.model)
++
++        return hash((self.creation_counter, field_class_hash, model_hash))
+
+     def __deepcopy__(self, memodict):
+         # We don't have to deepcopy very much here, since most things are not
+diff --git a/test_field_equality.py b/test_field_equality.py
+new file mode 100644
+index 0000000000..75e69049b2
+--- /dev/null
++++ b/test_field_equality.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++import os
++import sys
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++from django.db.models.fields import IntegerField
++
++# Create two IntegerField instances with the same creation_counter
++# but different "model" attributes to simulate fields from different models
++def create_test_fields():
++    # Create two fields
++    field1 = IntegerField()
++    field2 = IntegerField()
++
++    # Simulate them being attached to different models
++    # by setting model attribute directly
++    class Model1:
++        __name__ = 'Model1'
++
++    class Model2:
++        __name__ = 'Model2'
++
++    # Force the same creation_counter to simulate the issue
++    field1.creation_counter = field2.creation_counter = 100
++
++    # Set different models
++    field1.model = Model1
++    field2.model = Model2
++
++    return field1, field2
++
++
++def run_test():
++    """Test equality of fields with same creation_counter but different models."""
++
++    # Create fields from different models with same creation_counter
++    field_a, field_b = create_test_fields()
++
++    # Check if they're equal
++    print(f"Before fix:")
++    print(f"Field A == Field B: {field_a == field_b}")
++    print(f"Field A hash == Field B hash: {hash(field_a) == hash(field_b)}")
++
++    # Check how they behave in a set
++    field_set = {field_a, field_b}
++    print(f"Length of set containing both fields: {len(field_set)}")
++
++    # Print model information for verification
++    print(f"Field A model: {field_a.model.__name__}")
++    print(f"Field B model: {field_b.model.__name__}")
++    print(f"Field A creation_counter: {field_a.creation_counter}")
++    print(f"Field B creation_counter: {field_b.creation_counter}")
++
++    return field_set, field_a, field_b
++
++
++def run_test_after_fix(field_a, field_b):
++    """Test equality after fix is applied."""
++
++    # Check if they're equal
++    print(f"\nAfter fix:")
++    print(f"Field A == Field B: {field_a == field_b}")
++    print(f"Field A hash == Field B hash: {hash(field_a) == hash(field_b)}")
++
++    # Check how they behave in a set
++    field_set = {field_a, field_b}
++    print(f"Length of set containing both fields: {len(field_set)}")
++
++    return field_set
++
++
++if __name__ == "__main__":
++    field_set, field_a, field_b = run_test()
++
++    # Even though they have different models, they'll be considered
++    # equal because only creation_counter is compared
++    print("\nThis is the bug: fields with same creation_counter but different")
++    print("models are treated as equal, and one gets removed from sets.")
++
++    # Now test after the fix
++    field_set_after = run_test_after_fix(field_a, field_b)
++
++    # After our fix, the set should contain both fields
++    print("\nAfter fix, the set should contain both fields since they")
++    print("belong to different models, even with the same creation_counter.")
+\ No newline at end of file
+diff --git a/test_models_fields.py b/test_models_fields.py
+new file mode 100644
+index 0000000000..83dae12864
+--- /dev/null
++++ b/test_models_fields.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++"""
++Run tests to verify model field equality and comparison works correctly after fix.
++"""
++
++import os
++import sys
++import unittest
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++from django.db.models.fields import IntegerField, CharField, BooleanField
++
++class TestFieldEquality(unittest.TestCase):
++    """Test equality comparison between model fields."""
++
++    def setUp(self):
++        # Create different field types to test
++        self.field1 = IntegerField()
++        self.field2 = IntegerField()
++
++        # Different field types with same creation counter
++        self.char_field = CharField(max_length=100)
++
++        # Create dummy model classes
++        class Model1:
++            __name__ = 'Model1'
++
++        class Model2:
++            __name__ = 'Model2'
++
++        # Set model for each field
++        self.field1.model = Model1
++        self.field2.model = Model2
++        self.char_field.model = Model1
++
++        # Set same creation counter to simulate issue
++        self.field1.creation_counter = 100
++        self.field2.creation_counter = 100
++
++    def test_different_models_not_equal(self):
++        """Fields with same creation_counter but different models should not be equal."""
++        self.assertFalse(self.field1 == self.field2)
++
++    def test_different_models_different_hash(self):
++        """Fields with same creation_counter but different models should have different hash."""
++        self.assertFalse(hash(self.field1) == hash(self.field2))
++
++    def test_set_contains_both(self):
++        """Set should contain both fields from different models."""
++        field_set = {self.field1, self.field2}
++        self.assertEqual(len(field_set), 2)
++
++    def test_ordering_preserved(self):
++        """
++        Test that ordering is still based on creation_counter first,
++        with model as tie-breaker.
++        """
++        field3 = IntegerField()
++        field3.creation_counter = 50  # Lower than field1/field2
++        field3.model = self.field1.model
++
++        self.assertTrue(field3 < self.field1)  # Lower creation_counter comes first
++
++        # These have same creation_counter but different models
++        # The ordering should be consistent
++        result1 = self.field1 < self.field2
++        result2 = self.field2 < self.field1
++
++        # One should be less than the other, not both
++        self.assertNotEqual(result1, result2)
++
++    def test_different_field_types(self):
++        """Different field types should still compare by creation_counter first."""
++        # Reset to same creation counter
++        self.char_field.creation_counter = self.field1.creation_counter
++
++        # Should be different because of different models
++        self.assertFalse(self.field1 == self.char_field)
++
++        # But same model, so should depend on field type or id
++        field_set = {self.field1, self.char_field}
++        self.assertEqual(len(field_set), 2)
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file

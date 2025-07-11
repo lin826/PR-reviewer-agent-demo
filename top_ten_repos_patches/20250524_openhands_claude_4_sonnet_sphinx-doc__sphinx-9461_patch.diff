@@ -1,0 +1,136 @@
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index 1cecb1f79..b8ab7fcb9 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -2661,7 +2661,42 @@ class PropertyDocumenter(DocstringStripSignatureMixin, ClassLevelDocumenter):  #
+     @classmethod
+     def can_document_member(cls, member: Any, membername: str, isattr: bool, parent: Any
+                             ) -> bool:
+-        return inspect.isproperty(member) and isinstance(parent, ClassDocumenter)
++        # Check for regular properties
++        if inspect.isproperty(member) and isinstance(parent, ClassDocumenter):
++            return True
++        
++        # Check for @classmethod @property combinations
++        if isinstance(parent, ClassDocumenter) and hasattr(parent, 'object'):
++            parent_class = parent.object
++            if hasattr(parent_class, '__dict__') and membername in parent_class.__dict__:
++                class_member = parent_class.__dict__[membername]
++                if isinstance(class_member, classmethod):
++                    # Check for Python 3.10+ __wrapped__ attribute
++                    if hasattr(class_member, '__wrapped__') and inspect.isproperty(class_member.__wrapped__):
++                        return True
++                    # Check for Python 3.9 __func__ attribute
++                    elif hasattr(class_member, '__func__') and inspect.isproperty(class_member.__func__):
++                        return True
++        
++        return False
++
++    def import_object(self, raiseerror: bool = False) -> bool:
++        ret = super().import_object(raiseerror)
++        if not ret:
++            return ret
++
++        # Handle @classmethod @property combinations
++        if self.parent and hasattr(self.parent, '__dict__'):
++            class_member = self.parent.__dict__.get(self.object_name)
++            if isinstance(class_member, classmethod):
++                # Check for Python 3.10+ __wrapped__ attribute
++                if hasattr(class_member, '__wrapped__') and inspect.isproperty(class_member.__wrapped__):
++                    self.object = class_member.__wrapped__
++                # Check for Python 3.9 __func__ attribute
++                elif hasattr(class_member, '__func__') and inspect.isproperty(class_member.__func__):
++                    self.object = class_member.__func__
++
++        return ret
+ 
+     def document_members(self, all_members: bool = False) -> None:
+         pass
+diff --git a/tests/test_ext_autodoc_autoproperty.py b/tests/test_ext_autodoc_autoproperty.py
+index ee25aa8b7..a0ffcc828 100644
+--- a/tests/test_ext_autodoc_autoproperty.py
++++ b/tests/test_ext_autodoc_autoproperty.py
+@@ -11,6 +11,8 @@
+ 
+ import pytest
+ 
++from sphinx.ext.autodoc import PropertyDocumenter, ClassDocumenter
++
+ from .test_ext_autodoc import do_autodoc
+ 
+ 
+@@ -26,3 +28,74 @@ def test_properties(app):
+         '   docstring',
+         '',
+     ]
++
++
++class ClassWithClassMethodProperty:
++    """Test class with @classmethod @property methods."""
++    
++    @property
++    def regular_property(self):
++        """A regular property."""
++        return "regular"
++    
++    @classmethod
++    @property
++    def class_property(cls):
++        """A class property using @classmethod @property."""
++        return "class_prop"
++    
++    @classmethod
++    @property
++    def another_class_property(cls):
++        """Another class property."""
++        return "another"
++
++
++class MockClassDocumenter(ClassDocumenter):
++    """Mock ClassDocumenter for testing."""
++    def __init__(self, obj):
++        self.object = obj
++
++
++def test_classmethod_property_can_document_member():
++    """Test that PropertyDocumenter can document @classmethod @property methods."""
++    class_doc = MockClassDocumenter(ClassWithClassMethodProperty)
++    
++    # Test regular property (should work as before)
++    regular_prop = ClassWithClassMethodProperty.regular_property
++    can_document_regular = PropertyDocumenter.can_document_member(
++        regular_prop, 'regular_property', False, class_doc
++    )
++    assert can_document_regular, "Regular property should be documentable"
++    
++    # Test @classmethod @property (this is the new functionality)
++    class_prop = ClassWithClassMethodProperty.class_property
++    can_document_class = PropertyDocumenter.can_document_member(
++        class_prop, 'class_property', False, class_doc
++    )
++    assert can_document_class, "@classmethod @property should be documentable"
++    
++    # Test another @classmethod @property
++    another_class_prop = ClassWithClassMethodProperty.another_class_property
++    can_document_another = PropertyDocumenter.can_document_member(
++        another_class_prop, 'another_class_property', False, class_doc
++    )
++    assert can_document_another, "Another @classmethod @property should be documentable"
++
++
++def test_classmethod_property_detection_in_class_dict():
++    """Test that we can detect @classmethod @property in the class __dict__."""
++    
++    # Check that the class dict contains the classmethod
++    class_dict = ClassWithClassMethodProperty.__dict__
++    assert 'class_property' in class_dict
++    
++    class_member = class_dict['class_property']
++    assert isinstance(class_member, classmethod), "Should be a classmethod in class dict"
++    
++    # Check that the classmethod wraps a property
++    assert hasattr(class_member, '__func__'), "classmethod should have __func__ attribute"
++    assert isinstance(class_member.__func__, property), "classmethod.__func__ should be a property"
++    
++    # Check that the property has the correct docstring
++    assert class_member.__func__.__doc__ == "A class property using @classmethod @property."

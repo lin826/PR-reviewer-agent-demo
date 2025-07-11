@@ -1,0 +1,124 @@
+diff --git a/changelog/2574.bugfix.rst b/changelog/2574.bugfix.rst
+new file mode 100644
+index 000000000..ec7f97c98
+--- /dev/null
++++ b/changelog/2574.bugfix.rst
+@@ -0,0 +1,2 @@
++Fixed issue where ``caplog.get_records`` and ``caplog.records`` become inconsistent after calling ``caplog.clear()``. 
++Now ``get_records("call")`` properly returns an empty list after ``caplog.clear()`` is called.
+\ No newline at end of file
+diff --git a/src/_pytest/logging.py b/src/_pytest/logging.py
+index a4f4214b1..38e2b34e3 100644
+--- a/src/_pytest/logging.py
++++ b/src/_pytest/logging.py
+@@ -342,6 +342,9 @@ class LogCaptureHandler(logging_StreamHandler):
+         super().emit(record)
+ 
+     def reset(self) -> None:
++        # NOTE: This method is called from LogCaptureFixture.clear() in older versions,
++        # which causes problems by creating a new list, breaking references.
++        # In the current implementation we avoid this issue by clearing in place.
+         self.records = []
+         self.stream = StringIO()
+ 
+@@ -440,7 +443,16 @@ class LogCaptureFixture:
+ 
+     def clear(self) -> None:
+         """Reset the list of log records and the captured log text."""
+-        self.handler.reset()
++        # The problem is that `handler.reset()` creates a new list and assigns it to 
++        # `handler.records`, but the references to the old list are still stored in 
++        # the stash. So we need to clear the existing list instead of creating a new one.
++        
++        # 1. Clear the existing handler records list in place
++        if self.handler.records:
++            self.handler.records.clear()
++        
++        # 2. Create a new StringIO for the stream
++        self.handler.stream = StringIO()
+ 
+     def set_level(self, level: Union[int, str], logger: Optional[str] = None) -> None:
+         """Set the level of a logger for the duration of a test.
+diff --git a/test_caplog_issue.py b/test_caplog_issue.py
+new file mode 100644
+index 000000000..801d24878
+--- /dev/null
++++ b/test_caplog_issue.py
+@@ -0,0 +1,39 @@
++import logging
++
++def test_caplog_get_records_clear_conflict(caplog) -> None:
++    """Test that caplog.get_records() and caplog.records remain in sync after clear().
++    
++    This test verifies the behavior described in the issue:
++    - get_records("call") and records should be the same object initially
++    - After adding a log record, both should contain the record
++    - After calling clear(), both should be empty
++    - After adding another log record, both should contain only the new record
++    """
++    
++    # Initial state - both should be empty
++    assert caplog.get_records("call") == []
++    assert caplog.records == []
++    assert caplog.get_records("call") == caplog.records
++    
++    # Add a log message
++    logging.warning("test message")
++    assert len(caplog.get_records("call")) == 1
++    assert len(caplog.records) == 1
++    assert caplog.get_records("call") == caplog.records
++    
++    # Clear the logs
++    caplog.clear()
++    assert caplog.get_records("call") == []  # Should be empty
++    assert caplog.records == []  # Should be empty
++    assert caplog.get_records("call") == caplog.records  # Should be the same
++    
++    # Add another log message
++    logging.warning("another test message")
++    assert len(caplog.get_records("call")) == 1  # Should have the new message
++    assert len(caplog.records) == 1  # Should have the new message
++    assert caplog.get_records("call") == caplog.records  # Should be the same
++    
++    # Final verification of identity
++    get_records_id = id(caplog.get_records("call"))
++    records_id = id(caplog.records)
++    assert get_records_id == records_id, "get_records('call') and records should be the same object"
+\ No newline at end of file
+diff --git a/testing/logging/test_caplog_clear_consistency.py b/testing/logging/test_caplog_clear_consistency.py
+new file mode 100644
+index 000000000..09a5ac7c6
+--- /dev/null
++++ b/testing/logging/test_caplog_clear_consistency.py
+@@ -0,0 +1,30 @@
++import logging
++
++def test_caplog_get_records_clear_consistency(caplog):
++    """Test that caplog.get_records() and caplog.records remain in sync after caplog.clear().
++    
++    Regression test for issue #2574.
++    """
++    # Initial state - both should be empty
++    assert caplog.get_records("call") == []
++    assert caplog.records == []
++    
++    # Add a log message
++    logging.warning("test message")
++    assert len(caplog.get_records("call")) == 1
++    assert len(caplog.records) == 1
++    assert caplog.get_records("call") == caplog.records
++    
++    # Clear the logs
++    caplog.clear()
++    
++    # After clear(), both should be empty and equal
++    assert caplog.get_records("call") == []
++    assert caplog.records == []
++    assert caplog.get_records("call") == caplog.records
++    
++    # Add another log message
++    logging.warning("another test message")
++    assert len(caplog.get_records("call")) == 1
++    assert len(caplog.records) == 1
++    assert caplog.get_records("call") == caplog.records
+\ No newline at end of file

@@ -1,0 +1,56 @@
+--- a/src/_pytest/mark/expression.py
++++ b/src/_pytest/mark/expression.py
+@@ -165,6 +165,28 @@
+     s.reject((TokenType.NOT, TokenType.LPAREN, TokenType.IDENT))
+ 
+ 
++def _fix_constants_in_ast(node: ast.AST) -> ast.AST:
++    """Transform ast.Name nodes for built-in constants to avoid compilation errors in Python 3.8+."""
++    
++    class ConstantTransformer(ast.NodeTransformer):
++        def visit_Name(self, node: ast.Name) -> ast.AST:
++            if isinstance(node.ctx, ast.Load):
++                if node.id == "True":
++                    new_node = ast.NameConstant(True)
++                elif node.id == "False": 
++                    new_node = ast.NameConstant(False)
++                elif node.id == "None":
++                    new_node = ast.NameConstant(None)
++                else:
++                    return node
++                # Copy location information from the original node
++                return ast.copy_location(new_node, node)
++            return node
++    
++    transformed = ConstantTransformer().visit(node)
++    return ast.fix_missing_locations(transformed)
++
++
+ class MatcherAdapter(Mapping[str, bool]):
+     """Adapts a matcher function to a locals mapping as required by eval()."""
+ 
+@@ -199,9 +221,21 @@
+         :param input: The input expression - one line.
+         """
+         astexpr = expression(Scanner(input))
+-        code = compile(
+-            astexpr, filename="<pytest match expression>", mode="eval",
+-        )  # type: types.CodeType
++        try:
++            code = compile(
++                astexpr, filename="<pytest match expression>", mode="eval",
++            )  # type: types.CodeType
++        except ValueError as e:
++            # In Python 3.8+ debug builds, using ast.Name with built-in constants
++            # like "True", "False", "None" causes compilation errors.
++            # If compilation fails, try again with constants converted.
++            if "Name node can't be used with" in str(e):
++                astexpr = _fix_constants_in_ast(astexpr)
++                code = compile(
++                    astexpr, filename="<pytest match expression>", mode="eval",
++                )  # type: types.CodeType
++            else:
++                raise
+         return Expression(code)
+ 
+     def evaluate(self, matcher: Callable[[str], bool]) -> bool:

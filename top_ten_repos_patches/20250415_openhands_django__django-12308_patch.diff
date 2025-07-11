@@ -1,0 +1,207 @@
+diff --git a/django/contrib/admin/utils.py b/django/contrib/admin/utils.py
+index e4ddc8f017..7662018eab 100644
+--- a/django/contrib/admin/utils.py
++++ b/django/contrib/admin/utils.py
+@@ -398,6 +398,9 @@ def display_for_field(value, field, empty_value_display):
+         return formats.number_format(value)
+     elif isinstance(field, models.FileField) and value:
+         return format_html('<a href="{}">{}</a>', value.url, value)
++    elif isinstance(field, models.JSONField):
++        # Use the JSONField's formfield to properly format the value as JSON
++        return field.formfield().prepare_value(value)
+     else:
+         return display_for_value(value, empty_value_display)
+ 
+diff --git a/reproduce_jsonfield_issue.py b/reproduce_jsonfield_issue.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/test_jsonfield_admin_readonly.py b/test_jsonfield_admin_readonly.py
+new file mode 100644
+index 0000000000..9160c3926c
+--- /dev/null
++++ b/test_jsonfield_admin_readonly.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++from django.http import HttpResponse
++from django.urls import path
++
++# Set up Django
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF=__name__,
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.messages',
++            'django.contrib.staticfiles',
++        ],
++        MIDDLEWARE=[
++            'django.middleware.security.SecurityMiddleware',
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.middleware.common.CommonMiddleware',
++            'django.middleware.csrf.CsrfViewMiddleware',
++            'django.contrib.auth.middleware.AuthenticationMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++            'django.middleware.clickjacking.XFrameOptionsMiddleware',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        STATIC_URL='/static/',
++        TEMPLATES=[{
++            'BACKEND': 'django.template.backends.django.DjangoTemplates',
++            'APP_DIRS': True,
++            'OPTIONS': {
++                'context_processors': [
++                    'django.template.context_processors.debug',
++                    'django.template.context_processors.request',
++                    'django.contrib.auth.context_processors.auth',
++                    'django.contrib.messages.context_processors.messages',
++                ],
++            },
++        }],
++    )
++
++django.setup()
++
++from django.db import models
++from django.contrib import admin
++from django.test.utils import setup_test_environment
++from django.test import Client
++
++# Define model
++class TestModel(models.Model):
++    json_field = models.JSONField(default=dict)
++
++# Define admin
++class TestModelAdmin(admin.ModelAdmin):
++    readonly_fields = ['json_field']
++
++# Register model with admin
++admin.site.register(TestModel, TestModelAdmin)
++
++# URL patterns
++def index(request):
++    return HttpResponse("Test app")
++
++urlpatterns = [
++    path('', index),
++    path('admin/', admin.site.urls),
++]
++
++# Set up the environment
++django.setup()
++setup_test_environment()
++
++# Create superuser
++from django.contrib.auth.models import User
++if not User.objects.filter(username='admin').exists():
++    User.objects.create_superuser('admin', 'admin@example.com', 'password')
++
++# Create tables
++from django.db import connection
++connection.creation.create_test_db()
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++# Create a test model with a JSONField
++test_instance = TestModel.objects.create(json_field={"foo": "bar"})
++
++# Set up the test client
++client = Client()
++client.login(username='admin', password='password')
++
++# Get the admin page for the test model
++response = client.get(f'/admin/main/testmodel/{test_instance.id}/change/')
++content = response.content.decode('utf-8')
++
++# Check if the JSON is displayed correctly
++print("Response content:", content)
++if "{'foo': 'bar'}" in content:
++    print("Issue found: JSONField displayed as Python dict with single quotes")
++    print("This is not valid JSON format")
++else:
++    print("JSONField displayed correctly")
++
++# Clean up database
++connection.creation.destroy_test_db(':memory:')
+\ No newline at end of file
+diff --git a/verify_jsonfield_fix.py b/verify_jsonfield_fix.py
+new file mode 100644
+index 0000000000..208b5792fb
+--- /dev/null
++++ b/verify_jsonfield_fix.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++"""
++Script to verify the fix for JSONField readonly display in admin
++"""
++import json
++from django.db import models
++from django.contrib.admin.utils import display_for_field
++from django.forms import JSONField as FormJSONField
++
++class SampleJSONField(models.JSONField):
++    """Sample JSONField for testing"""
++    pass
++
++# Create a sample JSONField instance
++field = SampleJSONField()
++
++# Test with a sample dictionary value
++test_value = {"foo": "bar"}
++
++# Get the displayed value using display_for_field
++displayed_value = display_for_field(test_value, field, "")
++
++print("Original value:", test_value)
++print("Type:", type(test_value))
++print("Displayed value:", displayed_value)
++print("Is valid JSON?", end=" ")
++try:
++    # Try to parse the displayed value as JSON
++    json.loads(displayed_value if isinstance(displayed_value, str) else str(displayed_value))
++    print("Yes")
++except json.JSONDecodeError:
++    print("No")
++
++# Show what happens with form's prepare_value
++form_field = FormJSONField()
++prepared_value = form_field.prepare_value(test_value)
++print("\nForm field prepared value:", prepared_value)
++print("Is valid JSON?", end=" ")
++try:
++    # Check if the prepared value is valid JSON
++    json.loads(prepared_value if isinstance(prepared_value, str) else str(prepared_value))
++    print("Yes")
++except json.JSONDecodeError:
++    print("No")
++
++# Test with nested JSON
++nested_value = {"nested": {"foo": "bar", "list": [1, 2, 3]}}
++displayed_nested = display_for_field(nested_value, field, "")
++print("\nNested value test:")
++print("Displayed:", displayed_nested)
++print("Is valid JSON?", end=" ")
++try:
++    json.loads(displayed_nested if isinstance(displayed_nested, str) else str(displayed_nested))
++    print("Yes")
++except json.JSONDecodeError:
++    print("No")
++
++print("\nVerification:")
++if displayed_value == prepared_value:
++    print("[PASS] Fix applied successfully: JSONField values are now properly displayed using JSON format")
++else:
++    print("[FAIL] Fix did not work correctly: values are still not displayed as proper JSON")
+\ No newline at end of file

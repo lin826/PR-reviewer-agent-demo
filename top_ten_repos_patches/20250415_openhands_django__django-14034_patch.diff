@@ -1,0 +1,191 @@
+diff --git a/django/forms/fields.py b/django/forms/fields.py
+index 65d6a9ec82..ff5d6e63d9 100644
+--- a/django/forms/fields.py
++++ b/django/forms/fields.py
+@@ -1025,8 +1025,14 @@ class MultiValueField(Field):
+             if not value or not [v for v in value if v not in self.empty_values]:
+                 if self.required:
+                     raise ValidationError(self.error_messages['required'], code='required')
+-                else:
+-                    return self.compress([])
++                elif not self.require_all_fields:
++                    # Even if the MultiValueField is not required, individual
++                    # fields could be required and need to be checked when
++                    # require_all_fields is False
++                    for i, field in enumerate(self.fields):
++                        if field.required:
++                            raise ValidationError(field.error_messages['required'], code='required')
++                return self.compress([])
+         else:
+             raise ValidationError(self.error_messages['invalid'], code='invalid')
+         for i, field in enumerate(self.fields):
+diff --git a/test_multivalue_required_issue.py b/test_multivalue_required_issue.py
+new file mode 100644
+index 0000000000..2ba1580e2d
+--- /dev/null
++++ b/test_multivalue_required_issue.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue with MultiValueField ignoring a required value of a sub field.
++"""
++import os
++import sys
++
++# Add the django project directory to the Python path
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from django import setup
++from django.forms import (
++    Form,
++    CharField,
++    MultiValueField,
++    MultiWidget,
++)
++
++# Setup Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++# Create a minimal settings module
++if not os.path.exists('test_settings.py'):
++    with open('test_settings.py', 'w') as f:
++        f.write('''
++SECRET_KEY = 'test'
++INSTALLED_APPS = ['django.contrib.auth', 'django.contrib.contenttypes', 'django.contrib.sessions', 'django.forms']
++        ''')
++
++# Initialize Django
++setup()
++
++# Define classes as described in the issue
++class MF(MultiValueField):
++    widget = MultiWidget
++    def __init__(self):
++        fields = [
++            CharField(required=False),
++            CharField(required=True),
++        ]
++        widget = self.widget(widgets=[
++            f.widget
++            for f in fields
++        ], attrs={})
++        super(MF, self).__init__(
++            fields=fields,
++            widget=widget,
++            require_all_fields=False,
++            required=False,
++        )
++    def compress(self, value):
++        return []
++
++class F(Form):
++    mf = MF()
++
++def test_multivalue_required_issue():
++    """Test that a required subfield is properly validated."""
++    print("Running test_multivalue_required_issue...")
++    
++    # Case 1: Both fields empty - should fail validation
++    print("\nCase 1: Both fields empty")
++    form = F({
++        'mf_0': '',
++        'mf_1': '',
++    })
++
++    is_valid = form.is_valid()
++    print(f"  is_valid = {is_valid}")
++    print(f"  errors   = {form.errors}")
++    
++    if is_valid:
++        print("  BUG: The form is valid, but should not be (one subfield is required).")
++    else:
++        print("  EXPECTED: Validation correctly fails because the required subfield is empty.")
++    
++    # Case 2: First field has value, second field is empty - should still fail
++    print("\nCase 2: First field has value, second field is empty")
++    form = F({
++        'mf_0': 'xxx',
++        'mf_1': '',
++    })
++    
++    is_valid = form.is_valid()
++    print(f"  is_valid = {is_valid}")
++    print(f"  errors   = {form.errors}")
++    
++    if is_valid:
++        print("  BUG: The form is valid, but should not be (one subfield is required).")
++    else:
++        print("  EXPECTED: Validation correctly fails because the required subfield is empty.")
++    
++    # Case 3: Both fields have values - should pass validation
++    print("\nCase 3: Both fields have values")
++    form = F({
++        'mf_0': 'xxx',
++        'mf_1': 'yyy',
++    })
++    
++    is_valid = form.is_valid()
++    print(f"  is_valid = {is_valid}")
++    print(f"  errors   = {form.errors}")
++    
++    if is_valid:
++        print("  EXPECTED: The form is valid because all required fields have values.")
++    else:
++        print("  ERROR: The form is invalid but should be valid.")
++        
++    # Case 4: Test with require_all_fields=True
++    print("\nCase 4: Testing with require_all_fields=True")
++    
++    class MFAllRequired(MultiValueField):
++        widget = MultiWidget
++        def __init__(self):
++            fields = [
++                CharField(required=False),
++                CharField(required=True),
++            ]
++            widget = self.widget(widgets=[
++                f.widget
++                for f in fields
++            ], attrs={})
++            super(MFAllRequired, self).__init__(
++                fields=fields,
++                widget=widget,
++                require_all_fields=True,
++                required=False,
++            )
++        def compress(self, value):
++            return []
++
++    class FAllRequired(Form):
++        mf = MFAllRequired()
++        
++    # With require_all_fields=True, the field's individual required settings
++    # should be overridden by the field-level setting
++    form = FAllRequired({
++        'mf_0': '',
++        'mf_1': '',
++    })
++    
++    is_valid = form.is_valid()
++    print(f"  is_valid = {is_valid}")
++    print(f"  errors   = {form.errors}")
++    
++    if is_valid:
++        print("  EXPECTED: Form is valid because the multi-value field itself is not required.")
++    else:
++        print("  ERROR: The form is invalid but should be valid when require_all_fields=True and required=False.")
++
++if __name__ == "__main__":
++    test_multivalue_required_issue()
+\ No newline at end of file
+diff --git a/test_settings.py b/test_settings.py
+new file mode 100644
+index 0000000000..304725a85a
+--- /dev/null
++++ b/test_settings.py
+@@ -0,0 +1,4 @@
++
++SECRET_KEY = 'test'
++INSTALLED_APPS = ['django.contrib.auth', 'django.contrib.contenttypes', 'django.contrib.sessions', 'django.forms']
++        
+\ No newline at end of file

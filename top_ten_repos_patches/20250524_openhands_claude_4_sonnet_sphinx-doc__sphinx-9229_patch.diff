@@ -1,0 +1,632 @@
+diff --git a/debug_module_analyzer.py b/debug_module_analyzer.py
+new file mode 100644
+index 000000000..1083095c8
+--- /dev/null
++++ b/debug_module_analyzer.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++"""
++Debug script to test ModuleAnalyzer behavior.
++"""
++
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, str(Path(__file__).parent))
++
++def test_module_analyzer():
++    """Test ModuleAnalyzer on our test file."""
++    
++    from sphinx.pycode import ModuleAnalyzer, PycodeError
++    
++    try:
++        # Test the module analyzer on our test file
++        analyzer = ModuleAnalyzer.for_module('tests.roots.test-ext-autodoc.target.issue_type_aliases')
++        analyzer.analyze()
++        
++        print("=== Module Analysis Results ===")
++        print(f"attr_docs: {analyzer.attr_docs}")
++        print(f"tagorder: {analyzer.tagorder}")
++        print(f"tags: {analyzer.tags}")
++        
++        # Test each type alias
++        for alias_name in ['ScaffoldOpts', 'FileContents', 'FileOp', 'SimpleAlias', 'NoDocAlias', 'CommentAlias']:
++            key = ('', alias_name)
++            if key in analyzer.attr_docs:
++                print(f"\n{alias_name}: Found docstring")
++                print(f"  Content: {analyzer.attr_docs[key]}")
++            else:
++                print(f"\n{alias_name}: No docstring found")
++                
++    except PycodeError as e:
++        print(f"PycodeError: {e}")
++    except Exception as e:
++        print(f"Error: {e}")
++
++if __name__ == "__main__":
++    test_module_analyzer()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..d43f356ef
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,126 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the type alias documentation issue.
++"""
++
++import os
++import tempfile
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++def create_test_files():
++    """Create the test files as described in the issue."""
++    
++    # Create file.py with the type aliases from the issue
++    file_py_content = '''# file.py
++from pathlib import Path
++from typing import Any, Callable, Dict, Union
++
++# Signatures for the documentation purposes
++
++ScaffoldOpts = Dict[str, Any]
++"""Dictionary with PyScaffold's options, see ``pyscaffold.api.create_project``.
++Should be treated as immutable (if required, copy before changing).
++
++Please notice some behaviours given by the options **SHOULD** be observed. For example,
++files should be overwritten when the **force** option is ``True``. Similarly when
++**pretend** is ``True``, no operation should be really performed, but any action should
++be logged as if realized.
++"""
++
++FileContents = Union[str, None]
++"""When the file content is ``None``, the file should not be written to
++disk (empty files are represented by an empty string ``""`` as content).
++"""
++
++FileOp = Callable[[Path, FileContents, ScaffoldOpts], Union[Path, None]]
++"""Signature of functions considered file operations::
++
++    Callable[[Path, FileContents, ScaffoldOpts], Union[Path, None]]
++
++- **path** (:obj:`pathlib.Path`): file path potentially to be written to/changed
++  in the disk.
++- **contents** (:obj:`FileContents`): usually a string that represents a text content
++  of the file. :obj:`None` indicates the file should not be written.
++- **opts** (:obj:`ScaffoldOpts`): a dict with PyScaffold's options.
++
++If the file is written (or more generally changed, such as new access permissions),
++by convention they should return the :obj:`file path <pathlib.Path>`.
++If no file was touched, :obj:`None` should be returned. Please notice a **FileOp**
++might return :obj:`None` if a pre-existing file in the disk is not modified.
++
++.. note::
++    A **FileOp** usually has side effects (e.g. write a file to the disk), see
++    :obj:`FileFileContents` and :obj:`ScaffoldOpts` for other conventions.
++"""
++'''
++    
++    return file_py_content
++
++def test_autodoc_directly():
++    """Test autodoc directly using the existing test infrastructure."""
++    
++    # Create a temporary directory
++    with tempfile.TemporaryDirectory() as tmpdir:
++        tmpdir = Path(tmpdir)
++        
++        # Create the test file
++        file_py = tmpdir / "file.py"
++        file_py.write_text(create_test_files())
++        
++        # Add the temp directory to Python path
++        sys.path.insert(0, str(tmpdir))
++        
++        try:
++            # Import the module
++            import file
++            
++            # Test each type alias
++            for alias_name in ['ScaffoldOpts', 'FileContents', 'FileOp']:
++                print(f"\n=== Testing {alias_name} ===")
++                
++                # Get the object
++                obj = getattr(file, alias_name)
++                print(f"Object: {obj}")
++                print(f"Object type: {type(obj)}")
++                print(f"Object __doc__: {getattr(obj, '__doc__', 'No __doc__')}")
++                
++                # Check if it's a generic alias
++                import inspect
++                from sphinx.util import inspect as sphinx_inspect
++                print(f"Is generic alias: {sphinx_inspect.isgenericalias(obj)}")
++                print(f"Is NewType: {sphinx_inspect.isNewType(obj) if hasattr(sphinx_inspect, 'isNewType') else 'N/A'}")
++                
++                # Check the module's __doc__ for the variable
++                import ast
++                import inspect as inspect_mod
++                
++                # Get the source and parse it
++                source = inspect_mod.getsource(file)
++                tree = ast.parse(source)
++                
++                # Find the assignment and its docstring
++                for i, node in enumerate(tree.body):
++                    if isinstance(node, ast.Assign):
++                        for target in node.targets:
++                            if isinstance(target, ast.Name) and target.id == alias_name:
++                                print(f"Found assignment for {alias_name}")
++                                # Check if next node is a string (docstring)
++                                if (i + 1 < len(tree.body) and 
++                                    isinstance(tree.body[i + 1], ast.Expr) and
++                                    isinstance(tree.body[i + 1].value, ast.Constant) and
++                                    isinstance(tree.body[i + 1].value.value, str)):
++                                    docstring = tree.body[i + 1].value.value
++                                    print(f"Found docstring: {repr(docstring[:100])}...")
++                                else:
++                                    print("No docstring found after assignment")
++                                break
++                    
++        finally:
++            # Remove from path
++            sys.path.remove(str(tmpdir))
++
++if __name__ == "__main__":
++    test_autodoc_directly()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..6664e096c
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++"""
++Test edge cases that might trigger the issue.
++"""
++
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, str(Path(__file__).parent))
++
++def test_edge_cases():
++    """Test edge cases that might trigger the issue."""
++    
++    # Create a test file with potential edge cases
++    test_content = '''# edge_cases.py
++from typing import Any, Callable, Dict, List, Union
++
++# Edge case 1: Type alias with very long docstring
++LongDocAlias = Dict[str, Any]
++"""This is a very long docstring that spans multiple lines and contains a lot of text.
++It has multiple paragraphs and various formatting elements.
++
++This is the second paragraph with more text to make it really long.
++And this continues for several more lines to test if there are any issues
++with long docstrings that might cause the parser to fail or behave incorrectly.
++
++.. note::
++   This is a note block within the docstring.
++
++.. warning::
++   This is a warning block.
++
++:param test: This is a parameter description.
++:returns: This is a return description.
++"""
++
++# Edge case 2: Type alias with special characters in docstring
++SpecialCharsAlias = List[str]
++"""Docstring with special characters: àáâãäåæçèéêë ñòóôõö ùúûüý
++And some symbols: !@#$%^&*()_+-=[]{}|;':\",./<>?
++Unicode: 🚀 🎉 ✨ 🔥 💯
++"""
++
++# Edge case 3: Type alias with empty docstring
++EmptyDocAlias = Dict[str, str]
++""""""
++
++# Edge case 4: Type alias with only whitespace in docstring
++WhitespaceDocAlias = List[int]
++"""   
++   
++   """
++
++# Edge case 5: Type alias with docstring containing only metadata
++MetadataOnlyAlias = Dict[str, int]
++""":meta private:
++:meta deprecated:"""
++
++# Edge case 6: Complex nested type alias
++ComplexAlias = Dict[str, Union[List[Dict[str, Any]], Callable[[str, int], Union[str, None]]]]
++"""Complex nested type alias with multiple levels of nesting."""
++'''
++    
++    # Write to the test root directory
++    test_root = Path(__file__).parent / "tests" / "roots" / "test-ext-autodoc" / "target"
++    test_file = test_root / "edge_cases.py"
++    
++    try:
++        test_file.write_text(test_content)
++        
++        # Test with pytest
++        import pytest
++        from tests.test_ext_autodoc import do_autodoc
++        from sphinx.testing.path import path
++        from sphinx.testing.util import SphinxTestApp
++        import tempfile
++        
++        srcdir = path(__file__).parent / "tests" / "roots" / "test-ext-autodoc"
++        outdir = path(tempfile.mkdtemp())
++        
++        app = SphinxTestApp('html', srcdir=srcdir)
++        
++        # Test each edge case
++        edge_cases = [
++            'LongDocAlias', 'SpecialCharsAlias', 'EmptyDocAlias', 
++            'WhitespaceDocAlias', 'MetadataOnlyAlias', 'ComplexAlias'
++        ]
++        
++        for alias_name in edge_cases:
++            print(f"\n=== Testing {alias_name} ===")
++            
++            options = {}
++            actual = do_autodoc(app, 'data', f'target.edge_cases.{alias_name}', options)
++            result = list(actual)
++            
++            print("Generated documentation:")
++            for line in result:
++                print(f"  {repr(line)}")
++            
++            # Check if docstring is present (look for any content that's not just "alias of")
++            has_docstring = any(line.strip() and 
++                              not line.startswith('..') and 
++                              not line.startswith(':') and
++                              'alias of' not in line and
++                              line != '' and
++                              'module:' not in line
++                              for line in result)
++            
++            # Check if "alias of" is present
++            has_alias_of = any("alias of" in line for line in result)
++            
++            print(f"Has docstring: {has_docstring}")
++            print(f"Has 'alias of': {has_alias_of}")
++            
++            if alias_name not in ['EmptyDocAlias', 'WhitespaceDocAlias', 'MetadataOnlyAlias']:
++                if not has_docstring:
++                    print(f"ERROR: {alias_name} is missing its docstring!")
++            if not has_alias_of:
++                print(f"ERROR: {alias_name} is missing 'alias of' text!")
++                
++    finally:
++        # Clean up
++        if test_file.exists():
++            test_file.unlink()
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_issue_reproduce.py b/test_issue_reproduce.py
+new file mode 100644
+index 000000000..7c4cc90db
+--- /dev/null
++++ b/test_issue_reproduce.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the type alias documentation issue.
++"""
++
++import sys
++import pytest
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, str(Path(__file__).parent))
++
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_issue_type_aliases(app):
++    """Test the type alias documentation issue."""
++    
++    from tests.test_ext_autodoc import do_autodoc
++    
++    # Test each type alias
++    for alias_name in ['ScaffoldOpts', 'FileContents', 'FileOp']:
++        print(f"\n=== Testing {alias_name} ===")
++        
++        options = {"members": None, "undoc-members": None}
++        actual = do_autodoc(app, 'data', f'target.issue_type_aliases.{alias_name}', options)
++        result = list(actual)
++        
++        print("Generated documentation:")
++        for line in result:
++            print(f"  {repr(line)}")
++        
++        # Check if docstring is present
++        has_docstring = any("Dictionary with PyScaffold" in line or 
++                          "When the file content" in line or 
++                          "Signature of functions" in line 
++                          for line in result)
++        
++        # Check if "alias of" is present
++        has_alias_of = any("alias of" in line for line in result)
++        
++        print(f"Has docstring: {has_docstring}")
++        print(f"Has 'alias of': {has_alias_of}")
++        
++        if not has_docstring:
++            print(f"ERROR: {alias_name} is missing its docstring!")
++        if not has_alias_of:
++            print(f"ERROR: {alias_name} is missing 'alias of' text!")
++
++if __name__ == "__main__":
++    # Run the test manually
++    import tempfile
++    from sphinx.testing.path import path
++    from sphinx.testing.util import SphinxTestApp
++    
++    srcdir = path(__file__).parent / "tests" / "roots" / "test-ext-autodoc"
++    outdir = path(tempfile.mkdtemp())
++    
++    app = SphinxTestApp('html', srcdir=srcdir, builddir=outdir)
++    test_issue_type_aliases(app)
+\ No newline at end of file
+diff --git a/test_reproduce.py b/test_reproduce.py
+new file mode 100644
+index 000000000..b40179215
+--- /dev/null
++++ b/test_reproduce.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the issue using existing test infrastructure.
++"""
++
++import sys
++import os
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, str(Path(__file__).parent))
++
++from tests.test_ext_autodoc import do_autodoc
++import pytest
++from sphinx.testing.util import SphinxTestApp
++from tests.conftest import app_params
++
++def test_type_alias_issue():
++    """Test the type alias documentation issue."""
++    
++    # Create a temporary test file
++    test_content = '''# test_file.py
++from pathlib import Path
++from typing import Any, Callable, Dict, Union
++
++# Signatures for the documentation purposes
++
++ScaffoldOpts = Dict[str, Any]
++"""Dictionary with PyScaffold's options, see ``pyscaffold.api.create_project``.
++Should be treated as immutable (if required, copy before changing).
++
++Please notice some behaviours given by the options **SHOULD** be observed. For example,
++files should be overwritten when the **force** option is ``True``. Similarly when
++**pretend** is ``True``, no operation should be really performed, but any action should
++be logged as if realized.
++"""
++
++FileContents = Union[str, None]
++"""When the file content is ``None``, the file should not be written to
++disk (empty files are represented by an empty string ``""`` as content).
++"""
++
++FileOp = Callable[[Path, FileContents, ScaffoldOpts], Union[Path, None]]
++"""Signature of functions considered file operations::
++
++    Callable[[Path, FileContents, ScaffoldOpts], Union[Path, None]]
++
++- **path** (:obj:`pathlib.Path`): file path potentially to be written to/changed
++  in the disk.
++- **contents** (:obj:`FileContents`): usually a string that represents a text content
++  of the file. :obj:`None` indicates the file should not be written.
++- **opts** (:obj:`ScaffoldOpts`): a dict with PyScaffold's options.
++
++If the file is written (or more generally changed, such as new access permissions),
++by convention they should return the :obj:`file path <pathlib.Path>`.
++If no file was touched, :obj:`None` should be returned. Please notice a **FileOp**
++might return :obj:`None` if a pre-existing file in the disk is not modified.
++
++.. note::
++    A **FileOp** usually has side effects (e.g. write a file to the disk), see
++    :obj:`FileFileContents` and :obj:`ScaffoldOpts` for other conventions.
++"""
++'''
++    
++    # Write to the test root directory
++    test_root = Path(__file__).parent / "tests" / "roots" / "test-ext-autodoc" / "target"
++    test_file = test_root / "test_type_aliases.py"
++    
++    try:
++        test_file.write_text(test_content)
++        
++        # Create a minimal Sphinx app for testing
++        from sphinx.testing.path import path
++        from sphinx.testing.util import SphinxTestApp
++        
++        srcdir = path(__file__).parent / "tests" / "roots" / "test-ext-autodoc"
++        
++        with SphinxTestApp('html', srcdir=srcdir) as app:
++            # Test each type alias
++            for alias_name in ['ScaffoldOpts', 'FileContents', 'FileOp']:
++                print(f"\n=== Testing {alias_name} ===")
++                
++                options = {"members": None, "undoc-members": None}
++                actual = do_autodoc(app, 'data', f'target.test_type_aliases.{alias_name}', options)
++                result = list(actual)
++                
++                print("Generated documentation:")
++                for line in result:
++                    print(f"  {repr(line)}")
++                
++                # Check if docstring is present
++                has_docstring = any("Dictionary with PyScaffold" in line or 
++                                  "When the file content" in line or 
++                                  "Signature of functions" in line 
++                                  for line in result)
++                
++                # Check if "alias of" is present
++                has_alias_of = any("alias of" in line for line in result)
++                
++                print(f"Has docstring: {has_docstring}")
++                print(f"Has 'alias of': {has_alias_of}")
++                
++                if not has_docstring:
++                    print(f"ERROR: {alias_name} is missing its docstring!")
++                if not has_alias_of:
++                    print(f"ERROR: {alias_name} is missing 'alias of' text!")
++                    
++    finally:
++        # Clean up
++        if test_file.exists():
++            test_file.unlink()
++
++if __name__ == "__main__":
++    test_type_alias_issue()
+\ No newline at end of file
+diff --git a/tests/roots/test-ext-autodoc/target/issue_type_aliases.py b/tests/roots/test-ext-autodoc/target/issue_type_aliases.py
+new file mode 100644
+index 000000000..10648387d
+--- /dev/null
++++ b/tests/roots/test-ext-autodoc/target/issue_type_aliases.py
+@@ -0,0 +1,54 @@
++# issue_type_aliases.py
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Union
++
++# Test different scenarios to reproduce the issue
++
++# Scenario 1: Simple type alias with docstring (this should work)
++ScaffoldOpts = Dict[str, Any]
++"""Dictionary with PyScaffold's options, see ``pyscaffold.api.create_project``.
++Should be treated as immutable (if required, copy before changing).
++
++Please notice some behaviours given by the options **SHOULD** be observed. For example,
++files should be overwritten when the **force** option is ``True``. Similarly when
++**pretend** is ``True``, no operation should be really performed, but any action should
++be logged as if realized.
++"""
++
++# Scenario 2: Union type alias with docstring (this might not work)
++FileContents = Union[str, None]
++"""When the file content is ``None``, the file should not be written to
++disk (empty files are represented by an empty string ``""`` as content).
++"""
++
++# Scenario 3: Complex Callable type alias with docstring (this might not work)
++FileOp = Callable[[Path, FileContents, ScaffoldOpts], Union[Path, None]]
++"""Signature of functions considered file operations::
++
++    Callable[[Path, FileContents, ScaffoldOpts], Union[Path, None]]
++
++- **path** (:obj:`pathlib.Path`): file path potentially to be written to/changed
++  in the disk.
++- **contents** (:obj:`FileContents`): usually a string that represents a text content
++  of the file. :obj:`None` indicates the file should not be written.
++- **opts** (:obj:`ScaffoldOpts`): a dict with PyScaffold's options.
++
++If the file is written (or more generally changed, such as new access permissions),
++by convention they should return the :obj:`file path <pathlib.Path>`.
++If no file was touched, :obj:`None` should be returned. Please notice a **FileOp**
++might return :obj:`None` if a pre-existing file in the disk is not modified.
++
++.. note::
++    A **FileOp** usually has side effects (e.g. write a file to the disk), see
++    :obj:`FileFileContents` and :obj:`ScaffoldOpts` for other conventions.
++"""
++
++# Scenario 4: Test with different docstring styles
++SimpleAlias = Dict[str, str]
++"""Simple docstring."""
++
++# Scenario 5: Test without docstring
++NoDocAlias = Dict[str, int]
++
++# Scenario 6: Test with comment-style docstring
++CommentAlias = List[str]  #: Comment-style docstring
+\ No newline at end of file
+diff --git a/tests/test_issue_reproduce.py b/tests/test_issue_reproduce.py
+new file mode 100644
+index 000000000..bda499ef3
+--- /dev/null
++++ b/tests/test_issue_reproduce.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the type alias documentation issue.
++"""
++
++import sys
++import pytest
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, str(Path(__file__).parent))
++
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_issue_type_aliases(app):
++    """Test the type alias documentation issue."""
++    
++    from tests.test_ext_autodoc import do_autodoc
++    
++    # Test each type alias
++    for alias_name in ['ScaffoldOpts', 'FileContents', 'FileOp', 'SimpleAlias', 'NoDocAlias', 'CommentAlias']:
++        print(f"\n=== Testing {alias_name} ===")
++        
++        options = {}
++        actual = do_autodoc(app, 'data', f'target.issue_type_aliases.{alias_name}', options)
++        result = list(actual)
++        
++        print("Generated documentation:")
++        for line in result:
++            print(f"  {repr(line)}")
++        
++        # Check if docstring is present (look for any content that's not just "alias of")
++        has_docstring = any(line.strip() and 
++                          not line.startswith('..') and 
++                          not line.startswith(':') and
++                          'alias of' not in line and
++                          line != '' and
++                          'module:' not in line
++                          for line in result)
++        
++        # Check if "alias of" is present
++        has_alias_of = any("alias of" in line for line in result)
++        
++        print(f"Has docstring: {has_docstring}")
++        print(f"Has 'alias of': {has_alias_of}")
++        
++        if not has_docstring:
++            print(f"ERROR: {alias_name} is missing its docstring!")
++        if not has_alias_of:
++            print(f"ERROR: {alias_name} is missing 'alias of' text!")
++
++if __name__ == "__main__":
++    # Run the test manually
++    import tempfile
++    from sphinx.testing.path import path
++    from sphinx.testing.util import SphinxTestApp
++    
++    srcdir = path(__file__).parent / "tests" / "roots" / "test-ext-autodoc"
++    outdir = path(tempfile.mkdtemp())
++    
++    app = SphinxTestApp('html', srcdir=srcdir, builddir=outdir)
++    test_issue_type_aliases(app)
+\ No newline at end of file

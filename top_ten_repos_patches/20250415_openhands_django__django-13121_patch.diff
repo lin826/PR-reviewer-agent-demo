@@ -1,0 +1,255 @@
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 2e283a3193..de6956737d 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -579,8 +579,106 @@ class BaseDatabaseOperations:
+         return []
+ 
+     def convert_durationfield_value(self, value, expression, connection):
++        """
++        Converts a duration value from the database to a Python timedelta.
++        
++        Different database backends can return different formats:
++        - int/float: microseconds (SQLite/MySQL for stored values)
++        - string '0:00:00', '0:00:30' (time format)
++        - string '3 days, 0:00:00' (days + time format)
++        - string '0:00:00.500000' (time with microseconds)
++        - string '86400.000000' (total seconds with decimal places)
++        """
+         if value is not None:
+-            return datetime.timedelta(0, 0, value)
++            if isinstance(value, str):
++                # Process negative durations
++                if value.startswith('-'):
++                    is_negative = True
++                    value = value[1:]
++                else:
++                    is_negative = False
++                
++                try:
++                    # Try to parse as an integer (microseconds)
++                    value = int(value)
++                    delta = datetime.timedelta(0, 0, value)
++                    return -delta if is_negative else delta
++                except ValueError:
++                    # Handle various string formats
++                    
++                    # Case 1: 'X days, HH:MM:SS[.microseconds]' format
++                    if ', ' in value and ' day' in value.split(', ')[0]:
++                        try:
++                            days_part, time_part = value.split(', ', 1)
++                            days = int(days_part.split()[0])
++                            
++                            # Handle microseconds
++                            if '.' in time_part:
++                                time_part, microseconds_part = time_part.split('.', 1)
++                                microseconds = int(microseconds_part)
++                            else:
++                                microseconds = 0
++                            
++                            time_parts = time_part.split(':')
++                            if len(time_parts) == 3:
++                                hours, minutes, seconds = map(int, time_parts)
++                                delta = datetime.timedelta(
++                                    days=days, 
++                                    hours=hours, 
++                                    minutes=minutes, 
++                                    seconds=seconds, 
++                                    microseconds=microseconds
++                                )
++                                return -delta if is_negative else delta
++                        except (ValueError, IndexError):
++                            pass
++                    
++                    # Case 2: 'HH:MM:SS[.microseconds]' format
++                    elif ':' in value:
++                        try:
++                            # Handle microseconds
++                            microseconds = 0
++                            time_part = value
++                            if '.' in value:
++                                time_parts = value.split('.')
++                                time_part = time_parts[0]
++                                microseconds = int(time_parts[1])
++                            
++                            # Parse the time part
++                            parts = time_part.split(':')
++                            if len(parts) == 3:
++                                hours, minutes, seconds = map(int, parts)
++                                delta = datetime.timedelta(
++                                    hours=hours, 
++                                    minutes=minutes, 
++                                    seconds=seconds,
++                                    microseconds=microseconds
++                                )
++                                return -delta if is_negative else delta
++                        except (ValueError, IndexError):
++                            pass
++                    
++                    # Case 3: Try to use as a decimal string (MySQL format)
++                    from decimal import Decimal, InvalidOperation
++                    try:
++                        decimal_value = Decimal(value)
++                        # This could be total seconds (MySQL) or microseconds
++                        if '.' in value:  # It's likely seconds with fractional part
++                            delta = datetime.timedelta(seconds=float(value))
++                        else:
++                            # It's likely microseconds
++                            delta = datetime.timedelta(microseconds=int(decimal_value))
++                        return -delta if is_negative else delta
++                    except (ValueError, InvalidOperation, OverflowError):
++                        pass
++            
++            # If it's not a string or string parsing failed, use the original method
++            try:
++                return datetime.timedelta(0, 0, value)
++            except TypeError:
++                # If all parsing attempts failed, return the original value to maintain
++                # backward compatibility with any code that expects the raw value
++                return value
+ 
+     def check_expression_support(self, expression):
+         """
+diff --git a/test_duration.py b/test_duration.py
+new file mode 100644
+index 0000000000..0c8e255e98
+--- /dev/null
++++ b/test_duration.py
+@@ -0,0 +1,56 @@
++import os
++import sys
++import datetime
++from django.conf import settings
++from django.db import models
++from django.db.models import F
++
++# Configure minimal Django settings
++os.environ['DJANGO_SETTINGS_MODULE'] = 'test_settings'
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        },
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++)
++
++import django
++django.setup()
++from django.db import connection
++
++# Define a model with a DurationField
++class Experiment(models.Model):
++    name = models.CharField(max_length=100)
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test_app'
++
++# Create the database schema
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Insert test data
++exp = Experiment.objects.create(
++    name='Test Experiment',
++    estimated_time=datetime.timedelta(days=1)
++)
++
++# Try to run the query that's failing
++try:
++    delta = datetime.timedelta(days=1)
++    print("Trying to run Experiment.objects.annotate(duration=F('estimated_time') + delta)")
++    result = list(Experiment.objects.annotate(duration=F('estimated_time') + delta))
++    print(f"Success! Result: {result}")
++except Exception as e:
++    print(f"Error: {e}")
++    import traceback
++    traceback.print_exc()
++
++print("Done")
+\ No newline at end of file
+diff --git a/test_duration_edge_cases.py b/test_duration_edge_cases.py
+new file mode 100644
+index 0000000000..2ba82fefc0
+--- /dev/null
++++ b/test_duration_edge_cases.py
+@@ -0,0 +1,73 @@
++import os
++import sys
++import datetime
++from django.conf import settings
++from django.db import models
++from django.db.models import F
++
++# Configure minimal Django settings
++os.environ['DJANGO_SETTINGS_MODULE'] = 'test_settings'
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        },
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++)
++
++import django
++django.setup()
++from django.db import connection
++
++# Define a model with a DurationField
++class Experiment(models.Model):
++    name = models.CharField(max_length=100)
++    estimated_time = models.DurationField()
++
++    class Meta:
++        app_label = 'test_app'
++
++# Create the database schema
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Experiment)
++
++# Insert test data - various durations
++test_cases = [
++    ('Zero', datetime.timedelta(0)),
++    ('Small', datetime.timedelta(seconds=30)),
++    ('Medium', datetime.timedelta(minutes=45)),
++    ('Hours', datetime.timedelta(hours=5)),
++    ('Days', datetime.timedelta(days=3)),
++    ('Combined', datetime.timedelta(days=2, hours=8, minutes=15, seconds=30)),
++    ('Microseconds', datetime.timedelta(microseconds=500000)),
++    ('Negative', datetime.timedelta(days=-1)),
++]
++
++for name, duration in test_cases:
++    Experiment.objects.create(name=name, estimated_time=duration)
++
++# Test different operations
++print("\n=== Testing addition with different timedeltas ===")
++deltas = [
++    datetime.timedelta(0),
++    datetime.timedelta(seconds=1),
++    datetime.timedelta(days=7),
++    datetime.timedelta(days=-1)
++]
++
++for delta in deltas:
++    print(f"\nTesting with delta: {delta}")
++    try:
++        result = list(Experiment.objects.annotate(duration=F('estimated_time') + delta))
++        print(f"Success! Retrieved {len(result)} records")
++    except Exception as e:
++        print(f"Error: {e}")
++        import traceback
++        traceback.print_exc()
++
++print("\nDone")
+\ No newline at end of file

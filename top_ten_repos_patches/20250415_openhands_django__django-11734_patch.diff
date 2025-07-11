@@ -1,0 +1,202 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 35f3c5e1ea..f2a129c87c 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1046,6 +1046,13 @@ class Query(BaseExpression):
+         return sql, params
+ 
+     def resolve_lookup_value(self, value, can_reuse, allow_joins, simple_col):
++        from django.db.models.expressions import OuterRef
++
++        # Special case for OuterRef to ensure it works in negated contexts
++        if isinstance(value, OuterRef):
++            kwargs = {'reuse': can_reuse, 'allow_joins': allow_joins, 'simple_col': simple_col}
++            return value.resolve_expression(self, **kwargs)
++        
+         if hasattr(value, 'resolve_expression'):
+             kwargs = {'reuse': can_reuse, 'allow_joins': allow_joins}
+             if isinstance(value, F):
+@@ -1056,7 +1063,13 @@ class Query(BaseExpression):
+             # to be resolved independently.
+             resolved_values = []
+             for sub_value in value:
+-                if hasattr(sub_value, 'resolve_expression'):
++                # Also handle OuterRef in iterables
++                if isinstance(sub_value, OuterRef):
++                    resolved_values.append(sub_value.resolve_expression(
++                        self, reuse=can_reuse, allow_joins=allow_joins,
++                        simple_col=simple_col,
++                    ))
++                elif hasattr(sub_value, 'resolve_expression'):
+                     if isinstance(sub_value, F):
+                         resolved_values.append(sub_value.resolve_expression(
+                             self, reuse=can_reuse, allow_joins=allow_joins,
+diff --git a/test_outerref_exclude.py b/test_outerref_exclude.py
+new file mode 100644
+index 0000000000..aeac682f47
+--- /dev/null
++++ b/test_outerref_exclude.py
+@@ -0,0 +1,57 @@
++import os
++import django
++import sys
++from django.db import models
++from django.db.models import Exists, OuterRef, Q
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++django.setup()
++
++# Import after Django is configured
++from tests.queries.models import Number, Item, Tag, NamedCategory
++
++def test_exists_exclude():
++    """Test to reproduce the issue with OuterRef in exclude() or ~Q()"""
++    
++    print("Testing filter() with OuterRef")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        print("PASS: filter() with OuterRef works")
++        print(qs.query)
++    except Exception as e:
++        print("FAIL: filter() with OuterRef failed")
++        print(f"Error: {e}")
++    
++    print("\nTesting exclude() with OuterRef")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.exclude(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        print("PASS: exclude() with OuterRef works")
++        print(qs.query)
++    except Exception as e:
++        print("FAIL: exclude() with OuterRef failed")
++        print(f"Error: {e}")
++    
++    print("\nTesting filter(~Q()) with OuterRef")
++    try:
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(~Q(tags__category_id=OuterRef('pk')))
++            )
++        ).filter(foo=True)
++        print("PASS: filter(~Q()) with OuterRef works")
++        print(qs.query)
++    except Exception as e:
++        print("FAIL: filter(~Q()) with OuterRef failed")
++        print(f"Error: {e}")
++
++if __name__ == "__main__":
++    test_exists_exclude()
+\ No newline at end of file
+diff --git a/tests/queries/test_outerref_exclude.py b/tests/queries/test_outerref_exclude.py
+new file mode 100644
+index 0000000000..5dc416421e
+--- /dev/null
++++ b/tests/queries/test_outerref_exclude.py
+@@ -0,0 +1,98 @@
++from django.db.models import Exists, OuterRef, Q
++from django.test import TestCase
++
++from .models import Number, Item, Tag, NamedCategory, Author, Note, ExtraInfo, DateTimePK
++
++
++class OuterRefExcludeTests(TestCase):
++    @classmethod
++    def setUpTestData(cls):
++        # Create test data
++        number = Number.objects.create(num=1)
++        
++        # We have to create relationships in the correct order
++        date = DateTimePK.objects.create()
++        extra_info = ExtraInfo.objects.create(info="test_extra_info", value=1, date=date)
++        note = Note.objects.create(note="test_note", misc="test")
++        author = Author.objects.create(name="test_author", num=1, extra=extra_info)
++        
++        category = NamedCategory.objects.create(name="test_category")
++        tag = Tag.objects.create(name="test_tag", category=category)
++        
++        item = Item.objects.create(
++            name="test_item", 
++            created="2010-01-01", 
++            creator=author, 
++            note=note
++        )
++        item.tags.add(tag)
++
++    def test_exists_exclude(self):
++        """Test OuterRef in exclude() or ~Q()"""
++        # The first one should work
++        qs = Number.objects.annotate(
++            foo=Exists(
++                Item.objects.filter(tags__category_id=OuterRef('pk'))
++            )
++        ).filter(foo=True)
++        print("Filter query:", qs.query)
++
++        # These should now work with our fix
++        try:
++            qs = Number.objects.annotate(
++                foo=Exists(
++                    Item.objects.exclude(tags__category_id=OuterRef('pk'))
++                )
++            ).filter(foo=True)
++            print("Exclude query:", qs.query)
++            # Check if we can execute this query
++            results = list(qs)
++            print("Exclude query results:", results)
++        except Exception as e:
++            print("Exclude query exception:", str(e))
++            # Re-raise to see traceback
++            raise
++        
++        # Check with negated Q object as well
++        try:
++            qs = Number.objects.annotate(
++                foo=Exists(
++                    Item.objects.filter(~Q(tags__category_id=OuterRef('pk')))
++                )
++            ).filter(foo=True)
++            print("Negated Q query:", qs.query)
++            results = list(qs)
++            print("Negated Q query results:", results)
++        except Exception as e:
++            print("Negated Q query exception:", str(e))
++            raise
++            
++    def test_reference_preservation(self):
++        """Test that OuterRef preserves correct references even in negated contexts"""
++        # Create a query that should return Number objects with ID != 1
++        # First get the reference to compare against
++        category = NamedCategory.objects.get(name="test_category")
++        # Verify that category's ID is 1
++        self.assertEqual(category.id, 1)
++        
++        # This filter checks for Numbers with ID=1
++        filter_query = Number.objects.filter(pk=OuterRef('pk')).filter(pk=1)
++        
++        # Now create a query that negates this condition, should return numbers with ID != 1
++        # In both these queries we're using OuterRef in a negated context
++        with_exclude = Number.objects.annotate(
++            not_one=Exists(
++                filter_query.exclude(pk=OuterRef('pk'))
++            )
++        )
++        with_q = Number.objects.annotate(
++            not_one=Exists(
++                filter_query.filter(~Q(pk=OuterRef('pk')))
++            )
++        )
++        
++        # Both queries should give the same results
++        self.assertEqual(
++            set(with_exclude.filter(not_one=True).values_list('pk', flat=True)),
++            set(with_q.filter(not_one=True).values_list('pk', flat=True))
++        )
+\ No newline at end of file

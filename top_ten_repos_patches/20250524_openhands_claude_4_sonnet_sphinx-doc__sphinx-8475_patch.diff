@@ -1,0 +1,545 @@
+diff --git a/sphinx/builders/linkcheck.py b/sphinx/builders/linkcheck.py
+index 1dc0337c3..4104fe658 100644
+--- a/sphinx/builders/linkcheck.py
++++ b/sphinx/builders/linkcheck.py
+@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlparse
+ 
+ from docutils import nodes
+ from docutils.nodes import Node
+-from requests.exceptions import HTTPError
++from requests.exceptions import HTTPError, TooManyRedirects
+ 
+ from sphinx.application import Sphinx
+ from sphinx.builders import Builder
+@@ -172,7 +172,7 @@ class CheckExternalLinksBuilder(Builder):
+                                                  config=self.app.config, auth=auth_info,
+                                                  **kwargs)
+                         response.raise_for_status()
+-                    except HTTPError:
++                    except (HTTPError, TooManyRedirects):
+                         # retry with GET request if that fails, some servers
+                         # don't like HEAD requests.
+                         response = requests.get(req_url, stream=True, config=self.app.config,
+diff --git a/test_comprehensive_redirects.py b/test_comprehensive_redirects.py
+new file mode 100644
+index 000000000..81dfe689c
+--- /dev/null
++++ b/test_comprehensive_redirects.py
+@@ -0,0 +1,245 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for redirect handling in linkcheck.
++
++Tests various scenarios:
++1. TooManyRedirects with HEAD, success with GET (our main fix)
++2. HTTPError with HEAD, success with GET (existing functionality)
++3. TooManyRedirects with both HEAD and GET (should still fail)
++4. Normal redirects (should work as before)
++"""
++
++import http.server
++import threading
++import time
++import tempfile
++from pathlib import Path
++
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++class TestHandler(http.server.BaseHTTPRequestHandler):
++    """Handler for different test scenarios."""
++    
++    def __init__(self, scenario, *args, **kwargs):
++        self.scenario = scenario
++        super().__init__(*args, **kwargs)
++    
++    def do_HEAD(self):
++        if self.scenario == 'too_many_redirects_head_only':
++            # Infinite redirects for HEAD, but GET will work
++            self.send_response(302, "Found")
++            self.send_header("Location", f"http://localhost:{self.server.server_port}/")
++            self.end_headers()
++        elif self.scenario == 'http_error_head_only':
++            # HTTP error for HEAD, but GET will work
++            self.send_response(405, "Method Not Allowed")
++            self.end_headers()
++        elif self.scenario == 'too_many_redirects_both':
++            # Infinite redirects for both HEAD and GET
++            self.send_response(302, "Found")
++            self.send_header("Location", f"http://localhost:{self.server.server_port}/")
++            self.end_headers()
++        elif self.scenario == 'normal_redirect':
++            # Normal redirect that should work
++            if self.path == '/':
++                self.send_response(302, "Found")
++                self.send_header("Location", f"http://localhost:{self.server.server_port}/final")
++                self.end_headers()
++            else:
++                self.send_response(200, "OK")
++                self.end_headers()
++    
++    def do_GET(self):
++        if self.scenario == 'too_many_redirects_head_only':
++            # GET works fine
++            self.send_response(200, "OK")
++            self.send_header("Content-Type", "text/html")
++            self.end_headers()
++            self.wfile.write(b"<html><body>Success with GET!</body></html>")
++        elif self.scenario == 'http_error_head_only':
++            # GET works fine
++            self.send_response(200, "OK")
++            self.send_header("Content-Type", "text/html")
++            self.end_headers()
++            self.wfile.write(b"<html><body>Success with GET!</body></html>")
++        elif self.scenario == 'too_many_redirects_both':
++            # Infinite redirects for both HEAD and GET
++            self.send_response(302, "Found")
++            self.send_header("Location", f"http://localhost:{self.server.server_port}/")
++            self.end_headers()
++        elif self.scenario == 'normal_redirect':
++            # Normal redirect that should work
++            if self.path == '/':
++                self.send_response(302, "Found")
++                self.send_header("Location", f"http://localhost:{self.server.server_port}/final")
++                self.end_headers()
++            else:
++                self.send_response(200, "OK")
++                self.send_header("Content-Type", "text/html")
++                self.end_headers()
++                self.wfile.write(b"<html><body>Final destination!</body></html>")
++    
++    def log_message(self, format, *args):
++        # Suppress log messages for cleaner output
++        pass
++
++
++def create_handler_class(scenario):
++    """Create a handler class for the given scenario."""
++    class ScenarioHandler(TestHandler):
++        def __init__(self, *args, **kwargs):
++            super().__init__(scenario, *args, **kwargs)
++    return ScenarioHandler
++
++
++def start_test_server(port, scenario):
++    """Start a test server for the given scenario."""
++    handler_class = create_handler_class(scenario)
++    server = http.server.HTTPServer(('localhost', port), handler_class)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    return server
++
++
++def create_test_docs(tmpdir, urls):
++    """Create test documentation with multiple links."""
++    conf_content = '''
++extensions = []
++'''
++    
++    index_content = '''
++Test Document
++=============
++
++'''
++    
++    for i, url in enumerate(urls, 1):
++        index_content += f'Link {i}: `test link {i} <{url}>`_\n\n'
++    
++    conf_path = tmpdir / 'conf.py'
++    index_path = tmpdir / 'index.rst'
++    
++    conf_path.write_text(conf_content)
++    index_path.write_text(index_content)
++    
++    return tmpdir
++
++
++def run_linkcheck_test(urls, expected_results):
++    """Run linkcheck test and verify results."""
++    servers = []
++    
++    try:
++        # Start servers for each scenario
++        for i, (url, scenario) in enumerate(zip(urls, expected_results.keys())):
++            port = 7780 + i
++            server = start_test_server(port, scenario)
++            servers.append(server)
++        
++        time.sleep(0.2)  # Give servers time to start
++        
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmpdir = Path(tmpdir)
++            srcdir = tmpdir / 'source'
++            outdir = tmpdir / 'build'
++            doctreedir = tmpdir / 'doctrees'
++            
++            srcdir.mkdir()
++            outdir.mkdir()
++            doctreedir.mkdir()
++            
++            # Create test documentation
++            create_test_docs(srcdir, urls)
++            
++            print("Running comprehensive linkcheck test...")
++            
++            # Run Sphinx linkcheck
++            with docutils_namespace():
++                app = Sphinx(
++                    srcdir=str(srcdir),
++                    confdir=str(srcdir),
++                    outdir=str(outdir),
++                    doctreedir=str(doctreedir),
++                    buildername='linkcheck',
++                    confoverrides={
++                        'linkcheck_timeout': 5,
++                        'linkcheck_retries': 1,
++                    }
++                )
++                app.build()
++            
++            # Check the results
++            output_file = outdir / 'output.txt'
++            if output_file.exists():
++                content = output_file.read_text()
++                print("Linkcheck output:")
++                print(content)
++                print()
++                
++                # Verify each expected result
++                all_passed = True
++                for scenario, expected_status in expected_results.items():
++                    port = 7780 + list(expected_results.keys()).index(scenario)
++                    url = f'http://localhost:{port}/'
++                    
++                    if expected_status == 'working':
++                        if f'ok        {url}' in content or url not in content:
++                            print(f"✅ {scenario}: Link correctly marked as working")
++                        else:
++                            print(f"❌ {scenario}: Link should be working but isn't")
++                            all_passed = False
++                    elif expected_status == 'broken':
++                        if 'broken' in content and url in content:
++                            print(f"✅ {scenario}: Link correctly marked as broken")
++                        else:
++                            print(f"❌ {scenario}: Link should be broken but isn't")
++                            all_passed = False
++                    elif expected_status == 'redirected':
++                        if 'redirect' in content and url in content:
++                            print(f"✅ {scenario}: Link correctly marked as redirected")
++                        else:
++                            print(f"❌ {scenario}: Link should be redirected but isn't")
++                            all_passed = False
++                
++                return all_passed
++            else:
++                print("❌ No output file generated")
++                return False
++                
++    finally:
++        for server in servers:
++            server.shutdown()
++        print("All test servers stopped")
++
++
++def main():
++    """Run comprehensive tests."""
++    # Test scenarios
++    urls = [
++        'http://localhost:7780/',  # too_many_redirects_head_only
++        'http://localhost:7781/',  # http_error_head_only  
++        'http://localhost:7782/',  # too_many_redirects_both
++        'http://localhost:7783/',  # normal_redirect
++    ]
++    
++    expected_results = {
++        'too_many_redirects_head_only': 'working',  # Should work with our fix
++        'http_error_head_only': 'working',          # Should work (existing functionality)
++        'too_many_redirects_both': 'broken',        # Should still be broken
++        'normal_redirect': 'redirected',             # Should be redirected
++    }
++    
++    success = run_linkcheck_test(urls, expected_results)
++    
++    if success:
++        print("\n🎉 All tests passed! The fix is working correctly.")
++    else:
++        print("\n❌ Some tests failed. Please check the implementation.")
++    
++    return success
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_too_many_redirects.py b/test_too_many_redirects.py
+new file mode 100644
+index 000000000..9eb6541fa
+--- /dev/null
++++ b/test_too_many_redirects.py
+@@ -0,0 +1,136 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the TooManyRedirects issue in linkcheck.
++
++This script creates a mock server that causes infinite redirects with HEAD requests
++but works fine with GET requests, demonstrating the issue described in the bug report.
++"""
++
++import http.server
++import threading
++import time
++import tempfile
++import os
++from pathlib import Path
++
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++class InfiniteRedirectHandler(http.server.BaseHTTPRequestHandler):
++    """Handler that creates infinite redirects for HEAD requests but works for GET."""
++    
++    def do_HEAD(self):
++        # Always redirect HEAD requests to create infinite loop
++        self.send_response(302, "Found")
++        self.send_header("Location", "http://localhost:7777/")
++        self.end_headers()
++    
++    def do_GET(self):
++        # GET requests work fine
++        self.send_response(200, "OK")
++        self.send_header("Content-Type", "text/html")
++        self.end_headers()
++        self.wfile.write(b"<html><body>This works with GET!</body></html>")
++    
++    def log_message(self, format, *args):
++        # Suppress log messages for cleaner output
++        pass
++
++
++def start_test_server():
++    """Start the test server in a separate thread."""
++    server = http.server.HTTPServer(('localhost', 7777), InfiniteRedirectHandler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    return server
++
++
++def create_test_docs(tmpdir):
++    """Create test documentation with a link that causes TooManyRedirects."""
++    # Create conf.py
++    conf_content = '''
++extensions = []
++'''
++    
++    # Create index.rst with a link to our test server
++    index_content = '''
++Test Document
++=============
++
++This is a test link: `test link <http://localhost:7777/>`_
++'''
++    
++    conf_path = tmpdir / 'conf.py'
++    index_path = tmpdir / 'index.rst'
++    
++    conf_path.write_text(conf_content)
++    index_path.write_text(index_content)
++    
++    return tmpdir
++
++
++def test_linkcheck_too_many_redirects():
++    """Test that demonstrates the TooManyRedirects issue."""
++    print("Starting test server...")
++    server = start_test_server()
++    time.sleep(0.1)  # Give server time to start
++    
++    try:
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmpdir = Path(tmpdir)
++            srcdir = tmpdir / 'source'
++            outdir = tmpdir / 'build'
++            doctreedir = tmpdir / 'doctrees'
++            
++            srcdir.mkdir()
++            outdir.mkdir()
++            doctreedir.mkdir()
++            
++            # Create test documentation
++            create_test_docs(srcdir)
++            
++            print("Running linkcheck...")
++            
++            # Run Sphinx linkcheck
++            with docutils_namespace():
++                app = Sphinx(
++                    srcdir=str(srcdir),
++                    confdir=str(srcdir),
++                    outdir=str(outdir),
++                    doctreedir=str(doctreedir),
++                    buildername='linkcheck',
++                    confoverrides={
++                        'linkcheck_timeout': 5,
++                        'linkcheck_retries': 1,
++                    }
++                )
++                app.build()
++            
++            # Check the results
++            output_file = outdir / 'output.txt'
++            if output_file.exists():
++                content = output_file.read_text()
++                print("Linkcheck output:")
++                print(content)
++                
++                # Check if the link was marked as broken due to TooManyRedirects
++                if 'broken' in content and 'localhost:7777' in content:
++                    print("\n❌ BUG REPRODUCED: Link marked as broken due to TooManyRedirects")
++                    if 'TooManyRedirects' in content or 'too many redirects' in content.lower():
++                        print("   TooManyRedirects exception detected in output")
++                    return True
++                else:
++                    print("\n✅ Link check passed (bug may be fixed)")
++                    return False
++            else:
++                print("❌ No output file generated")
++                return False
++                
++    finally:
++        server.shutdown()
++        print("Test server stopped")
++
++
++if __name__ == '__main__':
++    test_linkcheck_too_many_redirects()
+\ No newline at end of file
+diff --git a/test_too_many_redirects_fix.py b/test_too_many_redirects_fix.py
+new file mode 100644
+index 000000000..2bd84266a
+--- /dev/null
++++ b/test_too_many_redirects_fix.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python3
++"""
++Test case for TooManyRedirects fix in linkcheck.
++
++This test can be added to the official test suite to ensure the fix is maintained.
++"""
++
++import http.server
++import textwrap
++
++import pytest
++
++try:
++    from .utils import http_server
++except ImportError:
++    # For standalone execution
++    http_server = None
++
++
++def make_too_many_redirects_handler():
++    """Create a handler that causes TooManyRedirects for HEAD but works for GET."""
++    class TooManyRedirectsHandler(http.server.BaseHTTPRequestHandler):
++        def do_HEAD(self):
++            # Always redirect HEAD requests to create infinite loop
++            self.send_response(302, "Found")
++            self.send_header("Location", "http://localhost:7777/")
++            self.end_headers()
++
++        def do_GET(self):
++            # GET requests work fine
++            self.send_response(200, "OK")
++            self.send_header("Content-Type", "text/html")
++            self.end_headers()
++            self.wfile.write(b"<html><body>Success with GET!</body></html>")
++
++        def log_date_time_string(self):
++            """Strip date and time from logged messages for assertions."""
++            return ""
++
++    return TooManyRedirectsHandler
++
++
++@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
++def test_too_many_redirects_fallback_to_get(app, capsys):
++    """Test that TooManyRedirects with HEAD requests falls back to GET."""
++    with http_server(make_too_many_redirects_handler()):
++        app.builder.build_all()
++    
++    stdout, stderr = capsys.readouterr()
++    content = (app.outdir / 'output.txt').read_text()
++    
++    # The link should be marked as working, not broken
++    # This tests our fix for TooManyRedirects fallback
++    assert content == ""  # No broken links should be reported
++    
++    # Check that HEAD was tried first, then GET succeeded
++    assert "HEAD / HTTP/1.1" in stderr
++    assert "GET / HTTP/1.1" in stderr
++
++
++if __name__ == '__main__':
++    # This allows the test to be run standalone for verification
++    import tempfile
++    from pathlib import Path
++    from sphinx.application import Sphinx
++    from sphinx.util.docutils import docutils_namespace
++    
++    def create_test_docs(tmpdir):
++        """Create test documentation."""
++        conf_content = 'extensions = []'
++        index_content = 'Test\n====\n\n`link <http://localhost:7777/>`_'
++        
++        (tmpdir / 'conf.py').write_text(conf_content)
++        (tmpdir / 'index.rst').write_text(index_content)
++        
++        return tmpdir
++    
++    # Start test server
++    import threading
++    import time
++    
++    server = http.server.HTTPServer(('localhost', 7777), make_too_many_redirects_handler())
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    time.sleep(0.1)
++    
++    try:
++        with tempfile.TemporaryDirectory() as tmpdir:
++            tmpdir = Path(tmpdir)
++            srcdir = tmpdir / 'source'
++            outdir = tmpdir / 'build'
++            doctreedir = tmpdir / 'doctrees'
++            
++            srcdir.mkdir()
++            outdir.mkdir()
++            doctreedir.mkdir()
++            
++            create_test_docs(srcdir)
++            
++            with docutils_namespace():
++                app = Sphinx(
++                    srcdir=str(srcdir),
++                    confdir=str(srcdir),
++                    outdir=str(outdir),
++                    doctreedir=str(doctreedir),
++                    buildername='linkcheck',
++                    confoverrides={'linkcheck_timeout': 5, 'linkcheck_retries': 1}
++                )
++                app.build()
++            
++            output_file = outdir / 'output.txt'
++            if output_file.exists():
++                content = output_file.read_text()
++                if content.strip():
++                    print(f"❌ Test failed - found broken links: {content}")
++                else:
++                    print("✅ Test passed - no broken links found")
++            else:
++                print("✅ Test passed - no output file (no broken links)")
++    finally:
++        server.shutdown()
+\ No newline at end of file

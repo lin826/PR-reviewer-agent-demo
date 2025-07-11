@@ -1,0 +1,108 @@
+diff --git a/django/template/autoreload.py b/django/template/autoreload.py
+index 84c8554165..f3fd704031 100644
+--- a/django/template/autoreload.py
++++ b/django/template/autoreload.py
+@@ -17,7 +17,7 @@ def get_template_directories():
+         if not isinstance(backend, DjangoTemplates):
+             continue
+ 
+-        items.update(cwd / to_path(dir) for dir in backend.engine.dirs)
++        items.update(cwd / to_path(dir) for dir in backend.engine.dirs if dir)
+ 
+         for loader in backend.engine.template_loaders:
+             if not hasattr(loader, "get_dirs"):
+@@ -25,7 +25,7 @@ def get_template_directories():
+             items.update(
+                 cwd / to_path(directory)
+                 for directory in loader.get_dirs()
+-                if not is_django_path(directory)
++                if directory and not is_django_path(directory)
+             )
+     return items
+ 
+diff --git a/old_file.py b/old_file.py
+new file mode 100644
+index 0000000000..36952ef9aa
+--- /dev/null
++++ b/old_file.py
+@@ -0,0 +1,50 @@
++from django.dispatch import receiver
++from django.template import engines
++from django.template.backends.django import DjangoTemplates
++from django.utils.autoreload import (
++    autoreload_started, file_changed, is_django_path,
++)
++
++
++def get_template_directories():
++    # Iterate through each template backend and find
++    # any template_loader that has a 'get_dirs' method.
++    # Collect the directories, filtering out Django templates.
++    items = set()
++    for backend in engines.all():
++        if not isinstance(backend, DjangoTemplates):
++            continue
++
++        items.update(backend.engine.dirs)
++
++        for loader in backend.engine.template_loaders:
++            if not hasattr(loader, 'get_dirs'):
++                continue
++            items.update(
++                directory
++                for directory in loader.get_dirs()
++                if not is_django_path(directory)
++            )
++    return items
++
++
++def reset_loaders():
++    for backend in engines.all():
++        if not isinstance(backend, DjangoTemplates):
++            continue
++        for loader in backend.engine.template_loaders:
++            loader.reset()
++
++
++@receiver(autoreload_started, dispatch_uid='template_loaders_watch_changes')
++def watch_for_template_changes(sender, **kwargs):
++    for directory in get_template_directories():
++        sender.watch_dir(directory, '**/*')
++
++
++@receiver(file_changed, dispatch_uid='template_loaders_file_changed')
++def template_changed(sender, file_path, **kwargs):
++    for template_dir in get_template_directories():
++        if template_dir in file_path.parents:
++            reset_loaders()
++            return True
+diff --git a/tests/template_tests/test_autoreloader.py b/tests/template_tests/test_autoreloader.py
+index cc2c3f58a5..aa3c5aa484 100644
+--- a/tests/template_tests/test_autoreloader.py
++++ b/tests/template_tests/test_autoreloader.py
+@@ -55,6 +55,25 @@ class TemplateReloadTests(SimpleTestCase):
+     def test_non_template_changed_in_template_directory(self, mock_reset):
+         self.assertIsNone(autoreload.template_changed(None, Path(__file__)))
+         mock_reset.assert_not_called()
++        
++    @override_settings(
++        TEMPLATES=[
++            {
++                "DIRS": [""],  # Empty string template directory
++                "BACKEND": "django.template.backends.django.DjangoTemplates",
++            }
++        ]
++    )
++    @mock.patch("django.template.autoreload.reset_loaders")
++    def test_empty_string_in_template_dirs(self, mock_reset):
++        """
++        Test that empty strings in TEMPLATE DIRS are handled correctly and
++        don't cause excessive reloading.
++        """
++        # Path to a file that's not in a template dir
++        test_file = Path(__file__).parent.parent / "urls.py"
++        self.assertIsNone(autoreload.template_changed(None, test_file))
++        mock_reset.assert_not_called()
+ 
+     def test_watch_for_template_changes(self):
+         mock_reloader = mock.MagicMock()

@@ -1,0 +1,93 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index d69c24419b..5f11434d50 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1316,6 +1316,32 @@ class Query(BaseExpression):
+         # rel_a doesn't produce any rows, then the whole condition must fail.
+         # So, demotion is OK.
+         existing_inner = {a for a in self.alias_map if self.alias_map[a].join_type == INNER}
++
++        # Special case handling for negated Q objects with FilteredRelation
++        if q_object.negated and len(q_object.children) == 1:
++            child = q_object.children[0]
++            if isinstance(child, tuple) and len(child) == 2:
++                # Check for the pattern: ~Q(relation__isnull=False)
++                key, value = child
++                if key.endswith('__isnull') and value is False:
++                    relation_name = key[:-8]  # Remove '__isnull'
++                    if relation_name in self._filtered_relations:
++                        # Replace with the equivalent positive case using the real relation
++                        filtered_relation = self._filtered_relations[relation_name]
++                        base_relation = filtered_relation.relation_name
++                        # We want the equivalent of:
++                        # SELECT * FROM author WHERE author.id NOT IN
++                        #   (SELECT author.id FROM author INNER JOIN book ON (...)
++                        #    WHERE book.title ILIKE 'poem by alice')
++                        
++                        # Create a subquery with just the filtered condition
++                        subq = Query(self.model)
++                        subq.add_q(filtered_relation.condition)
++                        subq.clear_ordering(True)
++                        
++                        # Find main table rows not in the subquery result
++                        q_object = ~Q(**{'pk__in': subq})
++
+         clause, _ = self._add_q(q_object, self.used_aliases)
+         if clause:
+             self.where.add(clause, AND)
+@@ -1664,8 +1690,10 @@ class Query(BaseExpression):
+         filter_lhs, filter_rhs = filter_expr
+         if isinstance(filter_rhs, F):
+             filter_expr = (filter_lhs, OuterRef(filter_rhs.name))
+-        # Generate the inner query.
++        # Generate the inner query, including copying any filtered_relations
+         query = Query(self.model)
++        # Copy filtered_relations to enable FilteredRelation to work with exclude()
++        query._filtered_relations = self._filtered_relations.copy()
+         query.add_filter(filter_expr)
+         query.clear_ordering(True)
+         # Try to have as simple as possible subquery -> trim leading joins from
+diff --git a/tests/filtered_relation/tests.py b/tests/filtered_relation/tests.py
+index 5e85dff16c..0a87e5d0fa 100644
+--- a/tests/filtered_relation/tests.py
++++ b/tests/filtered_relation/tests.py
+@@ -97,6 +97,39 @@ class FilteredRelationTests(TestCase):
+             ).filter(book_alice__isnull=False),
+             [self.author1]
+         )
++        
++    def test_with_join_exclude(self):
++        """Test that exclude on annotated FilteredRelation works properly"""
++        # First confirm that filter works
++        qs1 = Author.objects.annotate(
++            book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++        ).filter(book_alice__isnull=False)
++        self.assertEqual(qs1.count(), 1)
++        self.assertEqual(qs1[0].name, 'Alice')
++        
++        # Simple debugging to see what the SQL looks like
++        qs2 = Author.objects.annotate(
++            book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++        ).exclude(book_alice__isnull=False)
++        print("\nEXCLUDE SQL:", qs2.query)
++        
++        # Manually construct a working version for comparison
++        qs3 = Author.objects.exclude(
++            pk__in=Author.objects.filter(
++                book__title__iexact='poem by alice'
++            )
++        )
++        print("MANUAL SQL:", qs3.query)
++        print("Retrieving qs2 (should show Jane):", [a.name for a in qs2])
++        print("Retrieving qs3 (should show Jane):", [a.name for a in qs3])
++        
++        # Test exclude - should return all authors except Alice
++        self.assertSequenceEqual(
++            Author.objects.annotate(
++                book_alice=FilteredRelation('book', condition=Q(book__title__iexact='poem by alice')),
++            ).exclude(book_alice__isnull=False),
++            [self.author2]
++        )
+ 
+     def test_with_join_and_complex_condition(self):
+         self.assertSequenceEqual(

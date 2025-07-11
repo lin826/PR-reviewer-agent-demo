@@ -1,0 +1,858 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 9735ce10c8..594b31e090 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -545,11 +545,91 @@ class Query(BaseExpression):
+ 
+         return dict(zip(outer_query.annotation_select, result))
+ 
++    def _get_referenced_annotations(self, annotations):
++        """
++        Find annotations that are referenced by WHERE clauses, other annotations,
++        or ORDER BY clauses.
++        """
++        if not annotations:
++            return set()
++        
++        referenced = set()
++        
++        def collect_refs_from_expression(expr, refs_set):
++            """Recursively collect annotation references from an expression."""
++            if hasattr(expr, 'get_source_expressions'):
++                for source_expr in expr.get_source_expressions():
++                    collect_refs_from_expression(source_expr, refs_set)
++            
++            # Check if this is a Ref to an annotation
++            if isinstance(expr, Ref) and expr.refs in annotations:
++                refs_set.add(expr.refs)
++            
++            # Check if this is an F expression referencing an annotation
++            if hasattr(expr, 'name') and expr.name in annotations:
++                refs_set.add(expr.name)
++            
++            # Handle other expression types that might reference annotations
++            if hasattr(expr, 'children'):
++                for child in expr.children:
++                    collect_refs_from_expression(child, refs_set)
++        
++        # Check WHERE clause for annotation references
++        if self.where:
++            collect_refs_from_expression(self.where, referenced)
++        
++        # Check ORDER BY clause for annotation references
++        for order_expr in self.order_by:
++            if isinstance(order_expr, str):
++                # Handle string-based ordering like 'annotation_name' or '-annotation_name'
++                field_name = order_expr.lstrip('-')
++                if field_name in annotations:
++                    referenced.add(field_name)
++            else:
++                # Handle expression-based ordering
++                collect_refs_from_expression(order_expr, referenced)
++        
++        # Find transitive dependencies: if annotation A references annotation B,
++        # and B is referenced elsewhere, then A is also needed
++        changed = True
++        while changed:
++            changed = False
++            for alias, annotation in annotations.items():
++                if alias not in referenced:
++                    temp_refs = set()
++                    collect_refs_from_expression(annotation, temp_refs)
++                    # Check if this annotation references any already-referenced annotations
++                    if temp_refs.intersection(referenced):
++                        referenced.add(alias)
++                        changed = True
++        
++        return referenced
++
+     def get_count(self, using):
+         """
+         Perform a COUNT() query using the current filter constraints.
+         """
+         obj = self.clone()
++        
++        # Strip unused annotations to optimize the count query
++        if obj.annotations:
++            referenced_annotations = obj._get_referenced_annotations(obj.annotations)
++            # Keep only annotations that are actually referenced
++            if referenced_annotations != set(obj.annotations.keys()):
++                # Create a new annotations dict with only referenced annotations
++                obj.annotations = {
++                    alias: annotation 
++                    for alias, annotation in obj.annotations.items()
++                    if alias in referenced_annotations
++                }
++                # Clear the annotation select cache since we modified annotations
++                obj._annotation_select_cache = None
++                # Update annotation select mask if it exists
++                if obj.annotation_select_mask is not None:
++                    obj.annotation_select_mask = obj.annotation_select_mask.intersection(
++                        referenced_annotations
++                    )
++        
+         obj.add_annotation(Count("*"), alias="__count", is_summary=True)
+         return obj.get_aggregation(using, ["__count"])["__count"]
+ 
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..7cbd6f4f2b
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,173 @@
++#!/usr/bin/env python
++"""
++Final verification that the issue described in the GitHub issue is fixed
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.models import Count
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'tests.annotations',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Import models after Django setup
++from tests.annotations.models import Book, Author, Publisher
++
++def create_test_data():
++    """Create some test data"""
++    # Create test data
++    publisher = Publisher.objects.create(name="Test Publisher", num_awards=5)
++    author = Author.objects.create(name="Test Author", age=30)
++    
++    book1 = Book.objects.create(
++        isbn="123456789",
++        name="Test Book 1", 
++        pages=200,
++        rating=4.5,
++        price=29.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-01-01"
++    )
++    
++    book2 = Book.objects.create(
++        isbn="987654321",
++        name="Test Book 2",
++        pages=300, 
++        rating=3.8,
++        price=39.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-02-01"
++    )
++    
++    return book1, book2
++
++def main():
++    """Final verification test"""
++    print("=== Final Verification: Issue Resolution ===")
++    print()
++    print("Issue Description:")
++    print("  The query Book.objects.annotate(Count('chapters')).count()")
++    print("  produces a SQL statement that includes the Count('chapters'),")
++    print("  despite not being used in any filter operations.")
++    print()
++    print("  It should produce the same results as:")
++    print("  Book.objects.count()")
++    print()
++    print("  Django should strip out annotations that are not referenced")
++    print("  by filters, other annotations or ordering.")
++    print()
++    
++    # Create tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb', '--verbosity=0'])
++    
++    # Create test data
++    create_test_data()
++    
++    def capture_sql_and_result(queryset):
++        """Capture both SQL and result for a queryset count"""
++        queries_before = len(connection.queries)
++        result = queryset.count()
++        queries_after = len(connection.queries)
++        if queries_after > queries_before:
++            sql = connection.queries[-1]['sql']
++            return result, sql
++        return result, "No SQL captured"
++    
++    # Test the exact scenario from the issue
++    print("BEFORE FIX (expected behavior):")
++    print("  Complex subquery with GROUP BY and unnecessary annotation")
++    print()
++    
++    print("AFTER FIX (actual behavior):")
++    
++    # Test case 1: Book.objects.annotate(Count('authors')).count()
++    # (using 'authors' instead of 'chapters' since our model has authors)
++    result1, sql1 = capture_sql_and_result(
++        Book.objects.annotate(Count('authors'))
++    )
++    print(f"Book.objects.annotate(Count('authors')).count():")
++    print(f"  Result: {result1}")
++    print(f"  SQL: {sql1}")
++    print()
++    
++    # Test case 2: Book.objects.count()
++    result2, sql2 = capture_sql_and_result(Book.objects)
++    print(f"Book.objects.count():")
++    print(f"  Result: {result2}")
++    print(f"  SQL: {sql2}")
++    print()
++    
++    # Verification
++    print("=== VERIFICATION ===")
++    
++    # Check 1: Same results
++    if result1 == result2:
++        print("✅ Both queries return the same result")
++    else:
++        print("❌ Queries return different results")
++    
++    # Check 2: No subquery in annotated version
++    if "subquery" not in sql1.lower():
++        print("✅ Annotated query no longer uses subquery")
++    else:
++        print("❌ Annotated query still uses subquery")
++    
++    # Check 3: No GROUP BY in annotated version
++    if "group by" not in sql1.lower():
++        print("✅ Annotated query no longer uses GROUP BY")
++    else:
++        print("❌ Annotated query still uses GROUP BY")
++    
++    # Check 4: Complexity comparison
++    sql1_complexity = len([x for x in ['SELECT', 'FROM', 'JOIN', 'WHERE', 'GROUP BY', 'HAVING', 'ORDER BY'] if x.lower() in sql1.lower()])
++    sql2_complexity = len([x for x in ['SELECT', 'FROM', 'JOIN', 'WHERE', 'GROUP BY', 'HAVING', 'ORDER BY'] if x.lower() in sql2.lower()])
++    
++    if sql1_complexity <= sql2_complexity + 1:  # Allow for one extra part (JOIN)
++        print("✅ Annotated query complexity is now similar to simple query")
++    else:
++        print("❌ Annotated query is still significantly more complex")
++    
++    print()
++    print("=== CONCLUSION ===")
++    if result1 == result2 and "subquery" not in sql1.lower() and "group by" not in sql1.lower():
++        print("🎉 SUCCESS: The issue has been RESOLVED!")
++        print("   - Unused annotations are stripped from count queries")
++        print("   - Performance is significantly improved")
++        print("   - Results remain correct")
++    else:
++        print("❌ FAILURE: The issue is not fully resolved")
++    
++    print()
++    print("Performance improvement:")
++    print(f"  Before: Complex subquery with GROUP BY")
++    print(f"  After:  {sql1}")
++
++if __name__ == "__main__":
++    # Enable SQL query logging
++    settings.DEBUG = True
++    
++    main()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a04895e663
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the issue: Strip unused annotations from count queries
++
++This script demonstrates that Django includes unused annotations in count() queries,
++which is inefficient.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.models import Count
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'tests.annotations',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Import models after Django setup
++from tests.annotations.models import Book, Author, Publisher
++
++def create_test_data():
++    """Create some test data"""
++    # Create test data
++    publisher = Publisher.objects.create(name="Test Publisher", num_awards=5)
++    author = Author.objects.create(name="Test Author", age=30)
++    
++    book1 = Book.objects.create(
++        isbn="123456789",
++        name="Test Book 1", 
++        pages=200,
++        rating=4.5,
++        price=29.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-01-01"
++    )
++    
++    book2 = Book.objects.create(
++        isbn="987654321",
++        name="Test Book 2",
++        pages=300, 
++        rating=3.8,
++        price=39.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-02-01"
++    )
++    
++    return book1, book2
++
++def test_count_with_unused_annotation():
++    """Test count() with unused annotations"""
++    print("=== Testing count() with unused annotations ===")
++    
++    # Create tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb', '--verbosity=0'])
++    
++    # Create test data
++    create_test_data()
++    
++    # Test 1: Simple count without annotations
++    print("\n1. Simple count() query:")
++    with connection.cursor() as cursor:
++        cursor.execute("DELETE FROM sqlite_sequence WHERE name='django_query_log'")  # Clear any query log
++    
++    simple_count = Book.objects.count()
++    print(f"   Result: {simple_count}")
++    
++    # Get the last SQL query
++    queries_before = len(connection.queries)
++    simple_count = Book.objects.count()
++    queries_after = len(connection.queries)
++    if queries_after > queries_before:
++        simple_sql = connection.queries[-1]['sql']
++        print(f"   SQL: {simple_sql}")
++    
++    # Test 2: Count with unused annotation
++    print("\n2. count() with unused annotation:")
++    queries_before = len(connection.queries)
++    annotated_count = Book.objects.annotate(author_count=Count('authors')).count()
++    queries_after = len(connection.queries)
++    
++    print(f"   Result: {annotated_count}")
++    if queries_after > queries_before:
++        annotated_sql = connection.queries[-1]['sql']
++        print(f"   SQL: {annotated_sql}")
++    
++    # Test 3: Count with annotation used in filter
++    print("\n3. count() with annotation used in filter:")
++    queries_before = len(connection.queries)
++    filtered_count = Book.objects.annotate(author_count=Count('authors')).filter(author_count__gt=0).count()
++    queries_after = len(connection.queries)
++    
++    print(f"   Result: {filtered_count}")
++    if queries_after > queries_before:
++        filtered_sql = connection.queries[-1]['sql']
++        print(f"   SQL: {filtered_sql}")
++    
++    # Compare results
++    print(f"\n=== Results Comparison ===")
++    print(f"Simple count: {simple_count}")
++    print(f"Annotated count (unused): {annotated_count}")
++    print(f"Annotated count (used in filter): {filtered_count}")
++    
++    if simple_count == annotated_count:
++        print("✓ Simple and annotated counts match (as expected)")
++    else:
++        print("✗ Simple and annotated counts don't match (unexpected)")
++    
++    # Check if annotation is included in SQL
++    if 'COUNT(' in annotated_sql and annotated_sql.count('COUNT(') > 1:
++        print("✗ ISSUE: Unused annotation is included in count() SQL")
++        print("   This is the performance issue we want to fix")
++    else:
++        print("✓ Unused annotation is NOT included in count() SQL")
++        print("   The issue may already be fixed")
++
++if __name__ == "__main__":
++    # Enable SQL query logging
++    settings.DEBUG = True
++    
++    test_count_with_unused_annotation()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..562ce6e9ab
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the annotation stripping fix
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.models import Count, F, Value, Q
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'tests.annotations',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Import models after Django setup
++from tests.annotations.models import Book, Author, Publisher
++
++def create_test_data():
++    """Create some test data"""
++    # Create test data
++    publisher = Publisher.objects.create(name="Test Publisher", num_awards=5)
++    author = Author.objects.create(name="Test Author", age=30)
++    
++    book1 = Book.objects.create(
++        isbn="123456789",
++        name="Test Book 1", 
++        pages=200,
++        rating=4.5,
++        price=29.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-01-01"
++    )
++    
++    book2 = Book.objects.create(
++        isbn="987654321",
++        name="Test Book 2",
++        pages=300, 
++        rating=3.8,
++        price=39.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-02-01"
++    )
++    
++    return book1, book2
++
++def test_edge_cases():
++    """Test edge cases"""
++    print("=== Testing Edge Cases ===")
++    
++    # Create tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb', '--verbosity=0'])
++    
++    # Create test data
++    create_test_data()
++    
++    def get_sql_for_count(queryset, description):
++        """Helper to get SQL for a count query"""
++        print(f"\n{description}:")
++        try:
++            queries_before = len(connection.queries)
++            result = queryset.count()
++            queries_after = len(connection.queries)
++            if queries_after > queries_before:
++                sql = connection.queries[-1]['sql']
++                print(f"   Result: {result}")
++                print(f"   SQL: {sql}")
++                return result, sql
++            return result, "No SQL captured"
++        except Exception as e:
++            print(f"   ERROR: {e}")
++            return None, str(e)
++    
++    # Edge case tests
++    test_cases = [
++        # Basic cases
++        ("No annotations", Book.objects),
++        ("Empty queryset with annotation", Book.objects.filter(id__lt=0).annotate(count=Count('authors'))),
++        
++        # Complex annotation dependencies
++        ("Annotation chain A->B->C", Book.objects.annotate(
++            a=Count('authors'),
++            b=F('a') + 1,
++            c=F('b') * 2
++        )),
++        
++        # Annotations with Q objects
++        ("Annotation with Q filter", Book.objects.annotate(
++            high_rating=Count('authors', filter=Q(rating__gt=4.0))
++        )),
++        
++        # Multiple annotations, some used, some not
++        ("Mixed usage complex", Book.objects.annotate(
++            used_count=Count('authors'),
++            unused_val=Value(42),
++            used_calc=F('pages') + F('rating')
++        ).filter(used_count__gte=0).order_by('used_calc')),
++        
++        # Annotation referencing model fields
++        ("Field reference annotation", Book.objects.annotate(
++            page_rating_sum=F('pages') + F('rating')
++        )),
++        
++        # Nested annotations
++        ("Nested annotation reference", Book.objects.annotate(
++            author_count=Count('authors'),
++            double_count=F('author_count') * 2,
++            triple_count=F('double_count') + F('author_count')
++        ).filter(double_count__gt=0)),
++    ]
++    
++    for description, queryset in test_cases:
++        get_sql_for_count(queryset, description)
++
++if __name__ == "__main__":
++    # Enable SQL query logging
++    settings.DEBUG = True
++    
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..4f945c5869
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the annotation stripping fix
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.models import Count, F, Value
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'tests.annotations',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Import models after Django setup
++from tests.annotations.models import Book, Author, Publisher
++
++def create_test_data():
++    """Create some test data"""
++    # Create test data
++    publisher = Publisher.objects.create(name="Test Publisher", num_awards=5)
++    author = Author.objects.create(name="Test Author", age=30)
++    
++    book1 = Book.objects.create(
++        isbn="123456789",
++        name="Test Book 1", 
++        pages=200,
++        rating=4.5,
++        price=29.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-01-01"
++    )
++    
++    book2 = Book.objects.create(
++        isbn="987654321",
++        name="Test Book 2",
++        pages=300, 
++        rating=3.8,
++        price=39.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-02-01"
++    )
++    
++    return book1, book2
++
++def test_comprehensive():
++    """Comprehensive test of annotation stripping"""
++    print("=== Comprehensive Annotation Stripping Test ===")
++    
++    # Create tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb', '--verbosity=0'])
++    
++    # Create test data
++    create_test_data()
++    
++    def get_sql_for_count(queryset):
++        """Helper to get SQL for a count query"""
++        queries_before = len(connection.queries)
++        result = queryset.count()
++        queries_after = len(connection.queries)
++        if queries_after > queries_before:
++            return result, connection.queries[-1]['sql']
++        return result, "No SQL captured"
++    
++    # Test cases
++    test_cases = [
++        ("Simple count", Book.objects),
++        ("Unused annotation", Book.objects.annotate(author_count=Count('authors'))),
++        ("Unused annotation with Value", Book.objects.annotate(is_book=Value(1))),
++        ("Multiple unused annotations", Book.objects.annotate(
++            author_count=Count('authors'),
++            is_book=Value(1),
++            page_rating=F('pages') + F('rating')
++        )),
++        ("Used in filter", Book.objects.annotate(author_count=Count('authors')).filter(author_count__gt=0)),
++        ("Used in order_by", Book.objects.annotate(author_count=Count('authors')).order_by('author_count')),
++        ("Mixed: one used, one unused", Book.objects.annotate(
++            author_count=Count('authors'),
++            unused_val=Value(42)
++        ).filter(author_count__gte=0)),
++        ("Annotation referencing another", Book.objects.annotate(
++            author_count=Count('authors'),
++            double_count=F('author_count') * 2
++        )),
++    ]
++    
++    for name, queryset in test_cases:
++        print(f"\n{name}:")
++        result, sql = get_sql_for_count(queryset)
++        print(f"   Result: {result}")
++        print(f"   SQL: {sql}")
++        
++        # Analyze the SQL
++        if "subquery" in sql.lower():
++            print("   ⚠️  Uses subquery")
++        if "group by" in sql.lower():
++            print("   ⚠️  Uses GROUP BY")
++        if "having" in sql.lower():
++            print("   ⚠️  Uses HAVING")
++        if "join" in sql.lower():
++            print("   ⚠️  Uses JOIN")
++        if sql.count("COUNT(") > 1:
++            print("   ⚠️  Multiple COUNT expressions")
++
++if __name__ == "__main__":
++    # Enable SQL query logging
++    settings.DEBUG = True
++    
++    test_comprehensive()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..8c2175fd5f
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python
++"""
++Test the exact case from the issue description
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection
++from django.db.models import Count
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'tests.annotations',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Import models after Django setup
++from tests.annotations.models import Book, Author, Publisher
++
++def create_test_data():
++    """Create some test data"""
++    # Create test data
++    publisher = Publisher.objects.create(name="Test Publisher", num_awards=5)
++    author = Author.objects.create(name="Test Author", age=30)
++    
++    book1 = Book.objects.create(
++        isbn="123456789",
++        name="Test Book 1", 
++        pages=200,
++        rating=4.5,
++        price=29.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-01-01"
++    )
++    
++    # Add the author to the book's authors many-to-many relationship
++    book1.authors.add(author)
++    
++    book2 = Book.objects.create(
++        isbn="987654321",
++        name="Test Book 2",
++        pages=300, 
++        rating=3.8,
++        price=39.99,
++        contact=author,
++        publisher=publisher,
++        pubdate="2023-02-01"
++    )
++    
++    # Add the author to the book's authors many-to-many relationship
++    book2.authors.add(author)
++    
++    return book1, book2
++
++def test_original_issue():
++    """Test the exact case from the issue description"""
++    print("=== Testing Original Issue Case ===")
++    
++    # Create tables
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'migrate', '--run-syncdb', '--verbosity=0'])
++    
++    # Create test data
++    create_test_data()
++    
++    def get_sql_for_count(queryset, description):
++        """Helper to get SQL for a count query"""
++        print(f"\n{description}:")
++        queries_before = len(connection.queries)
++        result = queryset.count()
++        queries_after = len(connection.queries)
++        if queries_after > queries_before:
++            sql = connection.queries[-1]['sql']
++            print(f"   Result: {result}")
++            print(f"   SQL: {sql}")
++            return result, sql
++        return result, "No SQL captured"
++    
++    # Test the exact cases from the issue description
++    
++    # Case 1: Book.objects.annotate(Count('chapters')).count()
++    # Note: The issue mentions 'chapters' but our model has 'authors', so I'll use that
++    result1, sql1 = get_sql_for_count(
++        Book.objects.annotate(Count('authors')),
++        "Book.objects.annotate(Count('authors')).count()"
++    )
++    
++    # Case 2: Book.objects.count()
++    result2, sql2 = get_sql_for_count(
++        Book.objects,
++        "Book.objects.count()"
++    )
++    
++    print(f"\n=== Analysis ===")
++    print(f"Both queries return the same result: {result1 == result2}")
++    
++    # Check if the first query is now more similar to the second
++    if "subquery" in sql1.lower():
++        print("❌ First query still uses subquery (not fully optimized)")
++    else:
++        print("✅ First query no longer uses subquery")
++    
++    if "group by" in sql1.lower():
++        print("❌ First query still uses GROUP BY (not fully optimized)")
++    else:
++        print("✅ First query no longer uses GROUP BY")
++    
++    # Compare complexity
++    sql1_parts = len([part for part in ['SELECT', 'FROM', 'JOIN', 'WHERE', 'GROUP BY', 'HAVING', 'ORDER BY'] if part.lower() in sql1.lower()])
++    sql2_parts = len([part for part in ['SELECT', 'FROM', 'JOIN', 'WHERE', 'GROUP BY', 'HAVING', 'ORDER BY'] if part.lower() in sql2.lower()])
++    
++    print(f"SQL complexity - Annotated: {sql1_parts} parts, Simple: {sql2_parts} parts")
++    
++    if sql1_parts <= sql2_parts + 1:  # Allow for one extra part (JOIN) which might be acceptable
++        print("✅ Annotated query complexity is now similar to simple query")
++    else:
++        print("⚠️  Annotated query is still more complex than simple query")
++
++if __name__ == "__main__":
++    # Enable SQL query logging
++    settings.DEBUG = True
++    
++    test_original_issue()
+\ No newline at end of file

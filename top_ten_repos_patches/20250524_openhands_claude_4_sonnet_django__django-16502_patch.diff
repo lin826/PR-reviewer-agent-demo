@@ -1,0 +1,552 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..42a431ccc8 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -143,6 +143,35 @@ class ServerHandler(simple_server.ServerHandler):
+         if self.headers.get("Connection") == "close":
+             self.request_handler.close_connection = True
+ 
++    def write(self, data):
++        """'write()' callable as specified by PEP 3333
++        
++        Ensures compliance with RFC 2616 section 4.3 by not sending response
++        body for HEAD requests.
++        """
++        assert type(data) is bytes, \
++            "write() argument must be a bytes instance"
++
++        if not self.status:
++            raise AssertionError("write() before start_response()")
++
++        elif not self.headers_sent:
++            # Before the first output, send the stored headers
++            self.bytes_sent = len(data)    # make sure we know content-length
++            self.send_headers()
++        else:
++            self.bytes_sent += len(data)
++
++        # RFC 2616 section 4.3: HEAD responses MUST NOT include a message body
++        if getattr(self, 'environ', {}).get('REQUEST_METHOD') == 'HEAD':
++            # Skip writing data for HEAD requests, but still update bytes_sent
++            # to maintain accurate accounting
++            return
++
++        # XXX check Content-Length and truncate if too many bytes written?
++        self._write(data)
++        self._flush()
++
+     def close(self):
+         self.get_stdin().read()
+         super().close()
+diff --git a/start_test_server.py b/start_test_server.py
+new file mode 100644
+index 0000000000..6528eb39d5
+--- /dev/null
++++ b/start_test_server.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python
++"""
++Simple script to start a test server for manual testing.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++import django
++from django.conf import settings
++from django.core.management import execute_from_command_line
++from django.http import HttpResponse
++from django.urls import path
++
++
++def simple_view(request):
++    """A simple view that returns HTML content."""
++    return HttpResponse(
++        "<!DOCTYPE html>\n"
++        "<html><head><title>Test Page</title></head>\n"
++        "<body><h1>Hello World</h1><p>This is test content.</p></body></html>"
++    )
++
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        ALLOWED_HOSTS=['*'],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++if __name__ == '__main__':
++    execute_from_command_line(['manage.py', 'runserver', '127.0.0.1:8767', '--noreload'])
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..35d253328a
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,177 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the HEAD request fix.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++import django
++from django.conf import settings
++from django.core.management import execute_from_command_line
++from django.http import HttpResponse, StreamingHttpResponse
++from django.urls import path
++import threading
++import time
++import socket
++
++
++def simple_view(request):
++    """A simple view that returns HTML content."""
++    return HttpResponse(
++        "<!DOCTYPE html>\n"
++        "<html><head><title>Test Page</title></head>\n"
++        "<body><h1>Hello World</h1><p>This is test content.</p></body></html>"
++    )
++
++
++def streaming_view(request):
++    """A view that returns streaming content."""
++    def generate():
++        yield b"First chunk\n"
++        yield b"Second chunk\n"
++        yield b"Third chunk\n"
++    
++    return StreamingHttpResponse(generate(), content_type='text/plain')
++
++
++def empty_view(request):
++    """A view that returns empty content."""
++    return HttpResponse("")
++
++
++def large_view(request):
++    """A view that returns large content."""
++    return HttpResponse("X" * 10000)
++
++
++urlpatterns = [
++    path('', simple_view),
++    path('streaming/', streaming_view),
++    path('empty/', empty_view),
++    path('large/', large_view),
++]
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        ALLOWED_HOSTS=['*'],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++
++def start_server():
++    """Start the Django development server in a separate thread."""
++    def run_server():
++        try:
++            execute_from_command_line(['manage.py', 'runserver', '127.0.0.1:8768', '--noreload'])
++        except SystemExit:
++            pass
++    
++    server_thread = threading.Thread(target=run_server, daemon=True)
++    server_thread.start()
++    
++    # Wait for server to start
++    for _ in range(50):  # Wait up to 5 seconds
++        try:
++            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++            result = sock.connect_ex(('127.0.0.1', 8768))
++            sock.close()
++            if result == 0:
++                break
++        except:
++            pass
++        time.sleep(0.1)
++    else:
++        raise Exception("Server failed to start")
++    
++    return server_thread
++
++
++def test_request(path, method='HEAD'):
++    """Test a request to the given path."""
++    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    sock.connect(('127.0.0.1', 8768))
++    request = f'{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:8768\r\nConnection: close\r\n\r\n'
++    sock.send(request.encode())
++    response = b''
++    while True:
++        data = sock.recv(1024)
++        if not data:
++            break
++        response += data
++    sock.close()
++    response = response.decode('utf-8')
++    
++    if '\r\n\r\n' in response:
++        headers, body = response.split('\r\n\r\n', 1)
++        return headers, body
++    else:
++        return response, ""
++
++
++def test_edge_cases():
++    """Test various edge cases."""
++    print("Testing edge cases for HEAD request fix...")
++    
++    # Start the server
++    print("Starting Django development server...")
++    server_thread = start_server()
++    time.sleep(1)  # Give server time to fully start
++    
++    test_cases = [
++        ('/', 'simple view'),
++        ('/streaming/', 'streaming view'),
++        ('/empty/', 'empty view'),
++        ('/large/', 'large view'),
++    ]
++    
++    all_passed = True
++    
++    for path, description in test_cases:
++        print(f"\nTesting {description} at {path}:")
++        
++        # Test GET request first
++        get_headers, get_body = test_request(path, 'GET')
++        print(f"  GET body length: {len(get_body)} bytes")
++        
++        # Test HEAD request
++        head_headers, head_body = test_request(path, 'HEAD')
++        print(f"  HEAD body length: {len(head_body)} bytes")
++        
++        if head_body.strip():
++            print(f"  ❌ FAILED: HEAD request returned body: {repr(head_body[:50])}")
++            all_passed = False
++        else:
++            print(f"  ✅ PASSED: HEAD request returned no body")
++        
++        # Check that headers are similar (status line should be the same)
++        get_status = get_headers.split('\r\n')[0]
++        head_status = head_headers.split('\r\n')[0]
++        if get_status == head_status:
++            print(f"  ✅ PASSED: Status lines match: {get_status}")
++        else:
++            print(f"  ❌ FAILED: Status lines differ: GET={get_status}, HEAD={head_status}")
++            all_passed = False
++    
++    # Test other HTTP methods to ensure they still work
++    print(f"\nTesting other HTTP methods:")
++    for method in ['POST', 'PUT', 'DELETE', 'PATCH']:
++        headers, body = test_request('/', method)
++        if body.strip():
++            print(f"  ✅ PASSED: {method} request returned body ({len(body)} bytes)")
++        else:
++            print(f"  ❌ FAILED: {method} request returned no body")
++            all_passed = False
++    
++    return all_passed
++
++
++if __name__ == '__main__':
++    success = test_edge_cases()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_head_curl.py b/test_head_curl.py
+new file mode 100644
+index 0000000000..70649c4bb8
+--- /dev/null
++++ b/test_head_curl.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python
++"""
++Script to test HEAD request behavior using a more direct approach.
++"""
++
++import os
++import sys
++import threading
++import time
++import socket
++import subprocess
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++import django
++from django.conf import settings
++from django.core.management import execute_from_command_line
++from django.http import HttpResponse
++from django.urls import path
++
++
++def simple_view(request):
++    """A simple view that returns HTML content."""
++    return HttpResponse(
++        "<!DOCTYPE html>\n"
++        "<html><head><title>Test Page</title></head>\n"
++        "<body><h1>Hello World</h1><p>This is test content.</p></body></html>"
++    )
++
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        ALLOWED_HOSTS=['*'],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++
++def start_server():
++    """Start the Django development server in a separate thread."""
++    def run_server():
++        try:
++            execute_from_command_line(['manage.py', 'runserver', '127.0.0.1:8766', '--noreload'])
++        except SystemExit:
++            pass
++    
++    server_thread = threading.Thread(target=run_server, daemon=True)
++    server_thread.start()
++    
++    # Wait for server to start
++    for _ in range(50):  # Wait up to 5 seconds
++        try:
++            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++            result = sock.connect_ex(('127.0.0.1', 8766))
++            sock.close()
++            if result == 0:
++                break
++        except:
++            pass
++        time.sleep(0.1)
++    else:
++        raise Exception("Server failed to start")
++    
++    return server_thread
++
++
++def test_with_raw_socket():
++    """Test HEAD request using raw socket to see exact response."""
++    print("Testing HEAD request with raw socket...")
++    
++    # Start the server
++    print("Starting Django development server...")
++    server_thread = start_server()
++    time.sleep(1)  # Give server time to fully start
++    
++    try:
++        # Test GET request first
++        print("\n1. Testing GET request:")
++        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        sock.connect(('127.0.0.1', 8766))
++        sock.send(b'GET / HTTP/1.1\r\nHost: 127.0.0.1:8766\r\nConnection: close\r\n\r\n')
++        get_response = b''
++        while True:
++            data = sock.recv(1024)
++            if not data:
++                break
++            get_response += data
++        sock.close()
++        get_response = get_response.decode('utf-8')
++        
++        print("GET Response:")
++        print(get_response)
++        print(f"GET Response length: {len(get_response)} bytes")
++        
++        # Test HEAD request
++        print("\n2. Testing HEAD request:")
++        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        sock.connect(('127.0.0.1', 8766))
++        sock.send(b'HEAD / HTTP/1.1\r\nHost: 127.0.0.1:8766\r\nConnection: close\r\n\r\n')
++        head_response = b''
++        while True:
++            data = sock.recv(1024)
++            if not data:
++                break
++            head_response += data
++        sock.close()
++        head_response = head_response.decode('utf-8')
++        
++        print("HEAD Response:")
++        print(head_response)
++        print(f"HEAD Response length: {len(head_response)} bytes")
++        
++        # Check if HEAD response contains body
++        if '\r\n\r\n' in head_response:
++            headers, body = head_response.split('\r\n\r\n', 1)
++            if body.strip():
++                print(f"\n❌ ISSUE REPRODUCED: HEAD request returned response body!")
++                print(f"Body content: {repr(body)}")
++                return False
++            else:
++                print(f"\n✅ HEAD request correctly returned no body.")
++                return True
++        else:
++            print("Could not parse response properly")
++            return False
++                
++    except Exception as e:
++        print(f"Error during test: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++
++if __name__ == '__main__':
++    success = test_with_raw_socket()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_head_issue.py b/test_head_issue.py
+new file mode 100644
+index 0000000000..14e0bc8702
+--- /dev/null
++++ b/test_head_issue.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the HEAD request issue with Django's runserver.
++This script demonstrates that runserver returns response bodies for HEAD requests,
++which violates RFC 2616 section 4.3.
++"""
++
++import os
++import sys
++import tempfile
++import threading
++import time
++import urllib.request
++from urllib.error import URLError
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++import django
++from django.conf import settings
++from django.core.management import execute_from_command_line
++from django.http import HttpResponse
++from django.urls import path
++
++
++def simple_view(request):
++    """A simple view that returns HTML content."""
++    return HttpResponse(
++        "<!DOCTYPE html>\n"
++        "<html><head><title>Test Page</title></head>\n"
++        "<body><h1>Hello World</h1><p>This is test content.</p></body></html>"
++    )
++
++
++urlpatterns = [
++    path('', simple_view),
++]
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-secret-key',
++        ROOT_URLCONF=__name__,
++        ALLOWED_HOSTS=['*'],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++
++def start_server():
++    """Start the Django development server in a separate thread."""
++    def run_server():
++        try:
++            execute_from_command_line(['manage.py', 'runserver', '127.0.0.1:8765', '--noreload'])
++        except SystemExit:
++            pass
++    
++    server_thread = threading.Thread(target=run_server, daemon=True)
++    server_thread.start()
++    
++    # Wait for server to start
++    for _ in range(50):  # Wait up to 5 seconds
++        try:
++            urllib.request.urlopen('http://127.0.0.1:8765/')
++            break
++        except URLError:
++            time.sleep(0.1)
++    else:
++        raise Exception("Server failed to start")
++    
++    return server_thread
++
++
++def test_head_request():
++    """Test HEAD request behavior."""
++    print("Testing HEAD request behavior...")
++    
++    # Start the server
++    print("Starting Django development server...")
++    server_thread = start_server()
++    
++    try:
++        # Make a GET request first to see the expected content
++        print("\n1. Making GET request to see expected content:")
++        get_request = urllib.request.Request('http://127.0.0.1:8765/', method='GET')
++        with urllib.request.urlopen(get_request) as response:
++            get_content = response.read().decode('utf-8')
++            print(f"GET Status: {response.status}")
++            print(f"GET Content-Length: {len(get_content)} bytes")
++            print(f"GET Content (first 100 chars): {get_content[:100]}...")
++        
++        # Make a HEAD request
++        print("\n2. Making HEAD request:")
++        head_request = urllib.request.Request('http://127.0.0.1:8765/', method='HEAD')
++        with urllib.request.urlopen(head_request) as response:
++            head_content = response.read().decode('utf-8')
++            print(f"HEAD Status: {response.status}")
++            print(f"HEAD Content-Length: {len(head_content)} bytes")
++            
++            if head_content:
++                print(f"HEAD Content (first 100 chars): {head_content[:100]}...")
++                print("\n❌ ISSUE REPRODUCED: HEAD request returned response body!")
++                print("This violates RFC 2616 section 4.3.")
++                return False
++            else:
++                print("HEAD Content: (empty)")
++                print("\n✅ HEAD request correctly returned no body.")
++                return True
++                
++    except Exception as e:
++        print(f"Error during test: {e}")
++        return False
++
++
++if __name__ == '__main__':
++    success = test_head_request()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

@@ -1,0 +1,120 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 782e26e..7799579 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -603,8 +603,10 @@ class Query(BaseExpression):
+             join = rhs.alias_map[alias]
+             # If the left side of the join was already relabeled, use the
+             # updated alias.
++
+             join = join.relabeled_clone(change_map)
+-            new_alias = self.join(join, reuse=reuse)
++            new_alias = self.join(join, reuse=reuse, avoid_aliases=set(rhs.alias_map))
++
+             if join.join_type == INNER:
+                 rhs_votes.add(new_alias)
+             # We can't reuse the same join again in the query. If we have two
+@@ -745,13 +747,17 @@ class Query(BaseExpression):
+             for model, values in seen.items():
+                 callback(target, model, values)
+ 
+-    def table_alias(self, table_name, create=False, filtered_relation=None):
++
++    def table_alias(self, table_name, create=False, filtered_relation=None, avoid_aliases=frozenset()):
+         """
+-        Return a table alias for the given table_name and whether this is a
+-        new alias or not.
++        Return a tuple ``(alias, created)`` for *table_name*.
+ 
+-        If 'create' is true, a new alias is always created. Otherwise, the
+-        most recently created alias for the table (if one exists) is reused.
++        If *create* is False and an alias already exists, reuse the most
++        recently created one. Otherwise, generate a new alias.
++
++        When a new alias is required, skip any aliases present in
++        *avoid_aliases* to avoid collisions when, for example, two queries are
++        being combined.
+         """
+         alias_list = self.table_map.get(table_name)
+         if not create and alias_list:
+@@ -759,17 +765,32 @@ class Query(BaseExpression):
+             self.alias_refcount[alias] += 1
+             return alias, False
+ 
+-        # Create a new alias for this table.
++        # Generate a new alias.
+         if alias_list:
+-            alias = '%s%d' % (self.alias_prefix, len(self.alias_map) + 1)
++            suffix = len(self.alias_map) + 1
++            alias = f'{self.alias_prefix}{suffix}'
++            while alias in self.alias_map or alias in avoid_aliases:
++                suffix += 1
++                alias = f'{self.alias_prefix}{suffix}'
+             alias_list.append(alias)
+         else:
+-            # The first occurrence of a table uses the table name directly.
+-            alias = filtered_relation.alias if filtered_relation is not None else table_name
++            # Prefer the table name (or filtered relation alias) as the first
++            # alias unless it clashes with an avoided alias.
++            candidate = filtered_relation.alias if filtered_relation is not None else table_name
++            if candidate in self.alias_map or candidate in avoid_aliases:
++                suffix = len(self.alias_map) + 1
++                alias = f'{self.alias_prefix}{suffix}'
++                while alias in self.alias_map or alias in avoid_aliases:
++                    suffix += 1
++                    alias = f'{self.alias_prefix}{suffix}'
++            else:
++                alias = candidate
+             self.table_map[table_name] = [alias]
++
+         self.alias_refcount[alias] = 1
+         return alias, True
+ 
++
+     def ref_alias(self, alias):
+         """Increases the reference count for this alias."""
+         self.alias_refcount[alias] += 1
+@@ -948,7 +969,8 @@ class Query(BaseExpression):
+         """
+         return len([1 for count in self.alias_refcount.values() if count])
+ 
+-    def join(self, join, reuse=None):
++
++    def join(self, join, reuse=None, avoid_aliases=frozenset()):
+         """
+         Return an alias for the 'join', either reusing an existing alias for
+         that join or creating a new one. 'join' is either a base_table_class or
+@@ -957,13 +979,17 @@ class Query(BaseExpression):
+         The 'reuse' parameter can be either None which means all joins are
+         reusable, or it can be a set containing the aliases that can be reused.
+ 
++        Additionally, *avoid_aliases* can be supplied as a collection of alias
++        names that should be avoided when generating a new alias. This helps
++        prevent collisions when combining multiple queries.
++
+         A join is always created as LOUTER if the lhs alias is LOUTER to make
+         sure chains like t1 LOUTER t2 INNER t3 aren't generated. All new
+         joins are created as LOUTER if the join is nullable.
+         """
+         reuse_aliases = [
+             a for a, j in self.alias_map.items()
+-            if (reuse is None or a in reuse) and j.equals(join)
++            if (reuse is None or a in reuse) and a not in avoid_aliases and j.equals(join)
+         ]
+         if reuse_aliases:
+             if join.table_alias in reuse_aliases:
+@@ -976,7 +1002,13 @@ class Query(BaseExpression):
+             return reuse_alias
+ 
+         # No reuse is possible, so we need a new alias.
+-        alias, _ = self.table_alias(join.table_name, create=True, filtered_relation=join.filtered_relation)
++        alias, _ = self.table_alias(
++            join.table_name,
++            create=True,
++            filtered_relation=join.filtered_relation,
++            avoid_aliases=avoid_aliases,
++        )
++
+         if join.join_type:
+             if self.alias_map[join.parent_alias].join_type == LOUTER or join.nullable:
+                 join_type = LOUTER

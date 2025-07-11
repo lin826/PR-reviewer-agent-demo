@@ -1,0 +1,204 @@
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -446,6 +446,33 @@
+             for alias, annotation in self.annotations.items()
+             if alias not in added_aggregate_names
+         ]
++        
++        # Optimize count queries by excluding annotations that are not referenced
++        # in filters, ordering, or other annotations, but only if they don't
++        # affect the query structure (e.g., don't create joins).
++        if len(added_aggregate_names) == 1 and "__count" in added_aggregate_names:
++            used_annotation_aliases = self._get_used_annotations()
++            safe_to_ignore_aliases = self._get_safe_to_ignore_annotations()
++
++            existing_annotations = [
++                annotation
++                for alias, annotation in self.annotations.items()
++                if alias not in added_aggregate_names and (
++                    alias in used_annotation_aliases or 
++                    alias not in safe_to_ignore_aliases
++                )
++            ]
++            
++            # Also need to update the annotation_select mask to exclude unused annotations
++            # This prevents them from being included in the SELECT clause
++            unused_aliases = safe_to_ignore_aliases - used_annotation_aliases
++            if unused_aliases and self.annotation_select_mask:
++                # Remove unused annotations from the mask
++                self.set_annotation_mask(self.annotation_select_mask - unused_aliases)
++            elif unused_aliases and self.annotation_select_mask is None:
++                # Create a mask that excludes unused annotations
++                kept_aliases = set(self.annotations.keys()) - unused_aliases
++                self.set_annotation_mask(kept_aliases)
+         # Decide if we need to use a subquery.
+         #
+         # Existing annotations would cause incorrect results as get_aggregation()
+@@ -555,6 +582,167 @@
+ 
+     def has_filters(self):
+         return self.where
++
++    def _get_used_annotations(self):
++        """
++        Return a set of annotation aliases that are referenced in where clauses,
++        ordering, or other annotations. This is used to optimize count queries
++        by removing unused annotations.
++        """
++        if not self.annotations:
++            return set()
++            
++        used_annotations = set()
++        
++        # Check which annotations are referenced in the where clause
++        if self.where:
++            used_annotations.update(self._extract_annotation_refs(self.where))
++        
++        # Check which annotations are referenced in ordering
++        for order_by in self.order_by:
++            if hasattr(order_by, 'expression'):
++                expr = order_by.expression
++            else:
++                expr = order_by
++            used_annotations.update(self._extract_annotation_refs(expr))
++        
++        # Check which annotations are referenced by other annotations
++        # We need to do this iteratively in case of chained references
++        changed = True
++        while changed:
++            changed = False
++            for alias, annotation in self.annotations.items():
++                if alias not in used_annotations:
++                    refs = self._extract_annotation_refs(annotation)
++                    if refs.intersection(used_annotations):
++                        used_annotations.add(alias)
++                        changed = True
++        
++        return used_annotations
++    
++    def _extract_annotation_refs(self, expr):
++        """
++        Extract annotation references from an expression.
++        Returns a set of annotation aliases that are referenced.
++        """
++        if not expr:
++            return set()
++            
++        refs = set()
++        
++        # Handle Q objects
++        from django.db.models import Q, F
++        from django.db.models.constants import LOOKUP_SEP
++        
++        if isinstance(expr, Q):
++            for child in expr.children:
++                if isinstance(child, tuple):
++                    lookup, value = child
++                    field_parts = lookup.split(LOOKUP_SEP)
++                    if field_parts[0] in self.annotations:
++                        refs.add(field_parts[0])
++                    refs.update(self._extract_annotation_refs(value))
++                else:
++                    refs.update(self._extract_annotation_refs(child))
++        elif isinstance(expr, F):
++            field_parts = expr.name.split(LOOKUP_SEP)
++            if field_parts[0] in self.annotations:
++                refs.add(field_parts[0])
++        elif hasattr(expr, "get_source_expressions"):
++            for src_expr in expr.get_source_expressions():
++                if src_expr:
++                    refs.update(self._extract_annotation_refs(src_expr))
++        
++        return refs
++
++    def _get_safe_to_ignore_annotations(self):
++        """
++        Return a set of annotation aliases that are safe to ignore in count queries.
++        An annotation is safe to ignore if it doesn't create joins or modify the
++        fundamental structure of the query.
++        """
++        from django.db.models import Q, Value, Case, When
++        from django.db.models.expressions import Col
++        from django.db.models.aggregates import Aggregate
++        
++        safe_annotations = set()
++        
++        for alias, annotation in self.annotations.items():
++            # Only consider simple expressions that don't involve joins
++            if isinstance(annotation, (Q, Value, Case, When)):
++                # Q objects, Value objects, and Case/When expressions are generally safe
++                # as long as they don't reference fields that would create joins
++                if self._annotation_is_join_free(annotation):
++                    safe_annotations.add(alias)
++            elif isinstance(annotation, Col) and annotation.alias == self.get_initial_alias():
++                # Simple column references to the main table are safe
++                safe_annotations.add(alias)
++            elif hasattr(annotation, 'children'):
++                # This is likely a WhereNode (resolved Q object)
++                # It's safe if it doesn't reference related fields
++                if self._annotation_is_join_free(annotation):
++                    safe_annotations.add(alias)
++            # Aggregates like Count('related_field') are NOT safe because they create joins
++            # and affect the query structure
++        
++        return safe_annotations
++    
++    def _annotation_is_join_free(self, annotation):
++        """
++        Check if an annotation expression is join-free (doesn't reference related fields).
++        """
++        from django.db.models import Q, F
++        from django.db.models.constants import LOOKUP_SEP
++        
++        if isinstance(annotation, Q):
++            for child in annotation.children:
++                if isinstance(child, tuple):
++                    lookup, value = child
++                    if LOOKUP_SEP in lookup:
++                        # This references a related field, so it might create joins
++                        return False
++                    if not self._annotation_is_join_free(value):
++                        return False
++                elif not self._annotation_is_join_free(child):
++                    return False
++        elif isinstance(annotation, F):
++            if LOOKUP_SEP in annotation.name:
++                # This references a related field
++                return False
++        elif hasattr(annotation, 'children') and hasattr(annotation, 'where'):
++            # This is likely a WhereNode (resolved Q object)
++            # Check if any of its children reference related fields
++            return self._wherenode_is_join_free(annotation)
++        elif hasattr(annotation, "get_source_expressions"):
++            for src_expr in annotation.get_source_expressions():
++                if src_expr and not self._annotation_is_join_free(src_expr):
++                    return False
++        
++        return True
++    
++    def _wherenode_is_join_free(self, wherenode):
++        """
++        Check if a WhereNode only references fields from the main table.
++        """
++        from django.db.models.constants import LOOKUP_SEP
++        from django.db.models.lookups import Lookup
++        
++        for child in wherenode.children:
++            if hasattr(child, 'lhs') and hasattr(child, 'rhs'):
++                # This is a lookup (like IsNull)
++                if hasattr(child.lhs, 'target') and hasattr(child.lhs.target, 'model'):
++                    # Check if it references the main model
++                    if child.lhs.target.model != self.model:
++                        return False
++                # Also check if the lookup field name contains __ (indicating related field)
++                if hasattr(child, 'lookup_name') and LOOKUP_SEP in str(child.lhs):
++                    return False
++            elif hasattr(child, 'children'):
++                # Nested WhereNode
++                if not self._wherenode_is_join_free(child):
++                    return False
++        
++        return True
+ 
+     def exists(self, limit=True):
+         q = self.clone()

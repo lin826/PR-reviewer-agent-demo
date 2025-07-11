@@ -1,0 +1,755 @@
+diff --git a/debug_fix.py b/debug_fix.py
+new file mode 100644
+index 0000000000..160f3a3ac3
+--- /dev/null
++++ b/debug_fix.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand the issue with the fix.
++"""
++
++import os
++import sys
++import django
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++# Setup Django
++django.setup()
++
++from django.core.mail.utils import CachedDnsName
++
++def debug_punycode_conversion():
++    """Debug the punycode conversion logic."""
++    print("Debugging punycode conversion...")
++    
++    test_domain = "正宗"
++    print(f"Test domain: {test_domain}")
++    
++    # Test ASCII encoding
++    try:
++        test_domain.encode('ascii')
++        print("✓ Domain is ASCII")
++    except UnicodeEncodeError as e:
++        print(f"✗ Domain is not ASCII: {e}")
++        
++        # Test punycode conversion
++        try:
++            punycode = test_domain.encode('idna').decode('ascii')
++            print(f"✓ Punycode conversion successful: {punycode}")
++        except Exception as e:
++            print(f"✗ Punycode conversion failed: {e}")
++
++def debug_cached_dns_name():
++    """Debug the CachedDnsName implementation."""
++    print("\nDebugging CachedDnsName...")
++    
++    dns_name = CachedDnsName()
++    
++    # Check if _fqdn exists
++    print(f"Has _fqdn attribute: {hasattr(dns_name, '_fqdn')}")
++    
++    # Mock socket.getfqdn
++    import socket
++    original_getfqdn = socket.getfqdn
++    
++    def mock_getfqdn():
++        print("mock_getfqdn called, returning: 正宗")
++        return "正宗"
++    
++    socket.getfqdn = mock_getfqdn
++    
++    try:
++        # Clear any existing cache
++        if hasattr(dns_name, '_fqdn'):
++            delattr(dns_name, '_fqdn')
++        
++        print("Calling get_fqdn()...")
++        result = dns_name.get_fqdn()
++        print(f"get_fqdn() returned: {result} (type: {type(result)})")
++        
++        if result is not None:
++            try:
++                result.encode('ascii')
++                print("✓ Result is ASCII-compatible")
++            except UnicodeEncodeError:
++                print("✗ Result is not ASCII-compatible")
++        else:
++            print("✗ Result is None")
++            
++    finally:
++        socket.getfqdn = original_getfqdn
++
++if __name__ == "__main__":
++    debug_punycode_conversion()
++    debug_cached_dns_name()
+\ No newline at end of file
+diff --git a/django/core/mail/utils.py b/django/core/mail/utils.py
+index d18dfe4667..92d728f751 100644
+--- a/django/core/mail/utils.py
++++ b/django/core/mail/utils.py
+@@ -13,7 +13,19 @@ class CachedDnsName:
+ 
+     def get_fqdn(self):
+         if not hasattr(self, '_fqdn'):
+-            self._fqdn = socket.getfqdn()
++            fqdn = socket.getfqdn()
++            # Convert non-ASCII domain names to punycode for email headers
++            try:
++                fqdn.encode('ascii')
++            except UnicodeEncodeError:
++                # Domain contains non-ASCII characters, convert to punycode
++                try:
++                    fqdn = fqdn.encode('idna').decode('ascii')
++                except (UnicodeError, UnicodeDecodeError):
++                    # If punycode conversion fails, keep the original
++                    # This should rarely happen, but provides a fallback
++                    pass
++            self._fqdn = fqdn
+         return self._fqdn
+ 
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..c9f4c27abf
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the Unicode DNS name issue in Django email.
++"""
++
++import os
++import sys
++import django
++from unittest.mock import patch
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++# Setup Django
++django.setup()
++
++from django.core.mail import EmailMessage
++from django.core.mail.utils import DNS_NAME
++
++def test_unicode_dns_issue():
++    """Test that reproduces the Unicode DNS issue."""
++    print("Testing Unicode DNS issue...")
++    
++    # Test with non-ASCII hostname
++    with patch.object(DNS_NAME, 'get_fqdn', return_value="正宗"):
++        try:
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            print("✓ Test passed - no exception raised")
++            print(f"Message-ID: {message['Message-ID']}")
++            return True
++        except UnicodeEncodeError as e:
++            print(f"✗ Test failed with UnicodeEncodeError: {e}")
++            return False
++        except Exception as e:
++            print(f"✗ Test failed with unexpected error: {e}")
++            return False
++
++def test_ascii_dns_works():
++    """Test that ASCII DNS names work correctly."""
++    print("\nTesting ASCII DNS (should work)...")
++    
++    with patch.object(DNS_NAME, 'get_fqdn', return_value="example.com"):
++        try:
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            print("✓ ASCII DNS test passed")
++            print(f"Message-ID: {message['Message-ID']}")
++            return True
++        except Exception as e:
++            print(f"✗ ASCII DNS test failed: {e}")
++            return False
++
++if __name__ == "__main__":
++    print("Reproducing Django Unicode DNS issue...")
++    print("=" * 50)
++    
++    # Test ASCII first (should work)
++    ascii_result = test_ascii_dns_works()
++    
++    # Test Unicode (should fail before fix)
++    unicode_result = test_unicode_dns_issue()
++    
++    print("\n" + "=" * 50)
++    print("Summary:")
++    print(f"ASCII DNS test: {'PASS' if ascii_result else 'FAIL'}")
++    print(f"Unicode DNS test: {'PASS' if unicode_result else 'FAIL'}")
++    
++    if not unicode_result:
++        print("\nThe issue has been reproduced successfully!")
++        sys.exit(1)
++    else:
++        print("\nNo issue found - the fix may already be in place.")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..fc90063489
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the Unicode DNS fix.
++"""
++
++import os
++import sys
++import django
++import socket
++from unittest.mock import patch
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++# Setup Django
++django.setup()
++
++from django.core.mail import EmailMessage
++from django.core.mail.utils import CachedDnsName
++
++def test_various_unicode_domains():
++    """Test various Unicode domain names."""
++    print("Testing various Unicode domain names...")
++    
++    test_cases = [
++        ("正宗", "xn--jbt908a"),  # Chinese
++        ("münchen.de", "xn--mnchen-3ya.de"),  # German with umlaut
++        ("москва.рф", "xn--80adxhks.xn--p1ai"),  # Russian
++        ("한국.kr", "xn--3e0b707e.kr"),  # Korean
++        ("日本.jp", "xn--wgv71a.jp"),  # Japanese
++    ]
++    
++    results = []
++    
++    for original, expected in test_cases:
++        print(f"\nTesting: {original}")
++        
++        with patch('socket.getfqdn', return_value=original):
++            dns_name = CachedDnsName()
++            
++            try:
++                result = dns_name.get_fqdn()
++                print(f"  Converted to: {result}")
++                
++                # Check if it's ASCII-compatible
++                result.encode('ascii')
++                print("  ✓ ASCII-compatible")
++                
++                # Check if it matches expected punycode
++                if result == expected:
++                    print(f"  ✓ Matches expected punycode: {expected}")
++                    results.append(True)
++                else:
++                    print(f"  ✗ Expected {expected}, got {result}")
++                    results.append(False)
++                    
++            except Exception as e:
++                print(f"  ✗ Failed: {e}")
++                results.append(False)
++    
++    return all(results)
++
++def test_ascii_domains_unchanged():
++    """Test that ASCII domains remain unchanged."""
++    print("\nTesting ASCII domains remain unchanged...")
++    
++    test_cases = [
++        "example.com",
++        "localhost",
++        "test.example.org",
++        "sub.domain.co.uk",
++    ]
++    
++    results = []
++    
++    for domain in test_cases:
++        print(f"\nTesting: {domain}")
++        
++        with patch('socket.getfqdn', return_value=domain):
++            dns_name = CachedDnsName()
++            
++            try:
++                result = dns_name.get_fqdn()
++                print(f"  Result: {result}")
++                
++                if result == domain:
++                    print("  ✓ Unchanged")
++                    results.append(True)
++                else:
++                    print(f"  ✗ Changed from {domain} to {result}")
++                    results.append(False)
++                    
++            except Exception as e:
++                print(f"  ✗ Failed: {e}")
++                results.append(False)
++    
++    return all(results)
++
++def test_email_with_various_encodings():
++    """Test email creation with various encodings."""
++    print("\nTesting email creation with various encodings...")
++    
++    encodings = ['iso-8859-1', 'utf-8', 'ascii']
++    results = []
++    
++    with patch('socket.getfqdn', return_value="正宗"):
++        from django.core.mail.utils import DNS_NAME
++        if hasattr(DNS_NAME, '_fqdn'):
++            delattr(DNS_NAME, '_fqdn')
++        
++        for encoding in encodings:
++            print(f"\nTesting encoding: {encoding}")
++            
++            try:
++                email = EmailMessage('subject', 'body', 'from@example.com', ['to@example.com'])
++                email.encoding = encoding
++                message = email.message()
++                
++                message_id = message['Message-ID']
++                print(f"  Message-ID: {message_id}")
++                
++                if 'xn--jbt908a' in message_id:
++                    print("  ✓ Contains punycode")
++                    results.append(True)
++                else:
++                    print("  ✗ Does not contain punycode")
++                    results.append(False)
++                    
++            except Exception as e:
++                print(f"  ✗ Failed: {e}")
++                results.append(False)
++    
++    return all(results)
++
++def test_caching_behavior():
++    """Test that caching still works correctly."""
++    print("\nTesting caching behavior...")
++    
++    dns_name = CachedDnsName()
++    
++    # Clear cache
++    if hasattr(dns_name, '_fqdn'):
++        delattr(dns_name, '_fqdn')
++    
++    call_count = 0
++    
++    def counting_getfqdn():
++        nonlocal call_count
++        call_count += 1
++        return "正宗"
++    
++    with patch('socket.getfqdn', side_effect=counting_getfqdn):
++        # First call should invoke socket.getfqdn
++        result1 = dns_name.get_fqdn()
++        
++        # Second call should use cache
++        result2 = dns_name.get_fqdn()
++        
++        print(f"  First call result: {result1}")
++        print(f"  Second call result: {result2}")
++        print(f"  socket.getfqdn called {call_count} times")
++        
++        if call_count == 1 and result1 == result2:
++            print("  ✓ Caching works correctly")
++            return True
++        else:
++            print("  ✗ Caching not working")
++            return False
++
++if __name__ == "__main__":
++    print("Testing edge cases for Unicode DNS fix...")
++    print("=" * 60)
++    
++    # Run all tests
++    test1 = test_various_unicode_domains()
++    test2 = test_ascii_domains_unchanged()
++    test3 = test_email_with_various_encodings()
++    test4 = test_caching_behavior()
++    
++    print("\n" + "=" * 60)
++    print("Summary:")
++    print(f"Various Unicode domains: {'PASS' if test1 else 'FAIL'}")
++    print(f"ASCII domains unchanged: {'PASS' if test2 else 'FAIL'}")
++    print(f"Various encodings: {'PASS' if test3 else 'FAIL'}")
++    print(f"Caching behavior: {'PASS' if test4 else 'FAIL'}")
++    
++    if all([test1, test2, test3, test4]):
++        print("\n✓ All edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("\n✗ Some edge case tests failed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..bf755e80ec
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for Unicode DNS names.
++"""
++
++import os
++import sys
++import django
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++# Setup Django
++django.setup()
++
++from django.core.mail.utils import CachedDnsName
++from django.core.mail import EmailMessage
++
++def test_cached_dns_name_punycode():
++    """Test that CachedDnsName converts non-ASCII domains to punycode."""
++    print("Testing CachedDnsName punycode conversion...")
++    
++    # Create a new instance to test
++    dns_name = CachedDnsName()
++    
++    # Clear any existing cache
++    if hasattr(dns_name, '_fqdn'):
++        delattr(dns_name, '_fqdn')
++    
++    # Mock socket.getfqdn to return non-ASCII domain
++    import socket
++    original_getfqdn = socket.getfqdn
++    
++    def mock_getfqdn():
++        return "正宗"
++    
++    socket.getfqdn = mock_getfqdn
++    
++    try:
++        result = dns_name.get_fqdn()
++        print(f"Original domain: 正宗")
++        print(f"Converted domain: {result}")
++        
++        # Check if it's ASCII-compatible
++        try:
++            result.encode('ascii')
++            print("✓ Result is ASCII-compatible")
++            
++            # Check if it's the expected punycode
++            expected = "正宗".encode('idna').decode('ascii')
++            if result == expected:
++                print(f"✓ Correctly converted to punycode: {expected}")
++                return True
++            else:
++                print(f"✗ Expected {expected}, got {result}")
++                return False
++                
++        except UnicodeEncodeError:
++            print("✗ Result is not ASCII-compatible")
++            return False
++            
++    finally:
++        # Restore original function
++        socket.getfqdn = original_getfqdn
++
++def test_email_with_unicode_dns():
++    """Test email creation with Unicode DNS after fix."""
++    print("\nTesting email creation with Unicode DNS...")
++    
++    # Create a new DNS_NAME instance for testing
++    from django.core.mail import utils
++    original_dns_name = utils.DNS_NAME
++    
++    # Create a test DNS_NAME with Unicode domain
++    test_dns_name = CachedDnsName()
++    
++    # Mock socket.getfqdn to return non-ASCII domain
++    import socket
++    original_getfqdn = socket.getfqdn
++    
++    def mock_getfqdn():
++        return "正宗"
++    
++    socket.getfqdn = mock_getfqdn
++    
++    try:
++        # Replace DNS_NAME temporarily
++        utils.DNS_NAME = test_dns_name
++        
++        # Test email creation
++        email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++        email.encoding = 'iso-8859-1'
++        message = email.message()
++        
++        print("✓ Email created successfully")
++        print(f"Message-ID: {message['Message-ID']}")
++        
++        # Check that Message-ID contains punycode
++        message_id = message['Message-ID']
++        if 'xn--' in message_id:
++            print("✓ Message-ID contains punycode")
++            return True
++        else:
++            print("✗ Message-ID does not contain punycode")
++            return False
++            
++    except Exception as e:
++        print(f"✗ Email creation failed: {e}")
++        return False
++        
++    finally:
++        # Restore original values
++        socket.getfqdn = original_getfqdn
++        utils.DNS_NAME = original_dns_name
++
++if __name__ == "__main__":
++    print("Testing Unicode DNS fix...")
++    print("=" * 50)
++    
++    # Test the CachedDnsName conversion
++    dns_test = test_cached_dns_name_punycode()
++    
++    # Test email creation
++    email_test = test_email_with_unicode_dns()
++    
++    print("\n" + "=" * 50)
++    print("Summary:")
++    print(f"DNS conversion test: {'PASS' if dns_test else 'FAIL'}")
++    print(f"Email creation test: {'PASS' if email_test else 'FAIL'}")
++    
++    if dns_test and email_test:
++        print("\n✓ All tests passed! The fix is working.")
++        sys.exit(0)
++    else:
++        print("\n✗ Some tests failed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_issue_example.py b/test_issue_example.py
+new file mode 100644
+index 0000000000..91513007e2
+--- /dev/null
++++ b/test_issue_example.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python3
++"""
++Test the exact example from the issue description.
++"""
++
++import os
++import sys
++import django
++from unittest.mock import patch
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++# Setup Django
++django.setup()
++
++from django.core.mail import EmailMessage
++
++def test_issue_example():
++    """Test the exact example from the issue description."""
++    print("Testing the exact example from the issue description...")
++    
++    # The issue mentioned patching "django.core.mailmessage.DNS_NAME" but that's incorrect
++    # The correct path is "django.core.mail.utils.DNS_NAME" or we can patch socket.getfqdn
++    
++    # Test with the domain mentioned in the issue: "漢字"
++    with patch('socket.getfqdn', return_value="漢字"):
++        # Clear any cached DNS_NAME
++        from django.core.mail.utils import DNS_NAME
++        if hasattr(DNS_NAME, '_fqdn'):
++            delattr(DNS_NAME, '_fqdn')
++        
++        try:
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            
++            print("✓ Email created successfully - no UnicodeEncodeError")
++            print(f"Message-ID: {message['Message-ID']}")
++            
++            # Check that Message-ID contains punycode
++            message_id = message['Message-ID']
++            
++            # Convert "漢字" to punycode to see what we expect
++            expected_punycode = "漢字".encode('idna').decode('ascii')
++            print(f"Expected punycode for '漢字': {expected_punycode}")
++            
++            if expected_punycode in message_id:
++                print(f"✓ Message-ID contains expected punycode: {expected_punycode}")
++                return True
++            else:
++                print(f"✗ Message-ID does not contain expected punycode")
++                print(f"  Expected to find: {expected_punycode}")
++                print(f"  In Message-ID: {message_id}")
++                return False
++                
++        except UnicodeEncodeError as e:
++            print(f"✗ Still getting UnicodeEncodeError: {e}")
++            return False
++        except Exception as e:
++            print(f"✗ Unexpected error: {e}")
++            return False
++
++if __name__ == "__main__":
++    print("Testing the exact issue example...")
++    print("=" * 50)
++    
++    # First, let's see what punycode "漢字" converts to
++    punycode = "漢字".encode('idna').decode('ascii')
++    print(f"'漢字' converts to punycode: {punycode}")
++    print()
++    
++    result = test_issue_example()
++    
++    print("\n" + "=" * 50)
++    if result:
++        print("✓ Issue example test PASSED - the fix works!")
++    else:
++        print("✗ Issue example test FAILED")
++    
++    sys.exit(0 if result else 1)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..5dc601771b
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++"""
++Test the original issue reproduction with the fix in place.
++"""
++
++import os
++import sys
++import django
++import socket
++from unittest.mock import patch
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++# Setup Django
++django.setup()
++
++from django.core.mail import EmailMessage
++
++def test_unicode_dns_issue_fixed():
++    """Test that the Unicode DNS issue is now fixed."""
++    print("Testing Unicode DNS issue (should be fixed now)...")
++    
++    # Mock socket.getfqdn to return non-ASCII hostname
++    with patch('socket.getfqdn', return_value="正宗"):
++        # Clear any cached DNS_NAME
++        from django.core.mail.utils import DNS_NAME
++        if hasattr(DNS_NAME, '_fqdn'):
++            delattr(DNS_NAME, '_fqdn')
++        
++        try:
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            print("✓ Test passed - no exception raised")
++            print(f"Message-ID: {message['Message-ID']}")
++            
++            # Verify the Message-ID contains punycode
++            message_id = message['Message-ID']
++            if 'xn--jbt908a' in message_id:
++                print("✓ Message-ID correctly contains punycode")
++                return True
++            else:
++                print(f"✗ Message-ID does not contain expected punycode: {message_id}")
++                return False
++                
++        except UnicodeEncodeError as e:
++            print(f"✗ Test failed with UnicodeEncodeError: {e}")
++            return False
++        except Exception as e:
++            print(f"✗ Test failed with unexpected error: {e}")
++            return False
++
++def test_ascii_dns_still_works():
++    """Test that ASCII DNS names still work correctly."""
++    print("\nTesting ASCII DNS (should still work)...")
++    
++    with patch('socket.getfqdn', return_value="example.com"):
++        # Clear any cached DNS_NAME
++        from django.core.mail.utils import DNS_NAME
++        if hasattr(DNS_NAME, '_fqdn'):
++            delattr(DNS_NAME, '_fqdn')
++        
++        try:
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            print("✓ ASCII DNS test passed")
++            print(f"Message-ID: {message['Message-ID']}")
++            
++            # Verify the Message-ID contains the original domain
++            message_id = message['Message-ID']
++            if 'example.com' in message_id:
++                print("✓ Message-ID correctly contains original domain")
++                return True
++            else:
++                print(f"✗ Message-ID does not contain expected domain: {message_id}")
++                return False
++                
++        except Exception as e:
++            print(f"✗ ASCII DNS test failed: {e}")
++            return False
++
++if __name__ == "__main__":
++    print("Testing the fix for Django Unicode DNS issue...")
++    print("=" * 60)
++    
++    # Test ASCII first (should still work)
++    ascii_result = test_ascii_dns_still_works()
++    
++    # Test Unicode (should now work)
++    unicode_result = test_unicode_dns_issue_fixed()
++    
++    print("\n" + "=" * 60)
++    print("Summary:")
++    print(f"ASCII DNS test: {'PASS' if ascii_result else 'FAIL'}")
++    print(f"Unicode DNS test: {'PASS' if unicode_result else 'FAIL'}")
++    
++    if ascii_result and unicode_result:
++        print("\n✓ All tests passed! The issue has been fixed.")
++        sys.exit(0)
++    else:
++        print("\n✗ Some tests failed.")
++        sys.exit(1)
+\ No newline at end of file

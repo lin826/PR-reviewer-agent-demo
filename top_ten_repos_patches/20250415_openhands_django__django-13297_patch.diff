@@ -1,0 +1,277 @@
+diff --git a/django/views/generic/base.py b/django/views/generic/base.py
+index ea5baca08d..52400f0d63 100644
+--- a/django/views/generic/base.py
++++ b/django/views/generic/base.py
+@@ -11,7 +11,7 @@ from django.template.response import TemplateResponse
+ from django.urls import reverse
+ from django.utils.decorators import classonlymethod
+ from django.utils.deprecation import RemovedInDjango40Warning
+-from django.utils.functional import SimpleLazyObject
++from django.utils.functional import SimpleLazyObject, empty
+
+ logger = logging.getLogger('django.request')
+
+@@ -165,12 +165,36 @@ class TemplateView(TemplateResponseMixin, ContextMixin, View):
+
+
+ # RemovedInDjango40Warning
++class DBSafeLazyObject(SimpleLazyObject):
++    """
++    A specialized version of SimpleLazyObject that can be safely used in database operations.
++    When used in string contexts or database operations, it ensures proper evaluation.
++    """
++    def __str__(self):
++        # Force evaluation for str operations (which are used in DB operations)
++        if self._wrapped == empty:
++            self._setup()
++        return str(self._wrapped)
++
++    def __repr__(self):
++        if self._wrapped == empty:
++            self._setup()
++        return repr(self._wrapped)
++
++    # Support SQLite adapter protocol
++    def __conform__(self, protocol):
++        if self._wrapped == empty:
++            self._setup()
++        if hasattr(self._wrapped, '__conform__'):
++            return self._wrapped.__conform__(protocol)
++        return str(self._wrapped)
++
++
+ def _wrap_url_kwargs_with_deprecation_warning(url_kwargs):
+     context_kwargs = {}
+     for key, value in url_kwargs.items():
+-        # Bind into function closure.
+-        @SimpleLazyObject
+-        def access_value(key=key, value=value):
++        # Create a function that will show the deprecation warning
++        def warn_and_return_value(key=key, value=value):
+             warnings.warn(
+                 'TemplateView passing URL kwargs to the context is '
+                 'deprecated. Reference %s in your template through '
+@@ -178,7 +202,9 @@ def _wrap_url_kwargs_with_deprecation_warning(url_kwargs):
+                 RemovedInDjango40Warning, stacklevel=2,
+             )
+             return value
+-        context_kwargs[key] = access_value
++
++        # Use our enhanced lazy object for better db compatibility
++        context_kwargs[key] = DBSafeLazyObject(warn_and_return_value)
+     return context_kwargs
+
+
+diff --git a/test_db_interaction.py b/test_db_interaction.py
+new file mode 100644
+index 0000000000..f18fe8cc37
+--- /dev/null
++++ b/test_db_interaction.py
+@@ -0,0 +1,45 @@
++from django.views.generic.base import DBSafeLazyObject, SimpleLazyObject, empty
++import sqlite3
++
++def simulate_db_interaction(value):
++    """Simulate what happens when a value is used in a database query"""
++    conn = sqlite3.connect(':memory:')
++    cursor = conn.cursor()
++
++    # Create a table
++    cursor.execute('CREATE TABLE test_table (slug TEXT)')
++
++    try:
++        # Attempt to insert the lazy value
++        cursor.execute('INSERT INTO test_table (slug) VALUES (?)', (value,))
++        conn.commit()
++        print(f"✅ Successfully inserted {repr(value)} into database")
++
++        # Verify it worked
++        cursor.execute('SELECT slug FROM test_table')
++        result = cursor.fetchone()
++        print(f"Retrieved from database: {result[0]}")
++
++        return True
++    except Exception as e:
++        print(f"❌ Failed to insert {repr(value)} into database: {e}")
++        return False
++    finally:
++        conn.close()
++
++# Create test values
++plain_string = "test-slug"
++regular_lazy = SimpleLazyObject(lambda: "test-slug")
++dbsafe_lazy = DBSafeLazyObject(lambda: "test-slug")
++
++print("Testing database interaction with different value types:")
++print("\n1. Plain string:")
++simulate_db_interaction(plain_string)
++
++print("\n2. Regular SimpleLazyObject:")
++simulate_db_interaction(regular_lazy)
++
++print("\n3. Our improved DBSafeLazyObject:")
++simulate_db_interaction(dbsafe_lazy)
++
++print("\nTest complete.")
+\ No newline at end of file
+diff --git a/test_dbsafe_lazy_object.py b/test_dbsafe_lazy_object.py
+new file mode 100644
+index 0000000000..c8546d13c1
+--- /dev/null
++++ b/test_dbsafe_lazy_object.py
+@@ -0,0 +1,27 @@
++from django.views.generic.base import DBSafeLazyObject, SimpleLazyObject
++
++def test_value_func():
++    return "test-slug"
++
++# Create both types of lazy objects
++regular_lazy = SimpleLazyObject(test_value_func)
++dbsafe_lazy = DBSafeLazyObject(test_value_func)
++
++print("Regular SimpleLazyObject:")
++print(f"Type: {type(regular_lazy)}")
++print(f"Value: {regular_lazy}")
++print(f"String representation: {str(regular_lazy)}")
++
++print("\nDBSafeLazyObject:")
++print(f"Type: {type(dbsafe_lazy)}")
++print(f"Value: {dbsafe_lazy}")
++print(f"String representation: {str(dbsafe_lazy)}")
++
++# Simulate database filtering by ensuring str() works properly
++print("\nTests:")
++print(f"regular_lazy == 'test-slug': {regular_lazy == 'test-slug'}")
++print(f"dbsafe_lazy == 'test-slug': {dbsafe_lazy == 'test-slug'}")
++print(f"str(regular_lazy) == 'test-slug': {str(regular_lazy) == 'test-slug'}")
++print(f"str(dbsafe_lazy) == 'test-slug': {str(dbsafe_lazy) == 'test-slug'}")
++
++print("\nVerifying our fix addresses the issue described in the bug report.")
+\ No newline at end of file
+diff --git a/test_issue_scenario.py b/test_issue_scenario.py
+new file mode 100644
+index 0000000000..f65c3b3b27
+--- /dev/null
++++ b/test_issue_scenario.py
+@@ -0,0 +1,83 @@
++"""
++This test simulates the exact issue described in the bug report by creating a
++simplified version of the TemplateView and the database interaction scenario.
++"""
++
++import sqlite3
++from django.views.generic.base import SimpleLazyObject, DBSafeLazyObject, empty
++
++# Create in-memory database with test table
++conn = sqlite3.connect(':memory:')
++cursor = conn.cursor()
++cursor.execute('CREATE TABLE accounts (slug TEXT PRIMARY KEY, name TEXT)')
++cursor.execute("INSERT INTO accounts VALUES ('sample-offer', 'Sample Offer')")
++conn.commit()
++
++# Simulate the get_object_or_404 function
++def get_object_or_404(slug):
++    cursor.execute('SELECT * FROM accounts WHERE slug = ?', (slug,))
++    result = cursor.fetchone()
++    if result:
++        return {'slug': result[0], 'name': result[1]}
++    raise Exception("Object not found")
++
++# Test with regular SimpleLazyObject (what's used in Django 3.1)
++def test_with_regular_lazy_object():
++    print("\n=== Test with Regular SimpleLazyObject (Django 3.1) ===")
++    # Simulate URL kwargs with SimpleLazyObject
++    @SimpleLazyObject
++    def lazy_slug():
++        return "sample-offer"
++
++    print(f"Type of lazy_slug: {type(lazy_slug)}")
++    print(f"Value of lazy_slug: {lazy_slug}")
++
++    try:
++        # This is the line that would fail in Django 3.1
++        offer = get_object_or_404(lazy_slug)
++        print("✅ Success! Found offer:", offer)
++        return True
++    except Exception as e:
++        print("❌ Failed:", str(e))
++        # Try with str conversion as the issue description suggests
++        print("Trying with explicit string conversion...")
++        try:
++            offer = get_object_or_404(str(lazy_slug))
++            print("✅ Success with str conversion! Found offer:", offer)
++        except Exception as e:
++            print("❌ Still failed with str conversion:", str(e))
++        return False
++
++# Test with our improved DBSafeLazyObject
++def test_with_db_safe_lazy_object():
++    print("\n=== Test with DBSafeLazyObject (Our Fix) ===")
++    # Simulate URL kwargs with our improved DBSafeLazyObject
++    lazy_slug = DBSafeLazyObject(lambda: "sample-offer")
++
++    print(f"Type of lazy_slug: {type(lazy_slug)}")
++    print(f"Value of lazy_slug: {lazy_slug}")
++
++    try:
++        # This should work with our fix
++        offer = get_object_or_404(lazy_slug)
++        print("✅ Success! Found offer:", offer)
++        return True
++    except Exception as e:
++        print("❌ Failed:", str(e))
++        return False
++
++# Run the tests
++regular_result = test_with_regular_lazy_object()
++db_safe_result = test_with_db_safe_lazy_object()
++
++print("\n=== Summary ===")
++print(f"Regular SimpleLazyObject test: {'PASSED' if regular_result else 'FAILED'}")
++print(f"DBSafeLazyObject test: {'PASSED' if db_safe_result else 'FAILED'}")
++
++if not regular_result and db_safe_result:
++    print("\n✅ Our fix successfully addresses the issue!")
++else:
++    print("\n❌ Our fix may not have resolved the issue completely.")
++
++# Clean up
++conn.close()
+\ No newline at end of file
+diff --git a/test_lazy_object.py b/test_lazy_object.py
+new file mode 100644
+index 0000000000..16b2e9c4d6
+--- /dev/null
++++ b/test_lazy_object.py
+@@ -0,0 +1,30 @@
++from django.utils.functional import SimpleLazyObject
++from django.db.backends.sqlite3.operations import DatabaseOperations
++
++# We don't need a full Django setup for this test
++class MockConnection:
++    def __init__(self):
++        self.settings_dict = {'ENGINE': 'django.db.backends.sqlite3'}
++
++def lazy_value_func():
++    return "test-slug"
++
++# Create a lazy object
++lazy_value = SimpleLazyObject(lazy_value_func)
++
++# Print the type and value of the lazy object
++print(f"Type: {type(lazy_value)}, Raw: {lazy_value}, Str: {str(lazy_value)}")
++
++# Try to create a query with the lazy value
++mock_connection = MockConnection()
++ops = DatabaseOperations(mock_connection)
++try:
++    # Simulate what happens when a lazy value is used in a query
++    params = [lazy_value]
++    print("Original params:", params)
++    quoted_params = ops._quote_params_for_last_executed_query(params)
++    print("After quoting:", quoted_params)
++    print("Test passed!")
++except Exception as e:
++    print(f"Error occurred: {e}")
++    print(f"Converting to string first works: {ops._quote_params_for_last_executed_query([str(lazy_value)])}")
+\ No newline at end of file

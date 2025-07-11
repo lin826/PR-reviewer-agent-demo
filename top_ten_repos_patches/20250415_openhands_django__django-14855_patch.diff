@@ -1,0 +1,245 @@
+diff --git a/django/contrib/admin/helpers.py b/django/contrib/admin/helpers.py
+index dd154f72ee..ba8c3463a0 100644
+--- a/django/contrib/admin/helpers.py
++++ b/django/contrib/admin/helpers.py
+@@ -209,7 +209,11 @@ class AdminReadonlyField:
+             remote_field.model._meta.model_name,
+         )
+         try:
+-            url = reverse(url_name, args=[quote(remote_obj.pk)])
++            url = reverse(
++                url_name,
++                args=[quote(remote_obj.pk)],
++                current_app=self.model_admin.admin_site.name
++            )
+             return format_html('<a href="{}">{}</a>', url, remote_obj)
+         except NoReverseMatch:
+             return str(remote_obj)
+diff --git a/test_admin_url.py b/test_admin_url.py
+new file mode 100644
+index 0000000000..bedd1bcc4b
+--- /dev/null
++++ b/test_admin_url.py
+@@ -0,0 +1,105 @@
++"""
++Test script to manually verify the issue with URL generation in AdminReadonlyField.
++
++We'll directly modify the get_admin_url method in AdminReadonlyField class to demonstrate the issue.
++"""
++from django.contrib import admin
++from django.contrib.admin.helpers import AdminReadonlyField
++from django.urls import reverse, NoReverseMatch
++from unittest.mock import Mock, patch
++
++# Create minimal mock objects
++class MockRemoteField:
++    def __init__(self, app_label, model_name):
++        self.model = Mock()
++        self.model._meta.app_label = app_label
++        self.model._meta.model_name = model_name
++
++class MockRemoteObj:
++    def __init__(self, pk):
++        self.pk = pk
++    
++    def __str__(self):
++        return f"Object with pk={self.pk}"
++
++class MockAdminSite:
++    def __init__(self, name):
++        self.name = name
++
++# Create a function to simulate reverse with and without current_app to see difference
++def simulate_reverse(viewname, args=None, kwargs=None, current_app=None):
++    """
++    Simulates the Django reverse function but in a simplified way to show the issue.
++    """
++    args_str = '/'.join(str(arg) for arg in args) if args else ''
++    
++    # This simulates how Django would handle different admin sites
++    if current_app and current_app != 'admin':
++        # With current_app, URL would use custom admin path
++        return f"/{current_app}/{viewname.split(':')[1]}/{args_str}/"
++    else:
++        # Without current_app, URL would default to standard admin path
++        return f"/admin/{viewname.split(':')[1]}/{args_str}/"
++
++def test_get_admin_url():
++    # Set up the test objects
++    remote_field = MockRemoteField("app", "model")
++    remote_obj = MockRemoteObj(123)
++    
++    # Create model admin with default site
++    default_model_admin = Mock()
++    default_model_admin.admin_site = MockAdminSite("admin")
++    
++    # Create model admin with custom site
++    custom_model_admin = Mock()
++    custom_model_admin.admin_site = MockAdminSite("custom_admin")
++    
++    # Test the default implementation (no current_app)
++    with patch('django.contrib.admin.helpers.reverse', side_effect=simulate_reverse):
++        admin_readonly = AdminReadonlyField(Mock(), "field", is_first=True, model_admin=default_model_admin)
++        url_default = admin_readonly.get_admin_url(remote_field, remote_obj)
++        print(f"Default admin site URL: {url_default}")
++        
++        admin_readonly = AdminReadonlyField(Mock(), "field", is_first=True, model_admin=custom_model_admin)
++        url_custom = admin_readonly.get_admin_url(remote_field, remote_obj)
++        print(f"Custom admin site URL: {url_custom}")
++        
++    print("\nBoth URLs should be different (one with /admin/, one with /custom_admin/)")
++    print("But currently both use /admin/ - this is the issue we need to fix.")
++    
++    # Add the fix manually to verify it would work
++    with patch('django.contrib.admin.helpers.reverse') as mock_reverse:
++        # Test the fixed implementation
++        def fixed_get_admin_url(self, remote_field, remote_obj):
++            """The fixed version of the method with current_app parameter."""
++            url_name = 'admin:%s_%s_change' % (
++                remote_field.model._meta.app_label,
++                remote_field.model._meta.model_name,
++            )
++            try:
++                url = reverse(
++                    url_name,
++                    args=[remote_obj.pk],
++                    current_app=self.model_admin.admin_site.name
++                )
++                return f'<a href="{url}">{remote_obj}</a>'
++            except NoReverseMatch:
++                return str(remote_obj)
++        
++        # Mock the reverse function to show URLs would be different
++        mock_reverse.side_effect = simulate_reverse
++        
++        # Apply the patched method to test
++        with patch.object(AdminReadonlyField, 'get_admin_url', fixed_get_admin_url):
++            admin_readonly = AdminReadonlyField(Mock(), "field", is_first=True, model_admin=default_model_admin)
++            fixed_url_default = admin_readonly.get_admin_url(remote_field, remote_obj)
++            print(f"\nAfter fix - Default admin site URL: {fixed_url_default}")
++            
++            admin_readonly = AdminReadonlyField(Mock(), "field", is_first=True, model_admin=custom_model_admin)
++            fixed_url_custom = admin_readonly.get_admin_url(remote_field, remote_obj)
++            print(f"After fix - Custom admin site URL: {fixed_url_custom}")
++        
++        print("\nAfter the fix, the URLs should be different, using their respective site names.")
++
++if __name__ == "__main__":
++    test_get_admin_url()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..b49c6976b5
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,109 @@
++"""
++Simple demonstration of the issue and fix for get_admin_url in AdminReadonlyField.
++
++We're using simulated versions of the functions to clearly show the difference.
++"""
++
++# Simulated functions 
++def simulate_reverse(url_name, args=None, kwargs=None, current_app=None):
++    """
++    Simulates how Django's reverse() would behave with different admin sites
++    """
++    if not args:
++        args = []
++        
++    # Construct a URL path to demonstrate the difference
++    if current_app and current_app != 'admin':
++        # With current_app parameter, uses the custom admin site URL
++        return f"/{current_app}/{url_name.replace('admin:', '')}change/{args[0]}/"
++    else:
++        # Without current_app, or with default 'admin', uses standard admin URL
++        return f"/admin/{url_name.replace('admin:', '')}change/{args[0]}/"
++
++# Original method (simplified for demonstration)
++def original_get_admin_url(remote_field, remote_obj, model_admin):
++    """Simplified version of the original method"""
++    url_name = f"admin:{remote_field.app_label}_{remote_field.model_name}_change"
++    
++    # This is the issue: no current_app parameter
++    url = simulate_reverse(url_name, args=[remote_obj.pk]) 
++    return f'<a href="{url}">{remote_obj}</a>'
++
++# Fixed method with current_app parameter
++def fixed_get_admin_url(remote_field, remote_obj, model_admin):
++    """Simplified version of the fixed method"""
++    url_name = f"admin:{remote_field.app_label}_{remote_field.model_name}_change"
++    
++    # Here's the fix: adding current_app parameter
++    url = simulate_reverse(
++        url_name, 
++        args=[remote_obj.pk],
++        current_app=model_admin.admin_site.name
++    )
++    return f'<a href="{url}">{remote_obj}</a>'
++
++
++# Simple test objects
++class MockRemoteField:
++    def __init__(self, app_label, model_name):
++        self.app_label = app_label
++        self.model_name = model_name
++
++class MockObject:
++    def __init__(self, pk):
++        self.pk = pk
++    
++    def __str__(self):
++        return f"Object(pk={self.pk})"
++
++class MockAdminSite:
++    def __init__(self, name):
++        self.name = name
++
++class MockModelAdmin:
++    def __init__(self, admin_site):
++        self.admin_site = admin_site
++
++
++if __name__ == "__main__":
++    # Create mock objects for testing
++    remote_field = MockRemoteField("app", "model")
++    remote_obj = MockObject(123)
++    
++    # Regular admin site
++    default_admin_site = MockAdminSite("admin")
++    default_model_admin = MockModelAdmin(default_admin_site)
++    
++    # Custom admin site
++    custom_admin_site = MockAdminSite("custom_admin")  
++    custom_model_admin = MockModelAdmin(custom_admin_site)
++    
++    print("DEMONSTRATING THE ISSUE AND FIX")
++    print("-------------------------------")
++    print("\nWith the ORIGINAL implementation:")
++    print("----------------------------------")
++    
++    # Test original method with default admin
++    original_url_default = original_get_admin_url(remote_field, remote_obj, default_model_admin)
++    print(f"Default admin site URL: {original_url_default}")
++    
++    # Test original method with custom admin
++    original_url_custom = original_get_admin_url(remote_field, remote_obj, custom_model_admin)
++    print(f"Custom admin site URL: {original_url_custom}")
++    
++    # Both generate /admin/ URLs, which is the issue!
++    print("\nISSUE: Both URLs use /admin/ regardless of which admin site is used!")
++    
++    print("\nWith the FIXED implementation:")
++    print("------------------------------")
++    
++    # Test fixed method with default admin
++    fixed_url_default = fixed_get_admin_url(remote_field, remote_obj, default_model_admin)
++    print(f"Default admin site URL: {fixed_url_default}")
++    
++    # Test fixed method with custom admin
++    fixed_url_custom = fixed_get_admin_url(remote_field, remote_obj, custom_model_admin)
++    print(f"Custom admin site URL: {fixed_url_custom}")
++    
++    print("\nFIX: Now the custom admin site URL correctly uses /custom_admin/ instead of /admin/")
++    print("    This demonstrates that adding the current_app parameter fixes the issue.")
+\ No newline at end of file

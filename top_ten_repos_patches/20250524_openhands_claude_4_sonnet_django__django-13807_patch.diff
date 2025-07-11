@@ -1,0 +1,487 @@
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index 2eeaf98c0d..d23822c641 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -327,19 +327,19 @@ class DatabaseWrapper(BaseDatabaseWrapper):
+                     violations = cursor.execute('PRAGMA foreign_key_check').fetchall()
+                 else:
+                     violations = chain.from_iterable(
+-                        cursor.execute('PRAGMA foreign_key_check(%s)' % table_name).fetchall()
++                        cursor.execute('PRAGMA foreign_key_check(%s)' % self.ops.quote_name(table_name)).fetchall()
+                         for table_name in table_names
+                     )
+                 # See https://www.sqlite.org/pragma.html#pragma_foreign_key_check
+                 for table_name, rowid, referenced_table_name, foreign_key_index in violations:
+                     foreign_key = cursor.execute(
+-                        'PRAGMA foreign_key_list(%s)' % table_name
++                        'PRAGMA foreign_key_list(%s)' % self.ops.quote_name(table_name)
+                     ).fetchall()[foreign_key_index]
+                     column_name, referenced_column_name = foreign_key[3:5]
+                     primary_key_column_name = self.introspection.get_primary_key_column(cursor, table_name)
+                     primary_key_value, bad_value = cursor.execute(
+                         'SELECT %s, %s FROM %s WHERE rowid = %%s' % (
+-                            primary_key_column_name, column_name, table_name
++                            self.ops.quote_name(primary_key_column_name), self.ops.quote_name(column_name), self.ops.quote_name(table_name)
+                         ),
+                         (rowid,),
+                     ).fetchone()
+diff --git a/test_comprehensive_fix.py b/test_comprehensive_fix.py
+new file mode 100644
+index 0000000000..9c9e385ea7
+--- /dev/null
++++ b/test_comprehensive_fix.py
+@@ -0,0 +1,169 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the SQLite loaddata fix with various SQL keywords.
++"""
++import os
++import sys
++import tempfile
++import json
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.core.management import call_command
++from django.test.utils import setup_test_environment, teardown_test_environment
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models with various SQL keywords as table names
++class Order(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++        db_table = 'order'
++
++class Group(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++        db_table = 'group'
++
++class Select(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++        db_table = 'select'
++
++class Table(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++        db_table = 'table'
++
++def test_multiple_sql_keywords():
++    """Test with multiple SQL keyword table names."""
++    print("Testing multiple SQL keyword table names...")
++    setup_test_environment()
++    
++    models_to_test = [Order, Group, Select, Table]
++    
++    try:
++        # Create all tables
++        print("Creating tables...")
++        with connection.schema_editor() as schema_editor:
++            for model in models_to_test:
++                schema_editor.create_model(model)
++        
++        # Test check_constraints with all table names
++        table_names = [model._meta.db_table for model in models_to_test]
++        print(f"Testing check_constraints with table names: {table_names}")
++        
++        connection.check_constraints(table_names=table_names)
++        print("SUCCESS: check_constraints worked with all SQL keyword table names!")
++        
++        # Test loaddata with each model
++        for model in models_to_test:
++            print(f"Testing loaddata with {model._meta.db_table}...")
++            
++            # Create fixture
++            fixture_data = [
++                {
++                    "model": f"__main__.{model.__name__.lower()}",
++                    "pk": 1,
++                    "fields": {
++                        "name": f"Test {model.__name__}"
++                    }
++                }
++            ]
++            
++            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
++                json.dump(fixture_data, f)
++                fixture_file = f.name
++            
++            try:
++                call_command('loaddata', fixture_file, verbosity=0)
++                print(f"SUCCESS: loaddata worked with {model._meta.db_table}")
++            finally:
++                os.unlink(fixture_file)
++        
++        return True
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        return False
++    finally:
++        teardown_test_environment()
++
++def test_edge_cases():
++    """Test edge cases like table names with special characters."""
++    print("\nTesting edge cases...")
++    
++    # Test with table names that have special characters that need quoting
++    special_table_names = [
++        'order',  # SQL keyword
++        'my-table',  # hyphen
++        'my table',  # space
++        'my.table',  # dot
++        '123table',  # starts with number
++    ]
++    
++    try:
++        print(f"Testing check_constraints with special table names: {special_table_names}")
++        # Note: These tables don't exist, but we're testing that the SQL is properly formed
++        # The method should not crash with syntax errors
++        connection.check_constraints(table_names=special_table_names)
++        print("SUCCESS: check_constraints handled special table names without syntax errors!")
++        return True
++        
++    except Exception as e:
++        # We expect some errors (like table not found), but not syntax errors
++        if "syntax error" in str(e).lower():
++            print(f"FAILED: Syntax error with special table names: {e}")
++            return False
++        else:
++            print(f"Expected error (table not found): {e}")
++            return True
++
++if __name__ == '__main__':
++    print("Comprehensive test for SQLite loaddata fix...")
++    print("=" * 60)
++    
++    success1 = test_multiple_sql_keywords()
++    success2 = test_edge_cases()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"Multiple SQL keywords test: {'PASSED' if success1 else 'FAILED'}")
++    print(f"Edge cases test: {'PASSED' if success2 else 'FAILED'}")
++    
++    if success1 and success2:
++        print("\nAll tests passed! The fix is working correctly.")
++        sys.exit(0)
++    else:
++        print("\nSome tests failed.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_reproduce_issue.py b/test_reproduce_issue.py
+new file mode 100644
+index 0000000000..dd67561e41
+--- /dev/null
++++ b/test_reproduce_issue.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the SQLite loaddata issue with SQL keywords as table names.
++"""
++import os
++import sys
++import tempfile
++import json
++import sqlite3
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.core.management import call_command
++from django.apps import apps
++from django.test.utils import setup_test_environment, teardown_test_environment
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define a model with a SQL keyword as table name
++class Order(models.Model):
++    name = models.CharField(max_length=100)
++    quantity = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++        db_table = 'order'  # This is a SQL keyword
++
++def test_reproduce_issue():
++    """Test that reproduces the original issue."""
++    print("Setting up test environment...")
++    setup_test_environment()
++    
++    try:
++        # Create the table
++        print("Creating tables...")
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(Order)
++        
++        # Create a fixture file
++        print("Creating fixture...")
++        fixture_data = [
++            {
++                "model": "__main__.order",
++                "pk": 1,
++                "fields": {
++                    "name": "Test Order",
++                    "quantity": 5
++                }
++            }
++        ]
++        
++        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
++            json.dump(fixture_data, f)
++            fixture_file = f.name
++        
++        try:
++            # This should trigger the issue
++            print("Loading fixture (this should fail with the original bug)...")
++            call_command('loaddata', fixture_file, verbosity=2)
++            print("SUCCESS: Fixture loaded without error!")
++            
++        except Exception as e:
++            print(f"ERROR: {e}")
++            print(f"Error type: {type(e).__name__}")
++            if "near \"order\": syntax error" in str(e):
++                print("CONFIRMED: This is the expected bug!")
++                return False
++            else:
++                print("UNEXPECTED ERROR: Different error than expected")
++                raise
++        finally:
++            # Clean up fixture file
++            os.unlink(fixture_file)
++            
++    finally:
++        teardown_test_environment()
++    
++    return True
++
++def test_direct_check_constraints():
++    """Test the check_constraints method directly."""
++    print("\nTesting check_constraints method directly...")
++    
++    try:
++        # Test with table names that are SQL keywords (table already exists from previous test)
++        table_names = ['order']  # SQL keyword
++        print(f"Testing check_constraints with table names: {table_names}")
++        connection.check_constraints(table_names=table_names)
++        print("SUCCESS: check_constraints worked with SQL keyword table names!")
++        return True
++        
++    except Exception as e:
++        print(f"ERROR in check_constraints: {e}")
++        if "syntax error" in str(e):
++            print("CONFIRMED: check_constraints fails with SQL keyword table names")
++            return False
++        else:
++            raise
++
++if __name__ == '__main__':
++    print("Testing SQLite loaddata issue with SQL keywords...")
++    print("=" * 60)
++    
++    # Test 1: Reproduce the original issue
++    success1 = test_reproduce_issue()
++    
++    # Test 2: Test check_constraints directly
++    success2 = test_direct_check_constraints()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY:")
++    print(f"Loaddata test: {'PASSED' if success1 else 'FAILED (as expected)'}")
++    print(f"Direct check_constraints test: {'PASSED' if success2 else 'FAILED (as expected)'}")
++    
++    if not success1 or not success2:
++        print("\nThe bug is confirmed. The issue exists.")
++        sys.exit(1)
++    else:
++        print("\nNo bug found. The issue may have been fixed.")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_sql_keyword_fix.py b/test_sql_keyword_fix.py
+new file mode 100644
+index 0000000000..15af5b0ca4
+--- /dev/null
++++ b/test_sql_keyword_fix.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python
++"""
++Test specifically for the SQL keyword table name fix in check_constraints.
++This test should be added to the Django test suite.
++"""
++import os
++import sys
++import tempfile
++import json
++
++# Add Django to the path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.core.management import call_command
++from django.test import TransactionTestCase, override_settings
++from django.test.utils import setup_test_environment, teardown_test_environment
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++class SQLKeywordTableModel(models.Model):
++    """Model with a SQL keyword as table name."""
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++        db_table = 'order'  # SQL keyword
++
++class TestSQLKeywordTableNames(TransactionTestCase):
++    """Test that check_constraints works with SQL keyword table names."""
++    
++    def setUp(self):
++        # Create the table
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(SQLKeywordTableModel)
++    
++    def tearDown(self):
++        # Clean up the table
++        with connection.schema_editor() as schema_editor:
++            schema_editor.delete_model(SQLKeywordTableModel)
++    
++    def test_check_constraints_with_sql_keyword_table_names(self):
++        """Test that check_constraints works with SQL keyword table names."""
++        # This should not raise a syntax error
++        connection.check_constraints(table_names=['order'])
++        
++        # Test that the method doesn't crash with syntax errors for non-existent tables
++        # (it should raise "no such table" error, not syntax error)
++        try:
++            connection.check_constraints(table_names=['group', 'select'])
++        except Exception as e:
++            # Should be "no such table" error, not syntax error
++            self.assertIn("no such table", str(e).lower())
++            self.assertNotIn("syntax error", str(e).lower())
++    
++    def test_loaddata_with_sql_keyword_table_name(self):
++        """Test that loaddata works with SQL keyword table names."""
++        # Create a fixture
++        fixture_data = [
++            {
++                "model": "__main__.sqlkeywordtablemodel",
++                "pk": 1,
++                "fields": {
++                    "name": "Test Order"
++                }
++            }
++        ]
++        
++        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
++            json.dump(fixture_data, f)
++            fixture_file = f.name
++        
++        try:
++            # This should not raise a syntax error
++            call_command('loaddata', fixture_file, verbosity=0)
++            
++            # Verify the data was loaded
++            self.assertEqual(SQLKeywordTableModel.objects.count(), 1)
++            obj = SQLKeywordTableModel.objects.first()
++            self.assertEqual(obj.name, "Test Order")
++            
++        finally:
++            os.unlink(fixture_file)
++
++if __name__ == '__main__':
++    # Run the test
++    import unittest
++    
++    print("Running SQL keyword table name tests...")
++    
++    # Set up test environment
++    setup_test_environment()
++    
++    try:
++        # Create a test suite
++        suite = unittest.TestLoader().loadTestsFromTestCase(TestSQLKeywordTableNames)
++        runner = unittest.TextTestRunner(verbosity=2)
++        result = runner.run(suite)
++        
++        if result.wasSuccessful():
++            print("\nAll tests passed! The fix is working correctly.")
++            sys.exit(0)
++        else:
++            print(f"\nTests failed: {len(result.failures)} failures, {len(result.errors)} errors")
++            sys.exit(1)
++            
++    finally:
++        teardown_test_environment()
+\ No newline at end of file

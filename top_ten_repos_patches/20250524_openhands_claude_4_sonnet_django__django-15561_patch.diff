@@ -1,0 +1,530 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index 9d6952df21..85d53e3b1a 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -1378,6 +1378,7 @@ class BaseDatabaseSchemaEditor:
+         # - adding only a db_column and the column name is not changed
+         non_database_attrs = [
+             "blank",
++            "choices",
+             "db_column",
+             "editable",
+             "error_messages",
+diff --git a/reproduce_choices_issue.py b/reproduce_choices_issue.py
+new file mode 100644
+index 0000000000..8fc3f3a349
+--- /dev/null
++++ b/reproduce_choices_issue.py
+@@ -0,0 +1,172 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the AlterField choices issue on SQLite.
++
++This script demonstrates that adding/changing choices on a field in SQLite
++generates unnecessary SQL (table recreation) when it should be a no-op.
++"""
++
++import os
++import sys
++import tempfile
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.migrations.operations.fields import AlterField
++from django.db.migrations.state import ProjectState
++from django.apps.registry import Apps
++from django.test.utils import isolate_apps
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_choices_alter_field():
++    """Test that changing only choices doesn't generate SQL on SQLite."""
++    
++    # Create a test model
++    class TestModel(models.Model):
++        status = models.CharField(max_length=10)
++        
++        class Meta:
++            app_label = 'test_app'
++            db_table = 'test_model'
++        
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create old and new fields - only difference is choices
++    old_field = models.CharField(max_length=10)
++    old_field.set_attributes_from_name('status')
++    
++    new_field = models.CharField(
++        max_length=10, 
++        choices=[('A', 'Active'), ('I', 'Inactive')]
++    )
++    new_field.set_attributes_from_name('status')
++    
++    # Test the schema editor's decision
++    with connection.schema_editor() as schema_editor:
++        # Check if the field should be altered
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"Should alter field when adding choices: {should_alter}")
++        
++        if should_alter:
++            print("❌ ISSUE: Django thinks the field should be altered when only choices changed")
++            
++            # Let's see what SQL would be generated
++            print("\nSQL that would be generated:")
++            
++            # Capture SQL by using a mock schema editor
++            class SQLCapturingSchemaEditor(connection.schema_editor().__class__):
++                def __init__(self, *args, **kwargs):
++                    super().__init__(*args, **kwargs)
++                    self.captured_sql = []
++                
++                def execute(self, sql, params=()):
++                    self.captured_sql.append((sql, params))
++                    # Don't actually execute to avoid errors
++            
++            with SQLCapturingSchemaEditor(connection) as capturing_editor:
++                try:
++                    capturing_editor.alter_field(TestModel, old_field, new_field)
++                    for sql, params in capturing_editor.captured_sql:
++                        print(f"  {sql}")
++                        if params:
++                            print(f"    Params: {params}")
++                except Exception as e:
++                    print(f"  Error during SQL generation: {e}")
++                    
++        else:
++            print("✅ GOOD: Django correctly identifies this as a no-op")
++    
++    # Test with PostgreSQL-like behavior (what we want)
++    print(f"\nFor comparison, PostgreSQL would generate no SQL for this change.")
++    
++    # Test changing choices on existing field with choices
++    print(f"\nTesting changing existing choices...")
++    old_field_with_choices = models.CharField(
++        max_length=10, 
++        choices=[('A', 'Active'), ('I', 'Inactive')]
++    )
++    old_field_with_choices.set_attributes_from_name('status')
++    
++    new_field_with_different_choices = models.CharField(
++        max_length=10, 
++        choices=[('A', 'Active'), ('I', 'Inactive'), ('P', 'Pending')]
++    )
++    new_field_with_different_choices.set_attributes_from_name('status')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter_choices = schema_editor._field_should_be_altered(
++            old_field_with_choices, new_field_with_different_choices
++        )
++        print(f"Should alter field when changing choices: {should_alter_choices}")
++        
++        if should_alter_choices:
++            print("❌ ISSUE: Django thinks the field should be altered when only choices changed")
++        else:
++            print("✅ GOOD: Django correctly identifies this as a no-op")
++
++def test_other_non_db_attrs():
++    """Test that other non-database attributes don't trigger alterations."""
++    
++    class TestModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'test_app'
++            db_table = 'test_model_2'
++        
++    # Test various non-database attributes
++    test_cases = [
++        ('blank', {'blank': True}),
++        ('help_text', {'help_text': 'Some help text'}),
++        ('verbose_name', {'verbose_name': 'Name Field'}),
++        ('editable', {'editable': False}),
++    ]
++    
++    for attr_name, kwargs in test_cases:
++        old_field = models.CharField(max_length=100)
++        old_field.set_attributes_from_name('name')
++        
++        new_field = models.CharField(max_length=100, **kwargs)
++        new_field.set_attributes_from_name('name')
++        
++        with connection.schema_editor() as schema_editor:
++            should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++            print(f"Should alter field when changing {attr_name}: {should_alter}")
++            
++            if should_alter:
++                print(f"❌ ISSUE: Django thinks the field should be altered when only {attr_name} changed")
++            else:
++                print(f"✅ GOOD: Django correctly identifies {attr_name} change as a no-op")
++
++if __name__ == '__main__':
++    print("Testing AlterField choices issue on SQLite...")
++    print("=" * 60)
++    
++    test_choices_alter_field()
++    
++    print("\n" + "=" * 60)
++    print("Testing other non-database attributes...")
++    test_other_non_db_attrs()
++    
++    print("\n" + "=" * 60)
++    print("Test completed.")
+\ No newline at end of file
+diff --git a/test_comprehensive_choices.py b/test_comprehensive_choices.py
+new file mode 100644
+index 0000000000..4a5a890bb0
+--- /dev/null
++++ b/test_comprehensive_choices.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the choices fix to ensure we haven't broken anything.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.test.utils import isolate_apps
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_choices_scenarios():
++    """Test various choices-related scenarios."""
++    
++    print("Testing various choices scenarios...")
++    
++    # Test 1: Adding choices to a field without choices
++    print("\n1. Adding choices to field without choices:")
++    old_field = models.CharField(max_length=10)
++    old_field.set_attributes_from_name('status')
++    
++    new_field = models.CharField(max_length=10, choices=[('A', 'Active')])
++    new_field.set_attributes_from_name('status')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if not should_alter else f"  Should alter: {should_alter} ❌")
++    
++    # Test 2: Removing choices from a field
++    print("\n2. Removing choices from field:")
++    old_field = models.CharField(max_length=10, choices=[('A', 'Active')])
++    old_field.set_attributes_from_name('status')
++    
++    new_field = models.CharField(max_length=10)
++    new_field.set_attributes_from_name('status')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if not should_alter else f"  Should alter: {should_alter} ❌")
++    
++    # Test 3: Changing choices
++    print("\n3. Changing choices:")
++    old_field = models.CharField(max_length=10, choices=[('A', 'Active')])
++    old_field.set_attributes_from_name('status')
++    
++    new_field = models.CharField(max_length=10, choices=[('A', 'Active'), ('I', 'Inactive')])
++    new_field.set_attributes_from_name('status')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if not should_alter else f"  Should alter: {should_alter} ❌")
++    
++    # Test 4: Changing choices labels only
++    print("\n4. Changing choices labels only:")
++    old_field = models.CharField(max_length=10, choices=[('A', 'Active')])
++    old_field.set_attributes_from_name('status')
++    
++    new_field = models.CharField(max_length=10, choices=[('A', 'Available')])
++    new_field.set_attributes_from_name('status')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if not should_alter else f"  Should alter: {should_alter} ❌")
++
++def test_real_schema_changes():
++    """Test that real schema changes still trigger alterations."""
++    
++    print("\nTesting that real schema changes still work...")
++    
++    # Test 1: Changing max_length should trigger alteration
++    print("\n1. Changing max_length:")
++    old_field = models.CharField(max_length=10)
++    old_field.set_attributes_from_name('name')
++    
++    new_field = models.CharField(max_length=20)
++    new_field.set_attributes_from_name('name')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if should_alter else f"  Should alter: {should_alter} ❌")
++    
++    # Test 2: Changing null should trigger alteration
++    print("\n2. Changing null:")
++    old_field = models.CharField(max_length=10, null=False)
++    old_field.set_attributes_from_name('name')
++    
++    new_field = models.CharField(max_length=10, null=True)
++    new_field.set_attributes_from_name('name')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if should_alter else f"  Should alter: {should_alter} ❌")
++    
++    # Test 3: Changing field type should trigger alteration
++    print("\n3. Changing field type:")
++    old_field = models.CharField(max_length=10)
++    old_field.set_attributes_from_name('value')
++    
++    new_field = models.IntegerField()
++    new_field.set_attributes_from_name('value')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if should_alter else f"  Should alter: {should_alter} ❌")
++
++def test_combined_changes():
++    """Test combinations of choices with real schema changes."""
++    
++    print("\nTesting combined changes...")
++    
++    # Test 1: Changing both choices and max_length should trigger alteration
++    print("\n1. Changing both choices and max_length:")
++    old_field = models.CharField(max_length=10, choices=[('A', 'Active')])
++    old_field.set_attributes_from_name('status')
++    
++    new_field = models.CharField(max_length=20, choices=[('A', 'Active'), ('I', 'Inactive')])
++    new_field.set_attributes_from_name('status')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if should_alter else f"  Should alter: {should_alter} ❌")
++    
++    # Test 2: Changing choices and blank (non-db attr) should not trigger alteration
++    print("\n2. Changing choices and blank:")
++    old_field = models.CharField(max_length=10, choices=[('A', 'Active')], blank=False)
++    old_field.set_attributes_from_name('status')
++    
++    new_field = models.CharField(max_length=10, choices=[('A', 'Active'), ('I', 'Inactive')], blank=True)
++    new_field.set_attributes_from_name('status')
++    
++    with connection.schema_editor() as schema_editor:
++        should_alter = schema_editor._field_should_be_altered(old_field, new_field)
++        print(f"  Should alter: {should_alter} ✅" if not should_alter else f"  Should alter: {should_alter} ❌")
++
++if __name__ == '__main__':
++    print("Comprehensive test for choices fix")
++    print("=" * 50)
++    
++    test_choices_scenarios()
++    test_real_schema_changes()
++    test_combined_changes()
++    
++    print("\n" + "=" * 50)
++    print("All tests completed!")
+\ No newline at end of file
+diff --git a/test_migration_choices.py b/test_migration_choices.py
+new file mode 100644
+index 0000000000..74fe6baffe
+--- /dev/null
++++ b/test_migration_choices.py
+@@ -0,0 +1,161 @@
++#!/usr/bin/env python
++"""
++Test that demonstrates the fix for choices in migrations.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.migrations.operations.fields import AlterField
++from django.db.migrations.state import ProjectState
++from django.apps.registry import Apps
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def test_alter_field_choices_migration():
++    """Test that AlterField with only choices changes generates no SQL."""
++    
++    print("Testing AlterField migration with choices...")
++    
++    # Define the model
++    class TestModel(models.Model):
++        status = models.CharField(max_length=10)
++        
++        class Meta:
++            app_label = 'test_app'
++            db_table = 'test_migration_model'
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Test direct schema editor behavior (this is what migrations use)
++    old_field = models.CharField(max_length=10)
++    old_field.set_attributes_from_name('status')
++    
++    new_field = models.CharField(max_length=10, choices=[('A', 'Active'), ('I', 'Inactive')])
++    new_field.set_attributes_from_name('status')
++    
++    # Capture SQL generated by the operation
++    class SQLCapturingSchemaEditor(connection.schema_editor().__class__):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self.captured_sql = []
++        
++        def execute(self, sql, params=()):
++            self.captured_sql.append((sql, params))
++            # Don't actually execute to avoid errors
++    
++    with SQLCapturingSchemaEditor(connection) as capturing_editor:
++        try:
++            capturing_editor.alter_field(TestModel, old_field, new_field)
++            
++            if capturing_editor.captured_sql:
++                print("❌ ISSUE: SQL was generated for choices-only change:")
++                for sql, params in capturing_editor.captured_sql:
++                    print(f"  {sql}")
++                    if params:
++                        print(f"    Params: {params}")
++            else:
++                print("✅ SUCCESS: No SQL generated for choices-only change")
++                
++        except Exception as e:
++            print(f"Error during schema alteration: {e}")
++    
++    # Test the reverse operation
++    print("\nTesting reverse operation (removing choices)...")
++    
++    with SQLCapturingSchemaEditor(connection) as capturing_editor:
++        try:
++            capturing_editor.alter_field(TestModel, new_field, old_field)
++            
++            if capturing_editor.captured_sql:
++                print("❌ ISSUE: SQL was generated for removing choices:")
++                for sql, params in capturing_editor.captured_sql:
++                    print(f"  {sql}")
++                    if params:
++                        print(f"    Params: {params}")
++            else:
++                print("✅ SUCCESS: No SQL generated for removing choices")
++                
++        except Exception as e:
++            print(f"Error during reverse schema alteration: {e}")
++
++def test_alter_field_real_change_migration():
++    """Test that AlterField with real schema changes still generates SQL."""
++    
++    print("\nTesting AlterField migration with real schema change...")
++    
++    # Define the model
++    class TestModel2(models.Model):
++        name = models.CharField(max_length=10)
++        
++        class Meta:
++            app_label = 'test_app'
++            db_table = 'test_migration_model_2'
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel2)
++    
++    # Test direct schema editor behavior with real change
++    old_field = models.CharField(max_length=10)
++    old_field.set_attributes_from_name('name')
++    
++    new_field = models.CharField(max_length=20)  # Changed max_length
++    new_field.set_attributes_from_name('name')
++    
++    # Capture SQL generated by the operation
++    class SQLCapturingSchemaEditor(connection.schema_editor().__class__):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self.captured_sql = []
++        
++        def execute(self, sql, params=()):
++            self.captured_sql.append((sql, params))
++            # Don't actually execute to avoid errors
++    
++    with SQLCapturingSchemaEditor(connection) as capturing_editor:
++        try:
++            capturing_editor.alter_field(TestModel2, old_field, new_field)
++            
++            if capturing_editor.captured_sql:
++                print("✅ SUCCESS: SQL was generated for real schema change:")
++                for sql, params in capturing_editor.captured_sql:
++                    print(f"  {sql}")
++                    if params:
++                        print(f"    Params: {params}")
++            else:
++                print("❌ ISSUE: No SQL generated for real schema change")
++                
++        except Exception as e:
++            print(f"Error during schema alteration: {e}")
++
++if __name__ == '__main__':
++    print("Testing AlterField migration behavior with choices")
++    print("=" * 60)
++    
++    test_alter_field_choices_migration()
++    test_alter_field_real_change_migration()
++    
++    print("\n" + "=" * 60)
++    print("Migration tests completed!")
+\ No newline at end of file

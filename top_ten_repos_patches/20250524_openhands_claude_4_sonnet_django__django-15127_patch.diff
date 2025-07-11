@@ -1,0 +1,549 @@
+diff --git a/django/contrib/messages/storage/base.py b/django/contrib/messages/storage/base.py
+index 01422066a6..111d5480fa 100644
+--- a/django/contrib/messages/storage/base.py
++++ b/django/contrib/messages/storage/base.py
+@@ -1,7 +1,38 @@
+ from django.conf import settings
+ from django.contrib.messages import constants, utils
+ 
+-LEVEL_TAGS = utils.get_level_tags()
++
++class LevelTags:
++    """
++    A dictionary-like object that dynamically returns level tags,
++    respecting any settings overrides. This provides backward compatibility
++    while ensuring that @override_settings works correctly.
++    """
++    def get(self, key, default=None):
++        return utils.get_level_tags().get(key, default)
++    
++    def __getitem__(self, key):
++        return utils.get_level_tags()[key]
++    
++    def __setitem__(self, key, value):
++        # This is for backward compatibility with tests that might try to modify LEVEL_TAGS
++        # In practice, this won't have any effect since we always get fresh tags from settings
++        pass
++    
++    def __contains__(self, key):
++        return key in utils.get_level_tags()
++    
++    def keys(self):
++        return utils.get_level_tags().keys()
++    
++    def values(self):
++        return utils.get_level_tags().values()
++    
++    def items(self):
++        return utils.get_level_tags().items()
++
++
++LEVEL_TAGS = LevelTags()
+ 
+ 
+ class Message:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..27f7ab12bd
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the LEVEL_TAGS issue with @override_settings.
++
++This script demonstrates that when using @override_settings to modify MESSAGE_TAGS,
++the Message.level_tag property doesn't reflect the new tags and returns an empty string.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.messages',
++            'django.contrib.sessions',
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        MIDDLEWARE=[
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.messages.storage.base import Message
++from django.contrib.messages import constants
++from django.test import override_settings
++from django.contrib.messages import utils
++
++def test_without_override():
++    """Test level_tag without any settings override."""
++    print("=== Test without override_settings ===")
++    
++    # Create a message with a standard level
++    msg = Message(constants.INFO, "Test message")
++    print(f"Message level: {msg.level}")
++    print(f"Message level_tag: '{msg.level_tag}'")
++    print(f"Expected level_tag: 'info'")
++    print(f"Test passed: {msg.level_tag == 'info'}")
++    print()
++
++def test_with_override():
++    """Test level_tag with override_settings - this should fail."""
++    print("=== Test with override_settings (demonstrating the bug) ===")
++    
++    # Define custom tags
++    custom_tags = {
++        constants.INFO: 'custom-info',
++        constants.DEBUG: 'custom-debug',
++        constants.WARNING: 'custom-warning',
++        constants.ERROR: 'custom-error',
++        constants.SUCCESS: 'custom-success',
++        99: 'custom-level',  # Custom level
++    }
++    
++    with override_settings(MESSAGE_TAGS=custom_tags):
++        # Create a message with a custom level
++        msg = Message(99, "Custom level message")
++        print(f"Message level: {msg.level}")
++        print(f"Message level_tag: '{msg.level_tag}'")
++        print(f"Expected level_tag: 'custom-level'")
++        print(f"Test passed: {msg.level_tag == 'custom-level'}")
++        
++        # Also test standard level with custom tag
++        msg_info = Message(constants.INFO, "Info message")
++        print(f"Info message level_tag: '{msg_info.level_tag}'")
++        print(f"Expected level_tag: 'custom-info'")
++        print(f"Info test passed: {msg_info.level_tag == 'custom-info'}")
++        
++        # Show what get_level_tags() returns inside the override
++        current_tags = utils.get_level_tags()
++        print(f"utils.get_level_tags() returns: {current_tags}")
++        print()
++
++def test_manual_workaround():
++    """Test the manual workaround used in Django's own tests."""
++    print("=== Test with manual workaround (no longer needed) ===")
++    
++    from django.contrib.messages.storage import base
++    
++    # Define custom tags
++    custom_tags = {
++        constants.INFO: 'workaround-info',
++        constants.DEBUG: 'workaround-debug',
++        99: 'workaround-custom',
++    }
++    
++    # Check if LEVEL_TAGS constant still exists
++    if hasattr(base, 'LEVEL_TAGS'):
++        print("LEVEL_TAGS constant still exists - workaround needed")
++        with override_settings(MESSAGE_TAGS=custom_tags):
++            # Manually update LEVEL_TAGS like Django's tests do
++            old_level_tags = base.LEVEL_TAGS
++            base.LEVEL_TAGS = utils.get_level_tags()
++            
++            try:
++                # Create a message with a custom level
++                msg = Message(99, "Custom level message")
++                print(f"Message level: {msg.level}")
++                print(f"Message level_tag: '{msg.level_tag}'")
++                print(f"Expected level_tag: 'workaround-custom'")
++                print(f"Test passed: {msg.level_tag == 'workaround-custom'}")
++            finally:
++                # Restore original LEVEL_TAGS
++                base.LEVEL_TAGS = old_level_tags
++    else:
++        print("LEVEL_TAGS constant removed - workaround no longer needed!")
++        print("The fix makes level_tag dynamically get tags from settings.")
++    print()
++
++if __name__ == '__main__':
++    print("Reproducing LEVEL_TAGS issue with @override_settings\n")
++    
++    test_without_override()
++    test_with_override()
++    test_manual_workaround()
++    
++    print("=== Summary ===")
++    print("The bug is that Message.level_tag doesn't update when MESSAGE_TAGS")
++    print("is overridden using @override_settings. This is because LEVEL_TAGS")
++    print("is set at module import time and never refreshed.")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..db108aab41
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the LEVEL_TAGS fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.messages',
++            'django.contrib.sessions',
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        MIDDLEWARE=[
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.messages.storage.base import Message, LEVEL_TAGS
++from django.contrib.messages import constants
++from django.test import override_settings
++
++def test_empty_message_tags():
++    """Test with empty MESSAGE_TAGS."""
++    print("=== Test with empty MESSAGE_TAGS ===")
++    
++    with override_settings(MESSAGE_TAGS={}):
++        # Should fall back to DEFAULT_TAGS
++        msg = Message(constants.INFO, "Test message")
++        print(f"Message level_tag with empty MESSAGE_TAGS: '{msg.level_tag}'")
++        assert msg.level_tag == 'info', f"Expected 'info', got '{msg.level_tag}'"
++    
++    print("✅ Empty MESSAGE_TAGS test passed\n")
++
++def test_partial_message_tags():
++    """Test with partial MESSAGE_TAGS that only overrides some levels."""
++    print("=== Test with partial MESSAGE_TAGS ===")
++    
++    with override_settings(MESSAGE_TAGS={constants.ERROR: 'danger'}):
++        # ERROR should use custom tag
++        msg_error = Message(constants.ERROR, "Error message")
++        print(f"Error message level_tag: '{msg_error.level_tag}'")
++        assert msg_error.level_tag == 'danger', f"Expected 'danger', got '{msg_error.level_tag}'"
++        
++        # INFO should use default tag
++        msg_info = Message(constants.INFO, "Info message")
++        print(f"Info message level_tag: '{msg_info.level_tag}'")
++        assert msg_info.level_tag == 'info', f"Expected 'info', got '{msg_info.level_tag}'"
++    
++    print("✅ Partial MESSAGE_TAGS test passed\n")
++
++def test_none_and_empty_string_tags():
++    """Test with None and empty string tags."""
++    print("=== Test with None and empty string tags ===")
++    
++    with override_settings(MESSAGE_TAGS={
++        constants.INFO: '',  # Empty string
++        constants.DEBUG: None,  # None (this might cause issues)
++        constants.ERROR: 'error-tag',
++    }):
++        # Empty string tag
++        msg_info = Message(constants.INFO, "Info message")
++        print(f"Info message level_tag (empty string): '{msg_info.level_tag}'")
++        assert msg_info.level_tag == '', f"Expected '', got '{msg_info.level_tag}'"
++        
++        # None tag - this might be problematic, let's see how Django handles it
++        try:
++            msg_debug = Message(constants.DEBUG, "Debug message")
++            print(f"Debug message level_tag (None): '{msg_debug.level_tag}'")
++            # Django should handle None gracefully
++        except Exception as e:
++            print(f"Debug message with None tag failed: {e}")
++        
++        # Normal tag
++        msg_error = Message(constants.ERROR, "Error message")
++        print(f"Error message level_tag: '{msg_error.level_tag}'")
++        assert msg_error.level_tag == 'error-tag', f"Expected 'error-tag', got '{msg_error.level_tag}'"
++    
++    print("✅ None and empty string tags test passed\n")
++
++def test_level_tags_iteration():
++    """Test iteration methods on LEVEL_TAGS."""
++    print("=== Test LEVEL_TAGS iteration methods ===")
++    
++    # Test keys()
++    keys = list(LEVEL_TAGS.keys())
++    print(f"LEVEL_TAGS.keys(): {keys}")
++    assert constants.INFO in keys, "INFO should be in keys"
++    assert constants.ERROR in keys, "ERROR should be in keys"
++    
++    # Test values()
++    values = list(LEVEL_TAGS.values())
++    print(f"LEVEL_TAGS.values(): {values}")
++    assert 'info' in values, "'info' should be in values"
++    assert 'error' in values, "'error' should be in values"
++    
++    # Test items()
++    items = list(LEVEL_TAGS.items())
++    print(f"LEVEL_TAGS.items(): {items}")
++    assert (constants.INFO, 'info') in items, "(INFO, 'info') should be in items"
++    
++    # Test with custom tags
++    with override_settings(MESSAGE_TAGS={99: 'custom'}):
++        keys_custom = list(LEVEL_TAGS.keys())
++        print(f"LEVEL_TAGS.keys() with custom: {keys_custom}")
++        assert 99 in keys_custom, "99 should be in keys with custom tags"
++        
++        items_custom = list(LEVEL_TAGS.items())
++        print(f"LEVEL_TAGS.items() with custom: {items_custom}")
++        assert (99, 'custom') in items_custom, "(99, 'custom') should be in items"
++    
++    print("✅ LEVEL_TAGS iteration methods test passed\n")
++
++def test_performance():
++    """Basic performance test to ensure the fix doesn't significantly slow things down."""
++    print("=== Test performance ===")
++    
++    import time
++    
++    # Test creating many messages
++    start_time = time.time()
++    messages = []
++    for i in range(1000):
++        msg = Message(constants.INFO, f"Message {i}")
++        # Access level_tag to trigger the lookup
++        _ = msg.level_tag
++        messages.append(msg)
++    end_time = time.time()
++    
++    duration = end_time - start_time
++    print(f"Created 1000 messages and accessed level_tag in {duration:.4f} seconds")
++    
++    # This should be very fast (well under 1 second)
++    assert duration < 1.0, f"Performance test failed: took {duration:.4f} seconds"
++    
++    print("✅ Performance test passed\n")
++
++if __name__ == '__main__':
++    print("Running edge case tests for LEVEL_TAGS fix\n")
++    
++    test_empty_message_tags()
++    test_partial_message_tags()
++    test_none_and_empty_string_tags()
++    test_level_tags_iteration()
++    test_performance()
++    
++    print("🎉 All edge case tests passed!")
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 0000000000..fa0b57eb6a
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify that the LEVEL_TAGS fix works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'django.contrib.messages',
++            'django.contrib.sessions',
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        MIDDLEWARE=[
++            'django.contrib.sessions.middleware.SessionMiddleware',
++            'django.contrib.messages.middleware.MessageMiddleware',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.contrib.messages.storage.base import Message, LEVEL_TAGS
++from django.contrib.messages import constants
++from django.test import override_settings
++from django.contrib.messages import utils
++
++def test_level_tags_object():
++    """Test that LEVEL_TAGS behaves like a dictionary."""
++    print("=== Test LEVEL_TAGS object behavior ===")
++    
++    # Test .get() method
++    info_tag = LEVEL_TAGS.get(constants.INFO)
++    print(f"LEVEL_TAGS.get(INFO): {info_tag}")
++    assert info_tag == 'info', f"Expected 'info', got '{info_tag}'"
++    
++    # Test default value
++    unknown_tag = LEVEL_TAGS.get(999, 'default')
++    print(f"LEVEL_TAGS.get(999, 'default'): {unknown_tag}")
++    assert unknown_tag == 'default', f"Expected 'default', got '{unknown_tag}'"
++    
++    # Test __getitem__
++    debug_tag = LEVEL_TAGS[constants.DEBUG]
++    print(f"LEVEL_TAGS[DEBUG]: {debug_tag}")
++    assert debug_tag == 'debug', f"Expected 'debug', got '{debug_tag}'"
++    
++    # Test __contains__
++    has_info = constants.INFO in LEVEL_TAGS
++    print(f"INFO in LEVEL_TAGS: {has_info}")
++    assert has_info, "INFO should be in LEVEL_TAGS"
++    
++    has_unknown = 999 in LEVEL_TAGS
++    print(f"999 in LEVEL_TAGS: {has_unknown}")
++    assert not has_unknown, "999 should not be in LEVEL_TAGS"
++    
++    print("✅ LEVEL_TAGS object behavior test passed\n")
++
++def test_message_level_tag_basic():
++    """Test basic Message.level_tag functionality."""
++    print("=== Test basic Message.level_tag ===")
++    
++    msg_info = Message(constants.INFO, "Info message")
++    print(f"Info message level_tag: '{msg_info.level_tag}'")
++    assert msg_info.level_tag == 'info', f"Expected 'info', got '{msg_info.level_tag}'"
++    
++    msg_error = Message(constants.ERROR, "Error message")
++    print(f"Error message level_tag: '{msg_error.level_tag}'")
++    assert msg_error.level_tag == 'error', f"Expected 'error', got '{msg_error.level_tag}'"
++    
++    # Test unknown level
++    msg_unknown = Message(999, "Unknown level message")
++    print(f"Unknown level message level_tag: '{msg_unknown.level_tag}'")
++    assert msg_unknown.level_tag == '', f"Expected '', got '{msg_unknown.level_tag}'"
++    
++    print("✅ Basic Message.level_tag test passed\n")
++
++def test_override_settings_integration():
++    """Test that @override_settings works with Message.level_tag."""
++    print("=== Test @override_settings integration ===")
++    
++    # Test with custom tags
++    custom_tags = {
++        constants.INFO: 'custom-info',
++        constants.DEBUG: 'custom-debug',
++        constants.WARNING: 'custom-warning',
++        constants.ERROR: 'custom-error',
++        constants.SUCCESS: 'custom-success',
++        99: 'custom-level-99',
++        100: 'custom-level-100',
++    }
++    
++    with override_settings(MESSAGE_TAGS=custom_tags):
++        # Test standard levels with custom tags
++        msg_info = Message(constants.INFO, "Info message")
++        print(f"Info message level_tag (custom): '{msg_info.level_tag}'")
++        assert msg_info.level_tag == 'custom-info', f"Expected 'custom-info', got '{msg_info.level_tag}'"
++        
++        msg_error = Message(constants.ERROR, "Error message")
++        print(f"Error message level_tag (custom): '{msg_error.level_tag}'")
++        assert msg_error.level_tag == 'custom-error', f"Expected 'custom-error', got '{msg_error.level_tag}'"
++        
++        # Test custom levels
++        msg_99 = Message(99, "Custom level 99")
++        print(f"Custom level 99 level_tag: '{msg_99.level_tag}'")
++        assert msg_99.level_tag == 'custom-level-99', f"Expected 'custom-level-99', got '{msg_99.level_tag}'"
++        
++        msg_100 = Message(100, "Custom level 100")
++        print(f"Custom level 100 level_tag: '{msg_100.level_tag}'")
++        assert msg_100.level_tag == 'custom-level-100', f"Expected 'custom-level-100', got '{msg_100.level_tag}'"
++        
++        # Test that LEVEL_TAGS object also reflects the changes
++        level_tags_info = LEVEL_TAGS.get(constants.INFO)
++        print(f"LEVEL_TAGS.get(INFO) inside override: '{level_tags_info}'")
++        assert level_tags_info == 'custom-info', f"Expected 'custom-info', got '{level_tags_info}'"
++        
++        level_tags_99 = LEVEL_TAGS.get(99)
++        print(f"LEVEL_TAGS.get(99) inside override: '{level_tags_99}'")
++        assert level_tags_99 == 'custom-level-99', f"Expected 'custom-level-99', got '{level_tags_99}'"
++    
++    # Test that after override, we're back to defaults
++    msg_info_after = Message(constants.INFO, "Info message after override")
++    print(f"Info message level_tag (after override): '{msg_info_after.level_tag}'")
++    assert msg_info_after.level_tag == 'info', f"Expected 'info', got '{msg_info_after.level_tag}'"
++    
++    # Test that custom level is no longer available
++    msg_99_after = Message(99, "Custom level 99 after override")
++    print(f"Custom level 99 level_tag (after override): '{msg_99_after.level_tag}'")
++    assert msg_99_after.level_tag == '', f"Expected '', got '{msg_99_after.level_tag}'"
++    
++    print("✅ @override_settings integration test passed\n")
++
++def test_nested_overrides():
++    """Test nested @override_settings."""
++    print("=== Test nested @override_settings ===")
++    
++    with override_settings(MESSAGE_TAGS={constants.INFO: 'outer-info'}):
++        msg_outer = Message(constants.INFO, "Outer message")
++        print(f"Outer override level_tag: '{msg_outer.level_tag}'")
++        assert msg_outer.level_tag == 'outer-info', f"Expected 'outer-info', got '{msg_outer.level_tag}'"
++        
++        with override_settings(MESSAGE_TAGS={constants.INFO: 'inner-info'}):
++            msg_inner = Message(constants.INFO, "Inner message")
++            print(f"Inner override level_tag: '{msg_inner.level_tag}'")
++            assert msg_inner.level_tag == 'inner-info', f"Expected 'inner-info', got '{msg_inner.level_tag}'"
++        
++        # Back to outer override
++        msg_outer_again = Message(constants.INFO, "Outer message again")
++        print(f"Back to outer override level_tag: '{msg_outer_again.level_tag}'")
++        assert msg_outer_again.level_tag == 'outer-info', f"Expected 'outer-info', got '{msg_outer_again.level_tag}'"
++    
++    # Back to default
++    msg_default = Message(constants.INFO, "Default message")
++    print(f"Back to default level_tag: '{msg_default.level_tag}'")
++    assert msg_default.level_tag == 'info', f"Expected 'info', got '{msg_default.level_tag}'"
++    
++    print("✅ Nested @override_settings test passed\n")
++
++def test_backward_compatibility():
++    """Test backward compatibility with existing code that might modify LEVEL_TAGS."""
++    print("=== Test backward compatibility ===")
++    
++    # Test that we can still assign to LEVEL_TAGS (even though it won't have effect)
++    try:
++        LEVEL_TAGS[999] = 'test-assignment'
++        print("✅ Assignment to LEVEL_TAGS doesn't raise error")
++    except Exception as e:
++        print(f"❌ Assignment to LEVEL_TAGS failed: {e}")
++        raise
++    
++    # Test that the assignment doesn't actually affect the behavior
++    # (because we always get fresh tags from settings)
++    msg_999 = Message(999, "Test message")
++    print(f"Message with level 999 level_tag: '{msg_999.level_tag}'")
++    assert msg_999.level_tag == '', f"Expected '', got '{msg_999.level_tag}'"
++    
++    print("✅ Backward compatibility test passed\n")
++
++if __name__ == '__main__':
++    print("Running comprehensive tests for LEVEL_TAGS fix\n")
++    
++    test_level_tags_object()
++    test_message_level_tag_basic()
++    test_override_settings_integration()
++    test_nested_overrides()
++    test_backward_compatibility()
++    
++    print("🎉 All tests passed! The fix works correctly.")
+\ No newline at end of file

@@ -1,0 +1,215 @@
+diff --git a/django/contrib/admin/helpers.py b/django/contrib/admin/helpers.py
+index dd154f72ee..ba8c3463a0 100644
+--- a/django/contrib/admin/helpers.py
++++ b/django/contrib/admin/helpers.py
+@@ -209,7 +209,11 @@ class AdminReadonlyField:
+             remote_field.model._meta.model_name,
+         )
+         try:
+-            url = reverse(url_name, args=[quote(remote_obj.pk)])
++            url = reverse(
++                url_name,
++                args=[quote(remote_obj.pk)],
++                current_app=self.model_admin.admin_site.name
++            )
+             return format_html('<a href="{}">{}</a>', url, remote_obj)
+         except NoReverseMatch:
+             return str(remote_obj)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..4c900e895d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,191 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the issue with wrong URL generation for readonly fields in custom Admin Site.
++
++This script demonstrates that when a ForeignKey field is marked as readonly in a custom admin site,
++the generated URL points to /admin/ instead of the custom admin site URL.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.admin',
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        ROOT_URLCONF='__main__',
++    )
++
++django.setup()
++
++from django.contrib import admin
++from django.contrib.admin.helpers import AdminReadonlyField
++from django.forms import ModelForm
++from django.db import models
++
++
++# Define simple test models
++class Section(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    section = models.ForeignKey(Section, models.CASCADE, null=True, blank=True)
++    
++    def __str__(self):
++        return self.title
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class ArticleForm(ModelForm):
++    class Meta:
++        model = Article
++        fields = '__all__'
++
++
++class ArticleAdminWithReadonlySection(admin.ModelAdmin):
++    readonly_fields = ['section']
++
++
++# Create custom admin site
++custom_admin_site = admin.AdminSite(name='custom_admin')
++
++# Register models with admin sites
++admin.site.register(Section)
++admin.site.register(Article)
++custom_admin_site.register(Section)
++custom_admin_site.register(Article)
++
++# URL configuration
++from django.urls import path, include
++
++urlpatterns = [
++    path('admin/', admin.site.urls),
++    path('custom_admin/', custom_admin_site.urls),
++]
++
++# This will be added dynamically in the test
++def add_another_admin_urls():
++    global urlpatterns
++    from django.urls import path
++    another_admin_site = admin.AdminSite(name='another_admin')
++    urlpatterns.append(path('another_admin/', another_admin_site.urls))
++    return another_admin_site
++
++
++def test_readonly_field_url_generation():
++    """Test that readonly ForeignKey fields generate correct URLs in custom admin sites."""
++    
++    print("Setting up test data...")
++    
++    # Create database tables
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Section)
++        schema_editor.create_model(Article)
++    
++    # Create test data
++    section = Section.objects.create(name="Test Section")
++    article = Article.objects.create(
++        title="Test Article",
++        section=section
++    )
++    
++    print(f"Created section: {section} (id: {section.pk})")
++    print(f"Created article: {article} (id: {article.pk})")
++    
++    # Test 1: Custom admin site
++    print(f"\n=== Test 1: Custom admin site ===")
++    form = ArticleForm(instance=article)
++    model_admin = ArticleAdminWithReadonlySection(Article, custom_admin_site)
++    readonly_field = AdminReadonlyField(form, 'section', is_first=True, model_admin=model_admin)
++    
++    print(f"Custom admin site name: {custom_admin_site.name}")
++    field_obj = Article._meta.get_field('section')
++    url = readonly_field.get_admin_url(field_obj.remote_field, section)
++    print(f"Generated URL HTML: {url}")
++    
++    import re
++    url_match = re.search(r'href="([^"]*)"', str(url))
++    if url_match:
++        extracted_url = url_match.group(1)
++        print(f"Extracted URL: {extracted_url}")
++        
++        if '/custom_admin/' in extracted_url:
++            print("✅ SUCCESS: URL correctly uses custom admin site prefix")
++        else:
++            print("❌ FAILURE: URL doesn't use custom admin site prefix")
++            return False
++    else:
++        print(f"❌ ERROR: Could not extract URL from HTML: {url}")
++        return False
++    
++    # Test 2: Default admin site
++    print(f"\n=== Test 2: Default admin site ===")
++    default_model_admin = ArticleAdminWithReadonlySection(Article, admin.site)
++    default_readonly_field = AdminReadonlyField(form, 'section', is_first=True, model_admin=default_model_admin)
++    
++    print(f"Default admin site name: {admin.site.name}")
++    default_url = default_readonly_field.get_admin_url(field_obj.remote_field, section)
++    print(f"Generated URL HTML: {default_url}")
++    
++    default_url_match = re.search(r'href="([^"]*)"', str(default_url))
++    if default_url_match:
++        default_extracted_url = default_url_match.group(1)
++        print(f"Extracted URL: {default_extracted_url}")
++        
++        if '/admin/' in default_extracted_url and '/custom_admin/' not in default_extracted_url:
++            print("✅ SUCCESS: URL correctly uses default admin site prefix")
++        else:
++            print("❌ FAILURE: URL doesn't use default admin site prefix correctly")
++            return False
++    else:
++        print(f"❌ ERROR: Could not extract URL from HTML: {default_url}")
++        return False
++    
++    print(f"\n=== All tests passed! ===")
++    print("The fix correctly handles both default and custom admin sites.")
++    
++    return True
++
++
++if __name__ == '__main__':
++    # Run the test
++    success = test_readonly_field_url_generation()
++    
++    if not success:
++        print("\n" + "="*50)
++        print("ISSUE REPRODUCED: The readonly field URL generation is broken!")
++        print("The URL should use the custom admin site prefix but uses the default admin prefix instead.")
++        sys.exit(1)
++    else:
++        print("\n" + "="*50)
++        print("Issue not reproduced - the fix may already be in place.")
++        sys.exit(0)
+\ No newline at end of file

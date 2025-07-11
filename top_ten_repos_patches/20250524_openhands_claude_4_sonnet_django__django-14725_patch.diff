@@ -1,0 +1,1346 @@
+diff --git a/django/forms/formsets.py b/django/forms/formsets.py
+index 75b0646512..e002b070db 100644
+--- a/django/forms/formsets.py
++++ b/django/forms/formsets.py
+@@ -478,7 +478,7 @@ class BaseFormSet(RenderableFormMixin):
+ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+                     can_delete=False, max_num=None, validate_max=False,
+                     min_num=None, validate_min=False, absolute_max=None,
+-                    can_delete_extra=True, renderer=None):
++                    can_delete_extra=True, can_create=True, renderer=None):
+     """Return a FormSet for the given form class."""
+     if min_num is None:
+         min_num = DEFAULT_MIN_NUM
+@@ -499,6 +499,7 @@ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+         'can_order': can_order,
+         'can_delete': can_delete,
+         'can_delete_extra': can_delete_extra,
++        'can_create': can_create,
+         'min_num': min_num,
+         'max_num': max_num,
+         'absolute_max': absolute_max,
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 7effb202e3..9d024bfd1d 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -820,6 +820,9 @@ class BaseModelFormSet(BaseFormSet):
+             # object.
+             if self.can_delete and self._should_delete_form(form):
+                 continue
++            # If can_create is False, don't save new objects.
++            if not getattr(self, 'can_create', True):
++                continue
+             self.new_objects.append(self.save_new(form, commit=commit))
+             if not commit:
+                 self.saved_forms.append(form)
+@@ -875,7 +878,8 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                          widgets=None, validate_max=False, localized_fields=None,
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False, field_classes=None,
+-                         absolute_max=None, can_delete_extra=True, renderer=None):
++                         absolute_max=None, can_delete_extra=True, can_create=True,
++                         renderer=None):
+     """Return a FormSet class for the given Django model class."""
+     meta = getattr(form, 'Meta', None)
+     if (getattr(meta, 'fields', fields) is None and
+@@ -894,7 +898,7 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                               can_order=can_order, can_delete=can_delete,
+                               validate_min=validate_min, validate_max=validate_max,
+                               absolute_max=absolute_max, can_delete_extra=can_delete_extra,
+-                              renderer=renderer)
++                              can_create=can_create, renderer=renderer)
+     FormSet.model = model
+     return FormSet
+ 
+@@ -1076,7 +1080,8 @@ def inlineformset_factory(parent_model, model, form=ModelForm,
+                           widgets=None, validate_max=False, localized_fields=None,
+                           labels=None, help_texts=None, error_messages=None,
+                           min_num=None, validate_min=False, field_classes=None,
+-                          absolute_max=None, can_delete_extra=True, renderer=None):
++                          absolute_max=None, can_delete_extra=True, can_create=True,
++                          renderer=None):
+     """
+     Return an ``InlineFormSet`` for the given kwargs.
+ 
+@@ -1108,6 +1113,7 @@ def inlineformset_factory(parent_model, model, form=ModelForm,
+         'field_classes': field_classes,
+         'absolute_max': absolute_max,
+         'can_delete_extra': can_delete_extra,
++        'can_create': can_create,
+         'renderer': renderer,
+     }
+     FormSet = modelformset_factory(model, **kwargs)
+diff --git a/final_demonstration.py b/final_demonstration.py
+new file mode 100644
+index 0000000000..4a1b377dd7
+--- /dev/null
++++ b/final_demonstration.py
+@@ -0,0 +1,299 @@
++#!/usr/bin/env python
++"""
++Final demonstration of the can_create=False feature for model formsets.
++
++This script demonstrates the complete solution to the issue:
++"Provide a way for model formsets to disallow new object creation"
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory, inlineformset_factory
++
++# Define test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Author)
++    schema_editor.create_model(Book)
++
++def demonstrate_problem():
++    """Demonstrate the original problem with extra=0"""
++    print("=" * 60)
++    print("ORIGINAL PROBLEM: extra=0 is unreliable for 'edit only' mode")
++    print("=" * 60)
++    
++    # Clear and create test data
++    Author.objects.all().delete()
++    author1 = Author.objects.create(name="J.K. Rowling")
++    author2 = Author.objects.create(name="George Orwell")
++    
++    print(f"Initial authors: {Author.objects.count()}")
++    for author in Author.objects.all():
++        print(f"  - {author.name}")
++    
++    # User tries to create "edit only" formset with extra=0
++    AuthorFormSet = modelformset_factory(Author, fields=['name'], extra=0)
++    
++    # Simulate malicious form data (JavaScript manipulation or direct POST)
++    form_data = {
++        'form-TOTAL_FORMS': '4',  # Manipulated to include extra forms
++        'form-INITIAL_FORMS': '2',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        # Existing authors
++        'form-0-id': str(author1.pk),
++        'form-0-name': 'J.K. Rowling (edited)',
++        'form-1-id': str(author2.pk),
++        'form-1-name': 'George Orwell (edited)',
++        
++        # Malicious new authors
++        'form-2-name': 'Unauthorized Author 1',
++        'form-3-name': 'Unauthorized Author 2',
++    }
++    
++    formset = AuthorFormSet(data=form_data, queryset=Author.objects.all())
++    
++    if formset.is_valid():
++        formset.save()
++        print(f"\nAfter save with extra=0:")
++        print(f"Authors count: {Author.objects.count()}")
++        for author in Author.objects.all():
++            print(f"  - {author.name}")
++        
++        if Author.objects.count() > 2:
++            print("\n❌ PROBLEM: New authors were created despite extra=0!")
++            print("   This demonstrates the security vulnerability.")
++
++def demonstrate_solution():
++    """Demonstrate the solution with can_create=False"""
++    print("\n" + "=" * 60)
++    print("SOLUTION: can_create=False provides reliable 'edit only' mode")
++    print("=" * 60)
++    
++    # Clear and recreate test data
++    Author.objects.all().delete()
++    author1 = Author.objects.create(name="J.K. Rowling")
++    author2 = Author.objects.create(name="George Orwell")
++    
++    print(f"Initial authors: {Author.objects.count()}")
++    for author in Author.objects.all():
++        print(f"  - {author.name}")
++    
++    # Create truly "edit only" formset with can_create=False
++    AuthorFormSet = modelformset_factory(Author, fields=['name'], extra=0, can_create=False)
++    
++    # Same malicious form data as before
++    form_data = {
++        'form-TOTAL_FORMS': '4',  # Still manipulated
++        'form-INITIAL_FORMS': '2',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        # Existing authors
++        'form-0-id': str(author1.pk),
++        'form-0-name': 'J.K. Rowling (safely edited)',
++        'form-1-id': str(author2.pk),
++        'form-1-name': 'George Orwell (safely edited)',
++        
++        # Malicious new authors (will be ignored)
++        'form-2-name': 'Blocked Author 1',
++        'form-3-name': 'Blocked Author 2',
++    }
++    
++    formset = AuthorFormSet(data=form_data, queryset=Author.objects.all())
++    
++    if formset.is_valid():
++        formset.save()
++        print(f"\nAfter save with can_create=False:")
++        print(f"Authors count: {Author.objects.count()}")
++        for author in Author.objects.all():
++            print(f"  - {author.name}")
++        
++        if Author.objects.count() == 2:
++            print("\n✅ SOLUTION: New authors were blocked by can_create=False!")
++            print("   Existing authors were safely edited.")
++            print("   Server-side enforcement prevents client-side manipulation.")
++
++def demonstrate_inline_formsets():
++    """Demonstrate the solution works with inline formsets too"""
++    print("\n" + "=" * 60)
++    print("BONUS: can_create=False also works with inline formsets")
++    print("=" * 60)
++    
++    # Clear and create test data
++    Book.objects.all().delete()
++    Author.objects.all().delete()
++    
++    author = Author.objects.create(name="J.K. Rowling")
++    book1 = Book.objects.create(title="Harry Potter 1", author=author)
++    book2 = Book.objects.create(title="Harry Potter 2", author=author)
++    
++    print(f"Initial books for {author.name}: {Book.objects.filter(author=author).count()}")
++    for book in Book.objects.filter(author=author):
++        print(f"  - {book.title}")
++    
++    # Create "edit only" inline formset
++    BookFormSet = inlineformset_factory(Author, Book, fields=['title'], extra=0, can_create=False)
++    
++    form_data = {
++        'book_set-TOTAL_FORMS': '4',
++        'book_set-INITIAL_FORMS': '2',
++        'book_set-MAX_NUM_FORMS': '1000',
++        'book_set-MIN_NUM_FORMS': '0',
++        
++        # Existing books
++        'book_set-0-id': str(book1.pk),
++        'book_set-0-title': 'Harry Potter and the Philosopher\'s Stone',
++        'book_set-0-author': str(author.pk),
++        'book_set-1-id': str(book2.pk),
++        'book_set-1-title': 'Harry Potter and the Chamber of Secrets',
++        'book_set-1-author': str(author.pk),
++        
++        # Attempted new books (will be blocked)
++        'book_set-2-title': 'Unauthorized Book 1',
++        'book_set-2-author': str(author.pk),
++        'book_set-3-title': 'Unauthorized Book 2',
++        'book_set-3-author': str(author.pk),
++    }
++    
++    formset = BookFormSet(data=form_data, instance=author)
++    
++    if formset.is_valid():
++        formset.save()
++        print(f"\nAfter save with can_create=False:")
++        print(f"Books count: {Book.objects.filter(author=author).count()}")
++        for book in Book.objects.filter(author=author):
++            print(f"  - {book.title}")
++        
++        if Book.objects.filter(author=author).count() == 2:
++            print("\n✅ SUCCESS: Inline formset also respects can_create=False!")
++
++def demonstrate_backward_compatibility():
++    """Demonstrate that existing code continues to work"""
++    print("\n" + "=" * 60)
++    print("BACKWARD COMPATIBILITY: Existing code continues to work")
++    print("=" * 60)
++    
++    # Clear and create test data
++    Book.objects.all().delete()  # Delete books first due to foreign key
++    Author.objects.all().delete()
++    author1 = Author.objects.create(name="Existing Author")
++    
++    # Create formset without specifying can_create (should default to True)
++    AuthorFormSet = modelformset_factory(Author, fields=['name'], extra=1)
++    
++    form_data = {
++        'form-TOTAL_FORMS': '2',
++        'form-INITIAL_FORMS': '1',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        'form-0-id': str(author1.pk),
++        'form-0-name': 'Existing Author (edited)',
++        
++        'form-1-name': 'New Author',
++    }
++    
++    formset = AuthorFormSet(data=form_data, queryset=Author.objects.all())
++    
++    if formset.is_valid():
++        formset.save()
++        print(f"Authors count: {Author.objects.count()}")
++        for author in Author.objects.all():
++            print(f"  - {author.name}")
++        
++        if Author.objects.count() == 2:
++            print("\n✅ COMPATIBILITY: Default behavior unchanged (can_create=True)")
++
++def show_usage_examples():
++    """Show usage examples for developers"""
++    print("\n" + "=" * 60)
++    print("USAGE EXAMPLES FOR DEVELOPERS")
++    print("=" * 60)
++    
++    print("""
++# Create an "edit only" model formset
++AuthorFormSet = modelformset_factory(
++    Author, 
++    fields=['name'], 
++    extra=0,           # Don't show extra forms
++    can_create=False   # Prevent new object creation
++)
++
++# Create an "edit only" inline formset  
++BookFormSet = inlineformset_factory(
++    Author, 
++    Book, 
++    fields=['title'], 
++    extra=0,           # Don't show extra forms
++    can_create=False   # Prevent new object creation
++)
++
++# Default behavior (backward compatible)
++AuthorFormSet = modelformset_factory(Author, fields=['name'])
++# can_create defaults to True, so new objects can be created
++
++# You can still show extra forms for UI purposes while preventing saves
++AuthorFormSet = modelformset_factory(
++    Author, 
++    fields=['name'], 
++    extra=2,           # Show 2 extra forms for better UX
++    can_create=False   # But don't save them
++)
++""")
++
++if __name__ == '__main__':
++    demonstrate_problem()
++    demonstrate_solution()
++    demonstrate_inline_formsets()
++    demonstrate_backward_compatibility()
++    show_usage_examples()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY")
++    print("=" * 60)
++    print("✅ Problem solved: Model formsets now support reliable 'edit only' mode")
++    print("✅ Security: Server-side enforcement prevents client-side manipulation")
++    print("✅ Backward compatible: Existing code continues to work unchanged")
++    print("✅ Consistent: Follows Django's existing patterns (like can_delete)")
++    print("✅ Comprehensive: Works with both model formsets and inline formsets")
++    print("\nThe can_create=False parameter provides the reliable 'edit only'")
++    print("functionality that was missing from Django model formsets.")
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..9a5ce08e4c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the model formset "edit only" issue.
++
++This script demonstrates that setting extra=0 doesn't prevent new object creation
++when additional form data is submitted.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory
++
++# Define a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++def test_current_behavior():
++    """Test current behavior - extra=0 doesn't prevent new object creation"""
++    print("=== Testing Current Behavior ===")
++    
++    # Create some existing objects
++    obj1 = TestModel.objects.create(name="Existing Object 1")
++    obj2 = TestModel.objects.create(name="Existing Object 2")
++    
++    print(f"Initial objects count: {TestModel.objects.count()}")
++    
++    # Create formset with extra=0 (user's attempt to make it "edit only")
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0)
++    
++    # Simulate form data that includes existing objects AND additional new objects
++    # This simulates what could happen with JavaScript manipulation or direct POST data
++    form_data = {
++        'form-TOTAL_FORMS': '4',  # 2 existing + 2 new (simulating manipulation)
++        'form-INITIAL_FORMS': '2',  # 2 existing objects
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        # Existing objects
++        'form-0-id': str(obj1.pk),
++        'form-0-name': 'Modified Object 1',
++        'form-1-id': str(obj2.pk),
++        'form-1-name': 'Modified Object 2',
++        
++        # New objects (these should be prevented in "edit only" mode)
++        'form-2-name': 'New Object 1',
++        'form-3-name': 'New Object 2',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    if formset.is_valid():
++        saved_objects = formset.save()
++        print(f"Objects after save: {TestModel.objects.count()}")
++        print("Saved objects:")
++        for obj in TestModel.objects.all():
++            print(f"  - {obj.name} (pk={obj.pk})")
++        
++        # This demonstrates the problem: new objects were created despite extra=0
++        if TestModel.objects.count() > 2:
++            print("❌ PROBLEM: New objects were created despite extra=0!")
++            print("   This shows that extra=0 is not reliable for 'edit only' mode.")
++        else:
++            print("✅ No new objects created")
++    else:
++        print("Formset validation errors:")
++        for i, form in enumerate(formset.forms):
++            if form.errors:
++                print(f"  Form {i}: {form.errors}")
++
++def test_desired_behavior():
++    """Test what the desired behavior should be with a hypothetical can_create=False parameter"""
++    print("\n=== Testing Desired Behavior (Hypothetical) ===")
++    print("This is what we want to implement:")
++    print("- A formset with can_create=False should only allow editing existing objects")
++    print("- New objects should be ignored/rejected even if form data is manipulated")
++    print("- This should be enforced server-side for security")
++
++if __name__ == '__main__':
++    test_current_behavior()
++    test_desired_behavior()
+\ No newline at end of file
+diff --git a/test_can_create_feature.py b/test_can_create_feature.py
+new file mode 100644
+index 0000000000..c0b1d7af48
+--- /dev/null
++++ b/test_can_create_feature.py
+@@ -0,0 +1,261 @@
++#!/usr/bin/env python
++"""
++Test for the new can_create feature in model formsets.
++This test should be added to the Django test suite.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory, inlineformset_factory
++from django.test import TestCase
++
++# Define test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class ParentModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class ChildModel(models.Model):
++    name = models.CharField(max_length=100)
++    parent = models.ForeignKey(ParentModel, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++    schema_editor.create_model(ParentModel)
++    schema_editor.create_model(ChildModel)
++
++class CanCreateFeatureTest(TestCase):
++    """Test the can_create feature for model formsets."""
++    
++    def setUp(self):
++        # Clear any existing data
++        TestModel.objects.all().delete()
++        ChildModel.objects.all().delete()
++        ParentModel.objects.all().delete()
++    
++    def test_can_create_false_prevents_new_objects(self):
++        """Test that can_create=False prevents creation of new objects."""
++        # Create existing objects
++        obj1 = TestModel.objects.create(name="Existing 1")
++        obj2 = TestModel.objects.create(name="Existing 2")
++        
++        # Create formset with can_create=False
++        TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_create=False)
++        
++        # Form data with existing objects and new objects
++        form_data = {
++            'form-TOTAL_FORMS': '4',
++            'form-INITIAL_FORMS': '2',
++            'form-MAX_NUM_FORMS': '1000',
++            'form-MIN_NUM_FORMS': '0',
++            
++            # Existing objects
++            'form-0-id': str(obj1.pk),
++            'form-0-name': 'Modified 1',
++            'form-1-id': str(obj2.pk),
++            'form-1-name': 'Modified 2',
++            
++            # New objects (should be ignored)
++            'form-2-name': 'New 1',
++            'form-3-name': 'New 2',
++        }
++        
++        formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++        self.assertTrue(formset.is_valid())
++        
++        saved_objects = formset.save()
++        
++        # Should only have 2 objects (existing ones, modified)
++        self.assertEqual(TestModel.objects.count(), 2)
++        
++        # Check that existing objects were modified
++        obj1.refresh_from_db()
++        obj2.refresh_from_db()
++        self.assertEqual(obj1.name, 'Modified 1')
++        self.assertEqual(obj2.name, 'Modified 2')
++    
++    def test_can_create_true_allows_new_objects(self):
++        """Test that can_create=True (default) allows creation of new objects."""
++        # Create existing objects
++        obj1 = TestModel.objects.create(name="Existing 1")
++        obj2 = TestModel.objects.create(name="Existing 2")
++        
++        # Create formset with can_create=True (explicit)
++        TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_create=True)
++        
++        # Same form data as above
++        form_data = {
++            'form-TOTAL_FORMS': '4',
++            'form-INITIAL_FORMS': '2',
++            'form-MAX_NUM_FORMS': '1000',
++            'form-MIN_NUM_FORMS': '0',
++            
++            'form-0-id': str(obj1.pk),
++            'form-0-name': 'Modified 1',
++            'form-1-id': str(obj2.pk),
++            'form-1-name': 'Modified 2',
++            
++            'form-2-name': 'New 1',
++            'form-3-name': 'New 2',
++        }
++        
++        formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++        self.assertTrue(formset.is_valid())
++        
++        saved_objects = formset.save()
++        
++        # Should have 4 objects (2 existing + 2 new)
++        self.assertEqual(TestModel.objects.count(), 4)
++    
++    def test_can_create_default_behavior(self):
++        """Test that the default behavior (not specifying can_create) allows new objects."""
++        # Create existing object
++        obj1 = TestModel.objects.create(name="Existing 1")
++        
++        # Create formset without specifying can_create (should default to True)
++        TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=1)
++        
++        form_data = {
++            'form-TOTAL_FORMS': '2',
++            'form-INITIAL_FORMS': '1',
++            'form-MAX_NUM_FORMS': '1000',
++            'form-MIN_NUM_FORMS': '0',
++            
++            'form-0-id': str(obj1.pk),
++            'form-0-name': 'Modified 1',
++            
++            'form-1-name': 'New 1',
++        }
++        
++        formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++        self.assertTrue(formset.is_valid())
++        
++        saved_objects = formset.save()
++        
++        # Should have 2 objects (1 existing + 1 new)
++        self.assertEqual(TestModel.objects.count(), 2)
++    
++    def test_inline_formset_can_create_false(self):
++        """Test that can_create=False works with inline formsets."""
++        # Create parent and existing children
++        parent = ParentModel.objects.create(name="Parent")
++        child1 = ChildModel.objects.create(name="Child 1", parent=parent)
++        child2 = ChildModel.objects.create(name="Child 2", parent=parent)
++        
++        # Create inline formset with can_create=False
++        ChildFormSet = inlineformset_factory(ParentModel, ChildModel, fields=['name'], extra=0, can_create=False)
++        
++        form_data = {
++            'childmodel_set-TOTAL_FORMS': '4',
++            'childmodel_set-INITIAL_FORMS': '2',
++            'childmodel_set-MAX_NUM_FORMS': '1000',
++            'childmodel_set-MIN_NUM_FORMS': '0',
++            
++            'childmodel_set-0-id': str(child1.pk),
++            'childmodel_set-0-name': 'Modified Child 1',
++            'childmodel_set-0-parent': str(parent.pk),
++            'childmodel_set-1-id': str(child2.pk),
++            'childmodel_set-1-name': 'Modified Child 2',
++            'childmodel_set-1-parent': str(parent.pk),
++            
++            # New children (should be ignored)
++            'childmodel_set-2-name': 'New Child 1',
++            'childmodel_set-2-parent': str(parent.pk),
++            'childmodel_set-3-name': 'New Child 2',
++            'childmodel_set-3-parent': str(parent.pk),
++        }
++        
++        formset = ChildFormSet(data=form_data, instance=parent)
++        self.assertTrue(formset.is_valid())
++        
++        saved_objects = formset.save()
++        
++        # Should only have 2 children (existing ones, modified)
++        self.assertEqual(ChildModel.objects.count(), 2)
++        
++        # Check that existing children were modified
++        child1.refresh_from_db()
++        child2.refresh_from_db()
++        self.assertEqual(child1.name, 'Modified Child 1')
++        self.assertEqual(child2.name, 'Modified Child 2')
++    
++    def test_can_create_false_with_deletion(self):
++        """Test that can_create=False works correctly with deletion."""
++        # Create existing objects
++        obj1 = TestModel.objects.create(name="Existing 1")
++        obj2 = TestModel.objects.create(name="Existing 2")
++        
++        # Create formset with can_create=False and can_delete=True
++        TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_create=False, can_delete=True)
++        
++        form_data = {
++            'form-TOTAL_FORMS': '4',
++            'form-INITIAL_FORMS': '2',
++            'form-MAX_NUM_FORMS': '1000',
++            'form-MIN_NUM_FORMS': '0',
++            
++            # Existing objects (one marked for deletion)
++            'form-0-id': str(obj1.pk),
++            'form-0-name': 'Modified 1',
++            'form-0-DELETE': '',  # Not deleted
++            'form-1-id': str(obj2.pk),
++            'form-1-name': 'Modified 2',
++            'form-1-DELETE': 'on',  # Marked for deletion
++            
++            # New objects (should be ignored)
++            'form-2-name': 'New 1',
++            'form-2-DELETE': '',
++            'form-3-name': 'New 2',
++            'form-3-DELETE': '',
++        }
++        
++        formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++        self.assertTrue(formset.is_valid())
++        
++        saved_objects = formset.save()
++        
++        # Should only have 1 object (obj1 modified, obj2 deleted, new objects ignored)
++        self.assertEqual(TestModel.objects.count(), 1)
++        
++        # Check that obj1 was modified and still exists
++        obj1.refresh_from_db()
++        self.assertEqual(obj1.name, 'Modified 1')
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..459e64b7a9
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,171 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the can_create feature.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory
++
++# Define a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++def test_can_create_false_with_extra_greater_than_zero():
++    """Test can_create=False with extra > 0 (should still prevent new objects)"""
++    print("=== Testing can_create=False with extra=2 ===")
++    
++    TestModel.objects.all().delete()
++    obj1 = TestModel.objects.create(name="Existing 1")
++    
++    # Create formset with can_create=False but extra=2
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=2, can_create=False)
++    
++    # The formset should display extra forms but not save them
++    formset = TestFormSet(queryset=TestModel.objects.all())
++    print(f"Number of forms displayed: {len(formset.forms)}")  # Should be 3 (1 existing + 2 extra)
++    
++    # Submit data with the extra forms filled
++    form_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '1',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        'form-0-id': str(obj1.pk),
++        'form-0-name': 'Modified 1',
++        
++        'form-1-name': 'New 1',
++        'form-2-name': 'New 2',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    if formset.is_valid():
++        formset.save()
++        print(f"Objects after save: {TestModel.objects.count()}")
++        if TestModel.objects.count() == 1:
++            print("✅ SUCCESS: Extra forms displayed but new objects not saved")
++        else:
++            print("❌ FAILURE: New objects were saved despite can_create=False")
++
++def test_can_create_false_with_no_existing_objects():
++    """Test can_create=False with no existing objects"""
++    print("\n=== Testing can_create=False with no existing objects ===")
++    
++    TestModel.objects.all().delete()
++    
++    # Create formset with can_create=False and no existing objects
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=2, can_create=False)
++    
++    form_data = {
++        'form-TOTAL_FORMS': '2',
++        'form-INITIAL_FORMS': '0',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        'form-0-name': 'New 1',
++        'form-1-name': 'New 2',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    if formset.is_valid():
++        formset.save()
++        print(f"Objects after save: {TestModel.objects.count()}")
++        if TestModel.objects.count() == 0:
++            print("✅ SUCCESS: No objects created when can_create=False")
++        else:
++            print("❌ FAILURE: Objects were created despite can_create=False")
++
++def test_can_create_false_with_commit_false():
++    """Test can_create=False with commit=False"""
++    print("\n=== Testing can_create=False with commit=False ===")
++    
++    TestModel.objects.all().delete()
++    obj1 = TestModel.objects.create(name="Existing 1")
++    
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_create=False)
++    
++    form_data = {
++        'form-TOTAL_FORMS': '3',
++        'form-INITIAL_FORMS': '1',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        'form-0-id': str(obj1.pk),
++        'form-0-name': 'Modified 1',
++        
++        'form-1-name': 'New 1',
++        'form-2-name': 'New 2',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    if formset.is_valid():
++        saved_objects = formset.save(commit=False)
++        print(f"Objects returned by save(commit=False): {len(saved_objects)}")
++        print(f"Objects in database: {TestModel.objects.count()}")
++        
++        # Save the returned objects
++        for obj in saved_objects:
++            obj.save()
++        
++        print(f"Objects after manual save: {TestModel.objects.count()}")
++        if TestModel.objects.count() == 1:
++            print("✅ SUCCESS: Only existing object saved with commit=False")
++        else:
++            print("❌ FAILURE: New objects were included in save(commit=False)")
++
++def test_formset_attribute_exists():
++    """Test that the can_create attribute is properly set on the formset"""
++    print("\n=== Testing formset attribute ===")
++    
++    # Test with can_create=False
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], can_create=False)
++    formset = TestFormSet(queryset=TestModel.objects.none())
++    print(f"can_create=False: formset.can_create = {getattr(formset, 'can_create', 'NOT_SET')}")
++    
++    # Test with can_create=True
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], can_create=True)
++    formset = TestFormSet(queryset=TestModel.objects.none())
++    print(f"can_create=True: formset.can_create = {getattr(formset, 'can_create', 'NOT_SET')}")
++    
++    # Test with default (should be True)
++    TestFormSet = modelformset_factory(TestModel, fields=['name'])
++    formset = TestFormSet(queryset=TestModel.objects.none())
++    print(f"default: formset.can_create = {getattr(formset, 'can_create', 'NOT_SET')}")
++
++if __name__ == '__main__':
++    test_can_create_false_with_extra_greater_than_zero()
++    test_can_create_false_with_no_existing_objects()
++    test_can_create_false_with_commit_false()
++    test_formset_attribute_exists()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..68de3a936a
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,222 @@
++#!/usr/bin/env python
++"""
++Test script to verify the can_create=False fix works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory, inlineformset_factory
++
++# Define test models
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class ParentModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++class ChildModel(models.Model):
++    name = models.CharField(max_length=100)
++    parent = models.ForeignKey(ParentModel, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++    schema_editor.create_model(ParentModel)
++    schema_editor.create_model(ChildModel)
++
++def test_can_create_false():
++    """Test that can_create=False prevents new object creation"""
++    print("=== Testing can_create=False ===")
++    
++    # Create some existing objects
++    obj1 = TestModel.objects.create(name="Existing Object 1")
++    obj2 = TestModel.objects.create(name="Existing Object 2")
++    
++    print(f"Initial objects count: {TestModel.objects.count()}")
++    
++    # Create formset with can_create=False
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_create=False)
++    
++    # Simulate form data that includes existing objects AND additional new objects
++    form_data = {
++        'form-TOTAL_FORMS': '4',  # 2 existing + 2 new (simulating manipulation)
++        'form-INITIAL_FORMS': '2',  # 2 existing objects
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        # Existing objects
++        'form-0-id': str(obj1.pk),
++        'form-0-name': 'Modified Object 1',
++        'form-1-id': str(obj2.pk),
++        'form-1-name': 'Modified Object 2',
++        
++        # New objects (these should be prevented)
++        'form-2-name': 'New Object 1',
++        'form-3-name': 'New Object 2',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    if formset.is_valid():
++        saved_objects = formset.save()
++        print(f"Objects after save: {TestModel.objects.count()}")
++        print("Saved objects:")
++        for obj in TestModel.objects.all():
++            print(f"  - {obj.name} (pk={obj.pk})")
++        
++        # Check if new objects were prevented
++        if TestModel.objects.count() == 2:
++            print("✅ SUCCESS: New objects were prevented with can_create=False!")
++        else:
++            print("❌ FAILURE: New objects were still created!")
++    else:
++        print("Formset validation errors:")
++        for i, form in enumerate(formset.forms):
++            if form.errors:
++                print(f"  Form {i}: {form.errors}")
++
++def test_can_create_true():
++    """Test that can_create=True (default) still allows new object creation"""
++    print("\n=== Testing can_create=True (default behavior) ===")
++    
++    # Clear existing objects
++    TestModel.objects.all().delete()
++    
++    # Create some existing objects
++    obj1 = TestModel.objects.create(name="Existing Object 1")
++    obj2 = TestModel.objects.create(name="Existing Object 2")
++    
++    print(f"Initial objects count: {TestModel.objects.count()}")
++    
++    # Create formset with can_create=True (default)
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_create=True)
++    
++    # Same form data as before
++    form_data = {
++        'form-TOTAL_FORMS': '4',
++        'form-INITIAL_FORMS': '2',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        'form-0-id': str(obj1.pk),
++        'form-0-name': 'Modified Object 1',
++        'form-1-id': str(obj2.pk),
++        'form-1-name': 'Modified Object 2',
++        
++        'form-2-name': 'New Object 1',
++        'form-3-name': 'New Object 2',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    if formset.is_valid():
++        saved_objects = formset.save()
++        print(f"Objects after save: {TestModel.objects.count()}")
++        print("Saved objects:")
++        for obj in TestModel.objects.all():
++            print(f"  - {obj.name} (pk={obj.pk})")
++        
++        # Check if new objects were created
++        if TestModel.objects.count() == 4:
++            print("✅ SUCCESS: New objects were created with can_create=True!")
++        else:
++            print("❌ FAILURE: New objects were not created!")
++
++def test_inline_formset():
++    """Test that can_create=False works with inline formsets"""
++    print("\n=== Testing inline formset with can_create=False ===")
++    
++    # Clear existing objects
++    ChildModel.objects.all().delete()
++    ParentModel.objects.all().delete()
++    
++    # Create parent and some existing children
++    parent = ParentModel.objects.create(name="Parent")
++    child1 = ChildModel.objects.create(name="Child 1", parent=parent)
++    child2 = ChildModel.objects.create(name="Child 2", parent=parent)
++    
++    print(f"Initial children count: {ChildModel.objects.count()}")
++    
++    # Create inline formset with can_create=False
++    ChildFormSet = inlineformset_factory(ParentModel, ChildModel, fields=['name'], extra=0, can_create=False)
++    
++    # Form data with existing children and new ones
++    form_data = {
++        'childmodel_set-TOTAL_FORMS': '4',
++        'childmodel_set-INITIAL_FORMS': '2',
++        'childmodel_set-MAX_NUM_FORMS': '1000',
++        'childmodel_set-MIN_NUM_FORMS': '0',
++        
++        'childmodel_set-0-id': str(child1.pk),
++        'childmodel_set-0-name': 'Modified Child 1',
++        'childmodel_set-0-parent': str(parent.pk),
++        'childmodel_set-1-id': str(child2.pk),
++        'childmodel_set-1-name': 'Modified Child 2',
++        'childmodel_set-1-parent': str(parent.pk),
++        
++        'childmodel_set-2-name': 'New Child 1',
++        'childmodel_set-2-parent': str(parent.pk),
++        'childmodel_set-3-name': 'New Child 2',
++        'childmodel_set-3-parent': str(parent.pk),
++    }
++    
++    formset = ChildFormSet(data=form_data, instance=parent)
++    
++    print(f"Formset is valid: {formset.is_valid()}")
++    if formset.is_valid():
++        saved_objects = formset.save()
++        print(f"Children after save: {ChildModel.objects.count()}")
++        print("Saved children:")
++        for obj in ChildModel.objects.all():
++            print(f"  - {obj.name} (pk={obj.pk})")
++        
++        # Check if new objects were prevented
++        if ChildModel.objects.count() == 2:
++            print("✅ SUCCESS: New children were prevented with can_create=False!")
++        else:
++            print("❌ FAILURE: New children were still created!")
++    else:
++        print("Formset validation errors:")
++        for i, form in enumerate(formset.forms):
++            if form.errors:
++                print(f"  Form {i}: {form.errors}")
++
++if __name__ == '__main__':
++    test_can_create_false()
++    test_can_create_true()
++    test_inline_formset()
+\ No newline at end of file
+diff --git a/test_solution.py b/test_solution.py
+new file mode 100644
+index 0000000000..57cd15eb0e
+--- /dev/null
++++ b/test_solution.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python
++"""
++Test script showing how the new can_create=False parameter solves the original issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms.models import modelformset_factory
++
++# Define a simple test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++def test_original_problem():
++    """Demonstrate the original problem with extra=0"""
++    print("=== Original Problem: extra=0 is unreliable ===")
++    
++    # Create some existing objects
++    obj1 = TestModel.objects.create(name="Existing Object 1")
++    obj2 = TestModel.objects.create(name="Existing Object 2")
++    
++    print(f"Initial objects count: {TestModel.objects.count()}")
++    
++    # Create formset with extra=0 (user's attempt to make it "edit only")
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0)
++    
++    # Simulate form data manipulation (JavaScript or direct POST)
++    form_data = {
++        'form-TOTAL_FORMS': '4',  # Manipulated to include extra forms
++        'form-INITIAL_FORMS': '2',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        # Existing objects
++        'form-0-id': str(obj1.pk),
++        'form-0-name': 'Modified Object 1',
++        'form-1-id': str(obj2.pk),
++        'form-1-name': 'Modified Object 2',
++        
++        # Malicious/unwanted new objects
++        'form-2-name': 'Unwanted New Object 1',
++        'form-3-name': 'Unwanted New Object 2',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    
++    if formset.is_valid():
++        formset.save()
++        print(f"Objects after save: {TestModel.objects.count()}")
++        if TestModel.objects.count() > 2:
++            print("❌ PROBLEM: New objects were created despite extra=0!")
++            print("   This demonstrates the security/reliability issue.")
++
++def test_solution():
++    """Demonstrate the solution with can_create=False"""
++    print("\n=== Solution: can_create=False provides reliable 'edit only' mode ===")
++    
++    # Clear and recreate objects
++    TestModel.objects.all().delete()
++    obj1 = TestModel.objects.create(name="Existing Object 1")
++    obj2 = TestModel.objects.create(name="Existing Object 2")
++    
++    print(f"Initial objects count: {TestModel.objects.count()}")
++    
++    # Create formset with can_create=False for reliable "edit only" mode
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=0, can_create=False)
++    
++    # Same malicious form data as before
++    form_data = {
++        'form-TOTAL_FORMS': '4',  # Still manipulated
++        'form-INITIAL_FORMS': '2',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        # Existing objects
++        'form-0-id': str(obj1.pk),
++        'form-0-name': 'Modified Object 1',
++        'form-1-id': str(obj2.pk),
++        'form-1-name': 'Modified Object 2',
++        
++        # Malicious/unwanted new objects (will be ignored)
++        'form-2-name': 'Unwanted New Object 1',
++        'form-3-name': 'Unwanted New Object 2',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    
++    if formset.is_valid():
++        formset.save()
++        print(f"Objects after save: {TestModel.objects.count()}")
++        print("Final objects:")
++        for obj in TestModel.objects.all():
++            print(f"  - {obj.name} (pk={obj.pk})")
++        
++        if TestModel.objects.count() == 2:
++            print("✅ SOLUTION: New objects were prevented with can_create=False!")
++            print("   This provides reliable server-side 'edit only' enforcement.")
++
++def test_backward_compatibility():
++    """Test that the default behavior is unchanged (backward compatibility)"""
++    print("\n=== Backward Compatibility: Default behavior unchanged ===")
++    
++    # Clear and recreate objects
++    TestModel.objects.all().delete()
++    obj1 = TestModel.objects.create(name="Existing Object 1")
++    
++    print(f"Initial objects count: {TestModel.objects.count()}")
++    
++    # Create formset without specifying can_create (should default to True)
++    TestFormSet = modelformset_factory(TestModel, fields=['name'], extra=1)
++    
++    form_data = {
++        'form-TOTAL_FORMS': '2',
++        'form-INITIAL_FORMS': '1',
++        'form-MAX_NUM_FORMS': '1000',
++        'form-MIN_NUM_FORMS': '0',
++        
++        'form-0-id': str(obj1.pk),
++        'form-0-name': 'Modified Object 1',
++        
++        'form-1-name': 'New Object',
++    }
++    
++    formset = TestFormSet(data=form_data, queryset=TestModel.objects.all())
++    
++    if formset.is_valid():
++        formset.save()
++        print(f"Objects after save: {TestModel.objects.count()}")
++        
++        if TestModel.objects.count() == 2:
++            print("✅ COMPATIBILITY: Default behavior allows new objects (unchanged).")
++
++if __name__ == '__main__':
++    test_original_problem()
++    test_solution()
++    test_backward_compatibility()
+\ No newline at end of file

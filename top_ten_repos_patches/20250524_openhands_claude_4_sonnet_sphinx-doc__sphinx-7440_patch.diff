@@ -1,0 +1,102 @@
+diff --git a/sphinx/domains/std.py b/sphinx/domains/std.py
+index d820cfe5c..5d3ace43b 100644
+--- a/sphinx/domains/std.py
++++ b/sphinx/domains/std.py
+@@ -305,7 +305,7 @@ def make_glossary_term(env: "BuildEnvironment", textnodes: Iterable[Node], index
+         term['ids'].append(node_id)
+ 
+     std = cast(StandardDomain, env.get_domain('std'))
+-    std.note_object('term', termtext.lower(), node_id, location=term)
++    std.note_term(termtext, node_id, location=term)
+ 
+     # add an index entry too
+     indexnode = addnodes.index()
+@@ -646,6 +646,11 @@ class StandardDomain(Domain):
+     def objects(self) -> Dict[Tuple[str, str], Tuple[str, str]]:
+         return self.data.setdefault('objects', {})  # (objtype, name) -> docname, labelid
+ 
++    @property
++    def _original_case_terms(self) -> Dict[str, Tuple[str, str]]:
++        """Track original case terms for case-sensitive duplicate detection."""
++        return self.data.setdefault('original_case_terms', {})  # original_term -> docname, labelid
++
+     def note_object(self, objtype: str, name: str, labelid: str, location: Any = None
+                     ) -> None:
+         """Note a generic object for cross reference.
+@@ -658,6 +663,23 @@ class StandardDomain(Domain):
+                            objtype, name, docname, location=location)
+         self.objects[objtype, name] = (self.env.docname, labelid)
+ 
++    def note_term(self, original_term: str, labelid: str, location: Any = None) -> None:
++        """Note a glossary term with case-sensitive duplicate detection.
++        
++        .. versionadded:: 3.0.1
++        """
++        # Check for case-sensitive duplicates using original term text
++        if original_term in self._original_case_terms:
++            docname = self._original_case_terms[original_term][0]
++            logger.warning(__('duplicate %s description of %s, other instance in %s'),
++                           'term', original_term, docname, location=location)
++        
++        # Store with original case for duplicate detection and object listing
++        self._original_case_terms[original_term] = (self.env.docname, labelid)
++        
++        # Store with original case in objects (for get_objects() to return all terms)
++        self.objects[('term', original_term)] = (self.env.docname, labelid)
++
+     def add_object(self, objtype: str, name: str, docname: str, labelid: str) -> None:
+         warnings.warn('StandardDomain.add_object() is deprecated.',
+                       RemovedInSphinx50Warning)
+@@ -931,6 +953,16 @@ class StandardDomain(Domain):
+             if (objtype, target) in self.objects:
+                 docname, labelid = self.objects[objtype, target]
+                 break
++            # For terms, try case-insensitive lookup
++            elif objtype == 'term':
++                target_lower = target.lower()
++                for (stored_objtype, stored_name), (stored_docname, stored_labelid) in self.objects.items():
++                    if stored_objtype == 'term' and stored_name.lower() == target_lower:
++                        docname, labelid = stored_docname, stored_labelid
++                        break
++                else:
++                    continue
++                break
+         else:
+             docname, labelid = '', ''
+         if not docname:
+diff --git a/tests/test_domain_std.py b/tests/test_domain_std.py
+index aa1d29eb1..a911ce932 100644
+--- a/tests/test_domain_std.py
++++ b/tests/test_domain_std.py
+@@ -280,6 +280,31 @@ def test_glossary_conflicted_labels(app):
+     assert ("foo", "foo", "term", "index", "term-0", -1) in objects
+ 
+ 
++def test_glossary_case_sensitivity(app, status, warning):
++    """Test that glossary terms with different cases are not treated as duplicates."""
++    text = (".. glossary::\n"
++            "\n"
++            "   MySQL\n"
++            "       A popular database system.\n"
++            "\n"
++            "   mysql\n"
++            "       The command-line client for MySQL.\n")
++    restructuredtext.parse(app, text)
++    
++    # Check that no duplicate warnings are generated
++    warnings = warning.getvalue()
++    assert "duplicate term description" not in warnings
++    
++    # Check that both terms are stored with their original case
++    objects = list(app.env.get_domain("std").get_objects())
++    mysql_objects = [obj for obj in objects if obj[0] in ("MySQL", "mysql")]
++    assert len(mysql_objects) == 2
++    
++    # Verify both terms are accessible with their original case
++    assert ("MySQL", "MySQL", "term", "index", "term-MySQL", -1) in objects
++    assert ("mysql", "mysql", "term", "index", "term-mysql", -1) in objects
++
++
+ def test_cmdoption(app):
+     text = (".. program:: ls\n"
+             "\n"

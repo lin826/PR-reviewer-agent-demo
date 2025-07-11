@@ -1,0 +1,560 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..72bc6a6324
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,219 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script to verify the RadioSelect fix works correctly
++and doesn't break existing functionality.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This script as an app
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms import ModelForm, RadioSelect, Select
++
++
++# Define test models
++class BatchData(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TestRunRequired(models.Model):
++    # Required field (blank=False)
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=False)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TestRunOptional(models.Model):
++    # Optional field (blank=True)
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TestRunRequiredRadioForm(ModelForm):
++    class Meta:
++        model = TestRunRequired
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++
++class TestRunRequiredSelectForm(ModelForm):
++    class Meta:
++        model = TestRunRequired
++        fields = ['data_file']
++        widgets = {'data_file': Select()}
++
++
++class TestRunOptionalRadioForm(ModelForm):
++    class Meta:
++        model = TestRunOptional
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++
++class TestRunOptionalSelectForm(ModelForm):
++    class Meta:
++        model = TestRunOptional
++        fields = ['data_file']
++        widgets = {'data_file': Select()}
++
++
++def test_scenario(name, form_class, expected_has_blank, expected_blank_checked):
++    """Test a specific scenario and report results."""
++    print(f"\n=== {name} ===")
++    
++    form = form_class()
++    field_html = str(form['data_file'])
++    
++    has_blank_option = 'value=""' in field_html
++    blank_option_checked = 'checked' in field_html and 'value=""' in field_html
++    
++    print(f"  empty_label: {repr(form.fields['data_file'].empty_label)}")
++    print(f"  required: {form.fields['data_file'].required}")
++    print(f"  Has blank option: {has_blank_option}")
++    print(f"  Blank option checked: {blank_option_checked}")
++    
++    # Check expectations
++    success = True
++    if has_blank_option != expected_has_blank:
++        print(f"  ❌ FAIL: Expected has_blank_option={expected_has_blank}, got {has_blank_option}")
++        success = False
++    
++    if blank_option_checked != expected_blank_checked:
++        print(f"  ❌ FAIL: Expected blank_option_checked={expected_blank_checked}, got {blank_option_checked}")
++        success = False
++    
++    if success:
++        print(f"  ✅ PASS: Behavior matches expectations")
++    
++    return success
++
++
++def test_with_initial_value():
++    """Test that forms with initial values still work correctly."""
++    print(f"\n=== Testing with initial values ===")
++    
++    # Create test data
++    batch1 = BatchData.objects.get(name="First Data File")
++    
++    # Test required field with RadioSelect and initial value
++    instance = TestRunRequired(data_file=batch1)
++    form = TestRunRequiredRadioForm(instance=instance)
++    field_html = str(form['data_file'])
++    
++    has_blank_option = 'value=""' in field_html
++    has_checked_option = 'checked' in field_html
++    
++    print(f"  empty_label: {repr(form.fields['data_file'].empty_label)}")
++    print(f"  Has blank option: {has_blank_option}")
++    print(f"  Has checked option: {has_checked_option}")
++    
++    # For required fields with initial values, we should not have a blank option
++    # and should have a checked option (the initial value)
++    if not has_blank_option and has_checked_option:
++        print(f"  ✅ PASS: Required field with initial value behaves correctly")
++        return True
++    else:
++        print(f"  ❌ FAIL: Required field with initial value doesn't behave correctly")
++        return False
++
++
++def main():
++    # Create the database tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(BatchData)
++        schema_editor.create_model(TestRunRequired)
++        schema_editor.create_model(TestRunOptional)
++    
++    # Create some test data
++    batch1 = BatchData.objects.create(name="First Data File")
++    batch2 = BatchData.objects.create(name="Second Data File")
++    
++    print("Testing RadioSelect widget fix for foreign keys")
++    print("=" * 50)
++    
++    all_passed = True
++    
++    # Test 1: Required field with RadioSelect (the main fix)
++    # Should NOT have blank option, should NOT have checked option
++    all_passed &= test_scenario(
++        "Required field with RadioSelect (NEW FORM)",
++        TestRunRequiredRadioForm,
++        expected_has_blank=False,
++        expected_blank_checked=False
++    )
++    
++    # Test 2: Required field with Select (should maintain existing behavior)
++    # Should have blank option, should NOT have checked option
++    all_passed &= test_scenario(
++        "Required field with Select (should be unchanged)",
++        TestRunRequiredSelectForm,
++        expected_has_blank=True,
++        expected_blank_checked=False
++    )
++    
++    # Test 3: Optional field with RadioSelect (should maintain existing behavior)
++    # Should have blank option, should have checked blank option
++    all_passed &= test_scenario(
++        "Optional field with RadioSelect (should be unchanged)",
++        TestRunOptionalRadioForm,
++        expected_has_blank=True,
++        expected_blank_checked=True
++    )
++    
++    # Test 4: Optional field with Select (should maintain existing behavior)
++    # Should have blank option, should NOT have checked option
++    all_passed &= test_scenario(
++        "Optional field with Select (should be unchanged)",
++        TestRunOptionalSelectForm,
++        expected_has_blank=True,
++        expected_blank_checked=False
++    )
++    
++    # Test 5: Required field with initial value
++    all_passed &= test_with_initial_value()
++    
++    print(f"\n{'=' * 50}")
++    if all_passed:
++        print("🎉 ALL TESTS PASSED! The fix works correctly.")
++    else:
++        print("❌ SOME TESTS FAILED! Please review the implementation.")
++    
++    return 0 if all_passed else 1
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+\ No newline at end of file
+diff --git a/django/forms/models.py b/django/forms/models.py
+index dafc11f995..59024e3064 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -13,7 +13,7 @@ from django.forms.forms import BaseForm, DeclarativeFieldsMetaclass
+ from django.forms.formsets import BaseFormSet, formset_factory
+ from django.forms.utils import ErrorList
+ from django.forms.widgets import (
+-    HiddenInput, MultipleHiddenInput, SelectMultiple,
++    HiddenInput, MultipleHiddenInput, RadioSelect, SelectMultiple,
+ )
+ from django.utils.text import capfirst, get_text_list
+ from django.utils.translation import gettext, gettext_lazy as _
+@@ -1185,7 +1185,7 @@ class ModelChoiceField(ChoiceField):
+                  required=True, widget=None, label=None, initial=None,
+                  help_text='', to_field_name=None, limit_choices_to=None,
+                  **kwargs):
+-        if required and (initial is not None):
++        if required and (initial is not None or isinstance(widget, RadioSelect)):
+             self.empty_label = None
+         else:
+             self.empty_label = empty_label
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a96a289b4c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the RadioSelect widget issue with foreign keys.
++
++This script demonstrates that ModelForm RadioSelect widget for foreign keys
++shows a blank option even when blank=False on the model field.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This script as an app
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms import ModelForm, RadioSelect
++
++
++# Define test models
++class BatchData(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TestRun(models.Model):
++    # This field has blank=False, meaning it's required
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=False)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class TestRunForm(ModelForm):
++    class Meta:
++        model = TestRun
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++
++def main():
++    # Create the database tables
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(BatchData)
++        schema_editor.create_model(TestRun)
++    
++    # Create some test data
++    batch1 = BatchData.objects.create(name="First Data File")
++    batch2 = BatchData.objects.create(name="Second Data File")
++    
++    print("=== Testing RadioSelect widget with blank=False foreign key ===")
++    print()
++    
++    # Create a new form (no initial data)
++    form = TestRunForm()
++    
++    print("Model field configuration:")
++    print(f"  blank={TestRun._meta.get_field('data_file').blank}")
++    print(f"  null={TestRun._meta.get_field('data_file').null}")
++    print()
++    
++    print("Form field configuration:")
++    print(f"  required={form.fields['data_file'].required}")
++    print(f"  empty_label={repr(form.fields['data_file'].empty_label)}")
++    print()
++    
++    # Render the field
++    field_html = str(form['data_file'])
++    print("Rendered HTML:")
++    print(field_html)
++    print()
++    
++    # Check if blank option is present and selected
++    has_blank_option = 'value=""' in field_html
++    blank_option_checked = 'checked' in field_html and 'value=""' in field_html
++    
++    print("Analysis:")
++    print(f"  Has blank option: {has_blank_option}")
++    print(f"  Blank option is checked: {blank_option_checked}")
++    print()
++    
++    if blank_option_checked:
++        print("❌ ISSUE CONFIRMED: RadioSelect shows a checked blank option")
++        print("   even though the model field has blank=False")
++    else:
++        print("✅ No issue found: RadioSelect behaves correctly")
++    
++    print()
++    print("Expected behavior:")
++    print("  Since blank=False, no radio button should be initially checked")
++    print("  The user should be forced to make an explicit choice")
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_radioselect_blank_false.py b/test_radioselect_blank_false.py
+new file mode 100644
+index 0000000000..9a5e09358a
+--- /dev/null
++++ b/test_radioselect_blank_false.py
+@@ -0,0 +1,176 @@
++"""
++Test case for the RadioSelect widget fix for foreign keys with blank=False.
++
++This test should be added to the Django test suite to ensure the fix
++is maintained in future versions.
++"""
++
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.forms import ModelForm, RadioSelect, Select
++from django.test import TestCase
++
++
++class BatchData(models.Model):
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return self.name
++    
++    class Meta:
++        app_label = 'model_forms'
++
++
++class TestRunRequired(models.Model):
++    # Required field (blank=False)
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=False)
++    
++    class Meta:
++        app_label = 'model_forms'
++
++
++class TestRunOptional(models.Model):
++    # Optional field (blank=True)
++    data_file = models.ForeignKey(BatchData, on_delete=models.SET_NULL, null=True, blank=True)
++    
++    class Meta:
++        app_label = 'model_forms'
++
++
++class TestRunRequiredRadioForm(ModelForm):
++    class Meta:
++        model = TestRunRequired
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++
++class TestRunRequiredSelectForm(ModelForm):
++    class Meta:
++        model = TestRunRequired
++        fields = ['data_file']
++        widgets = {'data_file': Select()}
++
++
++class TestRunOptionalRadioForm(ModelForm):
++    class Meta:
++        model = TestRunOptional
++        fields = ['data_file']
++        widgets = {'data_file': RadioSelect()}
++
++
++class RadioSelectBlankFalseTest(TestCase):
++    """Test RadioSelect widget behavior with blank=False foreign keys."""
++    
++    @classmethod
++    def setUpTestData(cls):
++        cls.batch1 = BatchData.objects.create(name="First Data File")
++        cls.batch2 = BatchData.objects.create(name="Second Data File")
++    
++    def test_radioselect_required_field_no_blank_option(self):
++        """
++        RadioSelect widget for required foreign key fields (blank=False)
++        should not show a blank option in new forms.
++        """
++        form = TestRunRequiredRadioForm()
++        
++        # The field should be required and have no empty_label
++        self.assertTrue(form.fields['data_file'].required)
++        self.assertIsNone(form.fields['data_file'].empty_label)
++        
++        # The rendered HTML should not contain a blank option
++        field_html = str(form['data_file'])
++        self.assertNotIn('value=""', field_html)
++        self.assertNotIn('checked', field_html)  # No option should be checked
++    
++    def test_radioselect_required_field_with_initial(self):
++        """
++        RadioSelect widget for required foreign key fields with initial value
++        should not show a blank option and should check the initial value.
++        """
++        instance = TestRunRequired(data_file=self.batch1)
++        form = TestRunRequiredRadioForm(instance=instance)
++        
++        # The field should be required and have no empty_label
++        self.assertTrue(form.fields['data_file'].required)
++        self.assertIsNone(form.fields['data_file'].empty_label)
++        
++        # The rendered HTML should not contain a blank option
++        # but should have a checked option (the initial value)
++        field_html = str(form['data_file'])
++        self.assertNotIn('value=""', field_html)
++        self.assertIn('checked', field_html)  # Initial value should be checked
++    
++    def test_select_required_field_unchanged(self):
++        """
++        Select widget for required foreign key fields should maintain
++        existing behavior (show blank option but not checked).
++        """
++        form = TestRunRequiredSelectForm()
++        
++        # The field should be required but still have empty_label
++        self.assertTrue(form.fields['data_file'].required)
++        self.assertEqual(form.fields['data_file'].empty_label, '---------')
++        
++        # The rendered HTML should contain a blank option but not checked
++        field_html = str(form['data_file'])
++        self.assertIn('value=""', field_html)
++        # For Select widgets, the blank option is not "checked" (selected)
++        # in new forms, even though it exists
++    
++    def test_radioselect_optional_field_unchanged(self):
++        """
++        RadioSelect widget for optional foreign key fields (blank=True)
++        should maintain existing behavior (show checked blank option).
++        """
++        form = TestRunOptionalRadioForm()
++        
++        # The field should not be required and should have empty_label
++        self.assertFalse(form.fields['data_file'].required)
++        self.assertEqual(form.fields['data_file'].empty_label, '---------')
++        
++        # The rendered HTML should contain a blank option that is checked
++        field_html = str(form['data_file'])
++        self.assertIn('value=""', field_html)
++        self.assertIn('checked', field_html)  # Blank option should be checked
++
++
++if __name__ == '__main__':
++    from django.test.utils import get_runner
++    
++    # Create tables
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(BatchData)
++        schema_editor.create_model(TestRunRequired)
++        schema_editor.create_model(TestRunOptional)
++    
++    # Run tests
++    TestRunner = get_runner(settings)
++    test_runner = TestRunner()
++    failures = test_runner.run_tests(["__main__"])
++    
++    if failures:
++        exit(1)
+\ No newline at end of file

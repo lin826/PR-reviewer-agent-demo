@@ -1,0 +1,473 @@
+diff --git a/django/db/backends/sqlite3/schema.py b/django/db/backends/sqlite3/schema.py
+index 6752a8e3c0..01e4c6262f 100644
+--- a/django/db/backends/sqlite3/schema.py
++++ b/django/db/backends/sqlite3/schema.py
+@@ -327,7 +327,9 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+         # Fields with default values cannot by handled by ALTER TABLE ADD
+         # COLUMN statement because DROP DEFAULT is not supported in
+         # ALTER TABLE.
+-        if not field.null or self.effective_default(field) is not None:
++        # SQLite also doesn't support adding a UNIQUE field with NULL values
++        # so we need to recreate the table for those cases too (e.g. OneToOneField)
++        if not field.null or self.effective_default(field) is not None or field.unique:
+             self._remake_table(model, create_field=field)
+         else:
+             super().add_field(model, field)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..2a8986530a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,86 @@
++"""
++Script to verify how Django would handle the SQLite issue after our fix
++"""
++import os
++import sqlite3
++
++print("DIRECT SQLITE TEST")
++print("=================")
++print("First showing the raw SQLite error:")
++# Direct SQLite connection to demonstrate the issue
++conn = sqlite3.connect(':memory:')
++cursor = conn.cursor()
++
++# Create tables
++cursor.execute('''
++CREATE TABLE oauth2_provider_refreshtoken (
++    id INTEGER PRIMARY KEY,
++    token TEXT NOT NULL
++)
++''')
++
++cursor.execute('''
++CREATE TABLE oauth2_provider_accesstoken (
++    id INTEGER PRIMARY KEY,
++    token TEXT NOT NULL
++)
++''')
++
++# Execute the problematic ALTER TABLE statement
++try:
++    print("Attempting to add a UNIQUE NULL column directly with SQLite...")
++    cursor.execute('ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED')
++    print("Success - no error was raised (but this is unexpected with SQLite).")
++except sqlite3.OperationalError as e:
++    print(f"SQLite Error as expected: {e}")
++
++# Now test with Django
++print("\nDJANGO TEST WITH OUR FIX")
++print("========================")
++import django
++os.environ['DJANGO_SETTINGS_MODULE'] = 'test_sqlite'
++django.setup()
++
++from django.db import models, connection
++
++class RefreshToken(models.Model):
++    token = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class AccessToken(models.Model):
++    token = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the initial tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(RefreshToken)
++    schema_editor.create_model(AccessToken)
++
++try:
++    # Now try to add a OneToOneField to the existing model
++    # This would fail before our fix but should work now
++    field = models.OneToOneField(
++        RefreshToken,
++        models.SET_NULL,
++        blank=True,
++        null=True,
++    )
++    field.set_attributes_from_name("source_refresh_token")
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.add_field(AccessToken, field)
++    
++    print("SUCCESS: Django successfully added the nullable OneToOneField after our fix!")
++except Exception as e:
++    print(f"FAILED: Django error: {e}")
++finally:
++    # Clean up
++    with connection.schema_editor() as schema_editor:
++        schema_editor.delete_model(AccessToken)
++        schema_editor.delete_model(RefreshToken)
++
++conn.close()
+\ No newline at end of file
+diff --git a/test_direct.py b/test_direct.py
+new file mode 100644
+index 0000000000..5a1873130c
+--- /dev/null
++++ b/test_direct.py
+@@ -0,0 +1,52 @@
++"""
++Direct test for SQLite OneToOneField fix
++"""
++import os
++import django
++from django.db import models, connection
++
++os.environ['DJANGO_SETTINGS_MODULE'] = 'test_sqlite'
++django.setup()
++
++# Create our test models
++class RefreshToken(models.Model):
++    token = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++class AccessToken(models.Model):
++    token = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++# Create the initial tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(RefreshToken)
++    schema_editor.create_model(AccessToken)
++    
++print("Created initial tables successfully")
++
++try:
++    # Now try to add a OneToOneField to the existing model
++    # This would fail before our fix but should work now
++    field = models.OneToOneField(
++        RefreshToken,
++        models.SET_NULL,
++        blank=True,
++        null=True,
++    )
++    field.set_attributes_from_name("source_refresh_token")
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.add_field(AccessToken, field)
++    
++    print("SUCCESS: Successfully added the nullable OneToOneField!")
++except Exception as e:
++    print(f"FAILED: {e}")
++finally:
++    # Clean up
++    with connection.schema_editor() as schema_editor:
++        schema_editor.delete_model(AccessToken)
++        schema_editor.delete_model(RefreshToken)
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..01dbf603c8
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,90 @@
++"""
++Test that our fix for the SQLite nullable OneToOneField issue works
++"""
++import os
++import django
++from django.db import models, migrations
++from django.db.migrations.executor import MigrationExecutor
++from django.db import connection
++from django.test import TransactionTestCase
++
++# Define models for testing
++class RefreshToken(models.Model):
++    token = models.CharField(max_length=255)
++
++class AccessToken(models.Model):
++    token = models.CharField(max_length=255)
++    # This is the field we'll add in the migration
++    # source_refresh_token = models.OneToOneField(RefreshToken, on_delete=models.SET_NULL, null=True, blank=True)
++
++
++# Create the migration to test
++class TestMigration(TransactionTestCase):
++    """Test that adding a nullable OneToOneField works with SQLite."""
++
++    available_apps = ['django.contrib.contenttypes', 'django.contrib.auth']
++    
++    def setUp(self):
++        # Create tables for our test models
++        with connection.schema_editor() as editor:
++            editor.create_model(RefreshToken)
++            editor.create_model(AccessToken)
++    
++    def tearDown(self):
++        # Clean up the tables
++        with connection.schema_editor() as editor:
++            editor.delete_model(AccessToken)
++            editor.delete_model(RefreshToken)
++
++    def test_add_nullable_unique_field(self):
++        """Test that the fix allows adding a nullable OneToOneField in SQLite."""
++        
++        operation = migrations.AddField(
++            model_name='accesstoken',
++            name='source_refresh_token',
++            field=models.OneToOneField(
++                RefreshToken,
++                models.SET_NULL,
++                blank=True,
++                null=True,
++            ),
++        )
++        
++        # This should not raise an exception after our fix
++        with connection.schema_editor() as editor:
++            # Get the state as it is now
++            project_state = self.apply_operations('default', [
++                migrations.CreateModel(
++                    "RefreshToken",
++                    [("id", models.AutoField(primary_key=True)), ("token", models.CharField(max_length=255))],
++                ),
++                migrations.CreateModel(
++                    "AccessToken",
++                    [("id", models.AutoField(primary_key=True)), ("token", models.CharField(max_length=255))],
++                ),
++            ])
++            
++            # Add the field
++            new_state = project_state.clone()
++            operation.state_forwards('default', new_state)
++            operation.database_forwards('default', editor, project_state, new_state)
++            
++            # If we got here without an error, the fix works
++            print("Success! The fix works!")
++
++    def apply_operations(self, app_label, operations):
++        """Apply operations to a test database."""
++        project_state = migrations.state.ProjectState()
++        for operation in operations:
++            operation.state_forwards(app_label, project_state)
++        return project_state
++
++
++# Run the test
++if __name__ == "__main__":
++    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_sqlite')
++    django.setup()
++    
++    from django.test.runner import DiscoverRunner
++    runner = DiscoverRunner()
++    runner.run_tests(['__main__'])
+\ No newline at end of file
+diff --git a/test_fix_simple.py b/test_fix_simple.py
+new file mode 100644
+index 0000000000..b7c4834036
+--- /dev/null
++++ b/test_fix_simple.py
+@@ -0,0 +1,77 @@
++"""
++Simplified test script to verify our fix for the SQLite issue with OneToOneField
++"""
++import os
++import sqlite3
++import django
++
++# Import the fixed code
++from django.db import models, migrations, connections, connection
++from django.db.migrations.executor import MigrationExecutor
++from django.db.migrations.state import ProjectState
++
++os.environ['DJANGO_SETTINGS_MODULE'] = 'test_sqlite'
++django.setup()
++
++# Create test models
++class Migration(migrations.Migration):
++    initial = True
++    operations = [
++        migrations.CreateModel(
++            name='RefreshToken',
++            fields=[
++                ('id', models.AutoField(primary_key=True)),
++                ('token', models.CharField(max_length=255)),
++            ],
++        ),
++        migrations.CreateModel(
++            name='AccessToken',
++            fields=[
++                ('id', models.AutoField(primary_key=True)),
++                ('token', models.CharField(max_length=255)),
++            ],
++        ),
++    ]
++
++# Create a second migration to add the OneToOneField
++class AddOneToOneFieldMigration(migrations.Migration):
++    dependencies = [('auth', '0001_initial')]
++    operations = [
++        migrations.AddField(
++            model_name='AccessToken',
++            name='source_refresh_token',
++            field=models.OneToOneField(
++                'RefreshToken',
++                on_delete=models.SET_NULL,
++                null=True,
++                blank=True,
++            ),
++        ),
++    ]
++
++print("Testing the fix for SQLite nullable OneToOneField issue...")
++
++# Test with a real SQLite connection
++executor = MigrationExecutor(connection)
++project_state = ProjectState()
++
++# Apply the initial migration
++with connection.schema_editor() as schema_editor:
++    migration = Migration('initial', 'auth')
++    migration.apply(project_state, schema_editor)
++
++print("Created initial tables")
++
++# Now try to add the OneToOneField
++try:
++    with connection.schema_editor() as schema_editor:
++        migration = AddOneToOneFieldMigration('add_onetoone', 'auth')
++        migration.apply(project_state, schema_editor)
++    print("SUCCESS: The OneToOneField was added successfully!")
++except Exception as e:
++    print(f"ERROR: {e}")
++
++# Cleanup
++with connection.schema_editor() as schema_editor:
++    schema_editor.execute("DROP TABLE IF EXISTS auth_accesstoken")
++    schema_editor.execute("DROP TABLE IF EXISTS auth_refreshtoken")
+\ No newline at end of file
+diff --git a/test_one_to_one_field.py b/test_one_to_one_field.py
+new file mode 100644
+index 0000000000..6fd9698dc4
+--- /dev/null
++++ b/test_one_to_one_field.py
+@@ -0,0 +1,92 @@
++import os
++import sys
++import django
++from django.db import connection, migrations, models
++from django.db.migrations.state import ProjectState
++from django.db.migrations.executor import MigrationExecutor
++
++# Setup Django
++os.environ['DJANGO_SETTINGS_MODULE'] = 'test_sqlite'
++django.setup()
++
++# Define the test model classes
++class RefreshToken:
++    pass
++
++class AccessToken:
++    pass
++
++# Test the migration
++def test_add_one_to_one_field():
++    """
++    Test that adding a nullable OneToOneField doesn't crash SQLite.
++    This reproduces the issue described in https://github.com/jazzband/django-oauth-toolkit/issues/1064
++    """
++    # Create the original ProjectState with the base model
++    initial_state = ProjectState()
++    model_options = {
++        'app_label': 'auth',
++        'name': 'AccessToken',
++    }
++    refresh_token_model_options = {
++        'app_label': 'auth',
++        'name': 'RefreshToken',
++    }
++    
++    # Create initial models
++    initial_state.add_model(migrations.state.ModelState(
++        'auth',
++        'AccessToken',
++        [
++            ('id', models.BigAutoField(primary_key=True)),
++            ('token', models.CharField(max_length=255)),
++        ],
++        {},
++        None,
++    ))
++    
++    initial_state.add_model(migrations.state.ModelState(
++        'auth',
++        'RefreshToken',
++        [
++            ('id', models.BigAutoField(primary_key=True)),
++            ('token', models.CharField(max_length=255)),
++        ],
++        {},
++        None,
++    ))
++    
++    # Create a schema editor
++    executor = MigrationExecutor(connection)
++    # Use the state from the beginning of time
++    executor.loader.project_state = initial_state
++    state = executor.migrate([])
++    
++    # Now, try to add a OneToOneField
++    operation = migrations.AddField(
++        'AccessToken',
++        'source_refresh_token',
++        models.OneToOneField(
++            'RefreshToken',
++            models.SET_NULL,
++            name='source_refresh_token',
++            blank=True,
++            null=True,
++        ),
++    )
++    
++    # Apply the migration operation
++    print("Applying OneToOneField migration...")
++    with connection.schema_editor() as editor:
++        # This should not raise an exception
++        operation.database_forwards('auth', editor, state, initial_state)
++    
++    print("Migration successful!")
++    
++    # Cleanup the database
++    with connection.schema_editor() as editor:
++        editor.execute("DROP TABLE IF EXISTS auth_accesstoken")
++        editor.execute("DROP TABLE IF EXISTS auth_refreshtoken")
++
++if __name__ == '__main__':
++    test_add_one_to_one_field()
+\ No newline at end of file
+diff --git a/test_sqlite.py b/test_sqlite.py
+new file mode 100644
+index 0000000000..7dc1be2854
+--- /dev/null
++++ b/test_sqlite.py
+@@ -0,0 +1,19 @@
++"""
++Settings file for testing the SQLite issue with OneToOneField.
++"""
++
++SECRET_KEY = 'sqlite-onetoone-test'
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
++
++INSTALLED_APPS = [
++    'django.contrib.auth',
++    'django.contrib.contenttypes',
++]
++
++USE_TZ = False
+\ No newline at end of file

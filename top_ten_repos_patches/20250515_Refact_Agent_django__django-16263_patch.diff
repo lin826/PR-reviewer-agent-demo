@@ -1,0 +1,50 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 9735ce10c8..49297492f9 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -550,8 +550,45 @@ class Query(BaseExpression):
+         Perform a COUNT() query using the current filter constraints.
+         """
+         obj = self.clone()
++        
++        # If we have annotations but they're not being used in any way that would
++        # affect the count result, we can safely clear them to get a simpler
++        # and more efficient query.
++        if self.annotations and not self._needs_existing_annotations():
++            # Check if any of the annotations are aggregates that would change the
++            # semantics of the query if removed (like Count, Sum, etc.)
++            has_aggregates = any(
++                getattr(annotation, "contains_aggregate", False)
++                for annotation in self.annotations.values()
++            )
++            
++            # Only strip annotations if they don't contain aggregates
++            if not has_aggregates:
++                obj.annotations = {}
++                obj.annotation_select_mask = None
++                obj._annotation_select_cache = None
++            
+         obj.add_annotation(Count("*"), alias="__count", is_summary=True)
+         return obj.get_aggregation(using, ["__count"])["__count"]
++        
++    def _needs_existing_annotations(self):
++        """
++        Determine if existing annotations need to be preserved for an accurate COUNT.
++        Returns True if any of the following conditions are met:
++        - There are filters that might reference annotations
++        - There is ordering that might reference annotations
++        - There is a GROUP BY clause
++        - There are DISTINCT fields
++        - There is a query combinator (UNION, INTERSECTION, etc.)
++        """
++        return bool(
++            self.where or                  # Has filters
++            self.order_by or               # Has ordering
++            self.group_by is not None or   # Has GROUP BY
++            self.distinct or               # Has DISTINCT
++            self.distinct_fields or        # Has DISTINCT ON fields
++            self.combinator                # Has a query combinator
++        )
+ 
+     def has_filters(self):
+         return self.where

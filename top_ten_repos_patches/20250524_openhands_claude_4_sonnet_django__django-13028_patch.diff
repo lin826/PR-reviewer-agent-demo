@@ -1,0 +1,699 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index ce18098fd2..6376d08def 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1124,7 +1124,8 @@ class Query(BaseExpression):
+ 
+     def check_filterable(self, expression):
+         """Raise an error if expression cannot be used in a WHERE clause."""
+-        if not getattr(expression, 'filterable', True):
++        if (isinstance(expression, BaseExpression) and 
++            not getattr(expression, 'filterable', True)):
+             raise NotSupportedError(
+                 expression.__class__.__name__ + ' is disallowed in the filter '
+                 'clause.'
+diff --git a/exact_issue_reproduction.py b/exact_issue_reproduction.py
+new file mode 100644
+index 0000000000..d5e01c2e8c
+--- /dev/null
++++ b/exact_issue_reproduction.py
+@@ -0,0 +1,155 @@
++#!/usr/bin/env python
++"""
++Exact reproduction of the issue from the bug report.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.utils import timezone
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.utils import NotSupportedError
++
++
++# Exact models from the issue description
++class ProductMetaDataType(models.Model):
++    label = models.CharField(max_length=255, unique=True, blank=False, null=False)
++    filterable = models.BooleanField(default=False, verbose_name="filterable")
++    
++    class Meta:
++        app_label = "adminpricing"
++        verbose_name = "product meta data type"
++        verbose_name_plural = "product meta data types"
++    
++    def __str__(self):
++        return self.label
++
++
++class Produit(models.Model):
++    """Dummy product model"""
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = "adminpricing"
++
++
++class Plateforme(models.Model):
++    """Dummy platform model"""
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = "adminpricing"
++
++
++class ProductMetaData(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    product = models.ForeignKey(
++        Produit, null=False, blank=False, on_delete=models.CASCADE
++    )
++    value = models.TextField(null=False, blank=False)
++    marketplace = models.ForeignKey(
++        Plateforme, null=False, blank=False, on_delete=models.CASCADE
++    )
++    date_created = models.DateTimeField(null=True, default=timezone.now)
++    metadata_type = models.ForeignKey(
++        ProductMetaDataType, null=False, blank=False, on_delete=models.CASCADE
++    )
++    
++    class Meta:
++        app_label = "adminpricing"
++        verbose_name = "product meta data"
++        verbose_name_plural = "product meta datas"
++
++
++def create_tables():
++    """Create the database tables."""
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(Produit)
++        schema_editor.create_model(Plateforme)
++        schema_editor.create_model(ProductMetaDataType)
++        schema_editor.create_model(ProductMetaData)
++
++
++def test_exact_issue():
++    """Test the exact scenario from the issue description."""
++    print("Creating test data...")
++    
++    # Create supporting data
++    product = Produit.objects.create(name="Test Product")
++    platform = Plateforme.objects.create(name="Test Platform")
++    
++    # Create the problematic metadata type
++    brand_metadata = ProductMetaDataType.objects.create(
++        label="brand",
++        filterable=False  # This was causing the issue
++    )
++    
++    # Create metadata
++    metadata = ProductMetaData.objects.create(
++        product=product,
++        value="Dark Vador",
++        marketplace=platform,
++        metadata_type=brand_metadata
++    )
++    
++    print(f"Created metadata type: {brand_metadata} (filterable={brand_metadata.filterable})")
++    print(f"Created metadata: {metadata}")
++    
++    # This is the exact query from the issue that was failing
++    print("\nTesting the exact query from the issue...")
++    try:
++        result = ProductMetaData.objects.filter(
++            value="Dark Vador", 
++            metadata_type=brand_metadata
++        )
++        count = result.count()
++        print(f"✅ SUCCESS! Query executed successfully, found {count} results")
++        
++        for item in result:
++            print(f"  - {item.value} (type: {item.metadata_type.label})")
++        
++        return True
++    except NotSupportedError as e:
++        print(f"❌ FAILED! Still getting the error: {e}")
++        return False
++    except Exception as e:
++        print(f"❌ FAILED! Unexpected error: {e}")
++        return False
++
++
++if __name__ == "__main__":
++    print("Setting up database...")
++    create_tables()
++    
++    print("Testing exact issue reproduction...")
++    success = test_exact_issue()
++    
++    if success:
++        print("\n🎉 The exact issue from the bug report has been FIXED!")
++        sys.exit(0)
++    else:
++        print("\n❌ The issue is NOT fixed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/final_comprehensive_test.py b/final_comprehensive_test.py
+new file mode 100644
+index 0000000000..aab9e79484
+--- /dev/null
++++ b/final_comprehensive_test.py
+@@ -0,0 +1,219 @@
++#!/usr/bin/env python
++"""
++Final comprehensive test to verify the fix works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.utils import NotSupportedError
++from django.db.models.expressions import BaseExpression
++from django.db.models import Q
++
++
++# Test models from the original issue
++class ProductMetaDataType(models.Model):
++    label = models.CharField(max_length=255, unique=True, blank=False, null=False)
++    filterable = models.BooleanField(default=False, verbose_name="filterable")
++    
++    class Meta:
++        app_label = "__main__"
++    
++    def __str__(self):
++        return self.label
++
++
++class ProductMetaData(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    value = models.TextField(null=False, blank=False)
++    metadata_type = models.ForeignKey(
++        ProductMetaDataType, null=False, blank=False, on_delete=models.CASCADE
++    )
++    
++    class Meta:
++        app_label = "__main__"
++
++
++# Test expression that should not be filterable
++class NonFilterableExpression(BaseExpression):
++    filterable = False
++    
++    def __init__(self):
++        super().__init__()
++    
++    def as_sql(self, compiler, connection):
++        return "1", []
++
++
++def create_tables():
++    """Create the database tables."""
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ProductMetaDataType)
++        schema_editor.create_model(ProductMetaData)
++
++
++def test_original_issue():
++    """Test the original issue from the bug report."""
++    print("=== Testing Original Issue ===")
++    
++    # Create test data exactly as in the original issue
++    brand_metadata = ProductMetaDataType.objects.create(
++        label="brand",
++        filterable=False  # This should NOT affect filtering behavior
++    )
++    
++    ProductMetaData.objects.create(
++        value="Dark Vador",
++        metadata_type=brand_metadata
++    )
++    
++    # This should work now (was failing before the fix)
++    try:
++        result = ProductMetaData.objects.filter(
++            value="Dark Vador", 
++            metadata_type=brand_metadata
++        )
++        count = result.count()
++        print(f"✅ Original issue FIXED! Found {count} results")
++        return True
++    except NotSupportedError as e:
++        print(f"❌ Original issue NOT fixed: {e}")
++        return False
++
++
++def test_filterable_true():
++    """Test with filterable=True to ensure it still works."""
++    print("\n=== Testing filterable=True ===")
++    
++    category_metadata = ProductMetaDataType.objects.create(
++        label="category",
++        filterable=True
++    )
++    
++    ProductMetaData.objects.create(
++        value="Sci-Fi",
++        metadata_type=category_metadata
++    )
++    
++    try:
++        result = ProductMetaData.objects.filter(
++            value="Sci-Fi",
++            metadata_type=category_metadata
++        )
++        count = result.count()
++        print(f"✅ filterable=True works! Found {count} results")
++        return True
++    except Exception as e:
++        print(f"❌ filterable=True failed: {e}")
++        return False
++
++
++def test_django_expressions():
++    """Test that Django expressions with filterable=False still raise errors."""
++    print("\n=== Testing Django Expressions ===")
++    
++    expr = NonFilterableExpression()
++    
++    try:
++        from django.db.models.sql.query import Query
++        query = Query(ProductMetaData)
++        query.check_filterable(expr)
++        print("❌ ERROR: Django expression should have raised NotSupportedError!")
++        return False
++    except NotSupportedError as e:
++        print(f"✅ Django expressions still work correctly: {e}")
++        return True
++    except Exception as e:
++        print(f"❌ Unexpected error with Django expressions: {e}")
++        return False
++
++
++def test_complex_queries():
++    """Test complex queries to ensure nothing is broken."""
++    print("\n=== Testing Complex Queries ===")
++    
++    brand_metadata = ProductMetaDataType.objects.get(label="brand")
++    category_metadata = ProductMetaDataType.objects.get(label="category")
++    
++    try:
++        # Test Q objects
++        result1 = ProductMetaData.objects.filter(
++            Q(metadata_type=brand_metadata) | Q(metadata_type=category_metadata)
++        )
++        print(f"✅ Q objects work! Found {result1.count()} results")
++        
++        # Test field lookups
++        result2 = ProductMetaData.objects.filter(
++            metadata_type__filterable=False
++        )
++        print(f"✅ Field lookups work! Found {result2.count()} results")
++        
++        # Test multiple filters
++        result3 = ProductMetaData.objects.filter(
++            value="Dark Vador",
++            metadata_type=brand_metadata,
++            metadata_type__label="brand"
++        )
++        print(f"✅ Multiple filters work! Found {result3.count()} results")
++        
++        return True
++    except Exception as e:
++        print(f"❌ Complex queries failed: {e}")
++        return False
++
++
++def main():
++    print("Setting up database...")
++    create_tables()
++    
++    tests = [
++        test_original_issue,
++        test_filterable_true,
++        test_django_expressions,
++        test_complex_queries,
++    ]
++    
++    all_passed = True
++    for test in tests:
++        if not test():
++            all_passed = False
++    
++    print("\n" + "="*50)
++    if all_passed:
++        print("🎉 ALL TESTS PASSED! The fix is working correctly.")
++        print("\nSummary:")
++        print("- ✅ Original issue with filterable=False model field is fixed")
++        print("- ✅ Models with filterable=True still work")
++        print("- ✅ Django expressions with filterable=False still raise errors")
++        print("- ✅ Complex queries (Q objects, field lookups, etc.) work")
++        return 0
++    else:
++        print("❌ SOME TESTS FAILED! Please review the fix.")
++        return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+\ No newline at end of file
+diff --git a/test_expression_filterable.py b/test_expression_filterable.py
+new file mode 100644
+index 0000000000..05d38d6451
+--- /dev/null
++++ b/test_expression_filterable.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python
++"""
++Test script to ensure that legitimate Django expressions with filterable=False
++still raise NotSupportedError as expected.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.utils import NotSupportedError
++from django.db.models.expressions import BaseExpression
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = "__main__"
++
++
++class NonFilterableExpression(BaseExpression):
++    """A test expression that should not be filterable."""
++    filterable = False
++    
++    def __init__(self):
++        super().__init__()
++    
++    def as_sql(self, compiler, connection):
++        return "1", []
++
++
++def create_tables():
++    """Create the database tables."""
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++
++
++def test_expression_filterable():
++    """Test that expressions with filterable=False still raise errors."""
++    print("Testing that expressions with filterable=False still work correctly...")
++    
++    # Create a non-filterable expression
++    expr = NonFilterableExpression()
++    
++    # This should still raise NotSupportedError
++    try:
++        # We need to access the query's check_filterable method directly
++        from django.db.models.sql.query import Query
++        query = Query(TestModel)
++        query.check_filterable(expr)
++        print("❌ ERROR: Expected NotSupportedError was not raised!")
++        return False
++    except NotSupportedError as e:
++        print(f"✅ Correctly raised NotSupportedError: {e}")
++        return True
++    except Exception as e:
++        print(f"❌ Unexpected error: {e}")
++        return False
++
++
++if __name__ == "__main__":
++    print("Setting up database...")
++    create_tables()
++    
++    success = test_expression_filterable()
++    
++    if success:
++        print("\n✅ Expression filterable test passed!")
++        sys.exit(0)
++    else:
++        print("\n❌ Expression filterable test failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_filterable_issue.py b/test_filterable_issue.py
+new file mode 100644
+index 0000000000..bd08df8b45
+--- /dev/null
++++ b/test_filterable_issue.py
+@@ -0,0 +1,188 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the filterable field issue.
++This script reproduces the bug where a model field named 'filterable' 
++causes NotSupportedError when used in QuerySet filters.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test.utils import get_runner
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import connection
++from django.core.management.color import no_style
++from django.db.utils import NotSupportedError
++
++
++class ProductMetaDataType(models.Model):
++    label = models.CharField(max_length=255, unique=True, blank=False, null=False)
++    filterable = models.BooleanField(default=False, verbose_name="filterable")
++    
++    class Meta:
++        app_label = "__main__"
++        verbose_name = "product meta data type"
++        verbose_name_plural = "product meta data types"
++    
++    def __str__(self):
++        return self.label
++
++
++class ProductMetaData(models.Model):
++    id = models.BigAutoField(primary_key=True)
++    value = models.TextField(null=False, blank=False)
++    metadata_type = models.ForeignKey(
++        ProductMetaDataType, null=False, blank=False, on_delete=models.CASCADE
++    )
++    
++    class Meta:
++        app_label = "__main__"
++        verbose_name = "product meta data"
++        verbose_name_plural = "product meta datas"
++
++
++def create_tables():
++    """Create the database tables."""
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(ProductMetaDataType)
++        schema_editor.create_model(ProductMetaData)
++
++
++def test_filterable_issue():
++    """Test the filterable field issue."""
++    print("Creating test data...")
++    
++    # Create a metadata type with filterable=False
++    brand_metadata = ProductMetaDataType.objects.create(
++        label="brand",
++        filterable=False  # This should not affect filtering behavior
++    )
++    
++    # Create some metadata
++    metadata = ProductMetaData.objects.create(
++        value="Dark Vador",
++        metadata_type=brand_metadata
++    )
++    
++    print(f"Created metadata type: {brand_metadata} (filterable={brand_metadata.filterable})")
++    print(f"Created metadata: {metadata}")
++    
++    # This should work but currently raises NotSupportedError
++    print("\nTesting filter with metadata_type...")
++    try:
++        result = ProductMetaData.objects.filter(
++            value="Dark Vador", 
++            metadata_type=brand_metadata
++        )
++        print(f"Filter successful! Found {result.count()} results")
++        for item in result:
++            print(f"  - {item.value} (type: {item.metadata_type.label})")
++    except NotSupportedError as e:
++        print(f"ERROR: {e}")
++        return False
++    
++    # Test with filterable=True as well
++    print("\nTesting with filterable=True...")
++    other_metadata = ProductMetaDataType.objects.create(
++        label="category",
++        filterable=True
++    )
++    
++    other_data = ProductMetaData.objects.create(
++        value="Sci-Fi",
++        metadata_type=other_metadata
++    )
++    
++    try:
++        result = ProductMetaData.objects.filter(
++            value="Sci-Fi",
++            metadata_type=other_metadata
++        )
++        print(f"Filter successful! Found {result.count()} results")
++        for item in result:
++            print(f"  - {item.value} (type: {item.metadata_type.label})")
++    except NotSupportedError as e:
++        print(f"ERROR: {e}")
++        return False
++    
++    return True
++
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix doesn't break anything."""
++    print("\nTesting edge cases...")
++    
++    # Test with None values
++    try:
++        result = ProductMetaData.objects.filter(metadata_type=None)
++        print(f"✅ Filter with None successful! Found {result.count()} results")
++    except Exception as e:
++        print(f"❌ Filter with None failed: {e}")
++        return False
++    
++    # Test with multiple filters
++    brand_metadata = ProductMetaDataType.objects.get(label="brand")
++    try:
++        result = ProductMetaData.objects.filter(
++            value="Dark Vador",
++            metadata_type=brand_metadata,
++            metadata_type__filterable=False
++        )
++        print(f"✅ Multiple filters successful! Found {result.count()} results")
++    except Exception as e:
++        print(f"❌ Multiple filters failed: {e}")
++        return False
++    
++    # Test with Q objects
++    from django.db.models import Q
++    try:
++        result = ProductMetaData.objects.filter(
++            Q(metadata_type=brand_metadata) | Q(value="Sci-Fi")
++        )
++        print(f"✅ Q object filter successful! Found {result.count()} results")
++    except Exception as e:
++        print(f"❌ Q object filter failed: {e}")
++        return False
++    
++    return True
++
++
++if __name__ == "__main__":
++    print("Setting up database...")
++    create_tables()
++    
++    print("Running filterable field test...")
++    success = test_filterable_issue()
++    
++    if success:
++        success = test_edge_cases()
++    
++    if success:
++        print("\n✅ All tests passed!")
++        sys.exit(0)
++    else:
++        print("\n❌ Test failed!")
++        sys.exit(1)
+\ No newline at end of file

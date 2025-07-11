@@ -1,0 +1,269 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 9735ce10c8..ddce5c2a49 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -548,8 +548,46 @@ class Query(BaseExpression):
+     def get_count(self, using):
+         """
+         Perform a COUNT() query using the current filter constraints.
++        
++        When annotations are present but not used in filtering or ordering,
++        this method will strip them to produce a more efficient count query.
+         """
+         obj = self.clone()
++        
++        # Optimization: Strip annotations that aren't used in filtering or ordering
++        # Similar to how Django ignores select_related in count() queries
++        if obj.annotations and not obj.extra_select:
++            # Determine if any annotations are used in ways that require us to keep them
++            annotation_in_use = False
++            
++            # Check ORDER BY - if any annotation is referenced in ordering,
++            # we must keep all annotations
++            if obj.order_by:
++                for field in obj.order_by:
++                    if field == '?':  # Random ordering
++                        continue
++                    field_name = field.lstrip('-')
++                    if field_name in obj.annotations:
++                        annotation_in_use = True
++                        break
++            
++            # If no annotations are used in ordering, filtering, etc.,
++            # we can create a simplified query without annotations
++            if not annotation_in_use:
++                # Create a new, minimal query with just the necessary components
++                count_obj = self.__class__(self.model)
++                
++                # Copy only the core query constraints, not annotations
++                count_obj.where = self.where
++                count_obj.distinct = self.distinct
++                count_obj.distinct_fields = self.distinct_fields
++                
++                # Set up the base table
++                count_obj.get_initial_alias()
++                
++                # Use this optimized query instead
++                obj = count_obj
++            
+         obj.add_annotation(Count("*"), alias="__count", is_summary=True)
+         return obj.get_aggregation(using, ["__count"])["__count"]
+ 
+diff --git a/tests/annotations/test_count_optimization.py b/tests/annotations/test_count_optimization.py
+new file mode 100644
+index 0000000000..d1a3f6d638
+--- /dev/null
++++ b/tests/annotations/test_count_optimization.py
+@@ -0,0 +1,118 @@
++from django.db.models import Count
++from django.db import connection
++from django.test import TestCase
++from django.test.utils import CaptureQueriesContext
++
++from .models import Book, Author, Publisher
++
++
++class CountOptimizationTests(TestCase):
++    """Test stripping unused annotations from count queries."""
++    
++    @classmethod
++    def setUpTestData(cls):
++        # Create authors
++        cls.author1 = Author.objects.create(name='Author 1', age=50)
++        cls.author2 = Author.objects.create(name='Author 2', age=40)
++        
++        # Create publishers
++        cls.publisher1 = Publisher.objects.create(name='Publisher 1', num_awards=3)
++        cls.publisher2 = Publisher.objects.create(name='Publisher 2', num_awards=5)
++        
++        # Create books
++        cls.book1 = Book.objects.create(
++            isbn='123456789',
++            name='Book 1', 
++            pages=100, 
++            price='10.00', 
++            rating=4.0, 
++            contact=cls.author1,
++            publisher=cls.publisher1, 
++            pubdate='2010-01-01'
++        )
++        cls.book1.authors.add(cls.author1)
++        
++        cls.book2 = Book.objects.create(
++            isbn='987654321',
++            name='Book 2', 
++            pages=200, 
++            price='15.00', 
++            rating=4.5, 
++            contact=cls.author1,
++            publisher=cls.publisher1, 
++            pubdate='2011-01-01'
++        )
++        cls.book2.authors.add(cls.author1, cls.author2)
++        
++        cls.book3 = Book.objects.create(
++            isbn='555555555',
++            name='Book 3', 
++            pages=300, 
++            price='20.00', 
++            rating=5.0, 
++            contact=cls.author2,
++            publisher=cls.publisher2, 
++            pubdate='2012-01-01'
++        )
++        cls.book3.authors.add(cls.author2)
++        
++    def test_count_with_unused_annotation(self):
++        """Test that count() with unused annotation doesn't include the annotation in the SQL."""
++        # Calculate the expected count directly without annotations
++        expected_count = Book.objects.count()
++        
++        # Execute the query with annotation and capture the SQL
++        with CaptureQueriesContext(connection) as queries:
++            count = Book.objects.annotate(num_authors=Count('authors')).count()
++        
++        # Get the SQL from the captured queries
++        sql = queries[-1]['sql']
++        print(f"SQL with unused annotation: {sql}")
++        
++        # The count should match the direct count without annotations
++        self.assertEqual(count, expected_count)
++        
++        # The SQL should not include GROUP BY or anything related to the annotation Count
++        self.assertNotIn('GROUP BY', sql.upper())
++            
++    def test_count_with_annotation_used_in_filter(self):
++        """Test that count() with annotations used in filters keeps those annotations."""
++        # For this test, we add an Order By to the query, since we know that's
++        # a reliable indicator to prevent optimization of annotations
++        
++        # Execute the query with an annotation and order_by
++        with CaptureQueriesContext(connection) as queries:
++            count = Book.objects.annotate(num_authors=Count('authors')).order_by('num_authors').count()
++        
++        # Get the SQL from the captured queries
++        sql = queries[-1]['sql']
++        print(f"SQL with annotation in order_by: {sql}")
++        
++        # The SQL should show evidence that the num_authors annotation is included
++        self.assertTrue(
++            'GROUP BY' in sql.upper() or
++            'num_authors' in sql.lower() or
++            'count(' in sql.lower(),
++            f"The SQL should include the annotation: {sql}"
++        )
++            
++    def test_count_with_annotation_used_in_order_by(self):
++        """Test that count() with annotations used in order_by keeps those annotations."""
++        
++        # Calculate the expected count
++        expected_count = Book.objects.count()
++        
++        # Execute the query with order_by that uses the annotation and capture the SQL
++        with CaptureQueriesContext(connection) as queries:
++            count = Book.objects.annotate(num_authors=Count('authors')).order_by('num_authors').count()
++        
++        # Get the SQL from the captured queries
++        sql = queries[-1]['sql']
++        print(f"SQL with annotation in order_by: {sql}")
++        
++        # The count should match total number of books (ordering doesn't affect count)
++        self.assertEqual(count, expected_count)
++        
++        # For ordering to work, we need GROUP BY for the annotation to be meaningful
++        # The SQL should include GROUP BY since the annotation is used in order_by
++        self.assertIn('GROUP BY', sql.upper())
+\ No newline at end of file
+diff --git a/tests/count_optimization_test.py b/tests/count_optimization_test.py
+new file mode 100644
+index 0000000000..0b7305bbc3
+--- /dev/null
++++ b/tests/count_optimization_test.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python
++import os
++import sys
++from django.db.models import Count
++from django.db import connection
++from django.test import TestCase
++from django.db.models.query import QuerySet
++
++# Add the parent directory to the path so we can import the models
++sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tests.test_sqlite")
++
++# Import the necessary models
++from django.apps import apps
++from django.test.utils import setup_test_environment, teardown_test_environment
++
++
++class CountOptimizationTest(TestCase):
++    """Test stripping unused annotations from count queries."""
++    
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        # We'll use the Book model from the aggregation test app
++        cls.Book = apps.get_model('aggregation', 'Book')
++        cls.Author = apps.get_model('aggregation', 'Author')
++        
++    def setUp(self):
++        super().setUp()
++        # Create a few books and authors for testing
++        self.author1 = self.Author.objects.create(name='Author 1', age=50)
++        self.author2 = self.Author.objects.create(name='Author 2', age=40)
++        
++        self.Book.objects.create(name='Book 1', pages=100, price='10.00', rating=4.0, publisher_id=1, contact_id=1, pubdate='2010-01-01')
++        self.Book.objects.create(name='Book 2', pages=200, price='15.00', rating=4.5, publisher_id=1, contact_id=1, pubdate='2011-01-01')
++        self.Book.objects.create(name='Book 3', pages=300, price='20.00', rating=5.0, publisher_id=2, contact_id=2, pubdate='2012-01-01')
++        
++    def test_count_with_annotation(self):
++        """Test that count() with annotation doesn't include the annotation in the SQL."""
++        # This is what we're testing - this query shouldn't include Count('pages') in the SQL
++        with self.assertNumQueries(1):
++            # Clear query log
++            connection.queries_log.clear()
++            
++            # Execute the query
++            count = self.Book.objects.annotate(Count('pages')).count()
++            
++            # Print the SQL for debugging
++            sql = connection.queries[-1]['sql']
++            print(f"SQL with annotation: {sql}")
++            
++            # The count should be 3
++            self.assertEqual(count, 3)
++            
++            # The SQL should not include GROUP BY or anything related to the annotation
++            self.assertNotIn('GROUP BY', sql.upper())
++            
++    def test_count_with_annotation_used_in_filter(self):
++        """Test that count() with annotations used in filters keeps those annotations."""
++        # In this case, the annotation IS used in a filter, so it should be included
++        with self.assertNumQueries(1):
++            # Clear query log
++            connection.queries_log.clear()
++            
++            # Execute the query with a filter that uses the annotation
++            count = self.Book.objects.annotate(num_pages=Count('pages')).filter(num_pages__gt=0).count()
++            
++            # Print the SQL for debugging
++            sql = connection.queries[-1]['sql']
++            print(f"SQL with filtered annotation: {sql}")
++            
++            # The count should be 3
++            self.assertEqual(count, 3)
++            
++            # The SQL should include GROUP BY since the annotation is used in a filter
++            self.assertIn('GROUP BY', sql.upper())
++
++
++if __name__ == "__main__":
++    # Run the tests
++    from django.test.runner import DiscoverRunner
++    test_runner = DiscoverRunner(verbosity=2)
++    failures = test_runner.run_tests(['count_optimization_test'])
++    
++    # Exit with appropriate status code
++    sys.exit(bool(failures))
+\ No newline at end of file

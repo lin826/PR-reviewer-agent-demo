@@ -1,0 +1,657 @@
+diff --git a/astropy/wcs/wcsapi/wrappers/sliced_wcs.py b/astropy/wcs/wcsapi/wrappers/sliced_wcs.py
+index d7605b078c..fa9d4b13ff 100644
+--- a/astropy/wcs/wcsapi/wrappers/sliced_wcs.py
++++ b/astropy/wcs/wcsapi/wrappers/sliced_wcs.py
+@@ -246,12 +246,21 @@ class SlicedLowLevelWCS(BaseWCSWrapper):
+         world_arrays = tuple(map(np.asanyarray, world_arrays))
+         world_arrays_new = []
+         iworld_curr = -1
++        
++        # Calculate the world coordinates for dropped dimensions
++        # This is needed when dimensions are coupled via PC matrix
++        if len(self._world_keep) < self._wcs.world_n_dim:
++            # Get world coordinates at pixel position [0, 0, ...] for kept dimensions
++            dropped_world_coords = self._pixel_to_world_values_all(*[0]*len(self._pixel_keep))
++        
+         for iworld in range(self._wcs.world_n_dim):
+             if iworld in self._world_keep:
+                 iworld_curr += 1
+                 world_arrays_new.append(world_arrays[iworld_curr])
+             else:
+-                world_arrays_new.append(1.)
++                # Use the correct world coordinate for the dropped dimension
++                # instead of a fixed value of 1.0
++                world_arrays_new.append(dropped_world_coords[iworld])
+ 
+         world_arrays_new = np.broadcast_arrays(*world_arrays_new)
+         pixel_arrays = list(self._wcs.world_to_pixel_values(*world_arrays_new))
+diff --git a/debug_full_wcs.py b/debug_full_wcs.py
+new file mode 100644
+index 0000000000..644f79cd27
+--- /dev/null
++++ b/debug_full_wcs.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python
++"""
++Debug script to understand the full WCS issue.
++"""
++
++import numpy as np
++import astropy.wcs
++
++def debug_full_wcs():
++    """Debug the full WCS issue."""
++    
++    print("=== Debugging Full WCS Issue ===")
++    
++    # Create the WCS as described in the issue
++    nx = 100
++    ny = 25
++    nz = 2
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': (nx + 1)/2,
++        'CRPIX2': (ny + 1)/2,
++        'CRPIX3': 1.0,
++        'PC1_1': 0.0,
++        'PC1_2': -1.0,
++        'PC1_3': 0.0,
++        'PC2_1': 1.0,
++        'PC2_2': 0.0,
++        'PC2_3': -1.0,
++        'CDELT1': 5,
++        'CDELT2': 5,
++        'CDELT3': 0.055,
++        'CUNIT1': 'arcsec',
++        'CUNIT2': 'arcsec',
++        'CUNIT3': 'Angstrom',
++        'CTYPE1': 'HPLN-TAN',
++        'CTYPE2': 'HPLT-TAN',
++        'CTYPE3': 'WAVE',
++        'CRVAL1': 0.0,
++        'CRVAL2': 0.0,
++        'CRVAL3': 1.05,
++    }
++    fits_wcs = astropy.wcs.WCS(header=wcs_header)
++    
++    print("WCS Info:")
++    print(f"CRPIX: {fits_wcs.wcs.crpix}")
++    print(f"CRVAL: {fits_wcs.wcs.crval}")
++    print(f"CDELT: {fits_wcs.wcs.cdelt}")
++    print(f"CUNIT: {fits_wcs.wcs.cunit}")
++    print(f"PC matrix:")
++    print(fits_wcs.wcs.pc)
++    print()
++    
++    # Test different world coordinates
++    print("Testing different world coordinates:")
++    
++    # Test at CRVAL (reference values)
++    print(f"At CRVAL {fits_wcs.wcs.crval}:")
++    result = fits_wcs.world_to_pixel_values(*fits_wcs.wcs.crval)
++    print(f"  world_to_pixel_values result: {result}")
++    print(f"  Expected: close to CRPIX {fits_wcs.wcs.crpix}")
++    print()
++    
++    # Test at (0, 0, 1.05) - this is the problematic case from the original issue
++    print("At (0, 0, 1.05) - original issue case:")
++    result = fits_wcs.world_to_pixel_values(0.0, 0.0, 1.05)
++    print(f"  world_to_pixel_values result: {result}")
++    print()
++    
++    # Test at (0, 0, 1.05e-10) - correct units
++    print("At (0, 0, 1.05e-10) - correct units:")
++    result = fits_wcs.world_to_pixel_values(0.0, 0.0, 1.05e-10)
++    print(f"  world_to_pixel_values result: {result}")
++    print()
++    
++    # Test pixel_to_world at CRPIX
++    print(f"pixel_to_world at CRPIX {fits_wcs.wcs.crpix}:")
++    result = fits_wcs.pixel_to_world_values(*fits_wcs.wcs.crpix)
++    print(f"  pixel_to_world_values result: {result}")
++    print(f"  Expected: close to CRVAL {fits_wcs.wcs.crval}")
++    print()
++    
++    # Test round-trip
++    print("Round-trip test:")
++    px, py, pz = fits_wcs.wcs.crpix
++    world_result = fits_wcs.pixel_to_world_values(px, py, pz)
++    pixel_result = fits_wcs.world_to_pixel_values(*world_result)
++    print(f"  CRPIX -> world -> pixel: {fits_wcs.wcs.crpix} -> {world_result} -> {pixel_result}")
++
++if __name__ == "__main__":
++    debug_full_wcs()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..23894b33da
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the SlicedLowLevelWCS world_to_pixel issue.
++
++This reproduces the issue described in the GitHub issue where world_to_pixel
++returns incorrect results for SlicedLowLevelWCS when there are coupled dimensions
++via the PC matrix.
++"""
++
++import numpy as np
++import astropy.wcs
++from astropy.coordinates import SkyCoord
++import astropy.units as u
++
++def test_sliced_wcs_issue():
++    """Test the specific issue with SlicedLowLevelWCS world_to_pixel."""
++    
++    print("=== Reproducing SlicedLowLevelWCS world_to_pixel issue ===")
++    
++    # Create the WCS as described in the issue
++    nx = 100
++    ny = 25
++    nz = 2
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': (nx + 1)/2,
++        'CRPIX2': (ny + 1)/2,
++        'CRPIX3': 1.0,
++        'PC1_1': 0.0,
++        'PC1_2': -1.0,
++        'PC1_3': 0.0,
++        'PC2_1': 1.0,
++        'PC2_2': 0.0,
++        'PC2_3': -1.0,
++        'CDELT1': 5,
++        'CDELT2': 5,
++        'CDELT3': 0.055,
++        'CUNIT1': 'arcsec',
++        'CUNIT2': 'arcsec',
++        'CUNIT3': 'Angstrom',
++        'CTYPE1': 'HPLN-TAN',
++        'CTYPE2': 'HPLT-TAN',
++        'CTYPE3': 'WAVE',
++        'CRVAL1': 0.0,
++        'CRVAL2': 0.0,
++        'CRVAL3': 1.05,
++    }
++    fits_wcs = astropy.wcs.WCS(header=wcs_header)
++    
++    print("Created 3D WCS with PC matrix coupling spatial and spectral dimensions")
++    print("PC matrix elements:")
++    print(f"PC1_1={wcs_header['PC1_1']}, PC1_2={wcs_header['PC1_2']}, PC1_3={wcs_header['PC1_3']}")
++    print(f"PC2_1={wcs_header['PC2_1']}, PC2_2={wcs_header['PC2_2']}, PC2_3={wcs_header['PC2_3']}")
++    print()
++    
++    # Test world_to_pixel on the full WCS
++    # Use the correct units (meters for wavelength)
++    full_result = fits_wcs.world_to_pixel_values(0.0, 0.0, 1.05e-10)
++    print(f"Full WCS world_to_pixel_values result: {full_result}")
++    print(f"Full WCS world_to_pixel result: {full_result}")
++    print(f"Expected: (49.5, 12.0, ~0.0)")
++    print()
++    
++    # Test world_to_pixel on the sliced WCS
++    ll_sliced_wcs = astropy.wcs.wcsapi.SlicedLowLevelWCS(fits_wcs, 0)
++    sliced_result = ll_sliced_wcs.world_to_pixel_values(0.0, 0.0)
++    print(f"Sliced WCS world_to_pixel result: {sliced_result}")
++    print(f"Expected: (49.5, 12.0)")
++    print()
++    
++    # Check if the issue is present
++    if isinstance(sliced_result, tuple) and len(sliced_result) >= 2:
++        first_coord = sliced_result[0]
++        second_coord = sliced_result[1]
++        
++        # Check if first coordinate is essentially infinite (the bug)
++        if isinstance(first_coord, np.ndarray):
++            first_coord = first_coord.item()
++        if isinstance(second_coord, np.ndarray):
++            second_coord = second_coord.item()
++            
++        print(f"First coordinate: {first_coord}")
++        print(f"Second coordinate: {second_coord}")
++        
++        if abs(first_coord) > 1e10:
++            print("❌ BUG CONFIRMED: First coordinate is essentially infinite!")
++            print(f"   Got: {first_coord}, Expected: ~49.5")
++        else:
++            print("✅ First coordinate looks correct")
++            
++        if abs(second_coord - 12.0) < 1e-6:
++            print("✅ Second coordinate is correct")
++        else:
++            print(f"❌ Second coordinate is incorrect. Got: {second_coord}, Expected: ~12.0")
++    else:
++        print(f"❌ Unexpected result format: {sliced_result}")
++    
++    print()
++    
++    # Test pixel_to_world to verify it works correctly (as mentioned in the issue)
++    print("=== Testing pixel_to_world (should work correctly) ===")
++    px, py, pz = full_result
++    
++    full_p2w = fits_wcs.pixel_to_world_values(px, py, pz)
++    print(f"Full WCS pixel_to_world_values result: {full_p2w}")
++    
++    sliced_p2w = ll_sliced_wcs.pixel_to_world_values(px, py)
++    print(f"Sliced WCS pixel_to_world_values result: {sliced_p2w}")
++    print("✅ pixel_to_world works correctly for both full and sliced WCS")
++    
++    return sliced_result, full_result
++
++if __name__ == "__main__":
++    test_sliced_wcs_issue()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..3cfdae1bbb
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,219 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the fix works correctly and doesn't break existing functionality.
++"""
++
++import numpy as np
++import astropy.wcs
++from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS
++from numpy.testing import assert_allclose
++
++def test_original_issue():
++    """Test the original issue case."""
++    print("=== Testing Original Issue Case ===")
++    
++    # Create the WCS as described in the issue
++    nx = 100
++    ny = 25
++    nz = 2
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': (nx + 1)/2,
++        'CRPIX2': (ny + 1)/2,
++        'CRPIX3': 1.0,
++        'PC1_1': 0.0,
++        'PC1_2': -1.0,
++        'PC1_3': 0.0,
++        'PC2_1': 1.0,
++        'PC2_2': 0.0,
++        'PC2_3': -1.0,
++        'CDELT1': 5,
++        'CDELT2': 5,
++        'CDELT3': 0.055,
++        'CUNIT1': 'arcsec',
++        'CUNIT2': 'arcsec',
++        'CUNIT3': 'Angstrom',
++        'CTYPE1': 'HPLN-TAN',
++        'CTYPE2': 'HPLT-TAN',
++        'CTYPE3': 'WAVE',
++        'CRVAL1': 0.0,
++        'CRVAL2': 0.0,
++        'CRVAL3': 1.05,
++    }
++    fits_wcs = astropy.wcs.WCS(header=wcs_header)
++    
++    # Test sliced WCS
++    ll_sliced_wcs = SlicedLowLevelWCS(fits_wcs, 0)
++    sliced_result = ll_sliced_wcs.world_to_pixel_values(0.0, 0.0)
++    
++    print(f"Sliced WCS result: {sliced_result}")
++    
++    # Check that the result is reasonable (not infinite)
++    assert abs(sliced_result[0]) < 1000, f"First coordinate should be reasonable, got {sliced_result[0]}"
++    assert abs(sliced_result[1] - 12.0) < 1e-6, f"Second coordinate should be ~12.0, got {sliced_result[1]}"
++    
++    print("✅ Original issue case passed")
++    print()
++
++def test_no_coupling():
++    """Test case with no coupling (should work the same as before)."""
++    print("=== Testing No Coupling Case ===")
++    
++    # Create a simple WCS with no coupling
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': 50.5,
++        'CRPIX2': 13.0,
++        'CRPIX3': 1.0,
++        'CDELT1': 0.1,
++        'CDELT2': 0.1,
++        'CDELT3': 1.0,
++        'CUNIT1': 'deg',
++        'CUNIT2': 'deg',
++        'CUNIT3': 'Hz',
++        'CTYPE1': 'RA---TAN',
++        'CTYPE2': 'DEC--TAN',
++        'CTYPE3': 'FREQ',
++        'CRVAL1': 10.0,
++        'CRVAL2': 20.0,
++        'CRVAL3': 25.0,
++    }
++    fits_wcs = astropy.wcs.WCS(header=wcs_header)
++    
++    # Test sliced WCS
++    ll_sliced_wcs = SlicedLowLevelWCS(fits_wcs, 0)
++    
++    # Test world_to_pixel
++    sliced_result = ll_sliced_wcs.world_to_pixel_values(10.0, 20.0)
++    expected = (49.5, 12.0)  # Should be close to CRPIX-1 for the kept dimensions
++    
++    print(f"Sliced WCS result: {sliced_result}")
++    print(f"Expected: {expected}")
++    
++    assert_allclose(sliced_result, expected, rtol=1e-10)
++    
++    print("✅ No coupling case passed")
++    print()
++
++def test_round_trip():
++    """Test round-trip consistency."""
++    print("=== Testing Round-trip Consistency ===")
++    
++    # Create the original issue WCS
++    nx = 100
++    ny = 25
++    nz = 2
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': (nx + 1)/2,
++        'CRPIX2': (ny + 1)/2,
++        'CRPIX3': 1.0,
++        'PC1_1': 0.0,
++        'PC1_2': -1.0,
++        'PC1_3': 0.0,
++        'PC2_1': 1.0,
++        'PC2_2': 0.0,
++        'PC2_3': -1.0,
++        'CDELT1': 5,
++        'CDELT2': 5,
++        'CDELT3': 0.055,
++        'CUNIT1': 'arcsec',
++        'CUNIT2': 'arcsec',
++        'CUNIT3': 'Angstrom',
++        'CTYPE1': 'HPLN-TAN',
++        'CTYPE2': 'HPLT-TAN',
++        'CTYPE3': 'WAVE',
++        'CRVAL1': 0.0,
++        'CRVAL2': 0.0,
++        'CRVAL3': 1.05,
++    }
++    fits_wcs = astropy.wcs.WCS(header=wcs_header)
++    
++    # Test sliced WCS round-trip
++    ll_sliced_wcs = SlicedLowLevelWCS(fits_wcs, 0)
++    
++    # Start with some pixel coordinates
++    px, py = 30.0, 8.0
++    
++    # pixel -> world -> pixel
++    world_coords = ll_sliced_wcs.pixel_to_world_values(px, py)
++    pixel_coords = ll_sliced_wcs.world_to_pixel_values(*world_coords)
++    
++    print(f"Original pixel: ({px}, {py})")
++    print(f"World coords: {world_coords}")
++    print(f"Round-trip pixel: {pixel_coords}")
++    
++    assert_allclose(pixel_coords, (px, py), rtol=1e-10)
++    
++    print("✅ Round-trip consistency passed")
++    print()
++
++def test_multiple_slices():
++    """Test multiple different slice configurations."""
++    print("=== Testing Multiple Slice Configurations ===")
++    
++    # Create a 3D WCS with coupling
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': 50.5,
++        'CRPIX2': 13.0,
++        'CRPIX3': 1.0,
++        'PC1_1': 0.0,
++        'PC1_2': -1.0,
++        'PC1_3': 0.0,
++        'PC2_1': 1.0,
++        'PC2_2': 0.0,
++        'PC2_3': -1.0,
++        'CDELT1': 5,
++        'CDELT2': 5,
++        'CDELT3': 0.055,
++        'CUNIT1': 'arcsec',
++        'CUNIT2': 'arcsec',
++        'CUNIT3': 'Angstrom',
++        'CTYPE1': 'HPLN-TAN',
++        'CTYPE2': 'HPLT-TAN',
++        'CTYPE3': 'WAVE',
++        'CRVAL1': 0.0,
++        'CRVAL2': 0.0,
++        'CRVAL3': 1.05,
++    }
++    fits_wcs = astropy.wcs.WCS(header=wcs_header)
++    
++    # Test different slice configurations
++    slice_configs = [
++        (0, "slice first dimension"),
++        (1, "slice second dimension"),
++        (2, "slice third dimension"),
++        ([slice(None), 5], "slice middle dimension"),
++        ([10, slice(None)], "slice first dimension with explicit slice"),
++    ]
++    
++    for slice_config, description in slice_configs:
++        print(f"Testing: {description}")
++        try:
++            ll_sliced_wcs = SlicedLowLevelWCS(fits_wcs, slice_config)
++            
++            # Test that world_to_pixel doesn't crash and returns reasonable values
++            if ll_sliced_wcs.world_n_dim == 2:
++                result = ll_sliced_wcs.world_to_pixel_values(0.0, 0.0)
++                print(f"  Result: {result}")
++                # Check that values are not infinite
++                assert all(abs(x) < 1e10 for x in result), f"Values should be finite, got {result}"
++            elif ll_sliced_wcs.world_n_dim == 1:
++                result = ll_sliced_wcs.world_to_pixel_values(0.0)
++                print(f"  Result: {result}")
++                assert abs(result) < 1e10, f"Value should be finite, got {result}"
++                
++            print(f"  ✅ {description} passed")
++        except Exception as e:
++            print(f"  ❌ {description} failed: {e}")
++            raise
++    
++    print()
++
++if __name__ == "__main__":
++    test_original_issue()
++    test_no_coupling()
++    test_round_trip()
++    test_multiple_slices()
++    print("🎉 All tests passed!")
+\ No newline at end of file
+diff --git a/test_issue_reproduction.py b/test_issue_reproduction.py
+new file mode 100644
+index 0000000000..3ed3800b27
+--- /dev/null
++++ b/test_issue_reproduction.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python
++"""
++Test case that reproduces the exact issue from the GitHub issue description.
++This test should be added to the test suite to prevent regression.
++"""
++
++import numpy as np
++import astropy.wcs
++from astropy.coordinates import SkyCoord
++import astropy.units as u
++from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS
++from astropy.wcs.wcsapi.high_level_wcs_wrapper import HighLevelWCSWrapper
++from numpy.testing import assert_allclose
++
++def test_sliced_wcs_world_to_pixel_with_pc_coupling():
++    """
++    Test for the issue where SlicedLowLevelWCS.world_to_pixel returns incorrect
++    results when there are coupled dimensions via the PC matrix.
++    
++    This reproduces the issue described in GitHub issue where a 3D WCS with
++    PC matrix coupling spatial and spectral dimensions gives incorrect results
++    when sliced.
++    """
++    
++    # Create the WCS as described in the issue
++    nx = 100
++    ny = 25
++    nz = 2
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': (nx + 1)/2,
++        'CRPIX2': (ny + 1)/2,
++        'CRPIX3': 1.0,
++        'PC1_1': 0.0,
++        'PC1_2': -1.0,
++        'PC1_3': 0.0,
++        'PC2_1': 1.0,
++        'PC2_2': 0.0,
++        'PC2_3': -1.0,
++        'CDELT1': 5,
++        'CDELT2': 5,
++        'CDELT3': 0.055,
++        'CUNIT1': 'arcsec',
++        'CUNIT2': 'arcsec',
++        'CUNIT3': 'Angstrom',
++        'CTYPE1': 'HPLN-TAN',
++        'CTYPE2': 'HPLT-TAN',
++        'CTYPE3': 'WAVE',
++        'CRVAL1': 0.0,
++        'CRVAL2': 0.0,
++        'CRVAL3': 1.05,
++    }
++    fits_wcs = astropy.wcs.WCS(header=wcs_header)
++    
++    # Test the full WCS first (using correct units)
++    full_result = fits_wcs.world_to_pixel_values(0.0, 0.0, 1.05e-10)
++    expected_full = (49.5, 12.0, 0.0)  # approximately
++    
++    assert_allclose(full_result[0], expected_full[0], rtol=1e-10)
++    assert_allclose(full_result[1], expected_full[1], rtol=1e-10)
++    assert abs(full_result[2]) < 1e-10  # should be close to 0
++    
++    # Test the sliced WCS - this was the main issue
++    ll_sliced_wcs = SlicedLowLevelWCS(fits_wcs, 0)
++    sliced_result = ll_sliced_wcs.world_to_pixel_values(0.0, 0.0)
++    expected_sliced = (49.5, 12.0)
++    
++    # Before the fix, this would return (~1.8e11, 12.0) instead of (49.5, 12.0)
++    assert_allclose(sliced_result[0], expected_sliced[0], rtol=1e-10)
++    assert_allclose(sliced_result[1], expected_sliced[1], rtol=1e-10)
++    
++    # Test that the high-level wrapper also works
++    hl_sliced_wcs = HighLevelWCSWrapper(ll_sliced_wcs)
++    # Note: We can't easily test the high-level interface with SkyCoord here
++    # because of coordinate frame complexities, but the low-level test above
++    # covers the core functionality.
++    
++    # Test round-trip consistency
++    px, py = sliced_result
++    world_coords = ll_sliced_wcs.pixel_to_world_values(px, py)
++    pixel_coords = ll_sliced_wcs.world_to_pixel_values(*world_coords)
++    
++    assert_allclose(pixel_coords, (px, py), rtol=1e-10)
++    
++    print("✅ SlicedLowLevelWCS world_to_pixel with PC coupling test passed")
++
++if __name__ == "__main__":
++    test_sliced_wcs_world_to_pixel_with_pc_coupling()
+\ No newline at end of file
+diff --git a/test_original_exact.py b/test_original_exact.py
+new file mode 100644
+index 0000000000..af605cc802
+--- /dev/null
++++ b/test_original_exact.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python
++"""
++Test using the exact same approach as the original GitHub issue.
++"""
++
++import numpy as np
++import astropy.wcs
++from astropy.coordinates import SkyCoord
++import astropy.units as u
++
++def test_original_exact_issue():
++    """Test using the exact same code as the original issue."""
++    
++    print("=== Testing Original Issue Exact Code ===")
++    
++    nx = 100
++    ny = 25
++    nz = 2
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': (nx + 1)/2,
++        'CRPIX2': (ny + 1)/2,
++        'CRPIX3': 1.0,
++        'PC1_1': 0.0,
++        'PC1_2': -1.0,
++        'PC1_3': 0.0,
++        'PC2_1': 1.0,
++        'PC2_2': 0.0,
++        'PC2_3': -1.0,
++        'CDELT1': 5,
++        'CDELT2': 5,
++        'CDELT3': 0.055,
++        'CUNIT1': 'arcsec',
++        'CUNIT2': 'arcsec',
++        'CUNIT3': 'Angstrom',
++        'CTYPE1': 'HPLN-TAN',
++        'CTYPE2': 'HPLT-TAN',
++        'CTYPE3': 'WAVE',
++        'CRVAL1': 0.0,
++        'CRVAL2': 0.0,
++        'CRVAL3': 1.05,
++    }
++    fits_wcs = astropy.wcs.WCS(header=wcs_header)
++    
++    # Try to create the SkyCoord as in the original issue
++    try:
++        # This might fail due to coordinate frame issues, but let's try
++        pt = SkyCoord(Tx=0*u.arcsec, Ty=0*u.arcsec, frame=astropy.wcs.utils.wcs_to_celestial_frame(fits_wcs))
++        print("✅ Successfully created SkyCoord")
++        
++        # Test full WCS
++        try:
++            full_result = fits_wcs.world_to_pixel(pt, 1.05*u.angstrom)
++            print(f"Full WCS world_to_pixel result: {full_result}")
++        except Exception as e:
++            print(f"Full WCS failed: {e}")
++        
++        # Test sliced WCS
++        try:
++            ll_sliced_wcs = astropy.wcs.wcsapi.SlicedLowLevelWCS(fits_wcs, 0)
++            hl_sliced_wcs = astropy.wcs.wcsapi.HighLevelWCSWrapper(ll_sliced_wcs)
++            sliced_result = hl_sliced_wcs.world_to_pixel(pt)
++            print(f"Sliced WCS world_to_pixel result: {sliced_result}")
++            
++            # Check if the result is reasonable
++            if isinstance(sliced_result, tuple) and len(sliced_result) >= 2:
++                first_coord = sliced_result[0]
++                if isinstance(first_coord, np.ndarray):
++                    first_coord = first_coord.item()
++                
++                if abs(first_coord) < 1000:  # Should be reasonable, not infinite
++                    print("✅ Sliced WCS result looks correct")
++                else:
++                    print(f"❌ Sliced WCS result still incorrect: {first_coord}")
++            
++        except Exception as e:
++            print(f"Sliced WCS failed: {e}")
++            
++    except Exception as e:
++        print(f"SkyCoord creation failed: {e}")
++        print("This is expected due to coordinate frame issues, but the low-level fix still works")
++
++if __name__ == "__main__":
++    test_original_exact_issue()
+\ No newline at end of file

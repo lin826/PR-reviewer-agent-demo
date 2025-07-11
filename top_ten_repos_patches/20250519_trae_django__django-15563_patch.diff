@@ -1,0 +1,64 @@
+diff --git a/django/db/models/sql/subqueries.py b/django/db/models/sql/subqueries.py
+index 04063f73bc..0abb44dc68 100644
+--- a/django/db/models/sql/subqueries.py
++++ b/django/db/models/sql/subqueries.py
+@@ -3,6 +3,7 @@ Query subclasses which provide extra functionality beyond simple data retrieval.
+ """
+ 
+ from django.core.exceptions import FieldError
++from django.db import connections
+ from django.db.models.sql.constants import CURSOR, GET_ITERATOR_CHUNK_SIZE, NO_RESULTS
+ from django.db.models.sql.query import Query
+ 
+@@ -134,7 +135,49 @@ class UpdateQuery(Query):
+             query = UpdateQuery(model)
+             query.values = values
+             if self.related_ids is not None:
+-                query.add_filter("pk__in", self.related_ids)
++                # For multi-table inheritance, need to find the right column in the right parent table
++                parent_model = self.get_meta().model
++                # We need to check if we're in a multi-inheritance scenario
++                parent_bases = [b for b in parent_model.__bases__ if hasattr(b, '_meta')]
++                if len(parent_bases) > 1:
++                    # Find correct parent link for this model
++                    for parent_base in parent_bases:
++                        if model == parent_base or model == parent_base._meta.concrete_model:
++                            # This is the parent model we're updating
++                            # Find the pointer from child to this parent
++                            parent_link = parent_model._meta.get_ancestor_link(parent_base)
++                            if parent_link is not None:
++                                # Build a query to get the related parent IDs
++                                from django.db import connections
++                                # Get connection using the default db
++                                connection = connections['default']
++                                qn = connection.ops.quote_name
++                                
++                                # Get the table and column names needed for the SQL
++                                child_table = parent_model._meta.db_table
++                                child_column = parent_model._meta.pk.column
++                                
++                                # Pointer column in child table that refers to this parent
++                                linking_column = parent_link.column
++                                
++                                # Create lookup query to get the correct parent IDs
++                                with connection.cursor() as cursor:
++                                    pk_placeholders = ','.join(['%s'] * len(self.related_ids))
++                                    sql = (
++                                        f"SELECT {qn(linking_column)} FROM {qn(child_table)} "
++                                        f"WHERE {qn(child_column)} IN ({pk_placeholders})"
++                                    )
++                                    cursor.execute(sql, list(self.related_ids))
++                                    parent_ids = [row[0] for row in cursor.fetchall() if row[0] is not None]
++                                
++                                query.add_filter("pk__in", parent_ids)
++                                break
++                    else:
++                        # If we didn't find a specific parent link, fall back to default behavior
++                        query.add_filter("pk__in", self.related_ids)
++                else:
++                    # Standard single inheritance case
++                    query.add_filter("pk__in", self.related_ids)
+             result.append(query)
+         return result
+ 
+

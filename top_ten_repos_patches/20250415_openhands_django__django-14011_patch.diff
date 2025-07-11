@@ -1,0 +1,75 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index 14dab517c9..dafb7a183c 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -79,7 +79,7 @@ class WSGIServer(simple_server.WSGIServer):
+ 
+ class ThreadedWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
+     """A threaded version of the WSGIServer"""
+-    daemon_threads = True
++    daemon_threads = False
+ 
+ 
+ class ServerHandler(simple_server.ServerHandler):
+@@ -206,10 +206,9 @@ def run(addr, port, wsgi_handler, ipv6=False, threading=False, server_cls=WSGISe
+     if threading:
+         # ThreadingMixIn.daemon_threads indicates how threads will behave on an
+         # abrupt shutdown; like quitting the server by the user or restarting
+-        # by the auto-reloader. True means the server will not wait for thread
+-        # termination before it quits. This will make auto-reloader faster
+-        # and will prevent the need to kill the server manually if a thread
+-        # isn't terminating correctly.
+-        httpd.daemon_threads = True
++        # by the auto-reloader. False means the server will wait for thread
++        # termination before it quits. This is important for test cases to ensure
++        # all database connections are properly closed when the tests finish.
++        httpd.daemon_threads = False
+     httpd.set_app(wsgi_handler)
+     httpd.serve_forever()
+diff --git a/test_db_conn_issue.py b/test_db_conn_issue.py
+new file mode 100644
+index 0000000000..63dea8b2fc
+--- /dev/null
++++ b/test_db_conn_issue.py
+@@ -0,0 +1,40 @@
++import os
++import sys
++import time
++from django.test import LiveServerTestCase
++import threading
++import requests
++from django.db import connections
++import django
++
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "django.conf.global_settings")
++django.setup()
++
++class DatabaseConnectionTest(LiveServerTestCase):
++    def test_connections(self):
++        # Start a thread that makes requests to the server
++        def make_requests():
++            # Make a few requests to ensure thread creation
++            for i in range(5):
++                try:
++                    requests.get(self.live_server_url)
++                    time.sleep(0.1)
++                except Exception as e:
++                    print(f"Request error: {e}")
++
++        t = threading.Thread(target=make_requests)
++        t.daemon = True
++        t.start()
++        t.join(timeout=2)
++
++        # Check if connections are properly closed
++        print("Current connections:", connections.all())
++        for conn in connections.all():
++            print(f"Connection {conn.alias} is closed: {conn.connection is None}")
++
++
++if __name__ == "__main__":
++    # This will run the test and should demonstrate the issue
++    from django.test.runner import DiscoverRunner
++    test_runner = DiscoverRunner(verbosity=2)
++    test_runner.run_tests(["test_db_conn_issue"])
+\ No newline at end of file

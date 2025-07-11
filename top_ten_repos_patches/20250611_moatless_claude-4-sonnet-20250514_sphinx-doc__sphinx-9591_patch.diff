@@ -1,0 +1,715 @@
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -2708,6 +2708,21 @@
+         real_modname = self.get_attr(self.parent or self.object, '__module__', None)
+         return real_modname or self.modname
+ 
++    def format_signature(self, **kwargs: Any) -> str:
++        """Format the signature for properties to include return type annotation."""
++        # Only apply signature formatting to regular properties, not cached properties
++        if safe_getattr(self.object, 'fget', None):  # regular property
++            func = self.object.fget
++            try:
++                signature = inspect.signature(func, type_aliases=self.config.autodoc_type_aliases)
++                if signature.return_annotation is not Parameter.empty:
++                    # Format the return annotation for inclusion in the signature
++                    return ' -> %s' % stringify_typehint(signature.return_annotation)
++            except (TypeError, ValueError):
++                pass
++        
++        return ''
++
+     def add_directive_header(self, sig: str) -> None:
+         super().add_directive_header(sig)
+         sourcename = self.get_sourcename()
+@@ -2716,26 +2731,22 @@
+         if self.isclassmethod:
+             self.add_line('   :classmethod:', sourcename)
+ 
+-        if safe_getattr(self.object, 'fget', None):  # property
+-            func = self.object.fget
+-        elif safe_getattr(self.object, 'func', None):  # cached_property
++        # Handle cached properties separately - they should continue to use :type: directive
++        if safe_getattr(self.object, 'func', None):  # cached_property
+             func = self.object.func
+-        else:
+-            func = None
+-
+-        if func and self.config.autodoc_typehints != 'none':
+-            try:
+-                signature = inspect.signature(func,
+-                                              type_aliases=self.config.autodoc_type_aliases)
+-                if signature.return_annotation is not Parameter.empty:
+-                    objrepr = stringify_typehint(signature.return_annotation)
+-                    self.add_line('   :type: ' + objrepr, sourcename)
+-            except TypeError as exc:
+-                logger.warning(__("Failed to get a function signature for %s: %s"),
+-                               self.fullname, exc)
+-                return None
+-            except ValueError:
+-                return None
++            if func and self.config.autodoc_typehints != 'none':
++                try:
++                    signature = inspect.signature(func,
++                                                  type_aliases=self.config.autodoc_type_aliases)
++                    if signature.return_annotation is not Parameter.empty:
++                        objrepr = stringify_typehint(signature.return_annotation)
++                        self.add_line('   :type: ' + objrepr, sourcename)
++                except TypeError as exc:
++                    logger.warning(__("Failed to get a function signature for %s: %s"),
++                                   self.fullname, exc)
++                    return None
++                except ValueError:
++                    return None
+ 
+ 
+ class NewTypeAttributeDocumenter(AttributeDocumenter):
+
+--- a/sphinx/ext/autodoc/typehints.py
++++ b/sphinx/ext/autodoc/typehints.py
+@@ -24,15 +24,19 @@
+                      options: Dict, args: str, retann: str) -> None:
+     """Record type hints to env object."""
+     try:
+-        if callable(obj):
++        if callable(obj) or inspect.isproperty(obj):
++            # Handle property objects by extracting the underlying function
++            if inspect.isproperty(obj):
++                obj = obj.fget
++            
+             annotations = app.env.temp_data.setdefault('annotations', {})
+             annotation = annotations.setdefault(name, OrderedDict())
+             sig = inspect.signature(obj, type_aliases=app.config.autodoc_type_aliases)
+             for param in sig.parameters.values():
+                 if param.annotation is not param.empty:
+-                    annotation[param.name] = typing.stringify(param.annotation)
++                    annotation[param.name] = typing.restify(param.annotation)
+             if sig.return_annotation is not sig.empty:
+-                annotation['return'] = typing.stringify(sig.return_annotation)
++                annotation['return'] = typing.restify(sig.return_annotation)
+     except (TypeError, ValueError):
+         pass
+ 
+
+--- a/debug_typehints.py
++++ b/debug_typehints.py
+@@ -0,0 +1,95 @@
++"""Debug script to understand typehints behavior."""
++
++import tempfile
++import os
++import shutil
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++# Create a test module
++test_module_content = '''
++class Point:
++    """A class representing a point."""
++    x: int
++    y: int
++
++class Square:
++    """A class representing a square figure."""
++    start: Point
++    
++    @property
++    def end(self) -> Point:
++        """Square's end position."""
++        return Point()
++'''
++
++# Create temporary directory for testing
++tmpdir = tempfile.mkdtemp()
++srcdir = os.path.join(tmpdir, 'source')
++outdir = os.path.join(tmpdir, 'build')
++doctreedir = os.path.join(outdir, '.doctrees')
++
++os.makedirs(srcdir)
++
++# Write test module
++with open(os.path.join(srcdir, 'test_module.py'), 'w') as f:
++    f.write(test_module_content)
++
++# Write index.rst
++index_content = '''
++Test Documentation
++==================
++
++.. automodule:: test_module
++   :members:
++'''
++
++with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++    f.write(index_content)
++
++# Write conf.py
++conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.autodoc.typehints']
++master_doc = 'index'
++'''
++
++with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++    f.write(conf_content)
++
++try:
++    with docutils_namespace():
++        app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++        
++        # Enable debug logging
++        def debug_record_typehints(app, objtype, name, obj, options, args, retann):
++            print(f"record_typehints called: objtype={objtype}, name={name}, obj={obj}")
++            if hasattr(obj, '__name__'):
++                print(f"  obj.__name__ = {obj.__name__}")
++            if hasattr(obj, 'fget'):
++                print(f"  obj.fget = {obj.fget}")
++            if args:
++                print(f"  args = {args}")
++            if retann:
++                print(f"  retann = {retann}")
++            return None
++        
++        # Connect our debug function
++        app.connect('autodoc-process-signature', debug_record_typehints)
++        
++        # Build
++        app.build()
++        
++        # Check what annotations were recorded
++        if hasattr(app.env, 'temp_data') and 'annotations' in app.env.temp_data:
++            print("\nRecorded annotations:")
++            for name, annotations in app.env.temp_data['annotations'].items():
++                print(f"  {name}: {annotations}")
++        else:
++            print("\nNo annotations recorded")
++
++finally:
++    shutil.rmtree(tmpdir)
+
+--- a/debug_fix.py
++++ b/debug_fix.py
+@@ -0,0 +1,123 @@
++"""Debug the fix."""
++
++import tempfile
++import os
++import shutil
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++# Create a test module
++test_module_content = '''
++class Point:
++    """A class representing a point."""
++    x: int
++    y: int
++
++class Square:
++    """A class representing a square figure."""
++    start: Point
++    
++    @property
++    def end(self) -> Point:
++        """Square's end position."""
++        return Point()
++'''
++
++# Create temporary directory for testing
++tmpdir = tempfile.mkdtemp()
++srcdir = os.path.join(tmpdir, 'source')
++outdir = os.path.join(tmpdir, 'build')
++doctreedir = os.path.join(outdir, '.doctrees')
++
++os.makedirs(srcdir)
++
++# Write test module
++with open(os.path.join(srcdir, 'test_module.py'), 'w') as f:
++    f.write(test_module_content)
++
++# Write index.rst
++index_content = '''
++Test Documentation
++==================
++
++.. automodule:: test_module
++   :members:
++'''
++
++with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++    f.write(index_content)
++
++# Write conf.py
++conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.autodoc.typehints']
++master_doc = 'index'
++'''
++
++with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++    f.write(conf_content)
++
++# Patch the record_typehints function to add debug output
++from sphinx.ext.autodoc import typehints
++original_record_typehints = typehints.record_typehints
++
++def debug_record_typehints(app, objtype, name, obj, options, args, retann):
++    print(f"DEBUG: record_typehints called: objtype={objtype}, name={name}")
++    print(f"  obj = {obj}")
++    print(f"  type(obj) = {type(obj)}")
++    
++    try:
++        from sphinx.util import inspect
++        if callable(obj):
++            print(f"  obj is callable")
++            
++            # Handle property objects by extracting the underlying function
++            if inspect.isproperty(obj):
++                print(f"  obj is property, extracting fget")
++                obj = obj.fget
++                print(f"  extracted obj = {obj}")
++            
++            annotations = app.env.temp_data.setdefault('annotations', {})
++            annotation = annotations.setdefault(name, {})
++            
++            sig = inspect.signature(obj, type_aliases=app.config.autodoc_type_aliases)
++            print(f"  signature = {sig}")
++            
++            for param in sig.parameters.values():
++                if param.annotation is not param.empty:
++                    annotation[param.name] = str(param.annotation)
++                    print(f"  added param annotation: {param.name} = {param.annotation}")
++            if sig.return_annotation is not sig.empty:
++                annotation['return'] = str(sig.return_annotation)
++                print(f"  added return annotation: {sig.return_annotation}")
++                
++            print(f"  final annotation for {name}: {annotation}")
++        else:
++            print(f"  obj is not callable")
++    except Exception as exc:
++        print(f"  Exception: {exc}")
++        import traceback
++        traceback.print_exc()
++
++typehints.record_typehints = debug_record_typehints
++
++try:
++    with docutils_namespace():
++        app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++        
++        # Build
++        app.build()
++        
++        # Check what annotations were recorded
++        if hasattr(app.env, 'temp_data') and 'annotations' in app.env.temp_data:
++            print("\nFinal recorded annotations:")
++            for name, annotations in app.env.temp_data['annotations'].items():
++                print(f"  {name}: {annotations}")
++        else:
++            print("\nNo annotations recorded")
++
++finally:
++    shutil.rmtree(tmpdir)
+
+--- a/debug_fix2.py
++++ b/debug_fix2.py
+@@ -0,0 +1,123 @@
++"""Debug the fix with updated patch."""
++
++import tempfile
++import os
++import shutil
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++# Create a test module
++test_module_content = '''
++class Point:
++    """A class representing a point."""
++    x: int
++    y: int
++
++class Square:
++    """A class representing a square figure."""
++    start: Point
++    
++    @property
++    def end(self) -> Point:
++        """Square's end position."""
++        return Point()
++'''
++
++# Create temporary directory for testing
++tmpdir = tempfile.mkdtemp()
++srcdir = os.path.join(tmpdir, 'source')
++outdir = os.path.join(tmpdir, 'build')
++doctreedir = os.path.join(outdir, '.doctrees')
++
++os.makedirs(srcdir)
++
++# Write test module
++with open(os.path.join(srcdir, 'test_module.py'), 'w') as f:
++    f.write(test_module_content)
++
++# Write index.rst
++index_content = '''
++Test Documentation
++==================
++
++.. automodule:: test_module
++   :members:
++'''
++
++with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++    f.write(index_content)
++
++# Write conf.py
++conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.autodoc.typehints']
++master_doc = 'index'
++'''
++
++with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++    f.write(conf_content)
++
++# Patch the record_typehints function to add debug output
++from sphinx.ext.autodoc import typehints
++from sphinx.util import inspect, typing
++from collections import OrderedDict
++
++def debug_record_typehints(app, objtype, name, obj, options, args, retann):
++    print(f"DEBUG: record_typehints called: objtype={objtype}, name={name}")
++    print(f"  obj = {obj}")
++    print(f"  type(obj) = {type(obj)}")
++    
++    try:
++        if callable(obj) or inspect.isproperty(obj):
++            print(f"  obj is callable or property")
++            
++            # Handle property objects by extracting the underlying function
++            if inspect.isproperty(obj):
++                print(f"  obj is property, extracting fget")
++                obj = obj.fget
++                print(f"  extracted obj = {obj}")
++            
++            annotations = app.env.temp_data.setdefault('annotations', {})
++            annotation = annotations.setdefault(name, OrderedDict())
++            
++            sig = inspect.signature(obj, type_aliases=app.config.autodoc_type_aliases)
++            print(f"  signature = {sig}")
++            
++            for param in sig.parameters.values():
++                if param.annotation is not param.empty:
++                    annotation[param.name] = typing.stringify(param.annotation)
++                    print(f"  added param annotation: {param.name} = {param.annotation}")
++            if sig.return_annotation is not sig.empty:
++                annotation['return'] = typing.stringify(sig.return_annotation)
++                print(f"  added return annotation: {sig.return_annotation}")
++                
++            print(f"  final annotation for {name}: {annotation}")
++        else:
++            print(f"  obj is not callable or property")
++    except Exception as exc:
++        print(f"  Exception: {exc}")
++        import traceback
++        traceback.print_exc()
++
++typehints.record_typehints = debug_record_typehints
++
++try:
++    with docutils_namespace():
++        app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++        
++        # Build
++        app.build()
++        
++        # Check what annotations were recorded
++        if hasattr(app.env, 'temp_data') and 'annotations' in app.env.temp_data:
++            print("\nFinal recorded annotations:")
++            for name, annotations in app.env.temp_data['annotations'].items():
++                print(f"  {name}: {annotations}")
++        else:
++            print("\nNo annotations recorded")
++
++finally:
++    shutil.rmtree(tmpdir)
+
+--- a/debug_fix3.py
++++ b/debug_fix3.py
+@@ -0,0 +1,82 @@
++"""Debug the fix with better debugging."""
++
++import tempfile
++import os
++import shutil
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++# Create a test module
++test_module_content = '''
++class Point:
++    """A class representing a point."""
++    x: int
++    y: int
++
++class Square:
++    """A class representing a square figure."""
++    start: Point
++    
++    @property
++    def end(self) -> Point:
++        """Square's end position."""
++        return Point()
++'''
++
++# Create temporary directory for testing
++tmpdir = tempfile.mkdtemp()
++srcdir = os.path.join(tmpdir, 'source')
++outdir = os.path.join(tmpdir, 'build')
++doctreedir = os.path.join(outdir, '.doctrees')
++
++os.makedirs(srcdir)
++
++# Write test module
++with open(os.path.join(srcdir, 'test_module.py'), 'w') as f:
++    f.write(test_module_content)
++
++# Write index.rst
++index_content = '''
++Test Documentation
++==================
++
++.. automodule:: test_module
++   :members:
++'''
++
++with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++    f.write(index_content)
++
++# Write conf.py
++conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.autodoc.typehints']
++master_doc = 'index'
++'''
++
++with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++    f.write(conf_content)
++
++try:
++    with docutils_namespace():
++        app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++        
++        # Build
++        app.build()
++        
++        # Check what temp_data contains
++        print(f"app.env.temp_data = {app.env.temp_data}")
++        
++        # Check what annotations were recorded
++        if hasattr(app.env, 'temp_data') and 'annotations' in app.env.temp_data:
++            print("Recorded annotations:")
++            for name, annotations in app.env.temp_data['annotations'].items():
++                print(f"  {name}: {annotations}")
++        else:
++            print("No annotations recorded in temp_data")
++
++finally:
++    shutil.rmtree(tmpdir)
+
+--- a/show_full_html.py
++++ b/show_full_html.py
+@@ -0,0 +1,91 @@
++"""Show the full HTML to understand what's being generated."""
++
++import tempfile
++import os
++import shutil
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++# Create a test module
++test_module_content = '''
++class Point:
++    """A class representing a point."""
++    x: int
++    y: int
++
++class Square:
++    """A class representing a square figure."""
++    start: Point
++    
++    @property
++    def end(self) -> Point:
++        """Square's end position."""
++        return Point()
++'''
++
++# Create temporary directory for testing
++tmpdir = tempfile.mkdtemp()
++srcdir = os.path.join(tmpdir, 'source')
++outdir = os.path.join(tmpdir, 'build')
++doctreedir = os.path.join(outdir, '.doctrees')
++
++os.makedirs(srcdir)
++
++# Write test module
++with open(os.path.join(srcdir, 'test_module.py'), 'w') as f:
++    f.write(test_module_content)
++
++# Write index.rst
++index_content = '''
++Test Documentation
++==================
++
++.. automodule:: test_module
++   :members:
++'''
++
++with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++    f.write(index_content)
++
++# Write conf.py
++conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.autodoc.typehints']
++master_doc = 'index'
++'''
++
++with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++    f.write(conf_content)
++
++try:
++    with docutils_namespace():
++        app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++        
++        # Build
++        app.build()
++        
++        # Read the generated HTML
++        html_file = os.path.join(outdir, 'index.html')
++        if os.path.exists(html_file):
++            with open(html_file, 'r') as f:
++                content = f.read()
++                
++            # Extract just the main content (skip HTML boilerplate)
++            lines = content.split('\n')
++            in_content = False
++            for line in lines:
++                if '<div class="section" id="test-documentation">' in line:
++                    in_content = True
++                elif '</div>' in line and 'role="contentinfo"' in line:
++                    in_content = False
++                
++                if in_content:
++                    print(line)
++        else:
++            print("HTML file not found")
++
++finally:
++    shutil.rmtree(tmpdir)
+
+--- a/show_content.py
++++ b/show_content.py
+@@ -0,0 +1,85 @@
++"""Show key content from the HTML."""
++
++import tempfile
++import os
++import shutil
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++# Create a test module
++test_module_content = '''
++class Point:
++    """A class representing a point."""
++    x: int
++    y: int
++
++class Square:
++    """A class representing a square figure."""
++    start: Point
++    
++    @property
++    def end(self) -> Point:
++        """Square's end position."""
++        return Point()
++'''
++
++# Create temporary directory for testing
++tmpdir = tempfile.mkdtemp()
++srcdir = os.path.join(tmpdir, 'source')
++outdir = os.path.join(tmpdir, 'build')
++doctreedir = os.path.join(outdir, '.doctrees')
++
++os.makedirs(srcdir)
++
++# Write test module
++with open(os.path.join(srcdir, 'test_module.py'), 'w') as f:
++    f.write(test_module_content)
++
++# Write index.rst
++index_content = '''
++Test Documentation
++==================
++
++.. automodule:: test_module
++   :members:
++'''
++
++with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++    f.write(index_content)
++
++# Write conf.py
++conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.autodoc', 'sphinx.ext.autodoc.typehints']
++master_doc = 'index'
++'''
++
++with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++    f.write(conf_content)
++
++try:
++    with docutils_namespace():
++        app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++        
++        # Build
++        app.build()
++        
++        # Read the generated HTML
++        html_file = os.path.join(outdir, 'index.html')
++        if os.path.exists(html_file):
++            with open(html_file, 'r') as f:
++                content = f.read()
++                
++            # Look for class and property content
++            lines = content.split('\n')
++            for i, line in enumerate(lines):
++                if 'Square' in line or 'Point' in line or 'start' in line or 'end' in line:
++                    print(f"{i}: {line}")
++        else:
++            print("HTML file not found")
++
++finally:
++    shutil.rmtree(tmpdir)

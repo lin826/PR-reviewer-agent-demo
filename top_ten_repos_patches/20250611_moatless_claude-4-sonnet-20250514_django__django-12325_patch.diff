@@ -1,0 +1,95 @@
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -204,7 +204,15 @@
+             for field in base._meta.local_fields:
+                 if isinstance(field, OneToOneField):
+                     related = resolve_relation(new_class, field.remote_field.model)
+-                    parent_links[make_model_tuple(related)] = field
++                    key = make_model_tuple(related)
++                    # If there's already a parent link for this model, only replace it
++                    # if the current field has parent_link=True and the existing one doesn't.
++                    # This ensures that explicit parent_link=True fields take precedence.
++                    if key not in parent_links or (
++                        field.remote_field.parent_link and 
++                        not parent_links[key].remote_field.parent_link
++                    ):
++                        parent_links[key] = field
+ 
+         # Track fields inherited from base models.
+         inherited_attributes = set()
+
+--- a/debug_parent_links.py
++++ b/debug_parent_links.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the testbed directory to sys.path to import Django
++sys.path.insert(0, '/testbed')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        SECRET_KEY='test-secret-key'
++    )
++
++# Setup Django
++django.setup()
++
++from django.db import models
++
++print("Debugging parent_links dictionary...")
++
++class Document(models.Model):
++    class Meta:
++        app_label = '__main__'
++
++# Let's patch the ModelBase.__new__ method to debug what happens
++import django.db.models.base
++original_new = django.db.models.base.ModelBase.__new__
++
++def debug_new(cls, name, bases, attrs, **kwargs):
++    print(f"\n=== Creating model {name} ===")
++    result = original_new(cls, name, bases, attrs, **kwargs)
++    
++    if hasattr(result, '_meta') and hasattr(result._meta, 'parents'):
++        print(f"Model {name} parents: {result._meta.parents}")
++        if result._meta.parents:
++            for parent, field in result._meta.parents.items():
++                print(f"  Parent {parent}: field {field} (parent_link={field.remote_field.parent_link if field else 'N/A'})")
++    
++    return result
++
++django.db.models.base.ModelBase.__new__ = debug_new
++
++print("\n=== Creating model with document_ptr first, origin second ===")
++try:
++    class Picking(Document):
++        class Meta:
++            app_label = '__main__'
++        
++        document_ptr = models.OneToOneField(Document, on_delete=models.CASCADE, parent_link=True, related_name='+')
++        origin = models.OneToOneField(Document, related_name='picking', on_delete=models.PROTECT)
++    
++    print("SUCCESS: Model created successfully")
++    
++except Exception as e:
++    print(f"ERROR: {e}")
++
++print("\nTest completed.")

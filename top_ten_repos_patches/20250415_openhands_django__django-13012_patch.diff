@@ -1,0 +1,293 @@
+diff --git a/check_fix.py b/check_fix.py
+new file mode 100644
+index 0000000000..a3a205aeee
+--- /dev/null
++++ b/check_fix.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++
++# This script directly checks if our fix works by importing the freshly modified modules
++
++import importlib
++import sys
++import os
++
++# Force reimport of the django.db.models.expressions module
++if 'django.db.models.expressions' in sys.modules:
++    del sys.modules['django.db.models.expressions']
++
++# Now import the freshly modified module
++from django.db.models.expressions import ExpressionWrapper, Value
++from django.db.models import IntegerField
++
++# Create test expressions
++value = Value(3)
++wrapped_value = ExpressionWrapper(value, output_field=IntegerField())
++
++# Print results
++print(f"Value(3).get_group_by_cols(): {value.get_group_by_cols()}")
++print(f"ExpressionWrapper(Value(3)).get_group_by_cols(): {wrapped_value.get_group_by_cols()}")
++
++# Check if our fix worked
++if wrapped_value.get_group_by_cols() == value.get_group_by_cols():
++    print("\nFix successful! ExpressionWrapper now correctly delegates to the wrapped expression.")
++else:
++    print("\nFix did not work. ExpressionWrapper is using the wrong implementation.")
+\ No newline at end of file
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index c1a76584f0..a8f8b427ca 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -866,6 +866,9 @@ class ExpressionWrapper(Expression):
+     def as_sql(self, compiler, connection):
+         return self.expression.as_sql(compiler, connection)
+ 
++    def get_group_by_cols(self, alias=None):
++        return self.expression.get_group_by_cols(alias)
++
+     def __repr__(self):
+         return "{}({})".format(self.__class__.__name__, self.expression)
+ 
+diff --git a/test_reproducer/__init__.py b/test_reproducer/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/test_reproducer/debug_expr_wrapper.py b/test_reproducer/debug_expr_wrapper.py
+new file mode 100644
+index 0000000000..664cb9448e
+--- /dev/null
++++ b/test_reproducer/debug_expr_wrapper.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import inspect
++import django
++from django.db import models
++from django.db.models import F, Value, IntegerField, Sum, ExpressionWrapper
++from django.db.models.expressions import Expression
++
++# Set up Django environment
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_reproducer.settings')
++django.setup()
++
++# Debug the ExpressionWrapper class
++print("Checking ExpressionWrapper implementation:")
++print(f"Has get_group_by_cols? {'get_group_by_cols' in dir(ExpressionWrapper)}")
++print(f"Source of get_group_by_cols: {inspect.getsource(ExpressionWrapper.get_group_by_cols)}")
++
++# Define a simple model for testing
++class TestModel(models.Model):
++    column_a = models.IntegerField()
++    column_b = models.IntegerField()
++
++    class Meta:
++        app_label = 'test_reproducer'
++        db_table = 'test_model'
++
++# Create a value and check its group_by_cols behavior
++value = Value(3)
++print(f"\nValue(3).get_group_by_cols(): {value.get_group_by_cols()}")
++
++# Wrap it in ExpressionWrapper and check behavior
++wrapped_value = ExpressionWrapper(value, output_field=IntegerField())
++print(f"ExpressionWrapper(Value(3)).get_group_by_cols(): {wrapped_value.get_group_by_cols()}")
++
++# Create queries and inspect them
++def exec_query_with_wrapper():
++    expr = Value(3)
++    expr = ExpressionWrapper(expr, output_field=IntegerField())
++    query = TestModel.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    sql, params = query.query.sql_with_params()
++    print("\nSQL with ExpressionWrapper:")
++    print(sql)
++    return sql, params, query
++
++def exec_query_without_wrapper():
++    query = TestModel.objects.annotate(expr_res=Value(3, output_field=IntegerField())).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    sql, params = query.query.sql_with_params()
++    print("\nSQL without ExpressionWrapper:")
++    print(sql)
++    return sql, params, query
++
++# Execute both queries and debug
++sql_with_wrapper, params_with, query_with = exec_query_with_wrapper()
++sql_without_wrapper, params_without, query_without = exec_query_without_wrapper()
++
++# Print the GROUP BY clauses
++group_by_with = sql_with_wrapper.split("GROUP BY")[1].strip() if "GROUP BY" in sql_with_wrapper else "No GROUP BY"
++group_by_without = sql_without_wrapper.split("GROUP BY")[1].strip() if "GROUP BY" in sql_without_wrapper else "No GROUP BY"
++
++print("\nGROUP BY clause with wrapper:", group_by_with)
++print("GROUP BY clause without wrapper:", group_by_without)
++
++# Print the params
++print("\nParams with wrapper:", params_with)
++print("Params without wrapper:", params_without)
++
++# Count the items in GROUP BY
++group_by_terms_with_wrapper = group_by_with.count(",") + 1
++group_by_terms_without_wrapper = group_by_without.count(",") + 1
++
++print(f"\nGROUP BY terms with wrapper: {group_by_terms_with_wrapper}")
++print(f"GROUP BY terms without wrapper: {group_by_terms_without_wrapper}")
+\ No newline at end of file
+diff --git a/test_reproducer/reproduce_issue.py b/test_reproducer/reproduce_issue.py
+new file mode 100644
+index 0000000000..b04ff2e2bc
+--- /dev/null
++++ b/test_reproducer/reproduce_issue.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import django
++from django.db import models
++from django.db.models import F, Value, IntegerField, Sum, ExpressionWrapper
++
++# Set up Django environment
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_reproducer.settings')
++django.setup()
++
++# Define a simple model for testing
++class TestModel(models.Model):
++    column_a = models.IntegerField()
++    column_b = models.IntegerField()
++
++    class Meta:
++        app_label = 'test_reproducer'
++        db_table = 'test_model'
++
++def exec_query_with_wrapper():
++    # Reproduce the issue with ExpressionWrapper wrapping a constant value
++    expr = Value(3)
++    expr = ExpressionWrapper(expr, output_field=IntegerField())
++    query = TestModel.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    sql, params = query.query.sql_with_params()
++    print("SQL with ExpressionWrapper:")
++    print(sql)
++    return sql
++
++def exec_query_without_wrapper():
++    # Direct use of Value without ExpressionWrapper (no issue here)
++    query = TestModel.objects.annotate(expr_res=Value(3, output_field=IntegerField())).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    sql, params = query.query.sql_with_params()
++    print("\nSQL without ExpressionWrapper:")
++    print(sql)
++    return sql
++
++if __name__ == "__main__":
++    # Execute both queries and compare results
++    sql_with_wrapper = exec_query_with_wrapper()
++    sql_without_wrapper = exec_query_without_wrapper()
++    
++    # Verify if the issue is present by checking the number of terms in GROUP BY
++    group_by_terms_with_wrapper = sql_with_wrapper.split("GROUP BY")[1].strip().count(",") + 1
++    group_by_terms_without_wrapper = sql_without_wrapper.split("GROUP BY")[1].strip().count(",") + 1
++    
++    if group_by_terms_with_wrapper > group_by_terms_without_wrapper:
++        print("\nISSUE CONFIRMED: ExpressionWrapper incorrectly includes constant in GROUP BY clause")
++        print(f"GROUP BY terms with wrapper: {group_by_terms_with_wrapper}")
++        print(f"GROUP BY terms without wrapper: {group_by_terms_without_wrapper}")
++    else:
++        print("\nIssue not reproduced or already fixed")
+\ No newline at end of file
+diff --git a/test_reproducer/settings.py b/test_reproducer/settings.py
+new file mode 100644
+index 0000000000..dd041a7819
+--- /dev/null
++++ b/test_reproducer/settings.py
+@@ -0,0 +1,8 @@
++SECRET_KEY = 'fake-key'
++INSTALLED_APPS = ['test_reproducer']
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': ':memory:',
++    }
++}
+\ No newline at end of file
+diff --git a/test_reproducer/verify_fix.py b/test_reproducer/verify_fix.py
+new file mode 100644
+index 0000000000..b7272012e2
+--- /dev/null
++++ b/test_reproducer/verify_fix.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import importlib
++
++# Force reimporting necessary modules
++if 'django.db.models.expressions' in sys.modules:
++    del sys.modules['django.db.models.expressions']
++
++# Set up Django environment
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_reproducer.settings')
++
++import django
++django.setup()
++
++from django.db import models
++from django.db.models import F, Value, IntegerField, Sum, ExpressionWrapper
++
++# Define a simple model for testing
++class TestModel(models.Model):
++    column_a = models.IntegerField()
++    column_b = models.IntegerField()
++
++    class Meta:
++        app_label = 'test_reproducer'
++        db_table = 'test_model'
++
++def exec_query_with_wrapper():
++    # Reproduce the issue with ExpressionWrapper wrapping a constant value
++    expr = Value(3)
++    expr = ExpressionWrapper(expr, output_field=IntegerField())
++    query = TestModel.objects.annotate(expr_res=expr).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    sql, params = query.query.sql_with_params()
++    print("SQL with ExpressionWrapper:")
++    print(sql)
++    # Print the params too
++    print("Parameters:", params)
++    return sql, params
++
++def exec_query_without_wrapper():
++    # Direct use of Value without ExpressionWrapper (no issue here)
++    query = TestModel.objects.annotate(expr_res=Value(3, output_field=IntegerField())).values('expr_res', 'column_a').annotate(sum=Sum('column_b'))
++    sql, params = query.query.sql_with_params()
++    print("\nSQL without ExpressionWrapper:")
++    print(sql)
++    # Print the params too
++    print("Parameters:", params)
++    return sql, params
++
++# Execute both queries and compare results
++sql_with_wrapper, params_with = exec_query_with_wrapper()
++sql_without_wrapper, params_without = exec_query_without_wrapper()
++
++# Print GROUP BY clauses
++group_by_with = sql_with_wrapper.split("GROUP BY")[1].strip()
++group_by_without = sql_without_wrapper.split("GROUP BY")[1].strip()
++
++print("\nGROUP BY clause with wrapper:", group_by_with)
++print("GROUP BY clause without wrapper:", group_by_without)
++
++# Count the number of terms in GROUP BY
++group_by_terms_with_wrapper = group_by_with.count(",") + 1
++group_by_terms_without_wrapper = group_by_without.count(",") + 1
++
++print(f"\nGROUP BY terms with wrapper: {group_by_terms_with_wrapper}")
++print(f"GROUP BY terms without wrapper: {group_by_terms_without_wrapper}")
++
++# Check if the fix worked
++if group_by_terms_with_wrapper == group_by_terms_without_wrapper:
++    print("\nFIX SUCCESSFUL! ExpressionWrapper correctly handles constant expressions in GROUP BY.")
++else:
++    print("\nFIX FAILED: ExpressionWrapper still includes constant in GROUP BY clause.")
+\ No newline at end of file

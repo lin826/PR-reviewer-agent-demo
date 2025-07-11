@@ -1,0 +1,201 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..7c00cdf347 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -425,6 +425,20 @@ class ReverseOneToOneDescriptor:
+                 )
+             )
+         else:
++            # If this is a circular reference (e.g., User -> Profile -> User),
++            # ensure that any fields loaded in the related object are copied to the original object
++            if hasattr(rel_obj, '_prefetched_objects_cache'):
++                # Check if this is a circular reference by looking for a prefetch with the same model
++                for prefetch_name, prefetched_qs in rel_obj._prefetched_objects_cache.items():
++                    if prefetched_qs.model == rel_obj.__class__:
++                        # We have a circular reference - copy any loaded fields from the prefetched objects
++                        for prefetched_obj in prefetched_qs.all():
++                            if prefetched_obj.pk == rel_obj.pk:
++                                # Copy any non-deferred fields from prefetched_obj to rel_obj
++                                for field in rel_obj._meta.concrete_fields:
++                                    attname = field.attname
++                                    if attname in prefetched_obj.__dict__ and attname not in rel_obj.__dict__:
++                                        rel_obj.__dict__[attname] = prefetched_obj.__dict__[attname]
+             return rel_obj
+ 
+     def __set__(self, instance, value):
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fb6639793a..277c36b0f2 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -65,6 +65,16 @@ class ModelIterable(BaseIterable):
+                 for from_field in field.from_fields
+             ])) for field, related_objs in queryset._known_related_objects.items()
+         ]
++        
++        # Use a global identity map to track objects across different queries
++        # This is crucial for handling circular references correctly
++        if not hasattr(model_cls, '_global_identity_map'):
++            model_cls._global_identity_map = {}
++        identity_map = model_cls._global_identity_map
++        
++        # Local identity map for this query
++        seen_objs = {}
++        
+         for row in compiler.results_iter(results):
+             obj = model_cls.from_db(db, init_list, row[model_fields_start:model_fields_end])
+             for rel_populator in related_populators:
+@@ -73,6 +83,23 @@ class ModelIterable(BaseIterable):
+                 for attr_name, col_pos in annotation_col_map.items():
+                     setattr(obj, attr_name, row[col_pos])
+ 
++            # Check if this object has been seen before in this query or globally
++            existing = seen_objs.get(obj.pk) or identity_map.get(obj.pk)
++            
++            if existing is not None:
++                # Merge newly realized (not-yet-present) columns
++                for f in model_cls._meta.concrete_fields:
++                    a = f.attname
++                    if a in obj.__dict__ and a not in existing.__dict__:
++                        # Copy the attribute from the new object to the existing one
++                        existing.__dict__[a] = obj.__dict__[a]
++                # Use the existing object
++                obj = existing
++            else:
++                # First time seeing this object, store it in both identity maps
++                seen_objs[obj.pk] = obj
++                identity_map[obj.pk] = obj
++
+             # Add the known related objects to the model.
+             for field, rel_objs, rel_getter in known_related_objects:
+                 # Avoid overwriting objects loaded by, e.g., select_related().
+@@ -1692,6 +1719,14 @@ def prefetch_related_objects(model_instances, *related_lookups):
+ 
+     auto_lookups = set()  # we add to this as we go through.
+     followed_descriptors = set()  # recursion protection
++    
++    # Keep track of all model instances by model and pk for handling circular references
++    instance_map = {}
++    for instance in model_instances:
++        model_name = instance.__class__.__name__
++        if model_name not in instance_map:
++            instance_map[model_name] = {}
++        instance_map[model_name][instance.pk] = instance
+ 
+     all_lookups = normalize_prefetch_lookups(reversed(related_lookups))
+     while all_lookups:
+@@ -1771,6 +1806,26 @@ def prefetch_related_objects(model_instances, *related_lookups):
+                     lookup,
+                     level,
+                 )
++                
++                # Handle circular references by updating the original instances with any
++                # fields loaded in the prefetched instances
++                for obj in obj_list:
++                    if obj.pk is not None:
++                        model_name = obj.__class__.__name__
++                        if model_name in instance_map and obj.pk in instance_map[model_name]:
++                            original = instance_map[model_name][obj.pk]
++                            if original is not obj:  # Different instances of the same object
++                                # Copy any non-deferred fields from obj to original
++                                for field in obj._meta.concrete_fields:
++                                    attname = field.attname
++                                    if attname in obj.__dict__ and attname not in original.__dict__:
++                                        original.__dict__[attname] = obj.__dict__[attname]
++                        else:
++                            # Add this object to the instance map
++                            if model_name not in instance_map:
++                                instance_map[model_name] = {}
++                            instance_map[model_name][obj.pk] = obj
++                
+                 # We need to ensure we don't keep adding lookups from the
+                 # same relationships to stop infinite recursion. So, if we
+                 # are already on an automatically added lookup, don't add
+@@ -1944,6 +1999,18 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+                 # cache_name points to a field name in obj.
+                 # This field is a descriptor for a related object.
+                 setattr(obj, cache_name, val)
++                
++                # Handle circular references: if the related object is the same as one of our instances,
++                # copy any non-deferred fields from the prefetched object to the original instance
++                if val is not None and val.pk is not None:
++                    for instance in instances:
++                        if instance.pk == val.pk:
++                            # We have a circular reference - copy any loaded fields from val to instance
++                            for field in instance._meta.concrete_fields:
++                                attname = field.attname
++                                if attname in val.__dict__ and attname not in instance.__dict__:
++                                    # Field is loaded in val but deferred in instance
++                                    instance.__dict__[attname] = val.__dict__[attname]
+             else:
+                 # No to_attr has been given for this prefetch operation and the
+                 # cache_name does not point to a descriptor. Store the value of
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index 188b640850..677908c638 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -112,6 +112,59 @@ class DeferredAttribute:
+             # Let's see if the field is part of the parent chain. If so we
+             # might be able to reuse the already loaded value. Refs #18343.
+             val = self._check_parent_chain(instance)
++            
++            # Special handling for circular references in prefetch_related
++            if val is None:
++                # Check if this is a circular reference (e.g., User -> Profile -> User)
++                # by looking for a related object that might have this field loaded
++                
++                # Check if we have a related object with a relation back to us
++                # This is a special case for the issue at hand (User -> Profile -> User)
++                if hasattr(instance, '_prefetched_objects_cache'):
++                    # Look for prefetched objects
++                    for prefetch_name, prefetched_qs in instance._prefetched_objects_cache.items():
++                        # For each prefetched queryset
++                        for related_obj in prefetched_qs:
++                            # Check if the related object has a relation back to us
++                            if hasattr(related_obj, '_prefetched_objects_cache'):
++                                # Look for prefetched objects in the related object
++                                for rel_prefetch_name, rel_prefetched_qs in related_obj._prefetched_objects_cache.items():
++                                    # If this queryset contains objects of our type
++                                    if rel_prefetched_qs.model == instance.__class__:
++                                        # Look for an object with our PK
++                                        for back_obj in rel_prefetched_qs:
++                                            if back_obj.pk == instance.pk and field_name in back_obj.__dict__:
++                                                val = back_obj.__dict__[field_name]
++                                                break
++                                        if val is not None:
++                                            break
++                            if val is not None:
++                                break
++                        if val is not None:
++                            break
++                
++                # If we still don't have a value, try a more direct approach for OneToOne relations
++                if val is None:
++                    # Look for OneToOneField relations
++                    for rel_field in instance._meta.get_fields():
++                        if hasattr(rel_field, 'one_to_one') and rel_field.one_to_one:
++                            # Check if we have the related object
++                            if hasattr(instance, rel_field.name):
++                                related_obj = getattr(instance, rel_field.name)
++                                if related_obj is not None:
++                                    # Check if the related object has a relation back to us
++                                    for back_field in related_obj._meta.get_fields():
++                                        if (hasattr(back_field, 'related_model') and 
++                                            back_field.related_model == instance.__class__):
++                                            # Get the related object's relation back to us
++                                            if hasattr(related_obj, back_field.name):
++                                                back_obj = getattr(related_obj, back_field.name)
++                                                if back_obj is not None and field_name in back_obj.__dict__:
++                                                    val = back_obj.__dict__[field_name]
++                                                    break
++                                    if val is not None:
++                                        break
++            
+             if val is None:
+                 instance.refresh_from_db(fields=[field_name])
+             else:
+diff --git a/tests/migrations/__init__.py b/tests/migrations/__init__.py
+index e69de29bb2..8b13789179 100644
+--- a/tests/migrations/__init__.py
++++ b/tests/migrations/__init__.py
+@@ -0,0 +1 @@
++

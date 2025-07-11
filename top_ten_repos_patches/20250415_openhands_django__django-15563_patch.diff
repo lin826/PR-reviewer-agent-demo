@@ -1,0 +1,275 @@
+diff --git a/django/db/models/sql/subqueries.py b/django/db/models/sql/subqueries.py
+index 04063f73bc..d845fc7796 100644
+--- a/django/db/models/sql/subqueries.py
++++ b/django/db/models/sql/subqueries.py
+@@ -84,21 +84,29 @@ class UpdateQuery(Query):
+         querysets.
+         """
+         values_seq = []
++        meta = self.get_meta()
++        concrete_model = meta.concrete_model
++        
+         for name, val in values.items():
+-            field = self.get_meta().get_field(name)
++            field = meta.get_field(name)
+             direct = (
+                 not (field.auto_created and not field.concrete) or not field.concrete
+             )
+             model = field.model._meta.concrete_model
++            
+             if not direct or (field.is_relation and field.many_to_many):
+                 raise FieldError(
+                     "Cannot update model field %r (only non-relations and "
+                     "foreign keys permitted)." % field
+                 )
+-            if model is not self.get_meta().concrete_model:
++            
++            # The critical part: check if this field belongs to a parent model
++            # in a multi-table inheritance scenario
++            if model is not concrete_model:
+                 self.add_related_update(model, field, val)
+                 continue
+             values_seq.append((field, model, val))
++                
+         return self.add_update_fields(values_seq)
+ 
+     def add_update_fields(self, values_seq):
+@@ -129,13 +137,80 @@ class UpdateQuery(Query):
+         """
+         if not self.related_updates:
+             return []
++        
+         result = []
++        meta = self.get_meta()
++        concrete_model = meta.concrete_model
++        
++        # Check for multiple inheritance
++        multi_inheritance = False
++        if hasattr(concrete_model._meta, 'parents'):
++            # Count non-abstract parent models
++            non_abstract_parents = [p for p in concrete_model._meta.parents.keys()
++                                   if not p._meta.abstract]
++            multi_inheritance = len(non_abstract_parents) > 1
++        
+         for model, values in self.related_updates.items():
+             query = UpdateQuery(model)
+             query.values = values
+-            if self.related_ids is not None:
++            
++            # Short-circuit if there are no IDs to filter against
++            if self.related_ids is None or not self.related_ids:
++                result.append(query)
++                continue
++            
++            # For multiple inheritance, we need to handle parent links specially
++            if multi_inheritance:
++                # Find the correct parent link field for this model
++                parent_link = None
++                if hasattr(concrete_model._meta, 'parents'):
++                    parent_link = concrete_model._meta.parents.get(model)
++                    
++                if parent_link:
++                    # Get the related_ids via the child->parent linkage
++                    from django.db import models, connection
++                    
++                    # Get the ID mapping from Child to this specific parent
++                    # First build a query to select only Child instances' parent pointers
++                    child_table = concrete_model._meta.db_table
++                    
++                    # The parent link field may have a different name in the db
++                    if hasattr(parent_link, 'attname'):
++                        parent_link_field = parent_link.attname
++                    else:
++                        parent_link_field = parent_link.name
++                        
++                    # Get all current Child instances
++                    pk_column = concrete_model._meta.pk.attname
++                    child_ids_str = ",".join(str(id) for id in self.related_ids)
++                    
++                    # Build and execute query to get parent IDs for specified children
++                    parent_ids = []
++                    cursor = connection.cursor()
++                    try:
++                        cursor.execute(
++                            f"SELECT {parent_link_field} FROM {child_table} "
++                            f"WHERE {pk_column} IN ({child_ids_str})"
++                        )
++                        parent_ids = [row[0] for row in cursor.fetchall() if row[0] is not None]
++                    finally:
++                        cursor.close()
++                        
++                    # Use these IDs to filter the parent table
++                    if parent_ids:
++                        query.add_filter("pk__in", parent_ids)
++                    else:
++                        # Ensure no update if no IDs are found
++                        query.add_filter("pk__in", [])
++                else:
++                    # No parent link found, use default behavior
++                    query.add_filter("pk__in", self.related_ids)
++            else:
++                # Standard single inheritance behavior
+                 query.add_filter("pk__in", self.related_ids)
++                
+             result.append(query)
++            
+         return result
+ 
+ 
+diff --git a/test_multiple_inheritance.py b/test_multiple_inheritance.py
+new file mode 100755
+index 0000000000..1e0ad2475c
+--- /dev/null
++++ b/test_multiple_inheritance.py
+@@ -0,0 +1,150 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the QuerySet update issue with multiple inheritance.
++"""
++
++import os
++import sys
++import django
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.settings')
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'django.contrib.sessions',
++            'django.contrib.admin',
++        ],
++    )
++django.setup()
++
++# Import Django models
++from django.db import models
++from django.db.models import QuerySet
++
++# Define models for our test case
++class Base(models.Model):
++    base_id = models.AutoField(primary_key=True)
++    field_base = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++    
++class OtherBase(models.Model):
++    otherbase_id = models.AutoField(primary_key=True)
++    field_otherbase = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++    
++class Child(Base, OtherBase):
++    class Meta:
++        app_label = 'test_app'
++
++# Create all tables
++from django.db import connection
++
++# Create the tables directly using SQL to avoid Django's migration system
++with connection.cursor() as cursor:
++    # Base table
++    cursor.execute('''
++    CREATE TABLE test_app_base (
++        base_id INTEGER PRIMARY KEY AUTOINCREMENT,
++        field_base INTEGER NOT NULL
++    )
++    ''')
++    
++    # OtherBase table
++    cursor.execute('''
++    CREATE TABLE test_app_otherbase (
++        otherbase_id INTEGER PRIMARY KEY AUTOINCREMENT,
++        field_otherbase INTEGER NOT NULL
++    )
++    ''')
++    
++    # Child table with links to both parents
++    cursor.execute('''
++    CREATE TABLE test_app_child (
++        base_ptr_id INTEGER PRIMARY KEY REFERENCES test_app_base (base_id),
++        otherbase_ptr_id INTEGER UNIQUE REFERENCES test_app_otherbase (otherbase_id)
++    )
++    ''')
++
++# Test the issue
++def test_multiple_inheritance_update():
++    print("Creating test data...")
++    
++    # Create standalone OtherBase instances (not related to any Child)
++    ob1 = OtherBase.objects.create(field_otherbase=100)
++    ob2 = OtherBase.objects.create(field_otherbase=101)
++    print(f"Created standalone OtherBase instances with field_otherbase values: {ob1.field_otherbase}, {ob2.field_otherbase}")
++    
++    # Create Child instances - these will create their own OtherBase instances internally
++    c1 = Child.objects.create(field_base=0, field_otherbase=0)
++    c2 = Child.objects.create(field_base=1, field_otherbase=1)
++    print(f"Created Child instances with field_otherbase values: {c1.field_otherbase}, {c2.field_otherbase}")
++    
++    # Track the IDs of child-related OtherBase instances
++    child_otherbase_ids = [
++        getattr(c1, 'otherbase_ptr_id', None),
++        getattr(c2, 'otherbase_ptr_id', None)
++    ]
++    print(f"Child-related OtherBase ids: {child_otherbase_ids}")
++    
++    # Attempt to update all Child instances
++    print("\nUpdating Child instances with field_otherbase=55")
++    updated = Child.objects.update(field_otherbase=55)
++    print(f"Update reported {updated} rows affected")
++    
++    # Verify Child values
++    updated_children = list(Child.objects.all().values('base_id', 'field_base', 'field_otherbase'))
++    print("\nChild values after update:")
++    for child in updated_children:
++        print(f"  Child {child['base_id']}: field_base={child['field_base']}, field_otherbase={child['field_otherbase']}")
++    
++    # Verify OtherBase values
++    other_bases = list(OtherBase.objects.all().values('otherbase_id', 'field_otherbase'))
++    print("\nOtherBase values after update:")
++    for ob in other_bases:
++        print(f"  OtherBase {ob['otherbase_id']}: field_otherbase={ob['field_otherbase']}")
++    
++    # Verify that Child field_otherbase values were updated
++    child_updated = all(child['field_otherbase'] == 55 for child in updated_children)
++    
++    # Verify that standalone OtherBase instances (those not related to Child) were not affected
++    standalone_bases = [ob for ob in other_bases if ob['otherbase_id'] not in child_otherbase_ids]
++    standalone_unchanged = all(ob['field_otherbase'] in (100, 101) for ob in standalone_bases)
++    
++    # Verify that Child's OtherBase instances were updated correctly
++    child_bases = [ob for ob in other_bases if ob['otherbase_id'] in child_otherbase_ids]
++    child_bases_updated = all(ob['field_otherbase'] == 55 for ob in child_bases)
++    
++    if child_updated:
++        print("\nSUCCESS: Child instances were properly updated")
++    else:
++        print("\nFAILURE: Child instances were not updated correctly")
++    
++    if standalone_unchanged:
++        print("SUCCESS: Standalone OtherBase instances were not affected")
++    else:
++        print("FAILURE: Standalone OtherBase instances were incorrectly updated")
++    
++    if child_bases_updated:
++        print("SUCCESS: Child's OtherBase parent instances were properly updated")
++    else:
++        print("FAILURE: Child's OtherBase parent instances were not updated correctly")
++    
++    return child_updated and standalone_unchanged and child_bases_updated
++
++if __name__ == "__main__":
++    test_result = test_multiple_inheritance_update()
++    sys.exit(0 if test_result else 1)
+\ No newline at end of file

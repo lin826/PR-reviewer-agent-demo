@@ -1,0 +1,446 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index b99f03cd88..d69c24419b 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1338,7 +1338,7 @@ class Query(BaseExpression):
+             if isinstance(child, Node):
+                 child_clause, needed_inner = self._add_q(
+                     child, used_aliases, branch_negated,
+-                    current_negated, allow_joins, split_subq)
++                    current_negated, allow_joins, split_subq, simple_col)
+                 joinpromoter.add_votes(needed_inner)
+             else:
+                 child_clause, needed_inner = self.build_filter(
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d2ecac5ede
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python
++"""
++Reproduction script for CheckConstraint OR operator issue.
++This script reproduces the issue where CheckConstraint with OR operator 
++generates incorrect SQL on SQLite and Oracle.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Q
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define the test model from the issue description
++class TestConstraint(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'test_app'
++        constraints = [
++            models.CheckConstraint(
++                check=models.Q(flag__exact=True, field_1__isnull=False) |
++                      models.Q(flag__exact=False,),
++                name='field_1_has_value_if_flag_set'
++            ),
++        ]
++
++def test_constraint_sql_generation():
++    """Test that the CheckConstraint generates correct SQL."""
++    print("Testing CheckConstraint SQL generation...")
++    
++    # Get the constraint
++    constraint = TestConstraint._meta.constraints[0]
++    
++    # Create a schema editor to generate SQL
++    from django.db import connection
++    schema_editor = connection.schema_editor()
++    
++    # Generate the constraint SQL
++    constraint_sql = constraint._get_check_sql(TestConstraint, schema_editor)
++    
++    print(f"Generated constraint SQL: {constraint_sql}")
++    
++    # Check if the SQL contains qualified table names
++    if '"test_app_testconstraint".' in constraint_sql or '"testconstraint".' in constraint_sql:
++        print("❌ ISSUE REPRODUCED: SQL contains qualified table names!")
++        print("This will cause migration failures when tables are renamed.")
++        return False
++    else:
++        print("✅ SQL looks correct - no qualified table names found.")
++        return True
++
++def test_migration_sql():
++    """Test the actual migration SQL that would be generated."""
++    print("\nTesting migration SQL generation...")
++    
++    from django.db import connection
++    schema_editor = connection.schema_editor()
++    
++    # Get the constraint
++    constraint = TestConstraint._meta.constraints[0]
++    
++    # Generate the CREATE TABLE SQL with constraint
++    create_sql = schema_editor._create_check_sql(TestConstraint, constraint.name, 
++                                                constraint._get_check_sql(TestConstraint, schema_editor))
++    
++    # Convert to string if it's a Statement object
++    create_sql_str = str(create_sql)
++    print(f"Generated CREATE constraint SQL: {create_sql_str}")
++    
++    # Check for the problematic pattern
++    if any(table_ref in create_sql_str for table_ref in ['"test_app_testconstraint".', '"testconstraint".']):
++        print("❌ ISSUE REPRODUCED: Migration SQL contains qualified table names!")
++        return False
++    else:
++        print("✅ Migration SQL looks correct.")
++        return True
++
++def test_complex_q_object():
++    """Test the specific Q object structure from the issue."""
++    print("\nTesting complex Q object structure...")
++    
++    # Create the exact Q object from the issue
++    q_obj = Q(flag__exact=True, field_1__isnull=False) | Q(flag__exact=False)
++    
++    print(f"Q object: {q_obj}")
++    print(f"Q object connector: {q_obj.connector}")
++    print(f"Q object children: {q_obj.children}")
++    
++    # Check the structure
++    if len(q_obj.children) == 2 and q_obj.connector == 'OR':
++        print("✅ Q object structure is correct")
++        
++        # Check first child (should be AND)
++        first_child = q_obj.children[0]
++        if hasattr(first_child, 'connector') and first_child.connector == 'AND':
++            print("✅ First child is AND clause")
++        else:
++            print("❌ First child structure unexpected")
++            
++        # Check second child (should be simple tuple)
++        second_child = q_obj.children[1]
++        if isinstance(second_child, tuple):
++            print("✅ Second child is simple tuple")
++        else:
++            print("❌ Second child structure unexpected")
++            
++        return True
++    else:
++        print("❌ Q object structure is unexpected")
++        return False
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("REPRODUCING CHECKCONSTRAINT OR OPERATOR ISSUE")
++    print("=" * 60)
++    
++    # Test the Q object structure
++    q_test_passed = test_complex_q_object()
++    
++    # Test constraint SQL generation
++    constraint_test_passed = test_constraint_sql_generation()
++    
++    # Test migration SQL
++    migration_test_passed = test_migration_sql()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY")
++    print("=" * 60)
++    print(f"Q object structure test: {'✅ PASSED' if q_test_passed else '❌ FAILED'}")
++    print(f"Constraint SQL test: {'✅ PASSED' if constraint_test_passed else '❌ FAILED'}")
++    print(f"Migration SQL test: {'✅ PASSED' if migration_test_passed else '❌ FAILED'}")
++    
++    if not constraint_test_passed or not migration_test_passed:
++        print("\n🐛 ISSUE REPRODUCED: CheckConstraint generates incorrect SQL with qualified table names!")
++        sys.exit(1)
++    else:
++        print("\n✅ All tests passed - issue appears to be fixed!")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..0280411dd8
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for CheckConstraint OR operator fix.
++Tests various combinations of Q objects to ensure the fix works correctly.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Q, F
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Test models with various constraint patterns
++class TestModel1(models.Model):
++    """Simple OR constraint"""
++    field_a = models.IntegerField()
++    field_b = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++        constraints = [
++            models.CheckConstraint(
++                check=Q(field_a__gt=0) | Q(field_b__gt=0),
++                name='simple_or_constraint'
++            ),
++        ]
++
++class TestModel2(models.Model):
++    """Complex nested OR and AND"""
++    field_a = models.IntegerField()
++    field_b = models.IntegerField()
++    field_c = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++        constraints = [
++            models.CheckConstraint(
++                check=Q(field_a__gt=0, field_b__gt=0) | Q(field_c__gt=0),
++                name='complex_or_and_constraint'
++            ),
++        ]
++
++class TestModel3(models.Model):
++    """Multiple levels of nesting"""
++    field_a = models.IntegerField()
++    field_b = models.IntegerField()
++    field_c = models.IntegerField()
++    field_d = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++        constraints = [
++            models.CheckConstraint(
++                check=(Q(field_a__gt=0) | Q(field_b__gt=0)) & (Q(field_c__gt=0) | Q(field_d__gt=0)),
++                name='multi_level_constraint'
++            ),
++        ]
++
++class TestModel4(models.Model):
++    """F expressions with OR"""
++    price = models.IntegerField()
++    discounted_price = models.IntegerField()
++    cost = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++        constraints = [
++            models.CheckConstraint(
++                check=Q(price__gt=F('discounted_price')) | Q(cost__lt=F('discounted_price')),
++                name='f_expression_or_constraint'
++            ),
++        ]
++
++def test_constraint_sql(model_class, constraint_name):
++    """Test that a constraint generates correct SQL without qualified table names."""
++    print(f"\nTesting {model_class.__name__} - {constraint_name}")
++    
++    # Find the constraint
++    constraint = None
++    for c in model_class._meta.constraints:
++        if c.name == constraint_name:
++            constraint = c
++            break
++    
++    if not constraint:
++        print(f"❌ Constraint {constraint_name} not found")
++        return False
++    
++    # Generate SQL
++    schema_editor = connection.schema_editor()
++    constraint_sql = constraint._get_check_sql(model_class, schema_editor)
++    
++    print(f"Generated SQL: {constraint_sql}")
++    
++    # Check for qualified table names
++    table_name = model_class._meta.db_table
++    if f'"{table_name}".' in constraint_sql:
++        print(f"❌ FAILED: SQL contains qualified table name '{table_name}'")
++        return False
++    else:
++        print("✅ PASSED: No qualified table names found")
++        return True
++
++def run_all_tests():
++    """Run all constraint tests."""
++    print("=" * 80)
++    print("COMPREHENSIVE CHECKCONSTRAINT OR OPERATOR TESTS")
++    print("=" * 80)
++    
++    test_cases = [
++        (TestModel1, 'simple_or_constraint'),
++        (TestModel2, 'complex_or_and_constraint'),
++        (TestModel3, 'multi_level_constraint'),
++        (TestModel4, 'f_expression_or_constraint'),
++    ]
++    
++    results = []
++    for model_class, constraint_name in test_cases:
++        result = test_constraint_sql(model_class, constraint_name)
++        results.append((f"{model_class.__name__}.{constraint_name}", result))
++    
++    print("\n" + "=" * 80)
++    print("SUMMARY")
++    print("=" * 80)
++    
++    all_passed = True
++    for test_name, passed in results:
++        status = "✅ PASSED" if passed else "❌ FAILED"
++        print(f"{test_name}: {status}")
++        if not passed:
++            all_passed = False
++    
++    if all_passed:
++        print("\n🎉 All tests passed! The fix works correctly for all constraint patterns.")
++        return True
++    else:
++        print("\n❌ Some tests failed. The fix may need additional work.")
++        return False
++
++if __name__ == '__main__':
++    success = run_all_tests()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..54850460e0
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python
++"""
++Test the exact example from the original issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Q
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Exact model from the issue description
++class TestConstraint(models.Model):
++    field_1 = models.IntegerField(blank=True, null=True)
++    flag = models.BooleanField(blank=False, null=False)
++    
++    class Meta:
++        app_label = 'app'
++        constraints = [
++            models.CheckConstraint(check=models.Q(flag__exact=True, field_1__isnull=False) |
++                                         models.Q(flag__exact=False,),
++                                 name='field_1_has_value_if_flag_set'),
++        ]
++
++def test_original_issue():
++    """Test the exact constraint from the issue description."""
++    print("Testing original issue example...")
++    
++    # Get the constraint
++    constraint = TestConstraint._meta.constraints[0]
++    
++    # Generate SQL
++    schema_editor = connection.schema_editor()
++    constraint_sql = constraint._get_check_sql(TestConstraint, schema_editor)
++    
++    print(f"Generated constraint SQL: {constraint_sql}")
++    
++    # The issue was that it generated:
++    # (("new__app_testconstraint"."field_1" IS NOT NULL AND "new__app_testconstraint"."flag" = 1) OR "flag" = 0)
++    # 
++    # It should generate:
++    # (("field_1" IS NOT NULL AND "flag" = 1) OR "flag" = 0)
++    
++    expected_pattern = '(("field_1" IS NOT NULL AND "flag" = 1) OR "flag" = 0)'
++    
++    if constraint_sql == expected_pattern:
++        print("✅ PERFECT: Generated SQL matches expected pattern exactly!")
++        return True
++    elif '"app_testconstraint".' not in constraint_sql and '"testconstraint".' not in constraint_sql:
++        print("✅ GOOD: No qualified table names found (minor formatting differences OK)")
++        return True
++    else:
++        print("❌ FAILED: Still contains qualified table names")
++        return False
++
++if __name__ == '__main__':
++    print("=" * 60)
++    print("TESTING ORIGINAL ISSUE EXAMPLE")
++    print("=" * 60)
++    
++    success = test_original_issue()
++    
++    print("\n" + "=" * 60)
++    if success:
++        print("🎉 Original issue has been FIXED!")
++    else:
++        print("❌ Original issue still exists!")
++    print("=" * 60)
++    
++    sys.exit(0 if success else 1)
+\ No newline at end of file

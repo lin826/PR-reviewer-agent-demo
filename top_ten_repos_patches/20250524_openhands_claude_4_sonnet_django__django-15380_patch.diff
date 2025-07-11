@@ -1,0 +1,572 @@
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index bf9c2acd26..f1238a3504 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -824,7 +824,7 @@ class MigrationAutodetector:
+         for app_label, model_name, field_name in sorted(self.new_field_keys - self.old_field_keys):
+             old_model_name = self.renamed_models.get((app_label, model_name), model_name)
+             old_model_state = self.from_state.models[app_label, old_model_name]
+-            new_model_state = self.to_state.models[app_label, old_model_name]
++            new_model_state = self.to_state.models[app_label, model_name]
+             field = new_model_state.get_field(field_name)
+             # Scan to see if this is actually a rename!
+             field_dec = self.deep_deconstruct(field)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..05b2433f4c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the migration autodetector crash when renaming a model and field.
++
++This script reproduces the issue described in the bug report:
++- Migration autodetector crashes when renaming both a model and a field in a single step
++- Error: KeyError: ('test_one', 'mymodel') in generate_renamed_fields()
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.questioner import MigrationQuestioner
++from django.db.migrations.state import ModelState, ProjectState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def make_project_state(model_states):
++    """Helper function to create a ProjectState from model states."""
++    project_state = ProjectState()
++    for model_state in model_states:
++        project_state.add_model(model_state)
++    return project_state
++
++def test_rename_model_and_field():
++    """Test case that reproduces the bug."""
++    print("Testing rename model and field simultaneously...")
++    
++    # Define the initial model state (before rename)
++    initial_model = ModelState("test_one", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("old_field", models.CharField(max_length=200)),
++    ])
++    
++    # Define the final model state (after rename)
++    # Model renamed from MyModel to MyModel2
++    # Field renamed from old_field to new_field
++    final_model = ModelState("test_one", "MyModel2", [
++        ("id", models.AutoField(primary_key=True)),
++        ("new_field", models.CharField(max_length=200)),
++    ])
++    
++    # Create project states
++    before_state = make_project_state([initial_model])
++    after_state = make_project_state([final_model])
++    
++    # Create a questioner that will answer 'yes' to rename questions
++    questioner = MigrationQuestioner({"ask_rename": True, "ask_rename_model": True})
++    
++    # Create the autodetector
++    autodetector = MigrationAutodetector(
++        before_state,
++        after_state,
++        questioner,
++    )
++    
++    try:
++        # This should trigger the bug
++        changes = autodetector._detect_changes()
++        print("SUCCESS: No crash occurred!")
++        print(f"Generated changes: {changes}")
++        return True
++    except KeyError as e:
++        print(f"ERROR: KeyError occurred as expected: {e}")
++        print("This confirms the bug is present.")
++        return False
++    except Exception as e:
++        print(f"UNEXPECTED ERROR: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Reproducing migration autodetector crash...")
++    print("=" * 50)
++    
++    success = test_rename_model_and_field()
++    
++    print("=" * 50)
++    if success:
++        print("Test passed - bug appears to be fixed!")
++        sys.exit(0)
++    else:
++        print("Test failed - bug is present!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..b85e50d97c
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,218 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the migration autodetector fix.
++
++This script tests various scenarios to ensure the fix works correctly:
++1. Rename model and field simultaneously
++2. Rename only model (should still work)
++3. Rename only field (should still work)
++4. Multiple field renames with model rename
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.questioner import MigrationQuestioner
++from django.db.migrations.state import ModelState, ProjectState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def make_project_state(model_states):
++    """Helper function to create a ProjectState from model states."""
++    project_state = ProjectState()
++    for model_state in model_states:
++        project_state.add_model(model_state)
++    return project_state
++
++def test_rename_model_and_field():
++    """Test case 1: Rename model and field simultaneously."""
++    print("Test 1: Rename model and field simultaneously...")
++    
++    initial_model = ModelState("test_app", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("old_field", models.CharField(max_length=200)),
++    ])
++    
++    final_model = ModelState("test_app", "MyModel2", [
++        ("id", models.AutoField(primary_key=True)),
++        ("new_field", models.CharField(max_length=200)),
++    ])
++    
++    before_state = make_project_state([initial_model])
++    after_state = make_project_state([final_model])
++    
++    questioner = MigrationQuestioner({"ask_rename": True, "ask_rename_model": True})
++    autodetector = MigrationAutodetector(before_state, after_state, questioner)
++    
++    try:
++        changes = autodetector._detect_changes()
++        print("  ✓ SUCCESS: No crash occurred!")
++        return True
++    except Exception as e:
++        print(f"  ✗ ERROR: {e}")
++        return False
++
++def test_rename_model_only():
++    """Test case 2: Rename only model (regression test)."""
++    print("Test 2: Rename only model...")
++    
++    initial_model = ModelState("test_app", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("field", models.CharField(max_length=200)),
++    ])
++    
++    final_model = ModelState("test_app", "MyModel2", [
++        ("id", models.AutoField(primary_key=True)),
++        ("field", models.CharField(max_length=200)),
++    ])
++    
++    before_state = make_project_state([initial_model])
++    after_state = make_project_state([final_model])
++    
++    questioner = MigrationQuestioner({"ask_rename": True, "ask_rename_model": True})
++    autodetector = MigrationAutodetector(before_state, after_state, questioner)
++    
++    try:
++        changes = autodetector._detect_changes()
++        print("  ✓ SUCCESS: No crash occurred!")
++        return True
++    except Exception as e:
++        print(f"  ✗ ERROR: {e}")
++        return False
++
++def test_rename_field_only():
++    """Test case 3: Rename only field (regression test)."""
++    print("Test 3: Rename only field...")
++    
++    initial_model = ModelState("test_app", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("old_field", models.CharField(max_length=200)),
++    ])
++    
++    final_model = ModelState("test_app", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("new_field", models.CharField(max_length=200)),
++    ])
++    
++    before_state = make_project_state([initial_model])
++    after_state = make_project_state([final_model])
++    
++    questioner = MigrationQuestioner({"ask_rename": True, "ask_rename_model": True})
++    autodetector = MigrationAutodetector(before_state, after_state, questioner)
++    
++    try:
++        changes = autodetector._detect_changes()
++        print("  ✓ SUCCESS: No crash occurred!")
++        return True
++    except Exception as e:
++        print(f"  ✗ ERROR: {e}")
++        return False
++
++def test_rename_model_and_multiple_fields():
++    """Test case 4: Rename model and multiple fields."""
++    print("Test 4: Rename model and multiple fields...")
++    
++    initial_model = ModelState("test_app", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("old_field1", models.CharField(max_length=200)),
++        ("old_field2", models.IntegerField()),
++    ])
++    
++    final_model = ModelState("test_app", "MyModel2", [
++        ("id", models.AutoField(primary_key=True)),
++        ("new_field1", models.CharField(max_length=200)),
++        ("new_field2", models.IntegerField()),
++    ])
++    
++    before_state = make_project_state([initial_model])
++    after_state = make_project_state([final_model])
++    
++    questioner = MigrationQuestioner({"ask_rename": True, "ask_rename_model": True})
++    autodetector = MigrationAutodetector(before_state, after_state, questioner)
++    
++    try:
++        changes = autodetector._detect_changes()
++        print("  ✓ SUCCESS: No crash occurred!")
++        return True
++    except Exception as e:
++        print(f"  ✗ ERROR: {e}")
++        return False
++
++def test_no_renames():
++    """Test case 5: No renames (regression test)."""
++    print("Test 5: No renames...")
++    
++    initial_model = ModelState("test_app", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("field", models.CharField(max_length=200)),
++    ])
++    
++    final_model = ModelState("test_app", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("field", models.CharField(max_length=200)),
++        ("new_field", models.IntegerField(default=0)),
++    ])
++    
++    before_state = make_project_state([initial_model])
++    after_state = make_project_state([final_model])
++    
++    questioner = MigrationQuestioner({"ask_rename": True, "ask_rename_model": True})
++    autodetector = MigrationAutodetector(before_state, after_state, questioner)
++    
++    try:
++        changes = autodetector._detect_changes()
++        print("  ✓ SUCCESS: No crash occurred!")
++        return True
++    except Exception as e:
++        print(f"  ✗ ERROR: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Running comprehensive tests for migration autodetector fix...")
++    print("=" * 60)
++    
++    tests = [
++        test_rename_model_and_field,
++        test_rename_model_only,
++        test_rename_field_only,
++        test_rename_model_and_multiple_fields,
++        test_no_renames,
++    ]
++    
++    passed = 0
++    total = len(tests)
++    
++    for test in tests:
++        if test():
++            passed += 1
++        print()
++    
++    print("=" * 60)
++    print(f"Results: {passed}/{total} tests passed")
++    
++    if passed == total:
++        print("All tests passed! ✓")
++        sys.exit(0)
++    else:
++        print("Some tests failed! ✗")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_exact_scenario.py b/test_exact_scenario.py
+new file mode 100644
+index 0000000000..be5d22155d
+--- /dev/null
++++ b/test_exact_scenario.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++"""
++Test the exact scenario from the issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.questioner import MigrationQuestioner
++from django.db.migrations.state import ModelState, ProjectState
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++def make_project_state(model_states):
++    """Helper function to create a ProjectState from model states."""
++    project_state = ProjectState()
++    for model_state in model_states:
++        project_state.add_model(model_state)
++    return project_state
++
++def test_exact_issue_scenario():
++    """Test the exact scenario from the issue description."""
++    print("Testing exact scenario from issue description...")
++    
++    # The issue mentions renaming test_one.MyModel to MyModel2
++    # Let's use the exact app and model names from the error message
++    initial_model = ModelState("test_one", "MyModel", [
++        ("id", models.AutoField(primary_key=True)),
++        ("some_field", models.CharField(max_length=200)),
++    ])
++    
++    # Rename model from MyModel to MyModel2 and field
++    final_model = ModelState("test_one", "MyModel2", [
++        ("id", models.AutoField(primary_key=True)),
++        ("renamed_field", models.CharField(max_length=200)),
++    ])
++    
++    before_state = make_project_state([initial_model])
++    after_state = make_project_state([final_model])
++    
++    # Create a questioner that will answer 'yes' to rename questions
++    questioner = MigrationQuestioner({"ask_rename": True, "ask_rename_model": True})
++    
++    autodetector = MigrationAutodetector(before_state, after_state, questioner)
++    
++    try:
++        changes = autodetector._detect_changes()
++        print("  ✓ SUCCESS: No KeyError occurred!")
++        print(f"  Generated changes: {changes}")
++        
++        # Verify we got the expected changes
++        if 'test_one' in changes:
++            migration = changes['test_one'][0]
++            operations = migration.operations
++            operation_types = [op.__class__.__name__ for op in operations]
++            print(f"  Operations generated: {operation_types}")
++            
++            if 'RenameModel' in operation_types:
++                print("  ✓ RenameModel operation found")
++            if 'RenameField' in operation_types:
++                print("  ✓ RenameField operation found")
++        
++        return True
++    except KeyError as e:
++        print(f"  ✗ KeyError still occurs: {e}")
++        return False
++    except Exception as e:
++        print(f"  ✗ Unexpected error: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Testing the exact scenario from the issue description...")
++    print("=" * 60)
++    
++    success = test_exact_issue_scenario()
++    
++    print("=" * 60)
++    if success:
++        print("✓ Issue has been fixed!")
++        sys.exit(0)
++    else:
++        print("✗ Issue still exists!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_specific_fix.py b/test_specific_fix.py
+new file mode 100644
+index 0000000000..aecd3887ec
+--- /dev/null
++++ b/test_specific_fix.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python
++"""
++Specific test case for the bug fix.
++
++This test case should be added to the Django test suite to prevent regression.
++It tests the specific scenario described in the bug report.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.migrations.autodetector import MigrationAutodetector
++from django.db.migrations.questioner import MigrationQuestioner
++from django.db.migrations.state import ModelState, ProjectState
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++class RenameModelAndFieldTest(TestCase):
++    """
++    Test case for the specific bug: migration autodetector crashes when 
++    renaming a model and field simultaneously.
++    
++    This test should be added to tests/migrations/test_autodetector.py
++    """
++    
++    def make_project_state(self, model_states):
++        """Helper function to create a ProjectState from model states."""
++        project_state = ProjectState()
++        for model_state in model_states:
++            project_state.add_model(model_state)
++        return project_state
++
++    def get_changes(self, before_states, after_states, questioner=None):
++        """Helper function to get migration changes."""
++        if not isinstance(before_states, ProjectState):
++            before_states = self.make_project_state(before_states)
++        if not isinstance(after_states, ProjectState):
++            after_states = self.make_project_state(after_states)
++        return MigrationAutodetector(
++            before_states,
++            after_states,
++            questioner,
++        )._detect_changes()
++
++    def test_rename_model_and_field_simultaneously(self):
++        """
++        Test that renaming a model and a field in the same model simultaneously
++        doesn't crash the autodetector.
++        
++        This is a regression test for the bug where the autodetector would crash
++        with a KeyError when trying to access the old model name in the new state.
++        """
++        # Define the initial model state
++        initial_model = ModelState("test_app", "MyModel", [
++            ("id", models.AutoField(primary_key=True)),
++            ("old_field", models.CharField(max_length=200)),
++        ])
++        
++        # Define the final model state (both model and field renamed)
++        final_model = ModelState("test_app", "MyModel2", [
++            ("id", models.AutoField(primary_key=True)),
++            ("new_field", models.CharField(max_length=200)),
++        ])
++        
++        # Get the changes
++        changes = self.get_changes(
++            [initial_model], 
++            [final_model], 
++            MigrationQuestioner({"ask_rename": True, "ask_rename_model": True})
++        )
++        
++        # Should not crash and should generate migrations
++        self.assertIn('test_app', changes)
++        self.assertEqual(len(changes['test_app']), 1)
++        
++        # Check that we get the expected operations
++        migration = changes['test_app'][0]
++        operations = migration.operations
++        
++        # Should have RenameModel and RenameField operations
++        operation_types = [op.__class__.__name__ for op in operations]
++        self.assertIn('RenameModel', operation_types)
++        self.assertIn('RenameField', operation_types)
++
++if __name__ == "__main__":
++    import unittest
++    unittest.main()
+\ No newline at end of file

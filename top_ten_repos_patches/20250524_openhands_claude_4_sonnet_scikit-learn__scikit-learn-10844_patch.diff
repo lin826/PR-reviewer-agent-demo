@@ -1,0 +1,338 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..dea155bb9
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the fowlkes_mallows_score overflow issue.
++
++The issue occurs when pk * qk exceeds 2^32, causing integer overflow
++and resulting in RuntimeWarning and nan return value.
++"""
++
++import numpy as np
++import warnings
++from sklearn.metrics.cluster import fowlkes_mallows_score
++
++def test_overflow_issue():
++    """Test case that reproduces the overflow issue."""
++    print("Testing fowlkes_mallows_score overflow issue...")
++    
++    # Create large clustering data that will cause pk * qk to overflow
++    # We need to create data where the sum of squares of cluster sizes is large
++    
++    # Create a very large number of samples to force overflow
++    # The key is to have large cluster sizes that when squared and summed exceed 2^32
++    n_samples = 200000
++    
++    # Create labels where most samples are in one large cluster
++    # This will create a large pk and qk value
++    labels_true = np.zeros(n_samples, dtype=int)
++    labels_pred = np.zeros(n_samples, dtype=int)
++    
++    # Add a few small clusters to make it more realistic
++    labels_true[-1000:] = 1
++    labels_pred[-1000:] = 1
++    
++    print(f"Number of samples: {n_samples}")
++    print(f"Labels_true unique values: {len(np.unique(labels_true))}")
++    print(f"Labels_pred unique values: {len(np.unique(labels_pred))}")
++    
++    # Capture warnings
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        result = fowlkes_mallows_score(labels_true, labels_pred)
++        
++        print(f"Result: {result}")
++        print(f"Is result nan? {np.isnan(result)}")
++        
++        if w:
++            print(f"Warnings captured: {len(w)}")
++            for warning in w:
++                print(f"  - {warning.category.__name__}: {warning.message}")
++        else:
++            print("No warnings captured")
++    
++    return result, len(w) > 0
++
++def test_manual_calculation():
++    """Manually test the calculation to understand the overflow."""
++    print("\nTesting manual calculation...")
++    
++    # Use the same data that triggers the overflow
++    n_samples = 200000
++    labels_true = np.zeros(n_samples, dtype=int)
++    labels_pred = np.zeros(n_samples, dtype=int)
++    labels_true[-1000:] = 1
++    labels_pred[-1000:] = 1
++    
++    from sklearn.metrics.cluster.supervised import contingency_matrix
++    
++    c = contingency_matrix(labels_true, labels_pred, sparse=True)
++    tk = np.dot(c.data, c.data) - n_samples
++    pk = np.sum(np.asarray(c.sum(axis=0)).ravel() ** 2) - n_samples
++    qk = np.sum(np.asarray(c.sum(axis=1)).ravel() ** 2) - n_samples
++    
++    print(f"tk = {tk}")
++    print(f"pk = {pk}")
++    print(f"qk = {qk}")
++    print(f"pk * qk = {pk * qk}")
++    print(f"2^32 = {2**32}")
++    print(f"pk * qk > 2^32? {pk * qk > 2**32}")
++    
++    # Test the original calculation
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        original_result = tk / np.sqrt(pk * qk) if tk != 0. else 0.
++        print(f"Original calculation result: {original_result}")
++        
++        if w:
++            print(f"Warnings in original calculation: {len(w)}")
++            for warning in w:
++                print(f"  - {warning.category.__name__}: {warning.message}")
++    
++    # Test the proposed fix
++    proposed_result = np.sqrt(tk / pk) * np.sqrt(tk / qk) if tk != 0. else 0.
++    print(f"Proposed fix result: {proposed_result}")
++    
++    return original_result, proposed_result
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("REPRODUCING FOWLKES_MALLOWS_SCORE OVERFLOW ISSUE")
++    print("=" * 60)
++    
++    result, has_warnings = test_overflow_issue()
++    
++    print("\n" + "=" * 60)
++    print("MANUAL CALCULATION TEST")
++    print("=" * 60)
++    
++    original, proposed = test_manual_calculation()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY")
++    print("=" * 60)
++    print(f"Issue reproduced: {has_warnings or np.isnan(result)}")
++    print(f"Original result: {original}")
++    print(f"Proposed result: {proposed}")
++    print(f"Results are equivalent: {np.allclose([original], [proposed], equal_nan=True)}")
+\ No newline at end of file
+diff --git a/sklearn/metrics/cluster/supervised.py b/sklearn/metrics/cluster/supervised.py
+index a987778ae..9bcca75a2 100644
+--- a/sklearn/metrics/cluster/supervised.py
++++ b/sklearn/metrics/cluster/supervised.py
+@@ -856,7 +856,7 @@ def fowlkes_mallows_score(labels_true, labels_pred, sparse=False):
+     tk = np.dot(c.data, c.data) - n_samples
+     pk = np.sum(np.asarray(c.sum(axis=0)).ravel() ** 2) - n_samples
+     qk = np.sum(np.asarray(c.sum(axis=1)).ravel() ** 2) - n_samples
+-    return tk / np.sqrt(pk * qk) if tk != 0. else 0.
++    return np.sqrt(tk / pk) * np.sqrt(tk / qk) if tk != 0. else 0.
+ 
+ 
+ def entropy(labels):
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..147d56a27
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the fowlkes_mallows_score fix.
++"""
++
++import numpy as np
++import warnings
++from sklearn.metrics.cluster import fowlkes_mallows_score
++
++def test_edge_cases():
++    """Test edge cases to ensure the fix doesn't break anything."""
++    
++    print("Testing edge cases...")
++    
++    # Test case 1: tk = 0 (should return 0)
++    print("\n1. Testing tk = 0 case:")
++    labels_true = [0, 0, 1, 1]
++    labels_pred = [0, 1, 0, 1]  # Completely different clustering
++    result = fowlkes_mallows_score(labels_true, labels_pred)
++    print(f"   Result: {result} (should be 0.0)")
++    
++    # Test case 2: Perfect match (should return 1)
++    print("\n2. Testing perfect match:")
++    labels_true = [0, 0, 1, 1]
++    labels_pred = [0, 0, 1, 1]
++    result = fowlkes_mallows_score(labels_true, labels_pred)
++    print(f"   Result: {result} (should be 1.0)")
++    
++    # Test case 3: Small normal case
++    print("\n3. Testing small normal case:")
++    labels_true = [0, 0, 0, 1, 1, 1]
++    labels_pred = [0, 0, 1, 1, 2, 2]
++    result = fowlkes_mallows_score(labels_true, labels_pred)
++    expected = 4. / np.sqrt(12. * 6.)
++    print(f"   Result: {result}")
++    print(f"   Expected: {expected}")
++    print(f"   Close? {np.allclose(result, expected)}")
++    
++    # Test case 4: Single cluster (edge case)
++    print("\n4. Testing single cluster:")
++    labels_true = [0, 0, 0, 0]
++    labels_pred = [0, 0, 0, 0]
++    result = fowlkes_mallows_score(labels_true, labels_pred)
++    print(f"   Result: {result} (should be 1.0)")
++    
++    # Test case 5: All different clusters (should be 0)
++    print("\n5. Testing all different clusters:")
++    labels_true = [0, 0, 0, 0]
++    labels_pred = [0, 1, 2, 3]
++    result = fowlkes_mallows_score(labels_true, labels_pred)
++    print(f"   Result: {result} (should be 0.0)")
++
++def test_proposed_fix_manually():
++    """Test the proposed fix manually to ensure it works for all cases."""
++    
++    print("\n" + "="*50)
++    print("TESTING PROPOSED FIX MANUALLY")
++    print("="*50)
++    
++    def fowlkes_mallows_fixed(labels_true, labels_pred):
++        """Fixed version of fowlkes_mallows_score."""
++        from sklearn.metrics.cluster.supervised import check_clusterings, contingency_matrix
++        
++        labels_true, labels_pred = check_clusterings(labels_true, labels_pred)
++        n_samples, = labels_true.shape
++
++        c = contingency_matrix(labels_true, labels_pred, sparse=True)
++        tk = np.dot(c.data, c.data) - n_samples
++        pk = np.sum(np.asarray(c.sum(axis=0)).ravel() ** 2) - n_samples
++        qk = np.sum(np.asarray(c.sum(axis=1)).ravel() ** 2) - n_samples
++        
++        # Proposed fix: avoid pk * qk calculation
++        if tk != 0.:
++            return np.sqrt(tk / pk) * np.sqrt(tk / qk)
++        else:
++            return 0.
++    
++    # Test the overflow case
++    print("\n1. Testing overflow case with fixed function:")
++    n_samples = 200000
++    labels_true = np.zeros(n_samples, dtype=int)
++    labels_pred = np.zeros(n_samples, dtype=int)
++    labels_true[-1000:] = 1
++    labels_pred[-1000:] = 1
++    
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        result_fixed = fowlkes_mallows_fixed(labels_true, labels_pred)
++        print(f"   Fixed result: {result_fixed}")
++        print(f"   Warnings: {len(w)}")
++    
++    # Test normal cases
++    test_cases = [
++        ([0, 0, 1, 1], [0, 0, 1, 1], "Perfect match"),
++        ([0, 0, 1, 1], [0, 1, 0, 1], "Worst case"),
++        ([0, 0, 0, 1, 1, 1], [0, 0, 1, 1, 2, 2], "Normal case"),
++    ]
++    
++    for i, (true_labels, pred_labels, description) in enumerate(test_cases, 2):
++        print(f"\n{i}. Testing {description}:")
++        
++        # Original function
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            result_original = fowlkes_mallows_score(true_labels, pred_labels)
++        
++        # Fixed function
++        result_fixed = fowlkes_mallows_fixed(true_labels, pred_labels)
++        
++        print(f"   Original: {result_original}")
++        print(f"   Fixed: {result_fixed}")
++        print(f"   Match: {np.allclose(result_original, result_fixed)}")
++
++if __name__ == "__main__":
++    test_edge_cases()
++    test_proposed_fix_manually()
+\ No newline at end of file
+diff --git a/test_overflow_fix.py b/test_overflow_fix.py
+new file mode 100644
+index 000000000..3cd15cf6e
+--- /dev/null
++++ b/test_overflow_fix.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""
++Test to verify the fowlkes_mallows_score overflow fix.
++This test should be added to the official test suite.
++"""
++
++import numpy as np
++import warnings
++from sklearn.metrics.cluster import fowlkes_mallows_score
++
++
++def test_fowlkes_mallows_score_overflow():
++    """Test that fowlkes_mallows_score handles large values without overflow."""
++    # Create clustering data that would cause pk * qk to overflow 2^32
++    # This creates a scenario where most samples are in one large cluster
++    n_samples = 200000
++    labels_true = np.zeros(n_samples, dtype=int)
++    labels_pred = np.zeros(n_samples, dtype=int)
++    
++    # Add a small second cluster to make it more realistic
++    labels_true[-1000:] = 1
++    labels_pred[-1000:] = 1
++    
++    # This should not produce any warnings and should return a valid result
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        result = fowlkes_mallows_score(labels_true, labels_pred)
++        
++        # Check that no overflow warnings were generated
++        overflow_warnings = [warning for warning in w 
++                           if "overflow" in str(warning.message).lower()]
++        assert len(overflow_warnings) == 0, f"Overflow warnings detected: {overflow_warnings}"
++        
++        # Check that the result is valid (between 0 and 1)
++        assert 0.0 <= result <= 1.0, f"Result {result} is outside valid range [0, 1]"
++        
++        # For this specific case (perfect clustering), result should be 1.0
++        assert np.isclose(result, 1.0), f"Expected ~1.0 for perfect clustering, got {result}"
++        
++        print(f"✓ Overflow test passed: result = {result}, warnings = {len(w)}")
++
++
++def test_fowlkes_mallows_score_mathematical_equivalence():
++    """Test that the fix maintains mathematical equivalence for normal cases."""
++    test_cases = [
++        # (labels_true, labels_pred, expected_result, description)
++        ([0, 0, 1, 1], [0, 0, 1, 1], 1.0, "Perfect match"),
++        ([0, 0, 1, 1], [0, 1, 0, 1], 0.0, "Worst case"),
++        ([0, 0, 0, 1, 1, 1], [0, 0, 1, 1, 2, 2], 4. / np.sqrt(12. * 6.), "Normal case"),
++        ([0, 0, 0, 0], [0, 1, 2, 3], 0.0, "All different clusters"),
++        ([0, 0, 0, 0], [0, 0, 0, 0], 1.0, "Single cluster"),
++    ]
++    
++    for labels_true, labels_pred, expected, description in test_cases:
++        result = fowlkes_mallows_score(labels_true, labels_pred)
++        assert np.isclose(result, expected), \
++            f"{description}: expected {expected}, got {result}"
++        print(f"✓ {description}: {result}")
++
++
++if __name__ == "__main__":
++    print("Testing fowlkes_mallows_score overflow fix...")
++    print("=" * 50)
++    
++    test_fowlkes_mallows_score_overflow()
++    print()
++    test_fowlkes_mallows_score_mathematical_equivalence()
++    
++    print("\n" + "=" * 50)
++    print("All tests passed! ✓")
+\ No newline at end of file

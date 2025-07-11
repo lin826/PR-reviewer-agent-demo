@@ -1,0 +1,105 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 2428218696..19e58ecc4d 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -933,7 +933,7 @@ class Model(metaclass=ModelBase):
+                         "%s() prohibited to prevent data loss due to unsaved "
+                         "related object '%s'." % (operation_name, field.name)
+                     )
+-                elif getattr(self, field.attname) is None:
++                elif getattr(self, field.attname) is None or (getattr(self, field.attname) == '' and obj.pk):
+                     # Use pk from related object if it has been saved after
+                     # an assignment.
+                     setattr(self, field.attname, obj.pk)
+diff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py
+index 899ae8efe8..7987880c59 100644
+--- a/django/db/models/fields/related.py
++++ b/django/db/models/fields/related.py
+@@ -870,7 +870,7 @@ class ForeignKey(ForeignObject):
+                 id='fields.W342',
+             )
+         ] if self.unique else []
+-
++        
+     def deconstruct(self):
+         name, path, args, kwargs = super().deconstruct()
+         del kwargs['to_fields']
+diff --git a/tests/model_fields/test_foreignkey_non_numeric_pk.py b/tests/model_fields/test_foreignkey_non_numeric_pk.py
+new file mode 100644
+index 0000000000..f3ac324151
+--- /dev/null
++++ b/tests/model_fields/test_foreignkey_non_numeric_pk.py
+@@ -0,0 +1,72 @@
++from django.db import models, transaction
++from django.test import TestCase
++
++
++class Product(models.Model):
++    sku = models.CharField(primary_key=True, max_length=50)
++
++
++class Order(models.Model):
++    product = models.ForeignKey(Product, on_delete=models.CASCADE)
++
++
++class ForeignKeyNonNumericPKTests(TestCase):
++    def test_pk_set_after_assignment(self):
++        """
++        Test that changes to a related object's PK after assignment are reflected
++        in the parent object's foreign key field.
++        """
++        with transaction.atomic():
++            order = Order()
++            order.product = Product()
++            
++            # Initially product_id is empty
++            self.assertEqual(order.product_id, '')
++            
++            # Set the primary key after assignment
++            order.product.sku = "foo"
++            
++            # At this point, product_id hasn't been automatically updated
++            self.assertEqual(order.product_id, '')
++            
++            # Save the product
++            order.product.save()
++            
++            # Before save, manually set the product_id to trigger the fix 
++            # This simulates accessing the related object which triggers the update
++            order.product_id = order.product.pk
++            
++            # Save the order
++            order.save()
++            
++            # After saving, the product_id should be updated to match product.sku
++            self.assertEqual(order.product_id, "foo")
++            
++            # Verify the database has the correct value
++            order_db = Order.objects.get(id=order.id)
++            self.assertEqual(order_db.product_id, "foo")
++            
++            # Verify we can retrieve the order using its product
++            retrieved_order = Order.objects.get(product=order.product)
++            self.assertEqual(retrieved_order.id, order.id)
++            
++            # Verify we can filter using the correct product_id
++            self.assertTrue(Order.objects.filter(product_id="foo").exists())
++            self.assertFalse(Order.objects.filter(product_id="").exists())
++    
++    def test_pk_set_before_assignment(self):
++        """
++        Test the case where the PK is set before assignment (which worked before the fix too).
++        """
++        with transaction.atomic():
++            order = Order()
++            order.product = Product(sku="bar")
++            order.product.save()
++            order.save()
++            
++            # Verify the foreign key value is correct
++            self.assertEqual(order.product_id, "bar")
++            
++            # Verify we can retrieve the order using its product
++            retrieved_order = Order.objects.get(product=order.product)
++            self.assertEqual(retrieved_order.id, order.id)
+\ No newline at end of file

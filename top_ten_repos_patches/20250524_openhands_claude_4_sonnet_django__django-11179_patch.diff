@@ -1,0 +1,369 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 92fe4affb9..86cb5e22d3 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -272,12 +272,15 @@ class Collector:
+         deleted_counter = Counter()
+ 
+         # Optimize for the case with a single obj and no dependencies
+-        if len(self.data) == 1 and len(instances) == 1:
+-            instance = list(instances)[0]
+-            if self.can_fast_delete(instance):
+-                with transaction.mark_for_rollback_on_error():
+-                    count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
+-                return count, {model._meta.label: count}
++        if len(self.data) == 1:
++            model, instances = next(iter(self.data.items()))
++            if len(instances) == 1:
++                instance = list(instances)[0]
++                if self.can_fast_delete(instance):
++                    with transaction.mark_for_rollback_on_error():
++                        count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
++                    setattr(instance, model._meta.pk.attname, None)
++                    return count, {model._meta.label: count}
+ 
+         with transaction.atomic(using=self.using, savepoint=False):
+             # send pre_delete signals
+diff --git a/test_pk_deletion_issue.py b/test_pk_deletion_issue.py
+new file mode 100644
+index 0000000000..2b771cbc8d
+--- /dev/null
++++ b/test_pk_deletion_issue.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue where delete() on instances of models 
++without any dependencies doesn't clear PKs.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'tests.delete',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import models
++from django.core.management import execute_from_command_line
++from tests.delete.models import Avatar, R, A
++
++# Create the database tables
++from django.core.management.color import no_style
++from django.db import connection
++
++def create_tables():
++    """Create the necessary database tables."""
++    # Get all models from the delete app
++    from django.apps import apps
++    delete_app = apps.get_app_config('delete')
++    models_to_create = delete_app.get_models()
++    
++    with connection.schema_editor() as schema_editor:
++        for model in models_to_create:
++            schema_editor.create_model(model)
++
++def test_pk_deletion_issue():
++    """Test that PKs are set to None after deletion for models without dependencies."""
++    
++    print("Creating database tables...")
++    create_tables()
++    
++    print("Testing PK deletion behavior...")
++    
++    # Test 1: Model without dependencies (Avatar)
++    print("\n1. Testing Avatar model (no dependencies):")
++    avatar = Avatar.objects.create(desc="Test avatar")
++    original_pk = avatar.pk
++    print(f"   Created avatar with PK: {original_pk}")
++    
++    # Delete the avatar
++    avatar.delete()
++    print(f"   After deletion, avatar.pk = {avatar.pk}")
++    
++    if avatar.pk is None:
++        print("   ✓ PASS: PK correctly set to None")
++    else:
++        print("   ✗ FAIL: PK should be None but is still:", avatar.pk)
++    
++    # Test 2: Model with dependencies (R)
++    print("\n2. Testing R model (has dependencies via foreign keys):")
++    r = R.objects.create(is_default=False)
++    original_pk = r.pk
++    print(f"   Created R with PK: {original_pk}")
++    
++    # Delete the R instance
++    r.delete()
++    print(f"   After deletion, r.pk = {r.pk}")
++    
++    if r.pk is None:
++        print("   ✓ PASS: PK correctly set to None")
++    else:
++        print("   ✗ FAIL: PK should be None but is still:", r.pk)
++    
++    # Test 3: Another model without dependencies
++    print("\n3. Testing simple model without dependencies:")
++    
++    # Create a simple model for testing
++    class SimpleModel(models.Model):
++        name = models.CharField(max_length=100)
++        
++        class Meta:
++            app_label = 'tests'
++    
++    # Create the table (in memory)
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    simple = SimpleModel.objects.create(name="test")
++    original_pk = simple.pk
++    print(f"   Created SimpleModel with PK: {original_pk}")
++    
++    # Delete the simple model
++    simple.delete()
++    print(f"   After deletion, simple.pk = {simple.pk}")
++    
++    if simple.pk is None:
++        print("   ✓ PASS: PK correctly set to None")
++    else:
++        print("   ✗ FAIL: PK should be None but is still:", simple.pk)
++
++if __name__ == '__main__':
++    test_pk_deletion_issue()
+\ No newline at end of file
+diff --git a/test_pk_deletion_simple.py b/test_pk_deletion_simple.py
+new file mode 100644
+index 0000000000..d7bb402ce6
+--- /dev/null
++++ b/test_pk_deletion_simple.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python
++"""
++Simple test script to reproduce the issue where delete() on instances of models 
++without any dependencies doesn't clear PKs.
++"""
++
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__3.0')
++os.chdir('/workspace/django__django__3.0')
++
++# Run a simple test using Django's test runner
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.test import TestCase
++from django.db import models
++
++class SimpleModel(models.Model):
++    """A simple model with no dependencies for testing."""
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_pk_deletion():
++    """Test PK deletion behavior."""
++    from django.db import connection
++    
++    # Create the table for our simple model
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(SimpleModel)
++    
++    print("Testing PK deletion behavior...")
++    
++    # Test: Model without dependencies
++    print("\nTesting SimpleModel (no dependencies):")
++    simple = SimpleModel.objects.create(name="test")
++    original_pk = simple.pk
++    print(f"   Created SimpleModel with PK: {original_pk}")
++    
++    # Delete the simple model
++    simple.delete()
++    print(f"   After deletion, simple.pk = {simple.pk}")
++    
++    if simple.pk is None:
++        print("   ✓ PASS: PK correctly set to None")
++        return True
++    else:
++        print("   ✗ FAIL: PK should be None but is still:", simple.pk)
++        return False
++
++if __name__ == '__main__':
++    result = test_pk_deletion()
++    sys.exit(0 if result else 1)
+\ No newline at end of file
+diff --git a/test_pk_issue.py b/test_pk_issue.py
+new file mode 100644
+index 0000000000..48def62bf6
+--- /dev/null
++++ b/test_pk_issue.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python
++"""
++Test to reproduce the PK deletion issue.
++"""
++
++import os
++import sys
++
++# Set up Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++sys.path.insert(0, '/workspace/django__django__3.0')
++
++import django
++django.setup()
++
++from django.test import TestCase
++from tests.delete.models import Avatar
++
++def test_pk_deletion_issue():
++    """Test that demonstrates the PK deletion issue."""
++    print("Testing PK deletion issue...")
++    
++    # Create an Avatar instance (model with no dependencies)
++    avatar = Avatar.objects.create(desc="Test avatar")
++    original_pk = avatar.pk
++    print(f"Created Avatar with PK: {original_pk}")
++    
++    # Delete the avatar
++    result = avatar.delete()
++    print(f"Delete result: {result}")
++    print(f"After deletion, avatar.pk = {avatar.pk}")
++    
++    # Check if PK is None (expected behavior)
++    if avatar.pk is None:
++        print("✓ PASS: PK correctly set to None")
++        return True
++    else:
++        print("✗ FAIL: PK should be None but is still:", avatar.pk)
++        return False
++
++if __name__ == '__main__':
++    # Run the test using Django's test infrastructure
++    from django.test.utils import get_runner
++    from django.conf import settings
++    
++    TestRunner = get_runner(settings)
++    test_runner = TestRunner()
++    
++    # Create test database
++    test_runner.setup_test_environment()
++    old_config = test_runner.setup_databases()
++    
++    try:
++        # Run our test
++        success = test_pk_deletion_issue()
++        sys.exit(0 if success else 1)
++    finally:
++        # Clean up
++        test_runner.teardown_databases(old_config)
++        test_runner.teardown_test_environment()
+\ No newline at end of file
+diff --git a/tests/delete/test_pk_issue.py b/tests/delete/test_pk_issue.py
+new file mode 100644
+index 0000000000..e28fd745de
+--- /dev/null
++++ b/tests/delete/test_pk_issue.py
+@@ -0,0 +1,75 @@
++"""
++Test to reproduce the PK deletion issue.
++"""
++
++from django.test import TestCase
++from django.db import models
++from .models import Avatar, R, Base
++
++
++class PKDeletionIssueTest(TestCase):
++    """Test case to reproduce the PK deletion issue."""
++    
++    def test_pk_set_to_none_after_delete_no_dependencies(self):
++        """Test that PK is set to None after deletion for models without dependencies."""
++        # Create an Avatar instance (model with no dependencies)
++        avatar = Avatar.objects.create(desc="Test avatar")
++        original_pk = avatar.pk
++        
++        # Delete the avatar
++        result = avatar.delete()
++        
++        # Check if PK is None (expected behavior)
++        self.assertIsNone(avatar.pk, 
++                         f"PK should be None after deletion, but is {avatar.pk}")
++    
++    def test_pk_set_to_none_after_delete_with_dependencies(self):
++        """Test that PK is set to None after deletion for models with dependencies."""
++        # Create an R instance (model that can have dependencies)
++        r = R.objects.create(is_default=False)
++        original_pk = r.pk
++        
++        # Delete the R instance
++        result = r.delete()
++        
++        # Check if PK is None (expected behavior)
++        self.assertIsNone(r.pk, 
++                         f"PK should be None after deletion, but is {r.pk}")
++    
++    def test_fast_delete_path_pk_issue(self):
++        """Test to specifically trigger the fast delete path and check PK behavior."""
++        # Create a Base model that should trigger fast delete (has DO_NOTHING FK)
++        base = Base.objects.create()
++        original_pk = base.pk
++        
++        # Manually trigger the deletion collector to see the path taken
++        from django.db.models.deletion import Collector
++        from django.db import DEFAULT_DB_ALIAS
++        
++        collector = Collector(using=DEFAULT_DB_ALIAS)
++        collector.collect([base])
++        
++        # Check if this would take the fast delete path
++        self.assertEqual(len(collector.data), 1)
++        self.assertTrue(collector.can_fast_delete(base))
++        
++        # Now delete normally
++        result = base.delete()
++        
++        # Check if PK is None (expected behavior)
++        self.assertIsNone(base.pk, 
++                         f"PK should be None after deletion, but is {base.pk}")
++    
++    def test_multiple_instances_no_fast_delete(self):
++        """Test that multiple instances don't take the fast delete path."""
++        # Create multiple Base instances
++        base1 = Base.objects.create()
++        base2 = Base.objects.create()
++        
++        # Delete them individually (each should take fast delete path)
++        base1.delete()
++        base2.delete()
++        
++        # Both should have their PKs set to None
++        self.assertIsNone(base1.pk)
++        self.assertIsNone(base2.pk)
+\ No newline at end of file

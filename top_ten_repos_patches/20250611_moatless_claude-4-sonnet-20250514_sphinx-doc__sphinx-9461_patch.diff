@@ -1,0 +1,94 @@
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -2663,6 +2663,19 @@
+                             ) -> bool:
+         return inspect.isproperty(member) and isinstance(parent, ClassDocumenter)
+ 
++    def get_attr(self, obj: Any, name: str, *defargs: Any) -> Any:
++        """getattr() override to handle @classmethod @property combinations."""
++        # For @classmethod @property, we need to get the descriptor from the class __dict__
++        # instead of the evaluated result
++        if (inspect.isclass(obj) and hasattr(obj, '__dict__') and name in obj.__dict__):
++            obj_dict_value = obj.__dict__[name]
++            if (isinstance(obj_dict_value, classmethod) and 
++                hasattr(obj_dict_value, '__func__') and 
++                isinstance(obj_dict_value.__func__, property)):
++                return obj_dict_value
++        
++        return super().get_attr(obj, name, *defargs)
++
+     def document_members(self, all_members: bool = False) -> None:
+         pass
+ 
+@@ -2676,9 +2689,14 @@
+         if inspect.isabstractmethod(self.object):
+             self.add_line('   :abstractmethod:', sourcename)
+ 
+-        if safe_getattr(self.object, 'fget', None) and self.config.autodoc_typehints != 'none':
++        # Handle both regular properties and @classmethod @property combinations
++        prop_obj = self.object
++        if isinstance(self.object, classmethod) and hasattr(self.object, '__func__') and isinstance(self.object.__func__, property):
++            prop_obj = self.object.__func__
++        
++        if safe_getattr(prop_obj, 'fget', None) and self.config.autodoc_typehints != 'none':
+             try:
+-                signature = inspect.signature(self.object.fget,
++                signature = inspect.signature(prop_obj.fget,
+                                               type_aliases=self.config.autodoc_type_aliases)
+                 if signature.return_annotation is not Parameter.empty:
+                     objrepr = stringify_typehint(signature.return_annotation)
+
+--- a/sphinx/util/inspect.py
++++ b/sphinx/util/inspect.py
+@@ -390,7 +390,14 @@
+         if isinstance(obj, cached_property):
+             return True
+ 
+-    return isinstance(obj, property)
++    if isinstance(obj, property):
++        return True
++    
++    # Check for @classmethod @property combination (Python 3.9+)
++    if isinstance(obj, classmethod) and hasattr(obj, '__func__'):
++        return isinstance(obj.__func__, property)
++    
++    return False
+ 
+ 
+ def isgenericalias(obj: Any) -> bool:
+@@ -836,8 +843,13 @@
+     * partial functions
+     * inherited docstring
+     * inherited decorated methods
+-    """
+-    doc = attrgetter(obj, '__doc__', None)
++    * @classmethod @property combinations
++    """
++    # Handle @classmethod @property combination (Python 3.9+)
++    if isinstance(obj, classmethod) and hasattr(obj, '__func__') and isinstance(obj.__func__, property):
++        doc = attrgetter(obj.__func__, '__doc__', None)
++    else:
++        doc = attrgetter(obj, '__doc__', None)
+     if ispartial(obj) and doc == obj.__class__.__doc__:
+         return getdoc(obj.func)
+     elif doc is None and allow_inherited:
+
+--- a/sphinx/ext/autodoc/importer.py
++++ b/sphinx/ext/autodoc/importer.py
+@@ -281,7 +281,15 @@
+             unmangled = unmangle(subject, name)
+             if unmangled and unmangled not in members:
+                 if name in obj_dict:
+-                    members[unmangled] = ObjectMember(unmangled, value, class_=subject)
++                    # For @classmethod @property, prefer the descriptor from obj_dict
++                    # over the evaluated value
++                    obj_dict_value = obj_dict[name]
++                    if (isinstance(obj_dict_value, classmethod) and 
++                        hasattr(obj_dict_value, '__func__') and 
++                        isinstance(obj_dict_value.__func__, property)):
++                        members[unmangled] = ObjectMember(unmangled, obj_dict_value, class_=subject)
++                    else:
++                        members[unmangled] = ObjectMember(unmangled, value, class_=subject)
+                 else:
+                     members[unmangled] = ObjectMember(unmangled, value)
+         except AttributeError:

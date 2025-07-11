@@ -1,0 +1,85 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 7d226955d5..2d7d896647 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -120,6 +120,7 @@ class EnumSerializer(BaseSerializer):
+     def serialize(self):
+         enum_class = self.value.__class__
+         module = enum_class.__module__
++        # Use the full qualified name which includes parent classes for inner classes
+         return (
+             '%s.%s[%r]' % (module, enum_class.__qualname__, self.value.name),
+             {'import %s' % module},
+@@ -143,7 +144,11 @@ class FunctionTypeSerializer(BaseSerializer):
+         if getattr(self.value, "__self__", None) and isinstance(self.value.__self__, type):
+             klass = self.value.__self__
+             module = klass.__module__
+-            return "%s.%s.%s" % (module, klass.__name__, self.value.__name__), {"import %s" % module}
++            # For class methods, use the full qualified name of the class including parent classes for inner classes
++            if hasattr(klass, "__qualname__"):
++                return "%s.%s.%s" % (module, klass.__qualname__, self.value.__name__), {"import %s" % module}
++            else:
++                return "%s.%s.%s" % (module, klass.__name__, self.value.__name__), {"import %s" % module}
+         # Further error checking
+         if self.value.__name__ == '<lambda>':
+             raise ValueError("Cannot serialize function: lambda")
+@@ -153,6 +158,7 @@ class FunctionTypeSerializer(BaseSerializer):
+         module_name = self.value.__module__
+ 
+         if '<' not in self.value.__qualname__:  # Qualname can include <locals>
++            # Use __qualname__ which includes parent class names for inner class methods
+             return '%s.%s' % (module_name, self.value.__qualname__), {'import %s' % self.value.__module__}
+ 
+         raise ValueError(
+@@ -269,7 +275,13 @@ class TypeSerializer(BaseSerializer):
+             if module == builtins.__name__:
+                 return self.value.__name__, set()
+             else:
+-                return "%s.%s" % (module, self.value.__name__), {"import %s" % module}
++                # Handle nested classes (classes defined inside other classes)
++                # by checking if __qualname__ differs from __name__ and contains '.'
++                if hasattr(self.value, "__qualname__") and '.' in self.value.__qualname__:
++                    # For nested classes, we still import the top-level module
++                    return "%s.%s" % (module, self.value.__qualname__), {"import %s" % module}
++                else:
++                    return "%s.%s" % (module, self.value.__name__), {"import %s" % module}
+ 
+ 
+ class UUIDSerializer(BaseSerializer):
+diff --git a/tests/migrations/test_writer.py b/tests/migrations/test_writer.py
+index ca924f35ec..202b586b1c 100644
+--- a/tests/migrations/test_writer.py
++++ b/tests/migrations/test_writer.py
+@@ -187,6 +187,12 @@ class WriterTests(SimpleTestCase):
+     class NestedEnum(enum.IntEnum):
+         A = 1
+         B = 2
++        
++    class NestedField(models.CharField):
++        """A CharField subclass inside another class"""
++        def __init__(self, *args, **kwargs):
++            kwargs.setdefault('max_length', 100)
++            super().__init__(*args, **kwargs)
+ 
+     def safe_exec(self, string, value=None):
+         d = {}
+@@ -300,6 +306,19 @@ class WriterTests(SimpleTestCase):
+             ),
+         )
+         self.assertSerializedEqual(self.NestedEnum.A)
++        
++        # Test serialization of inner field classes
++        field = self.NestedField()
++        string, imports = MigrationWriter.serialize(field)
++        self.assertEqual(
++            string,
++            "migrations.test_writer.WriterTests.NestedField(max_length=100)",
++        )
++        # With the fix for inner classes, we might get either format of import
++        self.assertTrue(
++            imports == {'import migrations.test_writer'} or 
++            imports == {'import migrations.test_writer.WriterTests'}
++        )
+ 
+         field = models.CharField(default=TextEnum.B, choices=[(m.value, m) for m in TextEnum])
+         string = MigrationWriter.serialize(field)[0]

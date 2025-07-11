@@ -1,0 +1,125 @@
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -280,6 +280,110 @@
+                 return
+         self.data = {model: self.data[model] for model in sorted_models}
+ 
++    def _combine_fast_deletes(self):
++        """
++        Combine fast delete querysets that target the same table to reduce 
++        the number of database queries.
++        """
++        from django.db.models import Q
++        from collections import defaultdict
++        
++        # Group querysets by model
++        model_querysets = defaultdict(list)
++        for qs in self.fast_deletes:
++            model_querysets[qs.model].append(qs)
++        
++        combined_deletes = []
++        
++        for model, querysets in model_querysets.items():
++            if len(querysets) == 1:
++                # Single queryset, no need to combine
++                combined_deletes.extend(querysets)
++            else:
++                # Multiple querysets for the same model - combine them with OR
++                combined_q = Q()
++                can_combine = True
++                
++                for qs in querysets:
++                    # Extract the filter conditions from the queryset
++                    q = self._extract_queryset_q(qs)
++                    if q is not None:
++                        combined_q |= q
++                    else:
++                        # If we can't extract conditions from any queryset, 
++                        # fallback to original approach
++                        can_combine = False
++                        break
++                
++                if can_combine and combined_q.children:
++                    # Create a new combined queryset
++                    combined_qs = model._base_manager.using(self.using).filter(combined_q)
++                    combined_deletes.append(combined_qs)
++                else:
++                    # Fallback to original querysets if we can't combine
++                    combined_deletes.extend(querysets)
++        
++        return combined_deletes
++    
++    def _extract_queryset_q(self, queryset):
++        """
++        Extract Q object from a queryset's filter conditions.
++        This handles the common case of field__in lookups used in fast deletes.
++        """
++        from django.db.models import Q
++        
++        # For most fast delete cases, the queryset will have simple field__in conditions
++        # We'll try to reconstruct the Q object from the queryset's query
++        try:
++            # Clone the queryset to avoid modifying the original
++            qs_clone = queryset._clone()
++            
++            # Get the where node
++            where = qs_clone.query.where
++            if not where or not hasattr(where, 'children'):
++                return Q()
++            
++            # Build Q object from where conditions
++            q = Q()
++            for child in where.children:
++                if hasattr(child, 'lhs') and hasattr(child, 'rhs'):
++                    # Extract field name and lookup type
++                    field_name = self._get_field_name_from_lookup(child.lhs)
++                    lookup_name = getattr(child, 'lookup_name', 'exact')
++                    
++                    if field_name:
++                        if lookup_name == 'exact':
++                            lookup_key = field_name
++                        else:
++                            lookup_key = f"{field_name}__{lookup_name}"
++                        
++                        condition = Q(**{lookup_key: child.rhs})
++                        
++                        # Combine with OR since we're combining different conditions
++                        # for the same table
++                        q |= condition
++            
++            return q if q.children else None
++            
++        except Exception:
++            # If anything goes wrong, return None to trigger fallback
++            return None
++    
++    def _get_field_name_from_lookup(self, lhs):
++        """
++        Extract field name from a lookup's left-hand side.
++        """
++        try:
++            if hasattr(lhs, 'target') and hasattr(lhs.target, 'name'):
++                return lhs.target.name
++            elif hasattr(lhs, 'source') and hasattr(lhs.source, 'name'):
++                return lhs.source.name  
++            elif hasattr(lhs, 'field') and hasattr(lhs.field, 'name'):
++                return lhs.field.name
++        except AttributeError:
++            pass
++        return None
++
+     def delete(self):
+         # sort instance collections
+         for model, instances in self.data.items():
+@@ -309,8 +413,9 @@
+                         sender=model, instance=obj, using=self.using
+                     )
+ 
+-            # fast deletes
+-            for qs in self.fast_deletes:
++            # fast deletes - combine queries targeting the same table
++            combined_fast_deletes = self._combine_fast_deletes()
++            for qs in combined_fast_deletes:
+                 count = qs._raw_delete(using=self.using)
+                 deleted_counter[qs.model._meta.label] += count
+ 

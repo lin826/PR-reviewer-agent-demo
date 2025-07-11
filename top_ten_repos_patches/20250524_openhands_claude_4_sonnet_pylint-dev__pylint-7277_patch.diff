@@ -1,0 +1,731 @@
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 000000000..a707b2102
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""
++Final verification that the bug fix works correctly.
++
++This script reproduces the exact scenario from the bug report and verifies
++that the fix preserves custom paths while still removing current directory indicators.
++"""
++
++import sys
++import os
++from pylint import modify_sys_path
++
++def main():
++    print("🔍 Final Verification of Bug Fix")
++    print("=" * 50)
++    
++    # Save original sys.path for restoration
++    original_path = sys.path.copy()
++    
++    print(f"📍 Current working directory: {os.getcwd()}")
++    print(f"📍 Original sys.path[0]: {original_path[0]!r}")
++    
++    try:
++        # Test 1: Reproduce the exact bug report scenario
++        print("\n🧪 Test 1: Bug Report Scenario")
++        print("Adding 'something' to sys.path[0]...")
++        
++        sys.path.insert(0, "something")
++        print(f"   Before: sys.path[0] = {sys.path[0]!r}")
++        
++        modify_sys_path()
++        print(f"   After:  sys.path[0] = {sys.path[0]!r}")
++        
++        if sys.path[0] == "something":
++            print("   ✅ SUCCESS: Custom path 'something' preserved!")
++        else:
++            print("   ❌ FAILURE: Custom path was removed!")
++            return False
++        
++        # Test 2: Verify current directory indicators are still removed
++        print("\n🧪 Test 2: Current Directory Removal")
++        
++        # Test empty string
++        sys.path[:] = [""] + original_path[1:]
++        print(f"   Testing empty string...")
++        print(f"   Before: sys.path[0] = {sys.path[0]!r}")
++        modify_sys_path()
++        print(f"   After:  sys.path[0] = {sys.path[0]!r}")
++        if sys.path[0] != "":
++            print("   ✅ Empty string correctly removed")
++        else:
++            print("   ❌ Empty string not removed!")
++            return False
++        
++        # Test dot
++        sys.path[:] = ["."] + original_path[1:]
++        print(f"   Testing dot...")
++        print(f"   Before: sys.path[0] = {sys.path[0]!r}")
++        modify_sys_path()
++        print(f"   After:  sys.path[0] = {sys.path[0]!r}")
++        if sys.path[0] != ".":
++            print("   ✅ Dot correctly removed")
++        else:
++            print("   ❌ Dot not removed!")
++            return False
++        
++        # Test current working directory
++        cwd = os.getcwd()
++        sys.path[:] = [cwd] + original_path[1:]
++        print(f"   Testing current working directory...")
++        print(f"   Before: sys.path[0] = {sys.path[0]!r}")
++        modify_sys_path()
++        print(f"   After:  sys.path[0] = {sys.path[0]!r}")
++        if sys.path[0] != cwd:
++            print("   ✅ Current working directory correctly removed")
++        else:
++            print("   ❌ Current working directory not removed!")
++            return False
++        
++        # Test 3: Verify various custom paths are preserved
++        print("\n🧪 Test 3: Custom Path Preservation")
++        
++        custom_paths = [
++            "/custom/library/path",
++            "something",
++            "../relative/path",
++            "/absolute/path",
++            "simple_name"
++        ]
++        
++        for custom_path in custom_paths:
++            sys.path[:] = [custom_path] + original_path[1:]
++            print(f"   Testing: {custom_path!r}")
++            print(f"   Before: sys.path[0] = {sys.path[0]!r}")
++            modify_sys_path()
++            print(f"   After:  sys.path[0] = {sys.path[0]!r}")
++            if sys.path[0] == custom_path:
++                print(f"   ✅ Custom path {custom_path!r} preserved")
++            else:
++                print(f"   ❌ Custom path {custom_path!r} not preserved!")
++                return False
++        
++        print("\n🎉 All Tests Passed!")
++        print("✅ Bug fix verified: modify_sys_path() now correctly:")
++        print("   • Preserves custom user paths")
++        print("   • Removes current directory indicators (\"\", \".\", cwd)")
++        print("   • Maintains backward compatibility")
++        
++        return True
++        
++    finally:
++        # Always restore original sys.path
++        sys.path[:] = original_path
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/pylint/__init__.py b/pylint/__init__.py
+index 9f3dd74e6..3f37274a0 100644
+--- a/pylint/__init__.py
++++ b/pylint/__init__.py
+@@ -86,7 +86,7 @@ def modify_sys_path() -> None:
+     stdlib or pylint's own modules.
+     CPython issue: https://bugs.python.org/issue33053
+ 
+-    - Remove the first entry. This will always be either "" or the working directory
++    - Remove the first entry if it's a current directory indicator ("", ".", or cwd)
+     - Remove the working directory from the second and third entries
+       if PYTHONPATH includes a ":" at the beginning or the end.
+       https://github.com/PyCQA/pylint/issues/3636
+@@ -96,9 +96,11 @@ def modify_sys_path() -> None:
+       if pylint is installed in an editable configuration (as the last item).
+       https://github.com/PyCQA/pylint/issues/4161
+     """
+-    sys.path.pop(0)
+     env_pythonpath = os.environ.get("PYTHONPATH", "")
+     cwd = os.getcwd()
++    # Only remove the first entry if it's a current directory indicator
++    if sys.path and sys.path[0] in ("", ".", cwd):
++        sys.path.pop(0)
+     if env_pythonpath.startswith(":") and env_pythonpath not in (f":{cwd}", ":."):
+         sys.path.pop(0)
+     elif env_pythonpath.endswith(":") and env_pythonpath not in (f"{cwd}:", ".:"):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..e8dcea20a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for the sys.path issue when running pylint from runpy.
++
++This script demonstrates the problem where pylint removes the first item from
++sys.path even when it's a custom path added by the user, not a current directory indicator.
++"""
++
++import sys
++import runpy
++import os
++
++def test_current_behavior():
++    """Test the current problematic behavior."""
++    print("=== Testing Current Behavior ===")
++    
++    # Save original sys.path
++    original_path = sys.path.copy()
++    
++    # Add a custom path to the beginning of sys.path
++    custom_path = "/custom/library/path"
++    sys.path.insert(0, custom_path)
++    
++    print(f"Before runpy: sys.path[0] = {sys.path[0]!r}")
++    print(f"Custom path added: {custom_path!r}")
++    
++    try:
++        # This should trigger the modify_sys_path() function
++        # which incorrectly removes our custom path
++        runpy.run_module('pylint', run_name="__main__", alter_sys=True)
++    except SystemExit:
++        # pylint will exit, that's expected
++        pass
++    except Exception as e:
++        print(f"Exception occurred: {e}")
++    
++    print(f"After runpy: sys.path[0] = {sys.path[0]!r}")
++    
++    # Check if our custom path was incorrectly removed
++    if custom_path not in sys.path:
++        print("❌ PROBLEM: Custom path was incorrectly removed!")
++        return False
++    elif sys.path[0] != custom_path:
++        print("❌ PROBLEM: Custom path was moved from position 0!")
++        return False
++    else:
++        print("✅ GOOD: Custom path preserved correctly")
++        return True
++    
++    # Restore original sys.path
++    sys.path[:] = original_path
++
++def test_expected_behavior_empty_string():
++    """Test that empty string should be removed."""
++    print("\n=== Testing Expected Behavior: Empty String ===")
++    
++    # Save original sys.path
++    original_path = sys.path.copy()
++    
++    # Add empty string to the beginning (this should be removed)
++    sys.path.insert(0, "")
++    
++    print(f"Before: sys.path[0] = {sys.path[0]!r}")
++    
++    # Import and call modify_sys_path directly to test our fix
++    from pylint import modify_sys_path
++    modify_sys_path()
++    
++    print(f"After: sys.path[0] = {sys.path[0]!r}")
++    
++    # Empty string should have been removed
++    if "" not in sys.path[:2]:  # Check first two positions
++        print("✅ GOOD: Empty string was correctly removed")
++        result = True
++    else:
++        print("❌ PROBLEM: Empty string was not removed")
++        result = False
++    
++    # Restore original sys.path
++    sys.path[:] = original_path
++    return result
++
++def test_expected_behavior_dot():
++    """Test that '.' should be removed."""
++    print("\n=== Testing Expected Behavior: Dot ===")
++    
++    # Save original sys.path
++    original_path = sys.path.copy()
++    
++    # Add dot to the beginning (this should be removed)
++    sys.path.insert(0, ".")
++    
++    print(f"Before: sys.path[0] = {sys.path[0]!r}")
++    
++    # Import and call modify_sys_path directly to test our fix
++    from pylint import modify_sys_path
++    modify_sys_path()
++    
++    print(f"After: sys.path[0] = {sys.path[0]!r}")
++    
++    # Dot should have been removed
++    if "." not in sys.path[:2]:  # Check first two positions
++        print("✅ GOOD: Dot was correctly removed")
++        result = True
++    else:
++        print("❌ PROBLEM: Dot was not removed")
++        result = False
++    
++    # Restore original sys.path
++    sys.path[:] = original_path
++    return result
++
++def test_expected_behavior_cwd():
++    """Test that current working directory should be removed."""
++    print("\n=== Testing Expected Behavior: CWD ===")
++    
++    # Save original sys.path
++    original_path = sys.path.copy()
++    
++    # Add current working directory to the beginning (this should be removed)
++    cwd = os.getcwd()
++    sys.path.insert(0, cwd)
++    
++    print(f"Before: sys.path[0] = {sys.path[0]!r}")
++    print(f"CWD: {cwd!r}")
++    
++    # Import and call modify_sys_path directly to test our fix
++    from pylint import modify_sys_path
++    modify_sys_path()
++    
++    print(f"After: sys.path[0] = {sys.path[0]!r}")
++    
++    # CWD should have been removed from first position
++    if sys.path[0] != cwd:
++        print("✅ GOOD: CWD was correctly removed from first position")
++        result = True
++    else:
++        print("❌ PROBLEM: CWD was not removed from first position")
++        result = False
++    
++    # Restore original sys.path
++    sys.path[:] = original_path
++    return result
++
++if __name__ == "__main__":
++    print("Reproducing pylint sys.path issue...")
++    
++    # Test the current problematic behavior
++    current_works = test_current_behavior()
++    
++    # Test expected behaviors for what should be removed
++    empty_works = test_expected_behavior_empty_string()
++    dot_works = test_expected_behavior_dot()
++    cwd_works = test_expected_behavior_cwd()
++    
++    print(f"\n=== Summary ===")
++    print(f"Custom path preservation: {'✅' if current_works else '❌'}")
++    print(f"Empty string removal: {'✅' if empty_works else '❌'}")
++    print(f"Dot removal: {'✅' if dot_works else '❌'}")
++    print(f"CWD removal: {'✅' if cwd_works else '❌'}")
++    
++    if not current_works:
++        print("\n❌ Issue reproduced: Custom paths are incorrectly removed!")
++        sys.exit(1)
++    else:
++        print("\n✅ All tests passed!")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 000000000..fd3b3f0be
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,27 @@
++#!/usr/bin/env python3
++"""
++Simple test to reproduce the exact issue from the bug report.
++"""
++
++import sys
++import runpy
++
++print("Original sys.path[0]:", repr(sys.path[0]))
++
++# Add custom path as described in the issue
++sys.path.insert(0, "something")
++print("After inserting 'something':", repr(sys.path[0]))
++
++# This should trigger the issue
++try:
++    runpy.run_module('pylint', run_name="__main__", alter_sys=True)
++except SystemExit:
++    pass
++
++print("After runpy.run_module:", repr(sys.path[0]))
++
++# Check if "something" is still in sys.path
++if "something" in sys.path:
++    print("✅ 'something' is still in sys.path")
++else:
++    print("❌ 'something' was removed from sys.path")
+\ No newline at end of file
+diff --git a/test_bug_fix.py b/test_bug_fix.py
+new file mode 100644
+index 000000000..ef687514d
+--- /dev/null
++++ b/test_bug_fix.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""
++Test that reproduces the exact bug report scenario and verifies the fix.
++"""
++
++import sys
++import runpy
++import subprocess
++import tempfile
++import os
++
++def test_runpy_scenario():
++    """Test the exact scenario from the bug report."""
++    print("=== Testing the exact bug report scenario ===")
++    
++    # Create a test script that reproduces the issue
++    test_script = '''
++import sys
++import runpy
++import os
++
++# Save original sys.path
++original_path = sys.path.copy()
++
++print(f"Current working directory: {os.getcwd()!r}")
++print(f"Initial sys.path[0]: {sys.path[0]!r}")
++
++# Add custom path as described in the bug report
++sys.path.insert(0, "something")
++
++print(f"Before runpy: sys.path[0] = {sys.path[0]!r}")
++print(f"sys.path[:3]: {sys.path[:3]}")
++
++try:
++    # This should trigger the issue according to the bug report
++    runpy.run_module('pylint', run_name="__main__", alter_sys=True)
++except SystemExit:
++    # pylint will exit, that's expected
++    pass
++
++print(f"After runpy: sys.path[0] = {sys.path[0]!r}")
++print(f"sys.path[:3]: {sys.path[:3]}")
++
++# Check if "something" is still in sys.path
++if "something" in sys.path:
++    print(f"SUCCESS: Custom path preserved at index {sys.path.index('something')}")
++    exit(0)
++else:
++    print("FAILURE: Custom path was removed")
++    exit(1)
++'''
++    
++    # Write the test script to a temporary file
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(test_script)
++        script_path = f.name
++    
++    try:
++        # Run the test script
++        result = subprocess.run(
++            [sys.executable, script_path],
++            capture_output=True,
++            text=True,
++            cwd=os.path.dirname(os.path.abspath(__file__))
++        )
++        
++        print("Script output:")
++        print(result.stdout)
++        if result.stderr:
++            print("Script errors:")
++            print(result.stderr)
++        
++        if result.returncode == 0:
++            print("✅ Bug fix verified: Custom path is preserved!")
++            return True
++        else:
++            print("❌ Bug still exists: Custom path was removed!")
++            return False
++            
++    finally:
++        # Clean up the temporary file
++        os.unlink(script_path)
++
++if __name__ == "__main__":
++    success = test_runpy_scenario()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..cc5286b62
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the sys.path fix.
++"""
++
++import sys
++import os
++from pylint import modify_sys_path
++
++def test_empty_sys_path():
++    """Test when sys.path is empty."""
++    print("=== Testing empty sys.path ===")
++    original_path = sys.path.copy()
++    sys.path.clear()
++    
++    try:
++        modify_sys_path()
++        print("✅ Empty sys.path handled correctly")
++        result = True
++    except Exception as e:
++        print(f"❌ Error with empty sys.path: {e}")
++        result = False
++    finally:
++        sys.path[:] = original_path
++    
++    return result
++
++def test_single_item_custom_path():
++    """Test when sys.path has only one custom item."""
++    print("\n=== Testing single custom item ===")
++    original_path = sys.path.copy()
++    sys.path[:] = ["/custom/path"]
++    
++    try:
++        modify_sys_path()
++        if sys.path == ["/custom/path"]:
++            print("✅ Single custom path preserved")
++            result = True
++        else:
++            print(f"❌ Single custom path not preserved: {sys.path}")
++            result = False
++    except Exception as e:
++        print(f"❌ Error with single custom path: {e}")
++        result = False
++    finally:
++        sys.path[:] = original_path
++    
++    return result
++
++def test_single_item_cwd():
++    """Test when sys.path has only the current directory."""
++    print("\n=== Testing single CWD item ===")
++    original_path = sys.path.copy()
++    cwd = os.getcwd()
++    sys.path[:] = [cwd]
++    
++    try:
++        modify_sys_path()
++        if cwd not in sys.path:
++            print("✅ Single CWD correctly removed")
++            result = True
++        else:
++            print(f"❌ Single CWD not removed: {sys.path}")
++            result = False
++    except Exception as e:
++        print(f"❌ Error with single CWD: {e}")
++        result = False
++    finally:
++        sys.path[:] = original_path
++    
++    return result
++
++def test_single_item_empty_string():
++    """Test when sys.path has only an empty string."""
++    print("\n=== Testing single empty string ===")
++    original_path = sys.path.copy()
++    sys.path[:] = [""]
++    
++    try:
++        modify_sys_path()
++        if "" not in sys.path:
++            print("✅ Single empty string correctly removed")
++            result = True
++        else:
++            print(f"❌ Single empty string not removed: {sys.path}")
++            result = False
++    except Exception as e:
++        print(f"❌ Error with single empty string: {e}")
++        result = False
++    finally:
++        sys.path[:] = original_path
++    
++    return result
++
++def test_single_item_dot():
++    """Test when sys.path has only a dot."""
++    print("\n=== Testing single dot ===")
++    original_path = sys.path.copy()
++    sys.path[:] = ["."]
++    
++    try:
++        modify_sys_path()
++        if "." not in sys.path:
++            print("✅ Single dot correctly removed")
++            result = True
++        else:
++            print(f"❌ Single dot not removed: {sys.path}")
++            result = False
++    except Exception as e:
++        print(f"❌ Error with single dot: {e}")
++        result = False
++    finally:
++        sys.path[:] = original_path
++    
++    return result
++
++if __name__ == "__main__":
++    print("Testing edge cases for modify_sys_path fix...")
++    
++    results = [
++        test_empty_sys_path(),
++        test_single_item_custom_path(),
++        test_single_item_cwd(),
++        test_single_item_empty_string(),
++        test_single_item_dot(),
++    ]
++    
++    print(f"\n=== Summary ===")
++    passed = sum(results)
++    total = len(results)
++    print(f"Passed: {passed}/{total}")
++    
++    if passed == total:
++        print("✅ All edge case tests passed!")
++        sys.exit(0)
++    else:
++        print("❌ Some edge case tests failed!")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_modify_sys_path_fix.py b/test_modify_sys_path_fix.py
+new file mode 100644
+index 000000000..8b72436b3
+--- /dev/null
++++ b/test_modify_sys_path_fix.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++"""
++Test that specifically verifies the modify_sys_path fix.
++
++This test focuses on the exact issue described in the bug report:
++modify_sys_path() should not remove custom paths from sys.path[0].
++"""
++
++import sys
++import os
++from pylint import modify_sys_path
++
++def test_custom_path_preservation():
++    """Test that custom paths are preserved by modify_sys_path."""
++    print("=== Testing custom path preservation ===")
++    
++    # Save original sys.path
++    original_path = sys.path.copy()
++    
++    try:
++        # Test case 1: Custom path should be preserved
++        sys.path[:] = ["/custom/library/path"] + original_path[1:]
++        modify_sys_path()
++        assert sys.path[0] == "/custom/library/path", f"Custom path not preserved: {sys.path[0]}"
++        print("✅ Custom library path preserved")
++        
++        # Test case 2: Another custom path should be preserved
++        sys.path[:] = ["something"] + original_path[1:]
++        modify_sys_path()
++        assert sys.path[0] == "something", f"Custom path not preserved: {sys.path[0]}"
++        print("✅ Custom 'something' path preserved")
++        
++        # Test case 3: Relative custom path should be preserved
++        sys.path[:] = ["../custom"] + original_path[1:]
++        modify_sys_path()
++        assert sys.path[0] == "../custom", f"Custom path not preserved: {sys.path[0]}"
++        print("✅ Relative custom path preserved")
++        
++    finally:
++        # Restore original sys.path
++        sys.path[:] = original_path
++    
++    return True
++
++def test_current_directory_removal():
++    """Test that current directory indicators are still removed."""
++    print("\n=== Testing current directory removal ===")
++    
++    # Save original sys.path
++    original_path = sys.path.copy()
++    
++    try:
++        # Test case 1: Empty string should be removed
++        sys.path[:] = [""] + original_path[1:]
++        modify_sys_path()
++        assert sys.path[0] != "", f"Empty string not removed: {sys.path[0]}"
++        print("✅ Empty string removed")
++        
++        # Test case 2: Dot should be removed
++        sys.path[:] = ["."] + original_path[1:]
++        modify_sys_path()
++        assert sys.path[0] != ".", f"Dot not removed: {sys.path[0]}"
++        print("✅ Dot removed")
++        
++        # Test case 3: Current working directory should be removed
++        cwd = os.getcwd()
++        sys.path[:] = [cwd] + original_path[1:]
++        modify_sys_path()
++        assert sys.path[0] != cwd, f"CWD not removed: {sys.path[0]}"
++        print("✅ Current working directory removed")
++        
++    finally:
++        # Restore original sys.path
++        sys.path[:] = original_path
++    
++    return True
++
++def test_bug_report_scenario():
++    """Test the exact scenario from the bug report."""
++    print("\n=== Testing bug report scenario ===")
++    
++    # Save original sys.path
++    original_path = sys.path.copy()
++    
++    try:
++        # Reproduce the exact scenario from the bug report
++        sys.path.insert(0, "something")
++        
++        print(f"Before modify_sys_path: sys.path[0] = {sys.path[0]!r}")
++        
++        # This should NOT remove "something" according to the bug report
++        modify_sys_path()
++        
++        print(f"After modify_sys_path: sys.path[0] = {sys.path[0]!r}")
++        
++        # Verify that "something" is preserved
++        assert "something" in sys.path, "Custom path 'something' was removed!"
++        assert sys.path[0] == "something", f"Custom path moved from position 0: {sys.path[0]}"
++        
++        print("✅ Bug report scenario fixed: 'something' preserved at position 0")
++        
++    finally:
++        # Restore original sys.path
++        sys.path[:] = original_path
++    
++    return True
++
++if __name__ == "__main__":
++    print("Testing modify_sys_path fix...")
++    
++    results = [
++        test_custom_path_preservation(),
++        test_current_directory_removal(),
++        test_bug_report_scenario(),
++    ]
++    
++    print(f"\n=== Summary ===")
++    passed = sum(results)
++    total = len(results)
++    print(f"Passed: {passed}/{total}")
++    
++    if passed == total:
++        print("✅ All modify_sys_path tests passed!")
++        print("✅ Bug fix verified: Custom paths are preserved!")
++        sys.exit(0)
++    else:
++        print("❌ Some tests failed!")
++        sys.exit(1)
+\ No newline at end of file

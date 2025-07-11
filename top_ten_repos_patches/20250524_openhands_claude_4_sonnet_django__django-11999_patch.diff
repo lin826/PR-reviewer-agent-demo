@@ -1,0 +1,416 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index ee45bb941e..bccd259e73 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -763,8 +763,12 @@ class Field(RegisterLookupMixin):
+             if not getattr(cls, self.attname, None):
+                 setattr(cls, self.attname, self.descriptor_class(self))
+         if self.choices is not None:
+-            setattr(cls, 'get_%s_display' % self.name,
+-                    partialmethod(cls._get_FIELD_display, field=self))
++            # Don't override an existing get_FOO_display() method.
++            method_name = 'get_%s_display' % self.name
++            existing_method = getattr(cls, method_name, None)
++            if not existing_method:
++                setattr(cls, method_name,
++                        partialmethod(cls._get_FIELD_display, field=self))
+ 
+     def get_filter_kwargs_for_object(self, obj):
+         """
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..18bb425cd1
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python
++"""
++Simple test to verify the fix works in the Django test environment.
++"""
++
++import os
++import sys
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.db import models
++
++# Define the test model directly here to avoid any caching issues
++class TestOverrideModel(models.Model):
++    status = models.CharField(
++        max_length=10,
++        choices=[('active', 'Active'), ('inactive', 'Inactive')]
++    )
++    
++    def get_status_display(self):
++        return "Custom Override"
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_override():
++    instance = TestOverrideModel(status='active')
++    result = instance.get_status_display()
++    print(f"Result: {repr(result)}")
++    print(f"Expected: {repr('Custom Override')}")
++    print(f"Test {'PASSED' if result == 'Custom Override' else 'FAILED'}")
++    return result == 'Custom Override'
++
++if __name__ == '__main__':
++    success = test_override()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_get_display_override.py b/test_get_display_override.py
+new file mode 100644
+index 0000000000..d58bae5816
+--- /dev/null
++++ b/test_get_display_override.py
+@@ -0,0 +1,188 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue with overriding get_FOO_display() methods.
++This script demonstrates that user-defined get_FOO_display() methods are not
++being respected in Django 2.2+.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++
++class FooBar(models.Model):
++    """Test model with choices and overridden get_FOO_display method."""
++    foo_bar = models.CharField(
++        "foo", 
++        max_length=10,
++        choices=[(1, 'foo'), (2, 'bar')]
++    )
++    
++    def __str__(self):
++        return self.get_foo_bar_display()
++    
++    def get_foo_bar_display(self):
++        """This should override the auto-generated method."""
++        return "something"
++    
++    class Meta:
++        app_label = 'test'
++
++
++class NoOverride(models.Model):
++    """Test model with choices but no overridden get_FOO_display method."""
++    status = models.CharField(
++        max_length=10,
++        choices=[('active', 'Active'), ('inactive', 'Inactive')]
++    )
++    
++    class Meta:
++        app_label = 'test'
++
++
++class EmptyChoices(models.Model):
++    """Test model with empty choices and overridden get_FOO_display method."""
++    empty_field = models.CharField(
++        max_length=10,
++        choices=()
++    )
++    
++    def get_empty_field_display(self):
++        """This should override the auto-generated method."""
++        return "custom_empty"
++    
++    class Meta:
++        app_label = 'test'
++
++
++class NoChoices(models.Model):
++    """Test model with no choices and overridden get_FOO_display method."""
++    no_choices_field = models.CharField(max_length=10)
++    
++    def get_no_choices_field_display(self):
++        """This should not be overridden since there are no choices."""
++        return "custom_no_choices"
++    
++    class Meta:
++        app_label = 'test'
++
++
++def test_get_display_override():
++    """Test that user-defined get_FOO_display methods work correctly."""
++    print("Testing get_FOO_display() override...")
++    
++    # Test 1: Model with choices and override
++    instance = FooBar(foo_bar=1)
++    result = instance.get_foo_bar_display()
++    print(f"FooBar.get_foo_bar_display() returned: {repr(result)}")
++    
++    expected = "something"
++    success = True
++    if result == expected:
++        print("✓ SUCCESS: Override method is working correctly")
++    else:
++        print(f"✗ FAILURE: Expected {repr(expected)}, got {repr(result)}")
++        success = False
++    
++    # Test 2: Model with choices but no override (should use Django's method)
++    instance2 = NoOverride(status='active')
++    result2 = instance2.get_status_display()
++    print(f"NoOverride.get_status_display() returned: {repr(result2)}")
++    
++    expected2 = "Active"
++    if result2 == expected2:
++        print("✓ SUCCESS: Django's auto-generated method works when no override")
++    else:
++        print(f"✗ FAILURE: Expected {repr(expected2)}, got {repr(result2)}")
++        success = False
++    
++    # Test 3: Model with empty choices and override
++    instance3 = EmptyChoices(empty_field='test')
++    result3 = instance3.get_empty_field_display()
++    print(f"EmptyChoices.get_empty_field_display() returned: {repr(result3)}")
++    
++    expected3 = "custom_empty"
++    if result3 == expected3:
++        print("✓ SUCCESS: Override method works with empty choices")
++    else:
++        print(f"✗ FAILURE: Expected {repr(expected3)}, got {repr(result3)}")
++        success = False
++    
++    # Test 4: Model with no choices and override (should keep user method)
++    instance4 = NoChoices(no_choices_field='test')
++    result4 = instance4.get_no_choices_field_display()
++    print(f"NoChoices.get_no_choices_field_display() returned: {repr(result4)}")
++    
++    expected4 = "custom_no_choices"
++    if result4 == expected4:
++        print("✓ SUCCESS: User method preserved when no choices")
++    else:
++        print(f"✗ FAILURE: Expected {repr(expected4)}, got {repr(result4)}")
++        success = False
++    
++    return success
++
++
++def test_method_resolution():
++    """Test method resolution order to understand what's happening."""
++    print("\nTesting method resolution...")
++    
++    instance = FooBar(foo_bar=1)
++    
++    # Check if our method exists in the class
++    if hasattr(FooBar, 'get_foo_bar_display'):
++        method = getattr(FooBar, 'get_foo_bar_display')
++        print(f"get_foo_bar_display method: {method}")
++        print(f"Method type: {type(method)}")
++        
++        # Check if it's our method or Django's
++        if hasattr(method, 'func') and hasattr(method.func, '__name__'):
++            if method.func.__name__ == '_get_FIELD_display':
++                print("✗ Method is Django's auto-generated method (partialmethod)")
++            else:
++                print("✓ Method appears to be user-defined")
++        elif callable(method):
++            # Try to inspect the method
++            try:
++                import inspect
++                source = inspect.getsource(method)
++                if 'return "something"' in source:
++                    print("✓ Method is user-defined")
++                else:
++                    print("✗ Method is not user-defined")
++            except:
++                print("? Could not determine method source")
++    else:
++        print("✗ get_foo_bar_display method not found")
++
++
++if __name__ == '__main__':
++    print("Django version:", django.VERSION)
++    print("Testing get_FOO_display() override issue...\n")
++    
++    success = test_get_display_override()
++    test_method_resolution()
++    
++    print(f"\nTest {'PASSED' if success else 'FAILED'}")
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_new_model.py b/test_new_model.py
+new file mode 100644
+index 0000000000..aa86102698
+--- /dev/null
++++ b/test_new_model.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python
++"""
++Test with a completely new model to verify the fix works.
++"""
++
++import os
++import sys
++
++# Set up Django environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++
++class NewTestModel(models.Model):
++    status = models.CharField(
++        max_length=10,
++        choices=[('active', 'Active'), ('inactive', 'Inactive')]
++    )
++    
++    def get_status_display(self):
++        return "Custom Override"
++    
++    class Meta:
++        app_label = 'model_fields'  # Use the same app as the other test models
++
++class TestGetDisplayOverride(TestCase):
++    def test_override_works(self):
++        instance = NewTestModel(status='active')
++        result = instance.get_status_display()
++        self.assertEqual(result, "Custom Override")
++
++if __name__ == '__main__':
++    from django.test.utils import get_runner
++    from django.conf import settings
++    
++    TestRunner = get_runner(settings)
++    test_runner = TestRunner(verbosity=2)
++    failures = test_runner.run_tests(["__main__"])
++    sys.exit(bool(failures))
+\ No newline at end of file
+diff --git a/test_override_get_display.py b/test_override_get_display.py
+new file mode 100644
+index 0000000000..2d6bf1e554
+--- /dev/null
++++ b/test_override_get_display.py
+@@ -0,0 +1,73 @@
++"""
++Test case for the get_FOO_display() override functionality.
++This test should be added to the Django test suite to ensure the fix works correctly.
++"""
++
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.test import SimpleTestCase
++
++
++class OverrideGetDisplayModel(models.Model):
++    """Test model with choices and overridden get_FOO_display method."""
++    status = models.CharField(
++        max_length=10,
++        choices=[('active', 'Active'), ('inactive', 'Inactive')]
++    )
++    
++    def get_status_display(self):
++        """Override the auto-generated method."""
++        return "Custom Override"
++    
++    class Meta:
++        app_label = 'test'
++
++
++class GetFieldDisplayOverrideTests(SimpleTestCase):
++    """Test that user-defined get_FOO_display methods are respected."""
++    
++    def test_get_display_override_with_choices(self):
++        """
++        User-defined get_FOO_display() methods should not be overridden
++        by Django's auto-generated methods when a field has choices.
++        """
++        instance = OverrideGetDisplayModel(status='active')
++        result = instance.get_status_display()
++        self.assertEqual(result, "Custom Override")
++    
++    def test_get_display_override_with_invalid_choice(self):
++        """
++        User-defined get_FOO_display() methods should work even with
++        invalid choice values.
++        """
++        instance = OverrideGetDisplayModel(status='invalid')
++        result = instance.get_status_display()
++        self.assertEqual(result, "Custom Override")
++
++
++if __name__ == '__main__':
++    from django.test.utils import get_runner
++    
++    TestRunner = get_runner(settings)
++    test_runner = TestRunner()
++    failures = test_runner.run_tests(["__main__"])
+\ No newline at end of file
+diff --git a/tests/model_fields/models.py b/tests/model_fields/models.py
+index 98b32d0c1e..e3a6f770d1 100644
+--- a/tests/model_fields/models.py
++++ b/tests/model_fields/models.py
+@@ -76,6 +76,7 @@ class Choiceful(models.Model):
+     empty_choices_text = models.TextField(choices=())
+ 
+ 
++
+ class BigD(models.Model):
+     d = models.DecimalField(max_digits=32, decimal_places=30)
+ 
+diff --git a/tests/model_fields/tests.py b/tests/model_fields/tests.py
+index 0d6e930b06..a5b1d10bfb 100644
+--- a/tests/model_fields/tests.py
++++ b/tests/model_fields/tests.py
+@@ -187,6 +187,8 @@ class GetFieldDisplayTests(SimpleTestCase):
+         self.assertEqual(WhizIterEmpty(c='').c, '')        # Empty value
+ 
+ 
++
++
+ class GetChoicesTests(SimpleTestCase):
+ 
+     def test_empty_choices(self):

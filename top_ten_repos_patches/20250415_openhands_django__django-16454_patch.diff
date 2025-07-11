@@ -1,0 +1,248 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index abc6f79a15..9813e2017a 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -70,6 +70,34 @@ class CommandParser(ArgumentParser):
+             super().error(message)
+         else:
+             raise CommandError("Error: %s" % message)
++
++    def add_subparsers(self, **kwargs):
++        """
++        Override the add_subparsers method to ensure that the returned subparser
++        action creates parsers that inherit the error formatting and behavior from
++        the parent parser.
++
++        This addresses the issue where subparsers created by CommandParser were not
++        inheriting the parent's error formatting capabilities, resulting in stack
++        traces instead of human-friendly error messages.
++        """
++        # Add our CommandParser-specific attributes to subparser instances
++        subparsers_action = super().add_subparsers(**kwargs)
++
++        # Keep a reference to the original add_parser method
++        original_add_parser = subparsers_action.add_parser
++
++        # Define a new add_parser method that passes the CommandParser attributes
++        def add_parser_with_command_attrs(name, **sub_kwargs):
++            # Pass missing_args_message and called_from_command_line to the subparser
++            sub_kwargs.setdefault('missing_args_message', self.missing_args_message)
++            sub_kwargs.setdefault('called_from_command_line', self.called_from_command_line)
++            return original_add_parser(name, **sub_kwargs)
++
++        # Replace the action's add_parser method with our custom one
++        subparsers_action.add_parser = add_parser_with_command_attrs
++
++        return subparsers_action
+
+
+ def handle_default_options(options):
+diff --git a/final_test.py b/final_test.py
+new file mode 100644
+index 0000000000..bbb3cffd6a
+--- /dev/null
++++ b/final_test.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python
++"""
++Final test for the subparser error handling fix in CommandParser.
++This test directly uses CommandParser and checks both error scenarios.
++"""
++
++import sys
++from django.core.management.base import CommandParser, CommandError
++
++def run_tests():
++    # Create a parent parser with our custom attributes
++    parent_parser = CommandParser(
++        prog='manage.py test',
++        description='Test command',
++        missing_args_message='Please specify a subcommand',
++        called_from_command_line=False
++    )
++
++    # Add subparsers
++    subparsers = parent_parser.add_subparsers(dest='subcommand', required=True)
++
++    # Add a "create" subparser with a required "name" argument
++    create_parser = subparsers.add_parser('create')
++    create_parser.add_argument('name', help='Name argument')
++
++    # Test 1: Missing subcommand
++    print("\n=== Test 1: Missing subcommand ===")
++    try:
++        args = parent_parser.parse_args([])
++        print("This should not be reached - error should be raised")
++    except CommandError as e:
++        print(f"Error properly handled: {e}")
++        print("SUCCESS: Missing subcommand error properly formatted")
++    except Exception as e:
++        print(f"FAILURE: Unexpected exception: {type(e).__name__}: {e}")
++
++    # Test 2: Missing required argument to subcommand
++    print("\n=== Test 2: Missing required argument to subcommand ===")
++    try:
++        args = parent_parser.parse_args(['create'])
++        print("This should not be reached - error should be raised")
++    except CommandError as e:
++        print(f"Error properly handled: {e}")
++        print("SUCCESS: Missing argument to subcommand error properly formatted")
++    except Exception as e:
++        print(f"FAILURE: Unexpected exception: {type(e).__name__}: {e}")
++
++if __name__ == '__main__':
++    # Set up minimal Django environment
++    import django
++    from django.conf import settings
++    settings.configure()
++    django.setup()
++
++    run_tests()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..44da7d5967
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python
++"""
++A simple script to reproduce the issue with Django management command subparsers.
++This demonstrates how the subparsers don't retain the error formatting from the parent CommandParser.
++"""
++
++import os
++import sys
++from django.core.management.base import BaseCommand, CommandParser
++
++# Directly copying the example from the issue description
++class CheeseCommand(BaseCommand):
++    def add_arguments(self, parser):
++        subparsers = parser.add_subparsers(required=True)
++        create = subparsers.add_parser("create")
++        create.add_argument("name")
++
++    def handle(self, *args, **options):
++        pass
++
++def main():
++    # Simulate a command line call with missing arguments
++    from io import StringIO
++    import sys
++
++    original_stderr = sys.stderr
++    try:
++        # Case 1: Missing subcommand - should show nice error
++        print("\n=== Test 1: Missing subcommand 'create' ===")
++        sys.argv = ['manage.py', 'cheeses']
++        cmd = CheeseCommand()
++        try:
++            parser = cmd.create_parser('manage.py', 'cheeses')
++            options = parser.parse_args([])
++            print("Parser args:", options)
++        except Exception as e:
++            print(f"Error caught: {type(e).__name__}: {e}")
++
++        # Case 2: Missing required argument to subcommand - currently shows traceback
++        print("\n=== Test 2: Missing required 'name' argument to 'create' subcommand ===")
++        sys.argv = ['manage.py', 'cheeses', 'create']
++        cmd = CheeseCommand()
++        try:
++            parser = cmd.create_parser('manage.py', 'cheeses')
++            options = parser.parse_args(['create'])
++            print("Parser args:", options)
++        except Exception as e:
++            print(f"Error caught: {type(e).__name__}: {e}")
++    finally:
++        sys.stderr = original_stderr
++
++if __name__ == '__main__':
++    # Create a minimal Django settings dictionary
++    from django.conf import settings
++    if not settings.configured:
++        settings.configure(
++            INSTALLED_APPS=[],
++            DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++            DEFAULT_AUTO_FIELD='django.db.models.AutoField',
++        )
++    import django
++    django.setup()
++    main()
+\ No newline at end of file
+diff --git a/test_command.py b/test_command.py
+new file mode 100644
+index 0000000000..08f0bc6319
+--- /dev/null
++++ b/test_command.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python
++"""
++A more direct test of the management command with subparsers.
++This runs a command directly with Django's command running mechanism.
++"""
++
++import os
++import sys
++from io import StringIO
++from django.core.management import call_command, CommandError
++
++# Set up Django's settings
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    )
++    import django
++    django.setup()
++
++# Our test command
++from django.core.management.base import BaseCommand
++
++class CheeseCommand(BaseCommand):
++    help = 'Test cheese command with subparsers'
++
++    def add_arguments(self, parser):
++        subparsers = parser.add_subparsers(dest='subcommand', required=True)
++        create = subparsers.add_parser('create')
++        create.add_argument('name', help='Name of the cheese')
++
++    def handle(self, *args, **options):
++        subcommand = options.get('subcommand')
++        print(f"Command received: {subcommand}")
++        if subcommand == 'create':
++            print(f"Name: {options.get('name')}")
++
++# Register our command
++from django.core.management import ManagementUtility
++
++def test_command():
++    # Override sys.modules to register our command
++    from django.core.management import commands
++    commands.cheeses = type('module', (), {})
++    commands.cheeses.Command = CheeseCommand
++    sys.modules['django.core.management.commands.cheeses'] = commands.cheeses
++
++    # Test case 1: Missing subcommand
++    print("\n=== Test 1: Missing subcommand ===")
++    sys.argv = ['manage.py', 'cheeses']
++    stdout = StringIO()
++    stderr = StringIO()
++    try:
++        call_command('cheeses', stderr=stderr, stdout=stdout)
++    except CommandError as e:
++        print(f"Error caught: {e}")
++
++    # Test case 2: Missing argument to subcommand
++    print("\n=== Test 2: Missing required argument to create ===")
++    sys.argv = ['manage.py', 'cheeses', 'create']
++    stdout = StringIO()
++    stderr = StringIO()
++    try:
++        call_command('cheeses', 'create', stderr=stderr, stdout=stdout)
++    except CommandError as e:
++        print(f"Error caught: {e}")
++
++if __name__ == '__main__':
++    test_command()
+\ No newline at end of file

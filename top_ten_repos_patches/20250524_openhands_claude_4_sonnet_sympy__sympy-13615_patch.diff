@@ -1,0 +1,186 @@
+diff --git a/sympy/sets/sets.py b/sympy/sets/sets.py
+index 917717bb74..9db0481164 100644
+--- a/sympy/sets/sets.py
++++ b/sympy/sets/sets.py
+@@ -217,7 +217,38 @@ def _complement(self, other):
+             return S.EmptySet
+ 
+         elif isinstance(other, FiniteSet):
+-            return FiniteSet(*[el for el in other if self.contains(el) != True])
++            # Separate elements based on whether containment can be determined
++            determinable_in = []      # elements definitely in self
++            determinable_out = []     # elements definitely not in self  
++            non_determinable = []     # elements with symbolic containment
++            
++            for el in other:
++                contains_result = self.contains(el)
++                if contains_result is S.true:
++                    determinable_in.append(el)
++                elif contains_result is S.false:
++                    determinable_out.append(el)
++                else:
++                    non_determinable.append(el)
++            
++            # If there are non-determinable elements, return None to force 
++            # symbolic representation, but only if we can't fully evaluate
++            if non_determinable:
++                # If there are also determinable elements, we need to create
++                # a complement with the remaining elements after removing 
++                # those definitely in self
++                if determinable_in or determinable_out:
++                    remaining_elements = determinable_out + non_determinable
++                    if remaining_elements:
++                        return Complement(FiniteSet(*remaining_elements), self, evaluate=False)
++                    else:
++                        return S.EmptySet
++                else:
++                    # All elements are non-determinable, return None for symbolic form
++                    return None
++                
++            # All elements are determinable, return the elements not in self
++            return FiniteSet(*(determinable_out))
+ 
+     def symmetric_difference(self, other):
+         """
+diff --git a/test_complement_edge_cases.py b/test_complement_edge_cases.py
+new file mode 100644
+index 0000000000..8cc1b5cd0e
+--- /dev/null
++++ b/test_complement_edge_cases.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the Complement fix.
++"""
++
++from sympy import *
++
++def test_edge_cases():
++    """Test various edge cases for Complement."""
++    x, y, z = symbols('x y z')
++    
++    print("Testing edge cases for Complement fix:")
++    
++    # Test 1: Only numbers (should be fully evaluated)
++    a1 = FiniteSet(1, 2, 3, 15)
++    b1 = Interval(-10, 10)
++    result1 = Complement(a1, b1)
++    print(f"1. Complement({a1}, {b1}) = {result1}")
++    print(f"   Expected: {{15}} (only 15 is outside the interval)")
++    
++    # Test 2: Only symbols (should be symbolic)
++    a2 = FiniteSet(x, y, z)
++    b2 = Interval(-10, 10)
++    result2 = Complement(a2, b2)
++    print(f"2. Complement({a2}, {b2}) = {result2}")
++    print(f"   Expected: {{x, y, z}} \\ Interval(-10, 10)")
++    
++    # Test 3: Mixed with numbers outside interval
++    a3 = FiniteSet(x, y, 15, 20)
++    b3 = Interval(-10, 10)
++    result3 = Complement(a3, b3)
++    print(f"3. Complement({a3}, {b3}) = {result3}")
++    print(f"   Expected: {{15, 20, x, y}} \\ Interval(-10, 10)")
++    
++    # Test 4: Mixed with all numbers inside interval
++    a4 = FiniteSet(x, y, 2, 5)
++    b4 = Interval(-10, 10)
++    result4 = Complement(a4, b4)
++    print(f"4. Complement({a4}, {b4}) = {result4}")
++    print(f"   Expected: {{x, y}} \\ Interval(-10, 10)")
++    
++    # Test 5: Empty result case
++    a5 = FiniteSet(1, 2, 3)
++    b5 = Interval(-10, 10)
++    result5 = Complement(a5, b5)
++    print(f"5. Complement({a5}, {b5}) = {result5}")
++    print(f"   Expected: EmptySet()")
++    
++    # Test 6: With different interval
++    a6 = FiniteSet(x, y, 2)
++    b6 = Interval(5, 15)
++    result6 = Complement(a6, b6)
++    print(f"6. Complement({a6}, {b6}) = {result6}")
++    print(f"   Expected: {{2, x, y}} \\ Interval(5, 15) (2 is outside [5,15])")
++    
++    # Test 7: Complement with FiniteSet
++    a7 = FiniteSet(x, y, 2)
++    b7 = FiniteSet(2, 3, 4)
++    result7 = Complement(a7, b7)
++    print(f"7. Complement({a7}, {b7}) = {result7}")
++    print(f"   Expected: {{x, y}} (2 is removed)")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_complement_issue.py b/test_complement_issue.py
+new file mode 100644
+index 0000000000..a244136588
+--- /dev/null
++++ b/test_complement_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the Complement issue with mixed symbols and numbers.
++"""
++
++from sympy import *
++
++def test_complement_issue():
++    """Test the reported issue with Complement."""
++    x, y = symbols('x y')
++    
++    # Create the sets from the issue description
++    a = FiniteSet(x, y, 2)
++    b = Interval(-10, 10)
++    
++    print("Testing Complement issue:")
++    print(f"a = {a}")
++    print(f"b = {b}")
++    
++    # Compute the complement
++    result = Complement(a, b)
++    print(f"Complement(a, b) = {result}")
++    
++    # The expected result should be a symbolic representation
++    # that doesn't prematurely evaluate the complement
++    print(f"Expected: something like {{x, y}} \\ [-10,10] (symbolic representation)")
++    
++    # Test what we get vs what we expect
++    expected_elements = {x, y}  # Only x and y should remain after removing 2
++    
++    if isinstance(result, FiniteSet):
++        result_elements = set(result.args)
++        print(f"Result elements: {result_elements}")
++        print(f"Expected elements: {expected_elements}")
++        
++        if result_elements == expected_elements:
++            print("✓ Elements are correct, but representation should be symbolic")
++        else:
++            print("✗ Elements are incorrect")
++    else:
++        print(f"Result type: {type(result)}")
++        print("Result is not a FiniteSet - this might be the correct symbolic form")
++    
++    # Additional tests
++    print("\nAdditional tests:")
++    
++    # Test with only numbers
++    a_nums = FiniteSet(1, 2, 3)
++    result_nums = Complement(a_nums, b)
++    print(f"Complement({a_nums}, {b}) = {result_nums}")
++    
++    # Test with only symbols  
++    a_syms = FiniteSet(x, y)
++    result_syms = Complement(a_syms, b)
++    print(f"Complement({a_syms}, {b}) = {result_syms}")
++    
++    # Test the contains method behavior
++    print(f"\nContains tests:")
++    print(f"b.contains(2) = {b.contains(2)}")
++    print(f"b.contains(x) = {b.contains(x)}")
++    print(f"b.contains(y) = {b.contains(y)}")
++
++if __name__ == "__main__":
++    test_complement_issue()
+\ No newline at end of file

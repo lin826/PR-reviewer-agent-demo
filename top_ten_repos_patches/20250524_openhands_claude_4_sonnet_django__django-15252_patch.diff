@@ -1,0 +1,532 @@
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..5aea32afdb 100644
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -1,5 +1,5 @@
+ from django.apps.registry import Apps
+-from django.db import DatabaseError, models
++from django.db import DatabaseError, models, router
+ from django.utils.functional import classproperty
+ from django.utils.timezone import now
+ 
+@@ -62,6 +62,9 @@ class MigrationRecorder:
+         # in the codebase.
+         if self.has_table():
+             return
++        # Check if migrations are allowed on this database
++        if not router.allow_migrate(self.connection.alias, self.Migration._meta.app_label, model=self.Migration):
++            return
+         # Make the table
+         try:
+             with self.connection.schema_editor() as editor:
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..0824361826
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,177 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the MigrationRecorder router fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections
++from django.db.migrations.recorder import MigrationRecorder
++from django.test.utils import setup_test_environment, teardown_test_environment
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'third': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++        },
++        DATABASE_ROUTERS=['test_edge_cases.SelectiveRouter'],
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++
++class SelectiveRouter:
++    """
++    A router that allows migrations on 'default' and 'third' but not 'other'.
++    """
++    def allow_migrate(self, db, app_label, **hints):
++        if db in ['default', 'third']:
++            return True
++        elif db == 'other':
++            return False
++        return None  # Let other routers decide
++
++
++def test_multiple_databases():
++    """
++    Test MigrationRecorder with multiple databases and selective routing.
++    """
++    print("Testing MigrationRecorder with multiple databases...")
++    
++    # Get connections for all databases
++    default_conn = connections['default']
++    other_conn = connections['other']
++    third_conn = connections['third']
++    
++    # Create MigrationRecorder instances
++    default_recorder = MigrationRecorder(default_conn)
++    other_recorder = MigrationRecorder(other_conn)
++    third_recorder = MigrationRecorder(third_conn)
++    
++    # Test ensure_schema on all databases
++    print("Calling ensure_schema() on all databases...")
++    default_recorder.ensure_schema()
++    other_recorder.ensure_schema()
++    third_recorder.ensure_schema()
++    
++    # Check results
++    default_has_table = default_recorder.has_table()
++    other_has_table = other_recorder.has_table()
++    third_has_table = third_recorder.has_table()
++    
++    print(f"Default DB has table: {default_has_table}")
++    print(f"Other DB has table: {other_has_table}")
++    print(f"Third DB has table: {third_has_table}")
++    
++    # Verify router decisions
++    from django.db import router
++    print(f"Router allows migrations on 'default': {router.allow_migrate('default', 'migrations')}")
++    print(f"Router allows migrations on 'other': {router.allow_migrate('other', 'migrations')}")
++    print(f"Router allows migrations on 'third': {router.allow_migrate('third', 'migrations')}")
++    
++    # Expected: default and third should have tables, other should not
++    if default_has_table and third_has_table and not other_has_table:
++        print("✅ Multiple database routing works correctly")
++        return True
++    else:
++        print("❌ Multiple database routing failed")
++        return False
++
++
++def test_applied_migrations_with_routing():
++    """
++    Test that applied_migrations() works correctly with routing.
++    """
++    print("\nTesting applied_migrations() with routing...")
++    
++    default_conn = connections['default']
++    other_conn = connections['other']
++    
++    default_recorder = MigrationRecorder(default_conn)
++    other_recorder = MigrationRecorder(other_conn)
++    
++    # Record a migration on default (should work)
++    try:
++        default_recorder.record_applied('test_app', '0001_initial')
++        print("✅ Successfully recorded migration on default")
++    except Exception as e:
++        print(f"❌ Failed to record migration on default: {e}")
++        return False
++    
++    # Get applied migrations from both databases
++    default_applied = default_recorder.applied_migrations()
++    other_applied = other_recorder.applied_migrations()
++    
++    print(f"Default applied migrations: {len(default_applied)}")
++    print(f"Other applied migrations: {len(other_applied)}")
++    
++    # Expected: default should have 1 migration, other should have 0
++    if len(default_applied) == 1 and len(other_applied) == 0:
++        print("✅ applied_migrations() works correctly with routing")
++        return True
++    else:
++        print("❌ applied_migrations() failed with routing")
++        return False
++
++
++def test_table_already_exists():
++    """
++    Test that ensure_schema() works correctly when table already exists.
++    """
++    print("\nTesting ensure_schema() when table already exists...")
++    
++    default_conn = connections['default']
++    default_recorder = MigrationRecorder(default_conn)
++    
++    # Ensure table exists
++    default_recorder.ensure_schema()
++    initial_has_table = default_recorder.has_table()
++    
++    # Call ensure_schema again
++    default_recorder.ensure_schema()
++    final_has_table = default_recorder.has_table()
++    
++    if initial_has_table and final_has_table:
++        print("✅ ensure_schema() handles existing table correctly")
++        return True
++    else:
++        print("❌ ensure_schema() failed with existing table")
++        return False
++
++
++if __name__ == '__main__':
++    setup_test_environment()
++    try:
++        result1 = test_multiple_databases()
++        result2 = test_applied_migrations_with_routing()
++        result3 = test_table_already_exists()
++        
++        print("\n" + "="*60)
++        if result1 and result2 and result3:
++            print("✅ ALL EDGE CASE TESTS PASSED")
++            sys.exit(0)
++        else:
++            print("❌ SOME EDGE CASE TESTS FAILED")
++            sys.exit(1)
++    finally:
++        teardown_test_environment()
+\ No newline at end of file
+diff --git a/test_issue_scenario.py b/test_issue_scenario.py
+new file mode 100644
+index 0000000000..03f6bae929
+--- /dev/null
++++ b/test_issue_scenario.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python
++"""
++Test script that reproduces the exact scenario described in the issue.
++
++This tests the scenario where:
++1. We have a multi-db setup with one main connection and several read-only connections
++2. We have a router that only allows migrations on the 'default' connection
++3. During test database creation, migrate command is called against each connection
++4. MigrationRecorder should respect the router rules
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections
++from django.db.migrations.recorder import MigrationRecorder
++from django.db.migrations.executor import MigrationExecutor
++from django.test.utils import setup_test_environment, teardown_test_environment
++
++# Configure Django settings to match the issue scenario
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'read_only_db1': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'read_only_db2': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++        },
++        DATABASE_ROUTERS=['test_issue_scenario.Router'],
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++
++class Router(object):
++    """
++    Router that matches the one described in the issue.
++    Only allows migrations on the 'default' database.
++    """
++    def allow_migrate(self, db, app_label, **hints):
++        if db == 'default':
++            return True
++        return False
++
++
++def test_migration_recorder_with_issue_scenario():
++    """
++    Test the exact scenario described in the issue.
++    """
++    print("Testing MigrationRecorder with issue scenario...")
++    print("Router only allows migrations on 'default' database")
++    
++    # Test all database connections
++    db_aliases = ['default', 'read_only_db1', 'read_only_db2']
++    
++    for alias in db_aliases:
++        print(f"\nTesting database: {alias}")
++        
++        conn = connections[alias]
++        recorder = MigrationRecorder(conn)
++        
++        print(f"  Initial state - has table: {recorder.has_table()}")
++        
++        # This is what happens during test database creation
++        print(f"  Calling ensure_schema()...")
++        recorder.ensure_schema()
++        
++        has_table_after = recorder.has_table()
++        print(f"  After ensure_schema() - has table: {has_table_after}")
++        
++        # Check router decision
++        from django.db import router
++        router_allows = router.allow_migrate(alias, 'migrations')
++        print(f"  Router allows migrations: {router_allows}")
++        
++        # Verify the fix: table should only exist where router allows migrations
++        if alias == 'default':
++            if has_table_after:
++                print(f"  ✅ Correct: Table created on {alias} (router allows)")
++            else:
++                print(f"  ❌ Error: Table NOT created on {alias} (router allows)")
++                return False
++        else:
++            if not has_table_after:
++                print(f"  ✅ Correct: Table NOT created on {alias} (router forbids)")
++            else:
++                print(f"  ❌ Error: Table created on {alias} (router forbids)")
++                return False
++    
++    return True
++
++
++def test_migration_executor_scenario():
++    """
++    Test how MigrationExecutor behaves with the router.
++    """
++    print("\n" + "="*60)
++    print("Testing MigrationExecutor scenario...")
++    
++    # Test with default database (should work)
++    print("\nTesting MigrationExecutor on 'default' database:")
++    default_conn = connections['default']
++    default_executor = MigrationExecutor(default_conn)
++    
++    try:
++        # This should work because router allows migrations on default
++        default_executor.recorder.record_applied('test_app', '0001_initial')
++        print("  ✅ Successfully recorded migration on default database")
++    except Exception as e:
++        print(f"  ❌ Failed to record migration on default database: {e}")
++        return False
++    
++    # Test with read-only database (should fail)
++    print("\nTesting MigrationExecutor on 'read_only_db1' database:")
++    readonly_conn = connections['read_only_db1']
++    readonly_executor = MigrationExecutor(readonly_conn)
++    
++    try:
++        # This should fail because router doesn't allow migrations on read-only db
++        readonly_executor.recorder.record_applied('test_app', '0001_initial')
++        print("  ❌ Error: Migration recorded on read-only database (should have failed)")
++        return False
++    except Exception as e:
++        print(f"  ✅ Correctly failed to record migration on read-only database: {e}")
++    
++    return True
++
++
++if __name__ == '__main__':
++    setup_test_environment()
++    try:
++        result1 = test_migration_recorder_with_issue_scenario()
++        result2 = test_migration_executor_scenario()
++        
++        print("\n" + "="*60)
++        if result1 and result2:
++            print("✅ ISSUE SCENARIO TESTS PASSED")
++            print("MigrationRecorder now correctly respects database router rules!")
++            sys.exit(0)
++        else:
++            print("❌ ISSUE SCENARIO TESTS FAILED")
++            sys.exit(1)
++    finally:
++        teardown_test_environment()
+\ No newline at end of file
+diff --git a/test_migration_recorder_issue.py b/test_migration_recorder_issue.py
+new file mode 100644
+index 0000000000..9145b5136f
+--- /dev/null
++++ b/test_migration_recorder_issue.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the MigrationRecorder issue with database routing.
++
++This script demonstrates that MigrationRecorder.ensure_schema() creates
++the django_migrations table on all databases, even when a router
++explicitly forbids migrations on certain databases.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connections
++from django.db.migrations.recorder import MigrationRecorder
++from django.test.utils import setup_test_environment, teardown_test_environment
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++            'other': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            },
++        },
++        DATABASE_ROUTERS=['test_migration_recorder_issue.TestRouter'],
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++
++class TestRouter:
++    """
++    A router that only allows migrations on the 'default' database.
++    This mimics the router described in the issue.
++    """
++    def allow_migrate(self, db, app_label, **hints):
++        if db == 'default':
++            return True
++        return False
++
++
++def test_migration_recorder_respects_router():
++    """
++    Test that MigrationRecorder respects database router rules.
++    """
++    print("Testing MigrationRecorder with database routing...")
++    
++    # Get connections for both databases
++    default_conn = connections['default']
++    other_conn = connections['other']
++    
++    # Create MigrationRecorder instances for both databases
++    default_recorder = MigrationRecorder(default_conn)
++    other_recorder = MigrationRecorder(other_conn)
++    
++    print(f"Default database alias: {default_conn.alias}")
++    print(f"Other database alias: {other_conn.alias}")
++    
++    # Check initial state - no tables should exist
++    print(f"Default DB has django_migrations table: {default_recorder.has_table()}")
++    print(f"Other DB has django_migrations table: {other_recorder.has_table()}")
++    
++    # Call ensure_schema on both recorders
++    print("\nCalling ensure_schema() on default database...")
++    default_recorder.ensure_schema()
++    print(f"Default DB has django_migrations table: {default_recorder.has_table()}")
++    
++    print("\nCalling ensure_schema() on other database...")
++    other_recorder.ensure_schema()
++    print(f"Other DB has django_migrations table: {other_recorder.has_table()}")
++    
++    # Test the router directly
++    from django.db import router
++    print(f"\nRouter allows migrations on 'default': {router.allow_migrate('default', 'migrations')}")
++    print(f"Router allows migrations on 'other': {router.allow_migrate('other', 'migrations')}")
++    
++    # The issue: other_recorder.has_table() should be False after ensure_schema()
++    # because the router doesn't allow migrations on the 'other' database
++    if other_recorder.has_table():
++        print("\n❌ BUG REPRODUCED: django_migrations table was created on 'other' database")
++        print("   even though the router forbids migrations on that database!")
++        return False
++    else:
++        print("\n✅ WORKING CORRECTLY: django_migrations table was not created on 'other' database")
++        return True
++
++
++def test_record_applied_respects_router():
++    """
++    Test that record_applied respects database router rules.
++    """
++    print("\n" + "="*60)
++    print("Testing record_applied with database routing...")
++    
++    # Get connections for both databases
++    default_conn = connections['default']
++    other_conn = connections['other']
++    
++    # Create MigrationRecorder instances for both databases
++    default_recorder = MigrationRecorder(default_conn)
++    other_recorder = MigrationRecorder(other_conn)
++    
++    # Clear any existing tables
++    if default_recorder.has_table():
++        default_recorder.flush()
++    if other_recorder.has_table():
++        other_recorder.flush()
++    
++    print("Attempting to record migration on default database...")
++    try:
++        default_recorder.record_applied('test_app', '0001_initial')
++        print("✅ Successfully recorded migration on default database")
++        print(f"Default DB has django_migrations table: {default_recorder.has_table()}")
++    except Exception as e:
++        print(f"❌ Failed to record migration on default database: {e}")
++    
++    print("\nAttempting to record migration on other database...")
++    try:
++        other_recorder.record_applied('test_app', '0001_initial')
++        print("❌ BUG: Successfully recorded migration on other database (should have been blocked)")
++        print(f"Other DB has django_migrations table: {other_recorder.has_table()}")
++        return False
++    except Exception as e:
++        print(f"✅ Correctly blocked migration recording on other database: {e}")
++        return True
++
++
++if __name__ == '__main__':
++    setup_test_environment()
++    try:
++        result1 = test_migration_recorder_respects_router()
++        result2 = test_record_applied_respects_router()
++        
++        print("\n" + "="*60)
++        if result1 and result2:
++            print("✅ ALL TESTS PASSED - MigrationRecorder respects router rules")
++            sys.exit(0)
++        else:
++            print("❌ TESTS FAILED - MigrationRecorder does not respect router rules")
++            sys.exit(1)
++    finally:
++        teardown_test_environment()
+\ No newline at end of file

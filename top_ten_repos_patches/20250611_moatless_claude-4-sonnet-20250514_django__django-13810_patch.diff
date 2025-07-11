@@ -1,0 +1,125 @@
+--- a/django/core/handlers/base.py
++++ b/django/core/handlers/base.py
+@@ -49,14 +49,16 @@
+                 middleware_is_async = False
+             else:
+                 middleware_is_async = middleware_can_async
++            
+             try:
+                 # Adapt handler, if needed.
+-                handler = self.adapt_method_mode(
++                adapted_handler = self.adapt_method_mode(
+                     middleware_is_async, handler, handler_is_async,
+                     debug=settings.DEBUG, name='middleware %s' % middleware_path,
+                 )
+-                mw_instance = middleware(handler)
++                mw_instance = middleware(adapted_handler)
+             except MiddlewareNotUsed as exc:
++                # Don't modify handler state if middleware is not used
+                 if settings.DEBUG:
+                     if str(exc):
+                         logger.debug('MiddlewareNotUsed(%r): %s', middleware_path, exc)
+
+--- a/simple_debug.py
++++ b/simple_debug.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python
++"""
++Simple debug to see what handlers are received.
++"""
++
++import asyncio
++import os
++import sys
++
++sys.path.insert(0, '.')
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test-key',
++        INSTALLED_APPS=[],
++        MIDDLEWARE=[
++            'simple_debug.AsyncCapableTestMiddleware',
++            'simple_debug.SyncOnlyTestMiddleware',  # Raises MiddlewareNotUsed
++            'simple_debug.AsyncCapableTestMiddleware',
++        ],
++        ROOT_URLCONF='simple_debug',
++    )
++
++django.setup()
++
++from django.core.exceptions import MiddlewareNotUsed
++from django.core.handlers.base import BaseHandler
++
++
++class AsyncCapableTestMiddleware:
++    """Middleware that supports both sync and async for testing."""
++    sync_capable = True
++    async_capable = True
++    
++    # Class variable to track handler types received
++    received_handlers = []
++    
++    def __init__(self, get_response):
++        print(f"AsyncCapableTestMiddleware: handler type={type(get_response).__name__}, is_coroutine={asyncio.iscoroutinefunction(get_response)}")
++        self.get_response = get_response
++        # Record what type of handler this middleware received
++        AsyncCapableTestMiddleware.received_handlers.append({
++            'type': type(get_response),
++            'is_coroutine': asyncio.iscoroutinefunction(get_response),
++        })
++
++    async def __call__(self, request):
++        return await self.get_response(request)
++
++
++class SyncOnlyTestMiddleware:
++    """Sync-only middleware that raises MiddlewareNotUsed for testing."""
++    sync_capable = True
++    async_capable = False
++    
++    def __init__(self, get_response):
++        print(f"SyncOnlyTestMiddleware: handler type={type(get_response).__name__}, is_coroutine={asyncio.iscoroutinefunction(get_response)}")
++        # Record what handler type this middleware received before failing
++        AsyncCapableTestMiddleware.received_handlers.append({
++            'type': type(get_response),
++            'is_coroutine': asyncio.iscoroutinefunction(get_response),
++            'middleware': 'SyncOnlyTestMiddleware'
++        })
++        raise MiddlewareNotUsed("Sync middleware not used in async context")
++
++    def __call__(self, request):
++        return self.get_response(request)
++
++
++urlpatterns = []
++
++
++def test_simple():
++    # Clear previous test runs
++    AsyncCapableTestMiddleware.received_handlers = []
++    
++    # Test in async mode where the bug would manifest
++    handler = BaseHandler()
++    handler.load_middleware(is_async=True)
++    
++    print(f"Total handlers: {len(AsyncCapableTestMiddleware.received_handlers)}")
++    for i, h in enumerate(AsyncCapableTestMiddleware.received_handlers):
++        print(f"Handler {i}: {h}")
++    
++    if len(AsyncCapableTestMiddleware.received_handlers) >= 3:
++        first = AsyncCapableTestMiddleware.received_handlers[2]  # First middleware (processed last)
++        second = AsyncCapableTestMiddleware.received_handlers[0]  # Second middleware (processed first)
++        
++        print(f"First middleware is_coroutine: {first['is_coroutine']}")
++        print(f"Second middleware is_coroutine: {second['is_coroutine']}")
++        print(f"Equal? {first['is_coroutine'] == second['is_coroutine']}")
++
++
++if __name__ == '__main__':
++    test_simple()

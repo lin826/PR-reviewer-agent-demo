@@ -1,0 +1,59 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 215532d..6e2bbb2 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -477,9 +477,54 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+         c = self.copy()
+         c.is_summary = summarize
+         c.lhs = c.lhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
++
+         c.rhs = c.rhs.resolve_expression(query, allow_joins, reuse, summarize, for_save)
+         return c
+ 
++    def _resolve_output_field(self):
++        """
++        Infer the output field for temporal arithmetic performed by
++        CombinedExpression.
++
++        Rules implemented:
++        1. If an explicit output_field was supplied at construction time,
++           return it immediately.
++        2. (datetime - datetime) -> DurationField when the datetime types match.
++        3. (temporal ± duration) -> the temporal type.
++        4. (duration ± duration) -> DurationField.
++        5. All other cases fall back to the parent implementation.
++        """
++        if getattr(self, '_output_field', None) is not None:
++            return self._output_field
++
++        try:
++            lhs_field = self.lhs.output_field
++            rhs_field = self.rhs.output_field
++        except FieldError:
++            return super()._resolve_output_field()
++
++        datetime_types = (fields.DateField, fields.DateTimeField, fields.TimeField)
++
++        # datetime - datetime -> DurationField (when both sides are the same type)
++        if (
++            self.connector == self.SUB and
++            isinstance(lhs_field, datetime_types) and
++            isinstance(rhs_field, lhs_field.__class__)
++        ):
++            return fields.DurationField()
++
++        lhs_is_duration = isinstance(lhs_field, fields.DurationField)
++        rhs_is_duration = isinstance(rhs_field, fields.DurationField)
++
++        if self.connector in (self.ADD, self.SUB):
++            if lhs_is_duration and rhs_is_duration:
++                return fields.DurationField()
++            if lhs_is_duration ^ rhs_is_duration:  # Only one side is DurationField.
++                return rhs_field if lhs_is_duration else lhs_field
++
++        return super()._resolve_output_field()
++
++
+ 
+ class DurationExpression(CombinedExpression):
+     def compile(self, side, compiler, connection):

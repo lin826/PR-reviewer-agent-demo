@@ -1,0 +1,160 @@
+diff --git a/sympy/printing/latex.py b/sympy/printing/latex.py
+index 8253b2f682..75cc7a213d 100644
+--- a/sympy/printing/latex.py
++++ b/sympy/printing/latex.py
+@@ -1478,7 +1478,30 @@ def _print_Adjoint(self, expr):
+ 
+     def _print_MatAdd(self, expr):
+         terms = list(expr.args)
+-        tex = " + ".join(map(self._print, terms))
++        tex = ""
++        
++        for i, term in enumerate(terms):
++            if i == 0:
++                # First term
++                if term.is_MatMul and len(term.args) > 0 and term.args[0] == -1:
++                    # First term is negative
++                    if len(term.args) == 2:  # -1*B case
++                        tex += "-" + self._print(term.args[1])
++                    else:  # -1*A*B case
++                        tex += "-" + self._print(Mul(*term.args[1:]))
++                else:
++                    tex += self._print(term)
++            else:
++                # Subsequent terms
++                if term.is_MatMul and len(term.args) > 0 and term.args[0] == -1:
++                    # Term is negative
++                    if len(term.args) == 2:  # -1*B case
++                        tex += " - " + self._print(term.args[1])
++                    else:  # -1*A*B case
++                        tex += " - " + self._print(Mul(*term.args[1:]))
++                else:
++                    tex += " + " + self._print(term)
++        
+         return tex
+ 
+     def _print_MatMul(self, expr):
+diff --git a/sympy/printing/pretty/pretty.py b/sympy/printing/pretty/pretty.py
+index db24f4c612..389e4f51d7 100644
+--- a/sympy/printing/pretty/pretty.py
++++ b/sympy/printing/pretty/pretty.py
+@@ -819,7 +819,25 @@ def _print_BlockMatrix(self, B):
+         return self._print(B.blocks)
+ 
+     def _print_MatAdd(self, expr):
+-        return self._print_seq(expr.args, None, None, ' + ')
++        terms = list(expr.args)
++        
++        # Process and print each term
++        printed_terms = []
++        for term in terms:
++            if term.is_MatMul and len(term.args) > 0 and term.args[0] == -1:
++                # For terms with negative coefficients, print them with a minus sign
++                if len(term.args) == 2:
++                    pform = self._print(term.args[1])
++                else:
++                    pform = self._print(Mul(*term.args[1:]))
++                pform = prettyForm(*pform.left("-"))
++            else:
++                # Print regular terms
++                pform = self._print(term)
++            printed_terms.append(pform)
++            
++        # Join terms with + signs
++        return self._print_seq(printed_terms, None, None, ' + ')
+ 
+     def _print_MatMul(self, expr):
+         args = list(expr.args)
+diff --git a/sympy/printing/str.py b/sympy/printing/str.py
+index 0baefe0f7f..52e462213a 100644
+--- a/sympy/printing/str.py
++++ b/sympy/printing/str.py
+@@ -304,6 +304,13 @@ def _print_Mul(self, expr):
+             return sign + '*'.join(a_str) + "/(%s)" % '*'.join(b_str)
+ 
+     def _print_MatMul(self, expr):
++        # Check for negative coefficient at the beginning
++        if len(expr.args) > 0 and (expr.args[0] == -1 or expr.args[0] == S.NegativeOne):
++            if len(expr.args) == 2:  # -1*B case
++                return "-" + self._print(expr.args[1])
++            else:  # -1*A*B... case
++                return "-" + '*'.join([self.parenthesize(arg, precedence(expr))
++                    for arg in expr.args[1:]])
+         return '*'.join([self.parenthesize(arg, precedence(expr))
+             for arg in expr.args])
+ 
+@@ -312,8 +319,45 @@ def _print_HadamardProduct(self, expr):
+             for arg in expr.args])
+ 
+     def _print_MatAdd(self, expr):
+-        return ' + '.join([self.parenthesize(arg, precedence(expr))
+-            for arg in expr.args])
++        terms = list(expr.args)
++        
++        # Rearrange terms to put positive coefficients first (if possible)
++        # This helps with expressions like (-B + A) to print as (A - B)
++        try:
++            pos_terms = [t for t in terms if not (t.is_MatMul and t.args[0] == -1)]
++            neg_terms = [t for t in terms if (t.is_MatMul and t.args[0] == -1)]
++            
++            if pos_terms and not any(t.is_Add for t in pos_terms):
++                terms = pos_terms + neg_terms
++        except (AttributeError, IndexError):
++            pass
++            
++        PREC = precedence(expr)
++        l = []
++        for i, term in enumerate(terms):
++            if (term.is_MatMul and len(term.args) > 0 and term.args[0] == -1):
++                if i == 0:
++                    # First term is negative
++                    sign = "-"
++                    t = self._print(Mul(*term.args[1:]))
++                else:
++                    sign = " - "
++                    t = self._print(Mul(*term.args[1:]))
++            else:
++                if i == 0:
++                    # First term (positive)
++                    sign = ""
++                    t = self._print(term)
++                else:
++                    sign = " + "
++                    t = self._print(term)
++            
++            if precedence(term) < PREC:
++                l.append(sign + "(%s)" % t)
++            else:
++                l.append(sign + t)
++                
++        return "".join(l)
+ 
+     def _print_NaN(self, expr):
+         return 'nan'
+@@ -803,7 +847,11 @@ def sstr(expr, **settings):
+ 
+     p = StrPrinter(settings)
+     s = p.doprint(expr)
+-
++    
++    # Handle matrix subtraction formats - post-process the string
++    if hasattr(expr, 'is_MatAdd') and expr.is_MatAdd:
++        s = s.replace("(-1)*", "-")
++    
+     return s
+ 
+ 
+diff --git a/test_issue.py b/test_issue.py
+new file mode 100644
+index 0000000000..2091f1d556
+--- /dev/null
++++ b/test_issue.py
+@@ -0,0 +1,7 @@
++from sympy import *
++
++A = MatrixSymbol('A', 2, 2)
++B = MatrixSymbol('B', 2, 2)
++print(A - B)
++pprint(A - B)
++print(latex(A - B))
+\ No newline at end of file

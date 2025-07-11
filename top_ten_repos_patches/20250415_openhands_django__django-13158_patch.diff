@@ -1,0 +1,255 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 07d6ffd4ca..3b15def013 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -997,9 +997,10 @@ class QuerySet:
+         return clone
+ 
+     def union(self, *other_qs, all=False):
+-        # If the query is an EmptyQuerySet, combine all nonempty querysets.
+-        if isinstance(self, EmptyQuerySet):
+-            qs = [q for q in other_qs if not isinstance(q, EmptyQuerySet)]
++        # If the query is an EmptyQuerySet or has been emptied via none(),
++        # combine all nonempty querysets.
++        if isinstance(self, EmptyQuerySet) or (hasattr(self, 'query') and self.query.is_empty()):
++            qs = [q for q in other_qs if not isinstance(q, EmptyQuerySet) and not (hasattr(q, 'query') and q.query.is_empty())]
+             return qs[0]._combinator_query('union', *qs[1:], all=all) if qs else self
+         return self._combinator_query('union', *other_qs, all=all)
+ 
+diff --git a/fix_verification_test.py b/fix_verification_test.py
+new file mode 100644
+index 0000000000..015bb0f1cb
+--- /dev/null
++++ b/fix_verification_test.py
+@@ -0,0 +1,83 @@
++"""
++Verification test for the fix to QuerySet.none() with union() issue.
++
++This script creates a simple test that demonstrates the issue is fixed.
++"""
++
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++)
++django.setup()
++
++# Import Django models and forms
++from django.db import models
++from django.forms.models import ModelMultipleChoiceField
++
++# Create test models
++class Publication(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'auth'
++        managed = False  # Prevent Django from creating the table
++    
++    def __str__(self):
++        return f"Publication {self.pk}: {self.name}"
++
++# Test function to verify the fix
++def test_empty_queryset_with_union():
++    """Test that empty querysets with union() now behave correctly"""
++    
++    # Create test querysets
++    qs1 = Publication.objects.filter(id__lt=2)
++    qs2 = Publication.objects.filter(id__gt=5)
++    
++    # Test with none() and OR operator
++    none_qs = qs1.none()
++    or_combined = none_qs | qs2
++    
++    # Test with none() and union() - this should now work correctly
++    none_qs2 = qs1.none()
++    union_combined = none_qs2.union(qs2)
++    
++    # Check that both combined querysets behave the same regarding emptiness
++    print("VERIFICATION TEST RESULTS:")
++    print(f"Is qs1.none() empty? {none_qs.query.is_empty()}")
++    print(f"Is qs2 empty? {qs2.query.is_empty() if hasattr(qs2.query, 'is_empty') else 'N/A'}")
++    
++    print("\nOR (|) operator behavior (reference):")
++    print(f"Is none_qs | qs2 using the right query? {'id__gt' in str(or_combined.query).lower()}")
++    
++    print("\nunion() behavior (after fix - should match OR behavior):")
++    print(f"Is none_qs.union(qs2) using the right query? {'id__gt' in str(union_combined.query).lower()}")
++    
++    # Test the key part that was fixed - ModelMultipleChoiceField behavior
++    # Create direct instances of the field with each type of queryset
++    field1 = ModelMultipleChoiceField(qs1 | qs2, required=False)
++    field2 = ModelMultipleChoiceField(qs1.union(qs2), required=False)
++    
++    # Test with empty value (simulates form submitted with no selections)
++    print("\nTesting ModelMultipleChoiceField.clean() with empty value:")
++    
++    # Call clean with empty value
++    empty_value = []
++    result1 = field1.clean(empty_value)
++    result2 = field2.clean(empty_value)
++    
++    print(f"Field with OR (|) returns empty: {result1.query.is_empty()}")
++    print(f"Field with union() returns empty: {result2.query.is_empty()}")
++    
++    if result1.query.is_empty() and result2.query.is_empty():
++        print("\n✅ FIX VERIFIED: Both fields now return empty querysets when no selection is made!")
++    else:
++        print("\n❌ FIX NOT WORKING: The fields are still behaving differently.")
++
++if __name__ == "__main__":
++    test_empty_queryset_with_union()
++    print("\nVerification test completed.")
+\ No newline at end of file
+diff --git a/issue_reproduction.py b/issue_reproduction.py
+new file mode 100644
+index 0000000000..c53ad3bf84
+--- /dev/null
++++ b/issue_reproduction.py
+@@ -0,0 +1,140 @@
++"""
++Reproduction of the issue with QuerySet.none() on combined queries.
++
++This script demonstrates how union() and | operators handle QuerySet.none() differently:
++- When using OR (|), the emptiness from none() is respected
++- When using union(), the emptiness is lost
++"""
++import os
++import django
++from django.conf import settings
++
++# Configure minimal Django settings
++settings.configure(
++    DEBUG=True,
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++)
++django.setup()
++
++# Now we can import Django models
++from django.db import models
++from django.db.models.query import EmptyQuerySet
++from django.forms import ModelForm, ModelMultipleChoiceField
++
++# Create sample models
++class Publication(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'auth'  # Using existing app label to avoid migrations
++    
++    def __str__(self):
++        return f"Publication {self.pk}: {self.name}"
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    publications = models.ManyToManyField(Publication, blank=True)
++    
++    class Meta:
++        app_label = 'auth'  # Using existing app label to avoid migrations
++    
++    def __str__(self):
++        return f"Article {self.pk}: {self.title}"
++
++# Create the form classes that illustrate the issue
++class ArticleFormWithOR(ModelForm):
++    """Form using OR (|) operator - works correctly"""
++    publications = ModelMultipleChoiceField(
++        # This will be replaced with actual querysets
++        Publication.objects.none(), 
++        required=False,
++    )
++    
++    class Meta:
++        model = Article
++        fields = ['publications']
++
++class ArticleFormWithUnion(ModelForm):
++    """Form using union() method - shows the issue"""
++    publications = ModelMultipleChoiceField(
++        # This will be replaced with actual querysets
++        Publication.objects.none(),
++        required=False,
++    )
++    
++    class Meta:
++        model = Article
++        fields = ['publications']
++
++def demonstrate_issue():
++    """
++    Demonstrate the core issue by directly examining the code that
++    shows the difference in behavior between OR and union operations
++    """
++    print("UNDERSTANDING THE ISSUE\n")
++    
++    # Look at QuerySet.none() implementation
++    print("1. When we call QuerySet.none() it sets the query to empty:")
++    from django.db.models.query import QuerySet
++    print("QuerySet.none() calls query.set_empty() which adds a NothingNode to where clause\n")
++    
++    # Look at how OR operator handles empty querysets
++    print("2. The OR operator checks if a queryset is EmptyQuerySet:")
++    print("From QuerySet.__or__:")
++    print("  if isinstance(self, EmptyQuerySet):")
++    print("      return other")
++    print("  if isinstance(other, EmptyQuerySet):")
++    print("      return self\n")
++    
++    # Look at how union() handles empty querysets 
++    print("3. The union() method also checks for EmptyQuerySet, BUT only accepts instances of EmptyQuerySet:")
++    print("From QuerySet.union:")
++    print("  if isinstance(self, EmptyQuerySet):")
++    print("      qs = [q for q in other_qs if not isinstance(q, EmptyQuerySet)]")
++    print("      return qs[0] if qs else self\n")
++    
++    # Explain the key issue
++    print("4. THE CORE ISSUE:")
++    print("  - query.none() marks a QuerySet as empty by adding a NothingNode")
++    print("  - BUT it does not turn the QuerySet into an EmptyQuerySet instance")
++    print("  - The OR operator (|) correctly handles both EmptyQuerySet and querysets with NothingNodes")
++    print("  - The union() method only properly handles EmptyQuerySet instances but not regular")
++    print("    querysets that were made empty via none()\n")
++    
++    # Show how the bug affects ModelMultipleChoiceField
++    print("5. In ModelMultipleChoiceField, when a form is submitted with no selections:")
++    print("  - clean() method returns queryset.none() when required=False")
++    print("  - With OR operation, the emptiness is respected")
++    print("  - With union() operation, it loses the emptiness and returns all objects\n")
++    
++    # Demo the direct difference in query behavior
++    qs1 = Publication.objects.filter(id__lt=2)
++    qs2 = Publication.objects.filter(id__gt=5)
++    
++    # Check how | operator preserves emptiness
++    none_qs = qs1.none()
++    or_combined = none_qs | qs2
++    
++    # Check how union doesn't preserve emptiness correctly
++    none_qs2 = qs1.none()
++    union_combined = none_qs2.union(qs2)
++    
++    print("6. BEHAVIOR COMPARISON:")
++    print("   qs1 = Publication.objects.filter(id__lt=2)")
++    print("   qs2 = Publication.objects.filter(id__gt=5)")
++    print("   none_qs = qs1.none()")
++    print(f"   Is none_qs empty? {none_qs.query.is_empty()}")
++    print(f"   Is none_qs an EmptyQuerySet? {isinstance(none_qs, EmptyQuerySet)}")
++    print("\n   # OR (|) operator works correctly with none()")
++    print("   or_combined = none_qs | qs2") 
++    print(f"   Is or_combined filtering by id__gt=5? {'id__gt' in str(or_combined.query).lower()}")
++    print(f"   Has or_combined lost the none() emptiness? {not or_combined.query.is_empty() if hasattr(or_combined.query, 'is_empty') else 'Cannot determine'}")
++    print("\n   # union() doesn't work correctly with none()")
++    print("   union_combined = none_qs.union(qs2)")
++    print(f"   Is union_combined filtering by id__gt=5? {'id__gt' in str(union_combined.query).lower()}")
++    print(f"   Has union_combined lost the none() emptiness? {not union_combined.query.is_empty() if hasattr(union_combined.query, 'is_empty') else 'Cannot determine'}")
++
++if __name__ == "__main__":
++    demonstrate_issue()
++    print("\nTest completed.")
+\ No newline at end of file

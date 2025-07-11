@@ -1,0 +1,376 @@
+diff --git a/debug_ast.py b/debug_ast.py
+new file mode 100644
+index 000000000..0858e3174
+--- /dev/null
++++ b/debug_ast.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand the AST generation issue
++"""
++
++import ast
++from _pytest.mark.expression import Scanner, expression
++
++def debug_ast_generation():
++    """Debug the AST generation for reserved keywords"""
++    
++    test_cases = ["False", "True", "None", "regular_ident"]
++    
++    for test_case in test_cases:
++        print(f"\n=== Testing: '{test_case}' ===")
++        
++        try:
++            # Parse using pytest's expression parser
++            scanner = Scanner(test_case)
++            astexpr = expression(scanner)
++            
++            print(f"AST Expression: {ast.dump(astexpr)}")
++            
++            # Try to compile it
++            try:
++                code = compile(astexpr, filename="<test>", mode="eval")
++                print(f"✓ Compilation succeeded")
++            except Exception as e:
++                print(f"✗ Compilation failed: {e}")
++                
++        except Exception as e:
++            print(f"✗ AST generation failed: {e}")
++
++def test_correct_ast():
++    """Test what the correct AST should look like for constants"""
++    
++    print("\n=== Testing correct AST for constants ===")
++    
++    # Test what Python generates for these constants
++    test_cases = ["False", "True", "None"]
++    
++    for test_case in test_cases:
++        print(f"\nTesting: {test_case}")
++        
++        # Parse as a normal Python expression
++        try:
++            normal_ast = ast.parse(test_case, mode="eval")
++            print(f"Normal AST: {ast.dump(normal_ast)}")
++            
++            # Try to compile it
++            code = compile(normal_ast, filename="<test>", mode="eval")
++            print(f"✓ Normal compilation succeeded")
++            
++            # Evaluate it
++            result = eval(code)
++            print(f"✓ Evaluation result: {result}")
++            
++        except Exception as e:
++            print(f"✗ Normal parsing failed: {e}")
++
++if __name__ == "__main__":
++    debug_ast_generation()
++    test_correct_ast()
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..efb128d3d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""
++Script to reproduce the issue where Expression.compile("False") crashes
++the interpreter on debug builds for Python 3.8+
++"""
++
++from _pytest.mark.expression import Expression
++
++def test_reproduce_issue():
++    """Try to reproduce the crash with Expression.compile("False")"""
++    print("Testing Expression.compile('False')...")
++    try:
++        expr = Expression.compile("False")
++        print("✓ Expression.compile('False') succeeded")
++        
++        # Test evaluation
++        result = expr.evaluate(lambda x: x == "False")
++        print(f"✓ Evaluation result: {result}")
++        
++    except Exception as e:
++        print(f"✗ Exception occurred: {e}")
++        import traceback
++        traceback.print_exc()
++
++def test_other_reserved_keywords():
++    """Test other reserved keywords that might have the same issue"""
++    keywords = ["True", "False", "None"]
++    
++    for keyword in keywords:
++        print(f"\nTesting Expression.compile('{keyword}')...")
++        try:
++            expr = Expression.compile(keyword)
++            print(f"✓ Expression.compile('{keyword}') succeeded")
++            
++            # Test evaluation
++            result = expr.evaluate(lambda x: x == keyword)
++            print(f"✓ Evaluation result: {result}")
++            
++        except Exception as e:
++            print(f"✗ Exception occurred with '{keyword}': {e}")
++            import traceback
++            traceback.print_exc()
++
++if __name__ == "__main__":
++    test_reproduce_issue()
++    test_other_reserved_keywords()
+\ No newline at end of file
+diff --git a/src/_pytest/mark/expression.py b/src/_pytest/mark/expression.py
+index 04c73411a..ba7ac1314 100644
+--- a/src/_pytest/mark/expression.py
++++ b/src/_pytest/mark/expression.py
+@@ -161,17 +161,45 @@ def not_expr(s: Scanner) -> ast.expr:
+         return ret
+     ident = s.accept(TokenType.IDENT)
+     if ident:
+-        return ast.Name(ident.value, ast.Load())
++        # Handle reserved constants to avoid "Name node can't be used with 'X' constant" errors
++        # while still treating them as identifiers that can be matched
++        if ident.value in ("True", "False", "None"):
++            return ast.Subscript(
++                value=ast.Name("__reserved__", ast.Load()),
++                slice=ast.Constant(ident.value),
++                ctx=ast.Load()
++            )
++        else:
++            return ast.Name(ident.value, ast.Load())
+     s.reject((TokenType.NOT, TokenType.LPAREN, TokenType.IDENT))
+ 
+ 
++class ReservedAdapter(Mapping[str, bool]):
++    """Adapts reserved identifiers (True, False, None) to matcher results."""
++
++    def __init__(self, matcher: Callable[[str], bool]) -> None:
++        self.matcher = matcher
++
++    def __getitem__(self, key: str) -> bool:
++        return self.matcher(key)
++
++    def __iter__(self) -> Iterator[str]:
++        raise NotImplementedError()
++
++    def __len__(self) -> int:
++        raise NotImplementedError()
++
++
+ class MatcherAdapter(Mapping[str, bool]):
+     """Adapts a matcher function to a locals mapping as required by eval()."""
+ 
+     def __init__(self, matcher: Callable[[str], bool]) -> None:
+         self.matcher = matcher
++        self.reserved_adapter = ReservedAdapter(matcher)
+ 
+     def __getitem__(self, key: str) -> bool:
++        if key == "__reserved__":
++            return self.reserved_adapter
+         return self.matcher(key)
+ 
+     def __iter__(self) -> Iterator[str]:
+diff --git a/test_ast_alternatives.py b/test_ast_alternatives.py
+new file mode 100644
+index 000000000..640a66751
+--- /dev/null
++++ b/test_ast_alternatives.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Test different AST approaches for handling reserved identifiers
++"""
++
++import ast
++
++def test_ast_approaches():
++    """Test different ways to represent reserved identifiers in AST"""
++    
++    reserved_names = ["True", "False", "None"]
++    
++    for name in reserved_names:
++        print(f"\n=== Testing approaches for: {name} ===")
++        
++        # Approach 1: ast.Name (this fails)
++        try:
++            name_node = ast.Name(name, ast.Load())
++            expr = ast.Expression(name_node)
++            ast.fix_missing_locations(expr)
++            code = compile(expr, "<test>", "eval")
++            print(f"✓ ast.Name approach worked for {name}")
++        except Exception as e:
++            print(f"✗ ast.Name approach failed for {name}: {e}")
++        
++        # Approach 2: ast.Subscript with a special object
++        try:
++            # Create: __reserved__["True"]
++            subscript_node = ast.Subscript(
++                value=ast.Name("__reserved__", ast.Load()),
++                slice=ast.Constant(name),
++                ctx=ast.Load()
++            )
++            expr = ast.Expression(subscript_node)
++            ast.fix_missing_locations(expr)
++            code = compile(expr, "<test>", "eval")
++            print(f"✓ ast.Subscript approach worked for {name}")
++            
++            # Test evaluation
++            reserved_dict = {name: f"identifier_{name}"}
++            result = eval(code, {"__builtins__": {}, "__reserved__": reserved_dict})
++            print(f"  Evaluation result: {result}")
++            
++        except Exception as e:
++            print(f"✗ ast.Subscript approach failed for {name}: {e}")
++        
++        # Approach 3: ast.Attribute
++        try:
++            # Create: __reserved__.True (this won't work for "True" as attribute name)
++            # But let's try anyway
++            attr_node = ast.Attribute(
++                value=ast.Name("__reserved__", ast.Load()),
++                attr=name,
++                ctx=ast.Load()
++            )
++            expr = ast.Expression(attr_node)
++            ast.fix_missing_locations(expr)
++            code = compile(expr, "<test>", "eval")
++            print(f"✓ ast.Attribute approach worked for {name}")
++        except Exception as e:
++            print(f"✗ ast.Attribute approach failed for {name}: {e}")
++
++if __name__ == "__main__":
++    test_ast_approaches()
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 000000000..6675956f1
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify the fix for the reserved identifier issue
++"""
++
++from _pytest.mark.expression import Expression
++
++def test_reserved_identifiers_as_identifiers():
++    """Test that True, False, None work as identifiers (not constants)"""
++    
++    # Test that reserved identifiers can be matched by the matcher
++    reserved_cases = [
++        ("True", True),
++        ("False", True), 
++        ("None", True),
++    ]
++    
++    for identifier, expected in reserved_cases:
++        print(f"Testing {identifier} as identifier...")
++        expr = Expression.compile(identifier)
++        
++        # When matcher maps the identifier to True, result should be True
++        result = expr.evaluate({identifier: True}.__getitem__)
++        assert result == expected, f"Expected {expected}, got {result} for {identifier}"
++        
++        # When matcher maps the identifier to False, result should be False
++        result = expr.evaluate({identifier: False}.__getitem__)
++        assert result == False, f"Expected False, got {result} for {identifier}"
++        
++        print(f"✓ {identifier} works as identifier")
++
++def test_regular_identifiers_still_work():
++    """Test that regular identifiers still work correctly"""
++    
++    regular_cases = ["test", "foo", "bar", "true", "false", "none"]
++    
++    for identifier in regular_cases:
++        print(f"Testing regular identifier: {identifier}...")
++        expr = Expression.compile(identifier)
++        
++        # Test with matcher returning True
++        result = expr.evaluate({identifier: True}.__getitem__)
++        assert result == True, f"Expected True, got {result} for {identifier}"
++        
++        # Test with matcher returning False
++        result = expr.evaluate({identifier: False}.__getitem__)
++        assert result == False, f"Expected False, got {result} for {identifier}"
++        
++        print(f"✓ {identifier} works correctly")
++
++def test_complex_expressions_with_reserved_identifiers():
++    """Test complex expressions involving reserved identifiers"""
++    
++    test_cases = [
++        ("True and False", lambda x: x == "True", False),  # True and False -> True and False -> False
++        ("True and False", lambda x: x == "False", False), # False and True -> False
++        ("True or False", lambda x: True, True),  # True or True -> True
++        ("not True", lambda x: x == "True", False),  # not True -> False
++        ("not False", lambda x: x == "False", False), # not True -> False
++        ("test and True", lambda x: x in ["test", "True"], True),  # True and True -> True
++        ("test or False", lambda x: x == "test", True),  # True or False -> True
++    ]
++    
++    for expr_str, matcher, expected in test_cases:
++        print(f"Testing complex expression: {expr_str}")
++        expr = Expression.compile(expr_str)
++        result = expr.evaluate(matcher)
++        assert result == expected, f"Expected {expected}, got {result} for '{expr_str}'"
++        print(f"✓ '{expr_str}' -> {result}")
++
++def test_original_issue_reproduction():
++    """Test that the original issue is fixed"""
++    
++    print("Testing original issue: Expression.compile('False')")
++    
++    # This should not crash
++    try:
++        expr = Expression.compile("False")
++        print("✓ Expression.compile('False') succeeded")
++        
++        # Test evaluation
++        result = expr.evaluate({"False": True}.__getitem__)
++        assert result == True, f"Expected True, got {result}"
++        print("✓ Evaluation succeeded")
++        
++    except Exception as e:
++        raise AssertionError(f"Original issue not fixed: {e}")
++
++def test_all_reserved_keywords():
++    """Test all reserved keywords that were problematic"""
++    
++    reserved_keywords = ["True", "False", "None"]
++    
++    for keyword in reserved_keywords:
++        print(f"Testing reserved keyword: {keyword}")
++        
++        # Should not crash during compilation
++        expr = Expression.compile(keyword)
++        print(f"✓ Compilation of '{keyword}' succeeded")
++        
++        # Should work as identifier in evaluation
++        result = expr.evaluate({keyword: True}.__getitem__)
++        assert result == True, f"Expected True, got {result} for {keyword}"
++        print(f"✓ Evaluation of '{keyword}' succeeded")
++
++if __name__ == "__main__":
++    print("=== Testing Reserved Identifiers Fix ===\n")
++    
++    test_original_issue_reproduction()
++    print()
++    
++    test_all_reserved_keywords()
++    print()
++    
++    test_reserved_identifiers_as_identifiers()
++    print()
++    
++    test_regular_identifiers_still_work()
++    print()
++    
++    test_complex_expressions_with_reserved_identifiers()
++    print()
++    
++    print("🎉 All tests passed! The fix works correctly.")
+\ No newline at end of file

@@ -1,0 +1,60 @@
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -139,6 +139,30 @@
+     return "".join(path)
+ 
+ 
++def compile_json_path_for_has_key(key_transforms, include_root=True):
++    """
++    Compile JSON path for has_key lookups where the final key should always
++    be treated as an object key, but intermediate keys can be array indices.
++    """
++    path = ["$"] if include_root else []
++    for i, key_transform in enumerate(key_transforms):
++        is_final_key = (i == len(key_transforms) - 1)
++        if is_final_key:
++            # Final key in has_key lookup should always be treated as object key
++            path.append(".")
++            path.append(json.dumps(key_transform))
++        else:
++            # Intermediate keys can be array indices
++            try:
++                num = int(key_transform)
++            except ValueError:  # non-integer
++                path.append(".")
++                path.append(json.dumps(key_transform))
++            else:
++                path.append("[%s]" % num)
++    return "".join(path)
++
++
+ class DataContains(PostgresOperatorLookup):
+     lookup_name = "contains"
+     postgres_operator = "@>"
+@@ -197,7 +221,7 @@
+                 "%s%s"
+                 % (
+                     lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
++                    compile_json_path_for_has_key(rhs_key_transforms, include_root=False),
+                 )
+             )
+         # Add condition for each key.
+@@ -401,11 +425,12 @@
+         template = "JSON_TYPE(%s, %%s) IS NULL"
+         if not self.rhs:
+             template = "JSON_TYPE(%s, %%s) IS NOT NULL"
+-        return HasKey(self.lhs.lhs, self.lhs.key_name).as_sql(
+-            compiler,
+-            connection,
+-            template=template,
+-        )
++        # For isnull lookups, we want normal key transform behavior (not has_key behavior)
++        # The full path is already contained in self.lhs.preprocess_lhs()
++        lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(compiler, connection)
++        lhs_json_path = compile_json_path(lhs_key_transforms)
++        sql = template % lhs
++        return sql, tuple(lhs_params) + (lhs_json_path,)
+ 
+ 
+ class KeyTransformIn(lookups.In):

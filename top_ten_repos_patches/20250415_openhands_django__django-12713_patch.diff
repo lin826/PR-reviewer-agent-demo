@@ -1,0 +1,171 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 69a5fbf389..db7df891e3 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -249,16 +249,17 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
+             return None
+         db = kwargs.get('using')
+ 
+-        autocomplete_fields = self.get_autocomplete_fields(request)
+-        if db_field.name in autocomplete_fields:
+-            kwargs['widget'] = AutocompleteSelectMultiple(db_field.remote_field, self.admin_site, using=db)
+-        elif db_field.name in self.raw_id_fields:
+-            kwargs['widget'] = widgets.ManyToManyRawIdWidget(db_field.remote_field, self.admin_site, using=db)
+-        elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
+-            kwargs['widget'] = widgets.FilteredSelectMultiple(
+-                db_field.verbose_name,
+-                db_field.name in self.filter_vertical
+-            )
++        if 'widget' not in kwargs:
++            autocomplete_fields = self.get_autocomplete_fields(request)
++            if db_field.name in autocomplete_fields:
++                kwargs['widget'] = AutocompleteSelectMultiple(db_field.remote_field, self.admin_site, using=db)
++            elif db_field.name in self.raw_id_fields:
++                kwargs['widget'] = widgets.ManyToManyRawIdWidget(db_field.remote_field, self.admin_site, using=db)
++            elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
++                kwargs['widget'] = widgets.FilteredSelectMultiple(
++                    db_field.verbose_name,
++                    db_field.name in self.filter_vertical
++                )
+ 
+         if 'queryset' not in kwargs:
+             queryset = self.get_field_queryset(db, db_field, request)
+diff --git a/test_manytomany_widget.py b/test_manytomany_widget.py
+new file mode 100644
+index 0000000000..776bd66de8
+--- /dev/null
++++ b/test_manytomany_widget.py
+@@ -0,0 +1,27 @@
++import sys
++import os
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++# Let's simulate the issue manually by examining the code
++# of both formfield_for_foreignkey and formfield_for_manytomany
++
++print("Analyzing the issue with widget parameter in formfield_for_manytomany")
++print("-" * 70)
++
++# Reviewing formfield_for_foreignkey:
++print("In formfield_for_foreignkey, there is a check: if 'widget' not in kwargs:")
++print("This allows for custom widgets to be set via kwargs and prioritized")
++print("over the default widgets.")
++print("-" * 70)
++
++# Reviewing formfield_for_manytomany:
++print("In formfield_for_manytomany, there is NO check for 'widget' in kwargs")
++print("The method assigns widgets regardless of whether a custom widget was provided.")
++print("This means any custom widget passed to this method will be overridden by default widgets.")
++print("-" * 70)
++
++print("SOLUTION NEEDED:")
++print("Add a check for 'widget' not in kwargs in formfield_for_manytomany() similar to")
++print("how it exists in formfield_for_foreignkey(). This will allow for consistent API")
++print("behavior between these two similar methods.")
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..0e3b76f062
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,98 @@
++"""
++Test script to verify the fix for allowing widget override in formfield_for_manytomany.
++
++This script creates a mock scenario to check if customizing the widget in 
++formfield_for_manytomany works correctly.
++"""
++
++import sys
++import os
++
++# Mock objects to simulate Django's admin and form functionality without requiring 
++# a full Django setup
++class MockMeta:
++    auto_created = True
++
++class MockRemoteField:
++    through = type('MockThroughModel', (), {'_meta': MockMeta()})
++
++class MockDBField:
++    name = 'test_field'
++    remote_field = MockRemoteField()
++    verbose_name = 'Test Field'
++    
++    def formfield(self, **kwargs):
++        # Return the kwargs to inspect what was passed
++        return kwargs
++
++class CustomWidget:
++    """A simple custom widget for testing."""
++    pass
++
++class MockModelAdmin:
++    """Mocks the ModelAdmin class with the fixed formfield_for_manytomany method."""
++    admin_site = None
++    raw_id_fields = []
++    filter_vertical = []
++    filter_horizontal = []
++    
++    def get_autocomplete_fields(self, request):
++        return []
++    
++    def get_field_queryset(self, db, db_field, request):
++        return None
++    
++    def formfield_for_manytomany(self, db_field, request, **kwargs):
++        """
++        Get a form Field for a ManyToManyField.
++        """
++        # If it uses an intermediary model that isn't auto created, don't show
++        # a field in admin.
++        if not db_field.remote_field.through._meta.auto_created:
++            return None
++        db = kwargs.get('using')
++
++        if 'widget' not in kwargs:
++            autocomplete_fields = self.get_autocomplete_fields(request)
++            if db_field.name in autocomplete_fields:
++                kwargs['widget'] = 'AutocompleteSelectMultiple'
++            elif db_field.name in self.raw_id_fields:
++                kwargs['widget'] = 'ManyToManyRawIdWidget'
++            elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
++                kwargs['widget'] = 'FilteredSelectMultiple'
++
++        if 'queryset' not in kwargs:
++            queryset = self.get_field_queryset(db, db_field, request)
++            if queryset is not None:
++                kwargs['queryset'] = queryset
++
++        return db_field.formfield(**kwargs)
++
++print("Testing widget override in formfield_for_manytomany")
++print("-" * 70)
++
++# Test 1: Without providing a custom widget
++admin = MockModelAdmin()
++db_field = MockDBField()
++result = admin.formfield_for_manytomany(db_field, None)
++
++print("Test 1: Without providing a custom widget")
++print(f"Widget provided: {result.get('widget', 'None')}")
++print("Expected: None (default behavior)")
++print("-" * 50)
++
++# Test 2: With providing a custom widget
++custom_widget = CustomWidget()
++result_with_widget = admin.formfield_for_manytomany(db_field, None, widget=custom_widget)
++
++print("Test 2: With providing a custom widget")
++print(f"Widget provided: {result_with_widget.get('widget', 'None')}")
++print(f"Is our custom widget: {result_with_widget.get('widget') is custom_widget}")
++print("Expected: Our custom widget should be preserved")
++print("-" * 50)
++
++# Conclusion
++if result_with_widget.get('widget') is custom_widget:
++    print("✅ Fix is working correctly! Custom widgets are now respected in formfield_for_manytomany")
++else:
++    print("❌ Fix is NOT working. Custom widgets are still being overridden.")
+\ No newline at end of file

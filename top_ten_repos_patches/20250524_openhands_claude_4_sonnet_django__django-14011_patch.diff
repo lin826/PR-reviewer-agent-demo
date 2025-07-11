@@ -1,0 +1,579 @@
+diff --git a/django/test/testcases.py b/django/test/testcases.py
+index 92f566b7b0..f2c9f8000b 100644
+--- a/django/test/testcases.py
++++ b/django/test/testcases.py
+@@ -1514,11 +1514,15 @@ class LiveServerThread(threading.Thread):
+             connections.close_all()
+ 
+     def _create_server(self):
+-        return self.server_class(
++        server = self.server_class(
+             (self.host, self.port),
+             QuietWSGIRequestHandler,
+             allow_reuse_address=False,
+         )
++        # Ensure worker threads complete before server shutdown to allow
++        # proper cleanup of database connections.
++        server.daemon_threads = False
++        return server
+ 
+     def terminate(self):
+         if hasattr(self, 'httpd'):
+diff --git a/test_daemon_threads.py b/test_daemon_threads.py
+new file mode 100644
+index 0000000000..11cd3d78b6
+--- /dev/null
++++ b/test_daemon_threads.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python
++"""
++Test to verify the daemon_threads behavior in ThreadedWSGIServer.
++"""
++
++import sys
++import threading
++import time
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++from django.core.servers.basehttp import ThreadedWSGIServer
++from django.test.testcases import LiveServerThread
++
++
++def test_daemon_threads_behavior():
++    """Test the current daemon_threads behavior."""
++    
++    print("=== Testing ThreadedWSGIServer daemon_threads behavior ===")
++    
++    # Check the default daemon_threads setting
++    server = ThreadedWSGIServer(('localhost', 0), None)
++    print(f"ThreadedWSGIServer.daemon_threads = {server.daemon_threads}")
++    
++    # Check LiveServerThread's server class
++    thread = LiveServerThread('localhost', lambda x: x)
++    test_server = thread._create_server()
++    print(f"LiveServerThread server class: {type(test_server)}")
++    print(f"LiveServerThread server daemon_threads = {test_server.daemon_threads}")
++    
++    # Demonstrate the issue: daemon threads don't wait for completion
++    print("\n=== Demonstrating daemon thread behavior ===")
++    
++    class TestServer(ThreadedWSGIServer):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self.request_count = 0
++            
++        def process_request(self, request, client_address):
++            self.request_count += 1
++            print(f"Processing request {self.request_count} in thread {threading.current_thread().name}")
++            # Simulate some work that might involve database connections
++            time.sleep(0.1)
++            super().process_request(request, client_address)
++            print(f"Finished processing request {self.request_count}")
++    
++    # Test with daemon_threads = True (current behavior)
++    print("\n--- Testing with daemon_threads = True ---")
++    server_daemon = TestServer(('localhost', 0), None)
++    server_daemon.daemon_threads = True
++    print(f"Server daemon_threads: {server_daemon.daemon_threads}")
++    
++    # Test with daemon_threads = False (proposed fix)
++    print("\n--- Testing with daemon_threads = False ---")
++    server_no_daemon = TestServer(('localhost', 0), None)
++    server_no_daemon.daemon_threads = False
++    print(f"Server daemon_threads: {server_no_daemon.daemon_threads}")
++    
++    print("\nThe difference:")
++    print("- daemon_threads = True: Server doesn't wait for worker threads to finish")
++    print("- daemon_threads = False: Server waits for worker threads to finish")
++    print("\nThis affects database connection cleanup in LiveServerTestCase!")
++
++
++def test_proposed_fix():
++    """Test the proposed fix for the issue."""
++    
++    print("\n=== Testing Proposed Fix ===")
++    
++    class FixedLiveServerThread(LiveServerThread):
++        """LiveServerThread with fixed daemon_threads behavior."""
++        
++        def _create_server(self):
++            server = super()._create_server()
++            # Ensure threads are not daemon threads so they complete before cleanup
++            server.daemon_threads = False
++            return server
++    
++    # Test the fixed version
++    fixed_thread = FixedLiveServerThread('localhost', lambda x: x)
++    fixed_server = fixed_thread._create_server()
++    
++    print(f"Fixed LiveServerThread server daemon_threads = {fixed_server.daemon_threads}")
++    print("This should ensure all worker threads complete before database cleanup!")
++
++
++if __name__ == '__main__':
++    test_daemon_threads_behavior()
++    test_proposed_fix()
+\ No newline at end of file
+diff --git a/test_daemon_threads_fix.py b/test_daemon_threads_fix.py
+new file mode 100644
+index 0000000000..d537609ee2
+--- /dev/null
++++ b/test_daemon_threads_fix.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python
++"""
++Test to verify that the daemon_threads fix works correctly.
++This test specifically verifies that LiveServerThread creates servers
++with daemon_threads = False to ensure proper database connection cleanup.
++"""
++
++import sys
++import unittest
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++from django.test.testcases import LiveServerThread
++from django.core.servers.basehttp import ThreadedWSGIServer
++
++
++class DaemonThreadsFixTest(unittest.TestCase):
++    """Test that verifies the daemon_threads fix."""
++    
++    def test_live_server_thread_daemon_threads_false(self):
++        """Test that LiveServerThread creates servers with daemon_threads = False."""
++        # Create a LiveServerThread instance
++        thread = LiveServerThread('localhost', lambda x: x)
++        
++        # Create the server
++        server = thread._create_server()
++        
++        # Verify it's the correct type
++        self.assertIsInstance(server, ThreadedWSGIServer)
++        
++        # Verify daemon_threads is False (the fix)
++        self.assertFalse(server.daemon_threads, 
++                        "LiveServerThread should create servers with daemon_threads = False")
++    
++    def test_default_threaded_wsgi_server_still_daemon(self):
++        """Test that default ThreadedWSGIServer still has daemon_threads = True."""
++        # Create a default ThreadedWSGIServer
++        server = ThreadedWSGIServer(('localhost', 0), None)
++        
++        # Verify it still has daemon_threads = True by default
++        self.assertTrue(server.daemon_threads,
++                       "Default ThreadedWSGIServer should still have daemon_threads = True")
++    
++    def test_fix_only_affects_live_server_thread(self):
++        """Test that the fix only affects LiveServerThread, not other uses."""
++        # Create both servers
++        live_server_thread = LiveServerThread('localhost', lambda x: x)
++        live_server = live_server_thread._create_server()
++        
++        default_server = ThreadedWSGIServer(('localhost', 0), None)
++        
++        # Verify they have different daemon_threads settings
++        self.assertFalse(live_server.daemon_threads, 
++                        "LiveServerThread server should have daemon_threads = False")
++        self.assertTrue(default_server.daemon_threads,
++                       "Default ThreadedWSGIServer should have daemon_threads = True")
++        
++        # This ensures the fix is targeted and doesn't affect other uses
++        self.assertNotEqual(live_server.daemon_threads, default_server.daemon_threads,
++                           "Fix should only affect LiveServerThread, not default behavior")
++
++
++if __name__ == '__main__':
++    unittest.main(verbosity=2)
+\ No newline at end of file
+diff --git a/test_database_connection_issue.py b/test_database_connection_issue.py
+new file mode 100644
+index 0000000000..eabda00468
+--- /dev/null
++++ b/test_database_connection_issue.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the database connection issue with LiveServerTestCase.
++
++This script attempts to reproduce the race condition where ThreadedWSGIServer
++doesn't properly close database connections before test teardown.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.test.utils import get_runner
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.test import LiveServerTestCase
++from django.db import connections
++import threading
++import time
++
++
++class DatabaseConnectionTestCase(LiveServerTestCase):
++    """Test case to reproduce database connection issues."""
++    
++    def test_database_connections_closed(self):
++        """
++        Test that simulates the race condition where database connections
++        are not properly closed after LiveServerTestCase completes.
++        """
++        # Make a simple request to the live server to trigger thread creation
++        import urllib.request
++        try:
++            response = urllib.request.urlopen(self.live_server_url + '/non-existent-url/')
++        except urllib.error.HTTPError:
++            # We expect a 404, that's fine - we just want to trigger thread creation
++            pass
++        
++        # Give some time for threads to be created and potentially hold connections
++        time.sleep(0.1)
++        
++        # Check if there are any active connections
++        conn = connections['default']
++        print(f"Connection object: {conn}")
++        print(f"Connection.connection: {getattr(conn, 'connection', 'No connection attr')}")
++        
++        # Force some database activity to ensure connections are created
++        from django.contrib.auth.models import User
++        User.objects.count()  # This should create a database connection
++        
++        print(f"After DB activity - Connection.connection: {getattr(conn, 'connection', 'No connection attr')}")
++
++
++def run_test_multiple_times(num_runs=10):
++    """Run the test multiple times to try to reproduce the race condition."""
++    print(f"Running test {num_runs} times to try to reproduce the issue...")
++    
++    for i in range(num_runs):
++        print(f"\n--- Run {i+1}/{num_runs} ---")
++        
++        # Create a test suite with our test
++        from django.test.utils import setup_test_environment, teardown_test_environment
++        from django.test.runner import DiscoverRunner
++        
++        setup_test_environment()
++        runner = DiscoverRunner(verbosity=2, interactive=False, keepdb=False)
++        
++        # Create test database
++        old_config = runner.setup_databases()
++        
++        try:
++            # Run our specific test
++            from django.test.loader import TestLoader
++            loader = TestLoader()
++            suite = loader.loadTestsFromTestCase(DatabaseConnectionTestCase)
++            
++            # Run the test
++            result = runner.run_tests(['__main__.DatabaseConnectionTestCase.test_database_connections_closed'])
++            
++            if result > 0:
++                print(f"Test failed on run {i+1}")
++            else:
++                print(f"Test passed on run {i+1}")
++                
++        except Exception as e:
++            print(f"Exception during test run {i+1}: {e}")
++            
++        finally:
++            try:
++                # This is where the issue would manifest - during database teardown
++                runner.teardown_databases(old_config)
++                print(f"Database teardown successful on run {i+1}")
++            except Exception as e:
++                print(f"Database teardown failed on run {i+1}: {e}")
++                # This is the error we're trying to reproduce
++                if "is being accessed by other users" in str(e):
++                    print("*** REPRODUCED THE ISSUE! ***")
++                    return True
++            
++            teardown_test_environment()
++    
++    print("Could not reproduce the issue in the given number of runs.")
++    return False
++
++
++if __name__ == '__main__':
++    # Try to reproduce the issue
++    reproduced = run_test_multiple_times(5)
++    
++    if reproduced:
++        print("\n=== ISSUE REPRODUCED ===")
++        print("The database connection issue has been reproduced!")
++        sys.exit(1)
++    else:
++        print("\n=== ISSUE NOT REPRODUCED ===")
++        print("Could not reproduce the issue. This might be due to:")
++        print("1. The race condition not occurring in this run")
++        print("2. Using in-memory SQLite which behaves differently")
++        print("3. The issue being already fixed")
++        sys.exit(0)
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 0000000000..450fdf7c23
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python
++"""
++Test to verify that the fix for database connection cleanup works correctly.
++"""
++
++import sys
++import threading
++import time
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++from django.test.testcases import LiveServerThread
++from django.core.servers.basehttp import ThreadedWSGIServer
++
++
++def test_fix_verification():
++    """Verify that the fix correctly sets daemon_threads = False."""
++    
++    print("=== Verifying the Fix ===")
++    
++    # Test that LiveServerThread now creates servers with daemon_threads = False
++    thread = LiveServerThread('localhost', lambda x: x)
++    server = thread._create_server()
++    
++    print(f"LiveServerThread server type: {type(server)}")
++    print(f"LiveServerThread server daemon_threads: {server.daemon_threads}")
++    
++    # Verify it's a ThreadedWSGIServer
++    assert isinstance(server, ThreadedWSGIServer), "Server should be ThreadedWSGIServer"
++    
++    # Verify daemon_threads is False (the fix)
++    assert server.daemon_threads is False, "daemon_threads should be False after the fix"
++    
++    print("✓ Fix verified: LiveServerThread now creates servers with daemon_threads = False")
++    
++    # Compare with the default ThreadedWSGIServer behavior
++    default_server = ThreadedWSGIServer(('localhost', 0), None)
++    print(f"Default ThreadedWSGIServer daemon_threads: {default_server.daemon_threads}")
++    
++    print("\n=== Fix Summary ===")
++    print("Before fix: LiveServerThread used ThreadedWSGIServer with daemon_threads = True")
++    print("After fix:  LiveServerThread uses ThreadedWSGIServer with daemon_threads = False")
++    print("\nThis ensures worker threads complete before database cleanup, preventing:")
++    print("'OperationalError: database \"test_myapp\" is being accessed by other users'")
++
++
++def test_thread_behavior_simulation():
++    """Simulate the difference in thread behavior."""
++    
++    print("\n=== Simulating Thread Behavior ===")
++    
++    import socketserver
++    
++    class MockServer(socketserver.ThreadingMixIn):
++        def __init__(self, daemon_threads):
++            self.daemon_threads = daemon_threads
++            self.active_threads = []
++            
++        def process_request_thread(self, request, client_address):
++            """Simulate request processing with database work."""
++            thread_name = threading.current_thread().name
++            print(f"  Thread {thread_name} started processing request")
++            
++            # Simulate database work
++            time.sleep(0.1)
++            
++            print(f"  Thread {thread_name} finished processing request")
++            
++        def simulate_shutdown(self):
++            """Simulate server shutdown behavior."""
++            print(f"  Server shutting down (daemon_threads = {self.daemon_threads})")
++            
++            if self.daemon_threads:
++                print("  Not waiting for worker threads (daemon_threads = True)")
++                print("  → Potential database connection leak!")
++            else:
++                print("  Waiting for worker threads to complete (daemon_threads = False)")
++                print("  → Proper database connection cleanup!")
++    
++    # Test daemon behavior
++    print("\n--- Daemon Threads (OLD behavior) ---")
++    daemon_server = MockServer(daemon_threads=True)
++    daemon_server.simulate_shutdown()
++    
++    print("\n--- Non-Daemon Threads (NEW behavior with fix) ---")
++    non_daemon_server = MockServer(daemon_threads=False)
++    non_daemon_server.simulate_shutdown()
++
++
++if __name__ == '__main__':
++    test_fix_verification()
++    test_thread_behavior_simulation()
++    print("\n✓ All tests passed! The fix is working correctly.")
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 0000000000..3f1a44a459
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,136 @@
++#!/usr/bin/env python
++"""
++Simple test to reproduce the database connection issue.
++"""
++
++import os
++import sys
++import tempfile
++import threading
++import time
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++import django
++from django.conf import settings
++from django.test import LiveServerTestCase
++from django.db import connections
++
++# Configure Django with a file-based SQLite database to better reproduce the issue
++test_db_path = tempfile.mktemp(suffix='.db')
++
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': test_db_path,  # Use file-based DB instead of in-memory
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test-secret-key',
++        USE_TZ=True,
++        ROOT_URLCONF='test_urls',  # We'll create a simple URL conf
++    )
++
++django.setup()
++
++# Create a simple URL configuration
++from django.http import HttpResponse
++from django.urls import path
++
++def simple_view(request):
++    # Force database access to create connections
++    from django.contrib.auth.models import User
++    count = User.objects.count()
++    return HttpResponse(f'User count: {count}')
++
++# Create URL patterns
++urlpatterns = [
++    path('test/', simple_view, name='test_view'),
++]
++
++# Create the test_urls module dynamically
++import types
++test_urls_module = types.ModuleType('test_urls')
++test_urls_module.urlpatterns = urlpatterns
++sys.modules['test_urls'] = test_urls_module
++
++
++class DatabaseConnectionReproductionTest(LiveServerTestCase):
++    """Test to reproduce the database connection issue."""
++    
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        print(f"LiveServer started on: {cls.live_server_url}")
++        print(f"Server thread class: {cls.server_thread_class}")
++        print(f"Server class: {cls.server_thread.server_class}")
++        
++    def test_multiple_requests_with_database_access(self):
++        """Make multiple concurrent requests to trigger the race condition."""
++        import urllib.request
++        import urllib.error
++        import concurrent.futures
++        
++        def make_request():
++            try:
++                with urllib.request.urlopen(self.live_server_url + '/test/', timeout=5) as response:
++                    return response.read().decode()
++            except Exception as e:
++                return f"Error: {e}"
++        
++        # Make multiple concurrent requests to increase chance of race condition
++        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
++            futures = [executor.submit(make_request) for _ in range(10)]
++            results = [future.result() for future in concurrent.futures.as_completed(futures)]
++        
++        print(f"Request results: {results}")
++        
++        # Check current database connections
++        conn = connections['default']
++        print(f"Database connection after requests: {conn.connection}")
++        
++        # Give some time for threads to potentially not clean up
++        time.sleep(0.5)
++
++
++def run_test():
++    """Run the test and check for database cleanup issues."""
++    import unittest
++    
++    # Create and run the test
++    suite = unittest.TestLoader().loadTestsFromTestCase(DatabaseConnectionReproductionTest)
++    runner = unittest.TextTestRunner(verbosity=2)
++    
++    print("Running database connection reproduction test...")
++    result = runner.run(suite)
++    
++    # Check if there are any remaining connections
++    conn = connections['default']
++    if hasattr(conn, 'connection') and conn.connection:
++        print(f"WARNING: Database connection still exists after test: {conn.connection}")
++    else:
++        print("Database connection properly cleaned up.")
++    
++    return result.wasSuccessful()
++
++
++if __name__ == '__main__':
++    try:
++        success = run_test()
++        if success:
++            print("Test completed successfully")
++        else:
++            print("Test failed")
++    finally:
++        # Clean up the test database file
++        try:
++            os.unlink(test_db_path)
++        except FileNotFoundError:
++            pass
+\ No newline at end of file

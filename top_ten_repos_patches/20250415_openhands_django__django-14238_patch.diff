@@ -1,0 +1,278 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 0f53d9c30b..bce3844051 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -2524,7 +2524,12 @@ class AutoFieldMeta(type):
+         return isinstance(instance, self._subclasses) or super().__instancecheck__(instance)
+ 
+     def __subclasscheck__(self, subclass):
+-        return subclass in self._subclasses or super().__subclasscheck__(subclass)
++        # Handle direct subclasses (BigAutoField, SmallAutoField)
++        if subclass in self._subclasses or super().__subclasscheck__(subclass):
++            return True
++        
++        # Handle indirect subclasses (classes that inherit from BigAutoField or SmallAutoField)
++        return any(issubclass(subclass, direct_subclass) for direct_subclass in self._subclasses)
+ 
+ 
+ class AutoField(AutoFieldMixin, IntegerField, metaclass=AutoFieldMeta):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d6ff70eb2b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,27 @@
++"""
++Script to reproduce the issue with DEFAULT_AUTO_FIELD subclass check.
++"""
++import os
++import sys
++import importlib
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++
++# Let's test directly with the elements we need to verify
++from django.db.models.fields import AutoField, BigAutoField
++from django.db.models.fields import AutoFieldMeta
++
++# Create a custom field class that inherits from BigAutoField
++class MyBigAutoField(BigAutoField):
++    pass
++
++# Direct check of the issue
++print(f"Is MyBigAutoField a subclass of AutoField? {issubclass(MyBigAutoField, AutoField)}")
++
++# Manually inspect the _subclasses property of AutoFieldMeta
++print(f"Current _subclasses in AutoFieldMeta: {AutoFieldMeta._subclasses}")
++
++# The issue is that issubclass(MyBigAutoField, AutoField) should return True,
++# but it doesn't due to the implementation of __subclasscheck__ in AutoFieldMeta
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..c5c271d0c5
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,117 @@
++"""
++Script to verify the fix for DEFAULT_AUTO_FIELD subclass issue.
++"""
++import os
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++
++# Create a temporary directory for our test project
++import tempfile
++import shutil
++from os.path import join
++
++test_dir = tempfile.mkdtemp()
++try:
++    # Create a minimal Django project structure
++    os.makedirs(join(test_dir, 'example/core'))
++    
++    # Create the manage.py file
++    with open(join(test_dir, 'manage.py'), 'w') as f:
++        f.write("""#!/usr/bin/env python
++import os
++import sys
++
++def main():
++    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'example.settings')
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(sys.argv)
++
++if __name__ == '__main__':
++    main()
++""")
++    
++    # Create the settings.py file
++    with open(join(test_dir, 'example/settings.py'), 'w') as f:
++        f.write("""
++import os
++
++BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++SECRET_KEY = 'fake-key-for-test'
++DEBUG = True
++ALLOWED_HOSTS = []
++
++INSTALLED_APPS = [
++    'example.core',
++]
++
++MIDDLEWARE = []
++ROOT_URLCONF = 'example.urls'
++TEMPLATES = []
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
++    }
++}
++DEFAULT_AUTO_FIELD = 'example.core.models.MyBigAutoField'
++""")
++    
++    # Create urls.py file
++    with open(join(test_dir, 'example/urls.py'), 'w') as f:
++        f.write("""
++from django.urls import path
++
++urlpatterns = [
++]
++""")
++    
++    # Create __init__.py files
++    open(join(test_dir, 'example/__init__.py'), 'w').close()
++    open(join(test_dir, 'example/core/__init__.py'), 'w').close()
++    
++    # Create the models.py file with our custom field
++    with open(join(test_dir, 'example/core/models.py'), 'w') as f:
++        f.write("""
++from django.db import models
++
++class MyBigAutoField(models.BigAutoField):
++    pass
++
++class MyModel(models.Model):
++    pass
++""")
++    
++    # Try running a Django command to see if it works
++    print("Running Django command to verify fix...")
++    sys.path.insert(0, test_dir)
++    os.chdir(test_dir)
++    
++    # Set up the environment
++    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'example.settings')
++    
++    # Import Django and run the command
++    import django
++    django.setup()
++    
++    # Create a simple check command
++    from django.core.management import call_command
++    call_command('check')
++    
++    print("Success! The fix works - Django initializes correctly with a custom BigAutoField subclass.")
++
++    # Also try a direct call to MyModel to ensure it gets initialized properly
++    from example.core.models import MyModel
++    # Just accessing this class will initialize it and would trigger the error if our fix didn't work
++    print(f"MyModel was initialized successfully with id field type: {MyModel._meta.pk.__class__.__name__}")
++    
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
++finally:
++    # Clean up
++    shutil.rmtree(test_dir)
+\ No newline at end of file
+diff --git a/verify_small_autofield.py b/verify_small_autofield.py
+new file mode 100644
+index 0000000000..ce71e63296
+--- /dev/null
++++ b/verify_small_autofield.py
+@@ -0,0 +1,95 @@
++"""
++Script to verify the fix for SmallAutoField subclass.
++"""
++import os
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++
++# Create a temporary directory for our test project
++import tempfile
++import shutil
++from os.path import join
++
++test_dir = tempfile.mkdtemp()
++try:
++    # Create a minimal Django project structure
++    os.makedirs(join(test_dir, 'example/core'))
++    
++    # Create urls.py file
++    with open(join(test_dir, 'example/urls.py'), 'w') as f:
++        f.write("""
++from django.urls import path
++
++urlpatterns = [
++]
++""")
++    
++    # Create __init__.py files
++    open(join(test_dir, 'example/__init__.py'), 'w').close()
++    open(join(test_dir, 'example/core/__init__.py'), 'w').close()
++    
++    # Create the settings.py file
++    with open(join(test_dir, 'example/settings.py'), 'w') as f:
++        f.write("""
++import os
++
++BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++SECRET_KEY = 'fake-key-for-test'
++DEBUG = True
++ALLOWED_HOSTS = []
++
++INSTALLED_APPS = [
++    'example.core',
++]
++
++MIDDLEWARE = []
++ROOT_URLCONF = 'example.urls'
++TEMPLATES = []
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
++    }
++}
++DEFAULT_AUTO_FIELD = 'example.core.models.MySmallAutoField'
++""")
++    
++    # Create the models.py file with our custom field
++    with open(join(test_dir, 'example/core/models.py'), 'w') as f:
++        f.write("""
++from django.db import models
++
++class MySmallAutoField(models.SmallAutoField):
++    pass
++
++class MyModel(models.Model):
++    pass
++""")
++    
++    # Try running a Django command to see if it works
++    print("Running test for SmallAutoField subclass...")
++    sys.path.insert(0, test_dir)
++    os.chdir(test_dir)
++    
++    # Set up the environment
++    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'example.settings')
++    
++    # Import Django and run the command
++    import django
++    django.setup()
++    
++    # Import the model to trigger model initialization
++    from example.core.models import MyModel
++    print(f"MyModel was initialized successfully with id field type: {MyModel._meta.pk.__class__.__name__}")
++    
++except Exception as e:
++    print(f"Error: {type(e).__name__}: {e}")
++    import traceback
++    traceback.print_exc()
++finally:
++    # Clean up
++    shutil.rmtree(test_dir)
+\ No newline at end of file

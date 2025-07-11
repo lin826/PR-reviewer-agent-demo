@@ -1,0 +1,891 @@
+diff --git a/django/contrib/auth/forms.py b/django/contrib/auth/forms.py
+index d73d1c8495..7203f84af8 100644
+--- a/django/contrib/auth/forms.py
++++ b/django/contrib/auth/forms.py
+@@ -141,6 +141,9 @@ class UserCreationForm(forms.ModelForm):
+         user.set_password(self.cleaned_data["password1"])
+         if commit:
+             user.save()
++            self._save_m2m()
++        else:
++            self.save_m2m = self._save_m2m
+         return user
+ 
+ 
+diff --git a/test_m2m_bug.py b/test_m2m_bug.py
+new file mode 100644
+index 0000000000..aab44ad143
+--- /dev/null
++++ b/test_m2m_bug.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the UserCreationForm ManyToMany issue using Django's test runner.
++"""
++
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++sys.path.insert(0, '/workspace/django__django__4.2/tests')
++
++# Run using Django's test runner
++if __name__ == '__main__':
++    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'auth_tests.settings')
++    
++    import django
++    from django.test.utils import get_runner
++    from django.conf import settings
++    
++    django.setup()
++    
++    # Create a test case file
++    test_content = '''
++from django.contrib.auth.forms import UserCreationForm
++from django.forms import ModelMultipleChoiceField
++from django.test import TestCase, override_settings
++from auth_tests.models import CustomUserWithM2M, Organization
++
++# Create a custom UserCreationForm that includes the ManyToMany field
++class CustomUserCreationForm(UserCreationForm):
++    orgs = ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++    )
++    
++    class Meta:
++        model = CustomUserWithM2M
++        fields = ("username", "orgs")
++
++@override_settings(AUTH_USER_MODEL='auth_tests.CustomUserWithM2M')
++class UserCreationFormM2MTest(TestCase):
++    def setUp(self):
++        # Create some test organizations
++        self.org1 = Organization.objects.create(name="Organization 1")
++        self.org2 = Organization.objects.create(name="Organization 2")
++    
++    def test_m2m_fields_not_saved_with_commit_true(self):
++        """Test that demonstrates the bug: M2M fields are not saved with commit=True"""
++        print("\\n=== Testing UserCreationForm with ManyToMany fields ===")
++        print(f"Created organizations: {self.org1.name}, {self.org2.name}")
++        
++        # Test the form
++        print("\\n=== Testing form creation and validation ===")
++        form_data = {
++            'username': 'testuser',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk, self.org2.pk]  # Select both organizations
++        }
++
++        form = CustomUserCreationForm(data=form_data)
++        print(f"Form is valid: {form.is_valid()}")
++        
++        self.assertTrue(form.is_valid(), f"Form should be valid, errors: {form.errors}")
++        
++        print(f"Form cleaned data: {form.cleaned_data}")
++
++        # Save the form
++        print("\\n=== Testing form save ===")
++        user = form.save()
++        print(f"User created: {user.username}")
++        print(f"User ID: {user.pk}")
++
++        # Check if ManyToMany relationships were saved
++        print("\\n=== Checking ManyToMany relationships ===")
++        user_orgs = user.orgs.all()
++        print(f"User organizations count: {user_orgs.count()}")
++        print(f"User organizations: {[org.name for org in user_orgs]}")
++
++        # Expected: 2 organizations
++        # Actual: 0 organizations (this demonstrates the bug)
++
++        if user_orgs.count() == 0:
++            print("\\n❌ BUG CONFIRMED: ManyToMany relationships were NOT saved!")
++            print("This demonstrates the issue described in the GitHub issue.")
++        else:
++            print("\\n✅ ManyToMany relationships were saved correctly.")
++            
++        # This assertion will fail, demonstrating the bug
++        self.assertEqual(user_orgs.count(), 2, "ManyToMany relationships should be saved")
++    
++    def test_m2m_fields_with_commit_false(self):
++        """Test M2M fields with commit=False"""
++        print("\\n=== Testing with commit=False ===")
++        # Test with commit=False to see if save_m2m is available
++        form_data = {
++            'username': 'testuser2',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk]
++        }
++
++        form = CustomUserCreationForm(data=form_data)
++        self.assertTrue(form.is_valid())
++        
++        user = form.save(commit=False)
++        user.save()
++        
++        # Check if save_m2m method is available
++        if hasattr(form, 'save_m2m'):
++            print("save_m2m method is available")
++            form.save_m2m()
++            user_orgs = user.orgs.all()
++            print(f"After calling save_m2m, user organizations count: {user_orgs.count()}")
++            self.assertEqual(user_orgs.count(), 1, "save_m2m should work when available")
++        else:
++            print("❌ save_m2m method is NOT available")
++            self.fail("save_m2m method should be available when commit=False")
++'''
++    
++    # Write the test to a temporary file
++    with open('/workspace/django__django__4.2/tests/auth_tests/test_m2m_bug.py', 'w') as f:
++        f.write(test_content)
++    
++    # Run the specific test
++    from django.core.management import execute_from_command_line
++    execute_from_command_line(['manage.py', 'test', 'auth_tests.test_m2m_bug', '-v', '2'])
+\ No newline at end of file
+diff --git a/test_m2m_issue.py b/test_m2m_issue.py
+new file mode 100644
+index 0000000000..de01b72d95
+--- /dev/null
++++ b/test_m2m_issue.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the UserCreationForm ManyToMany issue.
++
++This script demonstrates that UserCreationForm doesn't save ManyToMany field data
++when using a custom User model with ManyToManyField relationships.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++sys.path.insert(0, '/workspace/django__django__4.2/tests')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'auth_tests',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++        AUTH_USER_MODEL='auth_tests.CustomUserWithM2M',
++    )
++
++django.setup()
++
++from django.contrib.auth.forms import UserCreationForm
++from django.forms import ModelMultipleChoiceField
++from django.db import connection
++from django.core.management.color import no_style
++from django.core.management.sql import sql_create_index
++
++# Import the test models
++from auth_tests.models import CustomUserWithM2M, Organization
++
++# Create the database tables
++style = no_style()
++with connection.schema_editor() as schema_editor:
++    # Create tables for our models
++    schema_editor.create_model(Organization)
++    schema_editor.create_model(CustomUserWithM2M)
++
++print("=== Testing UserCreationForm with ManyToMany fields ===")
++
++# Create some test organizations
++org1 = Organization.objects.create(name="Organization 1")
++org2 = Organization.objects.create(name="Organization 2")
++print(f"Created organizations: {org1.name}, {org2.name}")
++
++# Create a custom UserCreationForm that includes the ManyToMany field
++class CustomUserCreationForm(UserCreationForm):
++    orgs = ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++        widget=django.forms.CheckboxSelectMultiple
++    )
++    
++    class Meta:
++        model = CustomUserWithM2M
++        fields = ("username", "orgs")
++
++# Test the form
++print("\n=== Testing form creation and validation ===")
++form_data = {
++    'username': 'testuser',
++    'password1': 'testpassword123',
++    'password2': 'testpassword123',
++    'orgs': [org1.pk, org2.pk]  # Select both organizations
++}
++
++form = CustomUserCreationForm(data=form_data)
++print(f"Form is valid: {form.is_valid()}")
++
++if not form.is_valid():
++    print(f"Form errors: {form.errors}")
++    sys.exit(1)
++
++print(f"Form cleaned data: {form.cleaned_data}")
++
++# Save the form
++print("\n=== Testing form save ===")
++user = form.save()
++print(f"User created: {user.username}")
++print(f"User ID: {user.pk}")
++
++# Check if ManyToMany relationships were saved
++print("\n=== Checking ManyToMany relationships ===")
++user_orgs = user.orgs.all()
++print(f"User organizations count: {user_orgs.count()}")
++print(f"User organizations: {[org.name for org in user_orgs]}")
++
++# Expected: 2 organizations
++# Actual: 0 organizations (this demonstrates the bug)
++
++if user_orgs.count() == 0:
++    print("\n❌ BUG CONFIRMED: ManyToMany relationships were NOT saved!")
++    print("This demonstrates the issue described in the GitHub issue.")
++else:
++    print("\n✅ ManyToMany relationships were saved correctly.")
++
++print("\n=== Testing with commit=False ===")
++# Test with commit=False to see if save_m2m is available
++form2_data = {
++    'username': 'testuser2',
++    'password1': 'testpassword123',
++    'password2': 'testpassword123',
++    'orgs': [org1.pk]
++}
++
++form2 = CustomUserCreationForm(data=form2_data)
++if form2.is_valid():
++    user2 = form2.save(commit=False)
++    user2.save()
++    
++    # Check if save_m2m method is available
++    if hasattr(form2, 'save_m2m'):
++        print("save_m2m method is available")
++        form2.save_m2m()
++        user2_orgs = user2.orgs.all()
++        print(f"After calling save_m2m, user2 organizations count: {user2_orgs.count()}")
++    else:
++        print("❌ save_m2m method is NOT available")
++
++print("\n=== Test completed ===")
+\ No newline at end of file
+diff --git a/test_m2m_reproduction.py b/test_m2m_reproduction.py
+new file mode 100644
+index 0000000000..82f6cb93a7
+--- /dev/null
++++ b/test_m2m_reproduction.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the UserCreationForm ManyToMany issue using Django's test infrastructure.
++"""
++
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++sys.path.insert(0, '/workspace/django__django__4.2/tests')
++
++# Set up Django test environment
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'auth_tests.settings')
++
++import django
++from django.test.utils import get_runner
++from django.conf import settings
++
++django.setup()
++
++from django.contrib.auth.forms import UserCreationForm
++from django.forms import ModelMultipleChoiceField
++from django.test import TestCase, override_settings
++from auth_tests.models import CustomUserWithM2M, Organization
++
++# Create a custom UserCreationForm that includes the ManyToMany field
++class CustomUserCreationForm(UserCreationForm):
++    orgs = ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++    )
++    
++    class Meta:
++        model = CustomUserWithM2M
++        fields = ("username", "orgs")
++
++@override_settings(AUTH_USER_MODEL='auth_tests.CustomUserWithM2M')
++class UserCreationFormM2MTest(TestCase):
++    def setUp(self):
++        # Create some test organizations
++        self.org1 = Organization.objects.create(name="Organization 1")
++        self.org2 = Organization.objects.create(name="Organization 2")
++    
++    def test_m2m_fields_not_saved_with_commit_true(self):
++        """Test that demonstrates the bug: M2M fields are not saved with commit=True"""
++        print("\n=== Testing UserCreationForm with ManyToMany fields ===")
++        print(f"Created organizations: {self.org1.name}, {self.org2.name}")
++        
++        # Test the form
++        print("\n=== Testing form creation and validation ===")
++        form_data = {
++            'username': 'testuser',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk, self.org2.pk]  # Select both organizations
++        }
++
++        form = CustomUserCreationForm(data=form_data)
++        print(f"Form is valid: {form.is_valid()}")
++        
++        if not form.is_valid():
++            print(f"Form errors: {form.errors}")
++            return
++        
++        print(f"Form cleaned data: {form.cleaned_data}")
++
++        # Save the form
++        print("\n=== Testing form save ===")
++        user = form.save()
++        print(f"User created: {user.username}")
++        print(f"User ID: {user.pk}")
++
++        # Check if ManyToMany relationships were saved
++        print("\n=== Checking ManyToMany relationships ===")
++        user_orgs = user.orgs.all()
++        print(f"User organizations count: {user_orgs.count()}")
++        print(f"User organizations: {[org.name for org in user_orgs]}")
++
++        # Expected: 2 organizations
++        # Actual: 0 organizations (this demonstrates the bug)
++
++        if user_orgs.count() == 0:
++            print("\n❌ BUG CONFIRMED: ManyToMany relationships were NOT saved!")
++            print("This demonstrates the issue described in the GitHub issue.")
++        else:
++            print("\n✅ ManyToMany relationships were saved correctly.")
++            
++        # This assertion will fail, demonstrating the bug
++        self.assertEqual(user_orgs.count(), 2, "ManyToMany relationships should be saved")
++    
++    def test_m2m_fields_with_commit_false(self):
++        """Test M2M fields with commit=False"""
++        print("\n=== Testing with commit=False ===")
++        # Test with commit=False to see if save_m2m is available
++        form_data = {
++            'username': 'testuser2',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk]
++        }
++
++        form = CustomUserCreationForm(data=form_data)
++        if form.is_valid():
++            user = form.save(commit=False)
++            user.save()
++            
++            # Check if save_m2m method is available
++            if hasattr(form, 'save_m2m'):
++                print("save_m2m method is available")
++                form.save_m2m()
++                user_orgs = user.orgs.all()
++                print(f"After calling save_m2m, user organizations count: {user_orgs.count()}")
++                self.assertEqual(user_orgs.count(), 1, "save_m2m should work when available")
++            else:
++                print("❌ save_m2m method is NOT available")
++                self.fail("save_m2m method should be available when commit=False")
++
++if __name__ == '__main__':
++    # Run the test
++    test = UserCreationFormM2MTest()
++    test.setUp()
++    
++    try:
++        test.test_m2m_fields_not_saved_with_commit_true()
++    except AssertionError as e:
++        print(f"\nAssertion failed as expected: {e}")
++    
++    try:
++        test.test_m2m_fields_with_commit_false()
++    except AssertionError as e:
++        print(f"\nAssertion failed: {e}")
++    
++    print("\n=== Test completed ===")
+\ No newline at end of file
+diff --git a/test_m2m_simple.py b/test_m2m_simple.py
+new file mode 100644
+index 0000000000..99c3c39e47
+--- /dev/null
++++ b/test_m2m_simple.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python
++"""
++Simple test script to reproduce the UserCreationForm ManyToMany issue.
++
++This script demonstrates that UserCreationForm doesn't save ManyToMany field data
++when using a custom User model with ManyToManyField relationships.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++        AUTH_USER_MODEL='__main__.CustomUserWithM2M',
++    )
++
++django.setup()
++
++from django.contrib.auth.forms import UserCreationForm
++from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
++from django.forms import ModelMultipleChoiceField
++from django.db import models, connection
++from django.core.management.color import no_style
++
++# Define our test models
++class Organization(models.Model):
++    name = models.CharField(max_length=255)
++    
++    class Meta:
++        app_label = '__main__'
++
++class CustomUserWithM2MManager(BaseUserManager):
++    def create_user(self, username, password=None, **extra_fields):
++        user = self.model(username=username, **extra_fields)
++        user.set_password(password)
++        user.save(using=self._db)
++        return user
++
++class CustomUserWithM2M(AbstractBaseUser):
++    username = models.CharField(max_length=30, unique=True)
++    orgs = models.ManyToManyField(Organization, blank=True)
++    
++    objects = CustomUserWithM2MManager()
++    
++    USERNAME_FIELD = "username"
++    
++    class Meta:
++        app_label = '__main__'
++
++# Create the database tables
++style = no_style()
++with connection.schema_editor() as schema_editor:
++    # Create tables for our models
++    schema_editor.create_model(Organization)
++    schema_editor.create_model(CustomUserWithM2M)
++
++print("=== Testing UserCreationForm with ManyToMany fields ===")
++
++# Create some test organizations
++org1 = Organization.objects.create(name="Organization 1")
++org2 = Organization.objects.create(name="Organization 2")
++print(f"Created organizations: {org1.name}, {org2.name}")
++
++# Create a custom UserCreationForm that includes the ManyToMany field
++class CustomUserCreationForm(UserCreationForm):
++    orgs = ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++    )
++    
++    class Meta:
++        model = CustomUserWithM2M
++        fields = ("username", "orgs")
++
++# Test the form
++print("\n=== Testing form creation and validation ===")
++form_data = {
++    'username': 'testuser',
++    'password1': 'testpassword123',
++    'password2': 'testpassword123',
++    'orgs': [org1.pk, org2.pk]  # Select both organizations
++}
++
++form = CustomUserCreationForm(data=form_data)
++print(f"Form is valid: {form.is_valid()}")
++
++if not form.is_valid():
++    print(f"Form errors: {form.errors}")
++    sys.exit(1)
++
++print(f"Form cleaned data: {form.cleaned_data}")
++
++# Save the form
++print("\n=== Testing form save ===")
++user = form.save()
++print(f"User created: {user.username}")
++print(f"User ID: {user.pk}")
++
++# Check if ManyToMany relationships were saved
++print("\n=== Checking ManyToMany relationships ===")
++user_orgs = user.orgs.all()
++print(f"User organizations count: {user_orgs.count()}")
++print(f"User organizations: {[org.name for org in user_orgs]}")
++
++# Expected: 2 organizations
++# Actual: 0 organizations (this demonstrates the bug)
++
++if user_orgs.count() == 0:
++    print("\n❌ BUG CONFIRMED: ManyToMany relationships were NOT saved!")
++    print("This demonstrates the issue described in the GitHub issue.")
++else:
++    print("\n✅ ManyToMany relationships were saved correctly.")
++
++print("\n=== Testing with commit=False ===")
++# Test with commit=False to see if save_m2m is available
++form2_data = {
++    'username': 'testuser2',
++    'password1': 'testpassword123',
++    'password2': 'testpassword123',
++    'orgs': [org1.pk]
++}
++
++form2 = CustomUserCreationForm(data=form2_data)
++if form2.is_valid():
++    user2 = form2.save(commit=False)
++    user2.save()
++    
++    # Check if save_m2m method is available
++    if hasattr(form2, 'save_m2m'):
++        print("save_m2m method is available")
++        form2.save_m2m()
++        user2_orgs = user2.orgs.all()
++        print(f"After calling save_m2m, user2 organizations count: {user2_orgs.count()}")
++    else:
++        print("❌ save_m2m method is NOT available")
++
++print("\n=== Test completed ===")
+\ No newline at end of file
+diff --git a/tests/auth_tests/test_m2m_bug.py b/tests/auth_tests/test_m2m_bug.py
+new file mode 100644
+index 0000000000..81886d3ea8
+--- /dev/null
++++ b/tests/auth_tests/test_m2m_bug.py
+@@ -0,0 +1,96 @@
++
++from django.contrib.auth.forms import UserCreationForm
++from django.forms import ModelMultipleChoiceField
++from django.test import TestCase, override_settings
++from auth_tests.models import CustomUserWithM2M, Organization
++
++# Create a custom UserCreationForm that includes the ManyToMany field
++class CustomUserCreationForm(UserCreationForm):
++    orgs = ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++    )
++    
++    class Meta:
++        model = CustomUserWithM2M
++        fields = ("username", "orgs")
++
++@override_settings(AUTH_USER_MODEL='auth_tests.CustomUserWithM2M')
++class UserCreationFormM2MTest(TestCase):
++    def setUp(self):
++        # Create some test organizations
++        self.org1 = Organization.objects.create(name="Organization 1")
++        self.org2 = Organization.objects.create(name="Organization 2")
++    
++    def test_m2m_fields_not_saved_with_commit_true(self):
++        """Test that demonstrates the bug: M2M fields are not saved with commit=True"""
++        print("\n=== Testing UserCreationForm with ManyToMany fields ===")
++        print(f"Created organizations: {self.org1.name}, {self.org2.name}")
++        
++        # Test the form
++        print("\n=== Testing form creation and validation ===")
++        form_data = {
++            'username': 'testuser',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk, self.org2.pk]  # Select both organizations
++        }
++
++        form = CustomUserCreationForm(data=form_data)
++        print(f"Form is valid: {form.is_valid()}")
++        
++        self.assertTrue(form.is_valid(), f"Form should be valid, errors: {form.errors}")
++        
++        print(f"Form cleaned data: {form.cleaned_data}")
++
++        # Save the form
++        print("\n=== Testing form save ===")
++        user = form.save()
++        print(f"User created: {user.username}")
++        print(f"User ID: {user.pk}")
++
++        # Check if ManyToMany relationships were saved
++        print("\n=== Checking ManyToMany relationships ===")
++        user_orgs = user.orgs.all()
++        print(f"User organizations count: {user_orgs.count()}")
++        print(f"User organizations: {[org.name for org in user_orgs]}")
++
++        # Expected: 2 organizations
++        # Actual: 0 organizations (this demonstrates the bug)
++
++        if user_orgs.count() == 0:
++            print("\n❌ BUG CONFIRMED: ManyToMany relationships were NOT saved!")
++            print("This demonstrates the issue described in the GitHub issue.")
++        else:
++            print("\n✅ ManyToMany relationships were saved correctly.")
++            
++        # This assertion will fail, demonstrating the bug
++        self.assertEqual(user_orgs.count(), 2, "ManyToMany relationships should be saved")
++    
++    def test_m2m_fields_with_commit_false(self):
++        """Test M2M fields with commit=False"""
++        print("\n=== Testing with commit=False ===")
++        # Test with commit=False to see if save_m2m is available
++        form_data = {
++            'username': 'testuser2',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk]
++        }
++
++        form = CustomUserCreationForm(data=form_data)
++        self.assertTrue(form.is_valid())
++        
++        user = form.save(commit=False)
++        user.save()
++        
++        # Check if save_m2m method is available
++        if hasattr(form, 'save_m2m'):
++            print("save_m2m method is available")
++            form.save_m2m()
++            user_orgs = user.orgs.all()
++            print(f"After calling save_m2m, user organizations count: {user_orgs.count()}")
++            self.assertEqual(user_orgs.count(), 1, "save_m2m should work when available")
++        else:
++            print("❌ save_m2m method is NOT available")
++            self.fail("save_m2m method should be available when commit=False")
+diff --git a/tests/auth_tests/test_m2m_bug_reproduction.py b/tests/auth_tests/test_m2m_bug_reproduction.py
+new file mode 100644
+index 0000000000..c94bf36b91
+--- /dev/null
++++ b/tests/auth_tests/test_m2m_bug_reproduction.py
+@@ -0,0 +1,69 @@
++from django.contrib.auth.forms import UserCreationForm
++from django.forms import ModelMultipleChoiceField
++from django.test import TestCase, override_settings
++from .models import CustomUserWithM2M, Organization
++
++
++# Create a custom UserCreationForm that includes the ManyToMany field
++class CustomUserCreationForm(UserCreationForm):
++    orgs = ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++    )
++    
++    class Meta:
++        model = CustomUserWithM2M
++        fields = ("username", "orgs")
++    
++
++
++
++@override_settings(AUTH_USER_MODEL='auth_tests.CustomUserWithM2M')
++class UserCreationFormM2MTest(TestCase):
++    def setUp(self):
++        # Create some test organizations
++        self.org1 = Organization.objects.create(name="Organization 1")
++        self.org2 = Organization.objects.create(name="Organization 2")
++    
++    def test_m2m_fields_saved_with_commit_true(self):
++        """Test that M2M fields are saved with commit=True"""
++        form_data = {
++            'username': 'testuser',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk, self.org2.pk]  # Select both organizations
++        }
++
++        form = CustomUserCreationForm(data=form_data)
++        self.assertTrue(form.is_valid(), f"Form should be valid, errors: {form.errors}")
++
++        # Save the form
++        user = form.save()
++
++        # Check if ManyToMany relationships were saved
++        user_orgs = user.orgs.all()
++        self.assertEqual(user_orgs.count(), 2, "ManyToMany relationships should be saved")
++        self.assertIn(self.org1, user_orgs)
++        self.assertIn(self.org2, user_orgs)
++    
++    def test_m2m_fields_with_commit_false(self):
++        """Test M2M fields with commit=False"""
++        form_data = {
++            'username': 'testuser2',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk]
++        }
++
++        form = CustomUserCreationForm(data=form_data)
++        self.assertTrue(form.is_valid())
++        
++        user = form.save(commit=False)
++        user.save()
++        
++        # Check if save_m2m method is available and works
++        self.assertTrue(hasattr(form, 'save_m2m'), "save_m2m method should be available when commit=False")
++        form.save_m2m()
++        user_orgs = user.orgs.all()
++        self.assertEqual(user_orgs.count(), 1, "save_m2m should work when available")
++        self.assertIn(self.org1, user_orgs)
+\ No newline at end of file
+diff --git a/tests/auth_tests/test_m2m_edge_cases.py b/tests/auth_tests/test_m2m_edge_cases.py
+new file mode 100644
+index 0000000000..af1c63870b
+--- /dev/null
++++ b/tests/auth_tests/test_m2m_edge_cases.py
+@@ -0,0 +1,108 @@
++from django.contrib.auth.forms import UserCreationForm
++from django.forms import ModelMultipleChoiceField
++from django.test import TestCase, override_settings
++from .models import CustomUserWithM2M, CustomUserWithM2MThrough, Organization
++from .models.with_many_to_many import Membership
++
++
++# Test with regular M2M field
++class CustomUserCreationFormM2M(UserCreationForm):
++    orgs = ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++    )
++    
++    class Meta:
++        model = CustomUserWithM2M
++        fields = ("username", "orgs")
++
++
++# Test with M2M through field
++class CustomUserCreationFormM2MThrough(UserCreationForm):
++    orgs = ModelMultipleChoiceField(
++        queryset=Organization.objects.all(),
++        required=False,
++    )
++    
++    class Meta:
++        model = CustomUserWithM2MThrough
++        fields = ("username", "orgs")
++
++
++@override_settings(AUTH_USER_MODEL='auth_tests.CustomUserWithM2M')
++class UserCreationFormM2MEdgeCasesTest(TestCase):
++    def setUp(self):
++        self.org1 = Organization.objects.create(name="Organization 1")
++        self.org2 = Organization.objects.create(name="Organization 2")
++    
++    def test_empty_m2m_field(self):
++        """Test that empty M2M fields work correctly"""
++        form_data = {
++            'username': 'testuser',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': []  # Empty M2M field
++        }
++
++        form = CustomUserCreationFormM2M(data=form_data)
++        self.assertTrue(form.is_valid())
++
++        user = form.save()
++        user_orgs = user.orgs.all()
++        self.assertEqual(user_orgs.count(), 0, "Empty M2M field should result in no relationships")
++    
++    def test_no_m2m_field_in_form_data(self):
++        """Test when M2M field is not included in form data"""
++        form_data = {
++            'username': 'testuser2',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            # No 'orgs' field
++        }
++
++        form = CustomUserCreationFormM2M(data=form_data)
++        self.assertTrue(form.is_valid())
++
++        user = form.save()
++        user_orgs = user.orgs.all()
++        self.assertEqual(user_orgs.count(), 0, "Missing M2M field should result in no relationships")
++    
++    def test_single_m2m_value(self):
++        """Test with a single M2M value"""
++        form_data = {
++            'username': 'testuser3',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk]  # Single organization
++        }
++
++        form = CustomUserCreationFormM2M(data=form_data)
++        self.assertTrue(form.is_valid())
++
++        user = form.save()
++        user_orgs = user.orgs.all()
++        self.assertEqual(user_orgs.count(), 1, "Single M2M value should be saved")
++        self.assertIn(self.org1, user_orgs)
++    
++    @override_settings(AUTH_USER_MODEL='auth_tests.CustomUserWithM2MThrough')
++    def test_m2m_through_field(self):
++        """Test that M2M through fields work correctly"""
++        form_data = {
++            'username': 'testuser4',
++            'password1': 'testpassword123',
++            'password2': 'testpassword123',
++            'orgs': [self.org1.pk, self.org2.pk]
++        }
++
++        form = CustomUserCreationFormM2MThrough(data=form_data)
++        self.assertTrue(form.is_valid())
++
++        user = form.save()
++        user_orgs = user.orgs.all()
++        self.assertEqual(user_orgs.count(), 2, "M2M through relationships should be saved")
++        self.assertIn(self.org1, user_orgs)
++        self.assertIn(self.org2, user_orgs)
++        
++        # Check that the through model instances were created
++        memberships = Membership.objects.filter(user=user)
++        self.assertEqual(memberships.count(), 2, "Through model instances should be created")
+\ No newline at end of file

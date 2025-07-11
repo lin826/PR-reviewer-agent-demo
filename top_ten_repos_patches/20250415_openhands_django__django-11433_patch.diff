@@ -1,0 +1,83 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 5edbbd376f..bebea34cc4 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -39,18 +39,25 @@ def construct_instance(form, instance, fields=None, exclude=None):
+     cleaned_data = form.cleaned_data
+     file_field_list = []
+     for f in opts.fields:
+-        if not f.editable or isinstance(f, models.AutoField) \
+-                or f.name not in cleaned_data:
++        if not f.editable or isinstance(f, models.AutoField):
+             continue
++
++        # Skip if field is not in cleaned_data (can't save it)
++        if f.name not in cleaned_data:
++            continue
++
+         if fields is not None and f.name not in fields:
+             continue
+         if exclude and f.name in exclude:
+             continue
++
+         # Leave defaults for fields that aren't in POST data, except for
+         # checkbox inputs because they don't appear in POST data if not checked.
+-        if (f.has_default() and
++        # This check is only applied to fields that are present in the form.
++        if (f.name in form.fields and f.has_default() and
+                 form[f.name].field.widget.value_omitted_from_data(form.data, form.files, form.add_prefix(f.name))):
+             continue
++
+         # Defer saving file-type fields until after the other fields, so a
+         # callable upload_to can use the values from other fields.
+         if isinstance(f, models.FileField):
+@@ -393,7 +400,17 @@ class BaseModelForm(BaseForm):
+                 exclude.append(name)
+
+         try:
+-            self.instance = construct_instance(self, self.instance, opts.fields, opts.exclude)
++            # If fields is specified on the Meta class, expand it to include any
++            # additional fields from cleaned_data that aren't in the original form fields.
++            # This allows values modified in clean() and clean_<fieldname>() to be saved
++            # even if those fields weren't included in the form.
++            construct_fields = None
++            if opts.fields:
++                # Include all fields in cleaned_data that might not be in the form
++                additional_fields = [f for f in self.cleaned_data if f not in self.fields]
++                construct_fields = list(opts.fields) + additional_fields if opts.fields != '__all__' else None
++
++            self.instance = construct_instance(self, self.instance, construct_fields, opts.exclude)
+         except ValidationError as e:
+             self._update_errors(e)
+
+diff --git a/docs/releases/3.0.txt b/docs/releases/3.0.txt
+index 14156af459..1f98c97865 100644
+--- a/docs/releases/3.0.txt
++++ b/docs/releases/3.0.txt
+@@ -164,6 +164,10 @@ Forms
+   :attr:`~django.forms.formsets.BaseFormSet.can_order` by setting the
+   :attr:`~django.forms.formsets.BaseFormSet.ordering_widget` attribute or
+   overriding :attr:`~django.forms.formsets.BaseFormSet.get_ordering_widget()`.
++
++* :meth:`ModelForm.save() <django.forms.ModelForm.save>` now respects modifications to
++  values in ``cleaned_data`` made in the form's ``clean()`` method, even if the field
++  isn't included in the form's fields.
+
+ Generic Views
+ ~~~~~~~~~~~~~
+diff --git a/docs/topics/forms/modelforms.txt b/docs/topics/forms/modelforms.txt
+index 2a13c2d1df..b86b46705b 100644
+--- a/docs/topics/forms/modelforms.txt
++++ b/docs/topics/forms/modelforms.txt
+@@ -348,6 +348,11 @@ don't appear in the data of an HTML form submission. Use a custom form field or
+ widget if you're designing an API and want the default fallback behavior for a
+ field that uses one of these widgets.
+
++If a field is not present in the form's data but you modify it through the
++``cleaned_data`` dictionary in the form's ``clean()`` method, the modified value
++will take precedence over the model field default value, even if the field wasn't
++included in the form.
++
+ This ``save()`` method accepts an optional ``commit`` keyword argument, which
+ accepts either ``True`` or ``False``. If you call ``save()`` with
+ ``commit=False``, then it will return an object that hasn't yet been saved to

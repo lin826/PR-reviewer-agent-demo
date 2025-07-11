@@ -1,0 +1,139 @@
+diff --git a/sphinx/directives/other.py b/sphinx/directives/other.py
+index 35e16e623..4d5d0cfab 100644
+--- a/sphinx/directives/other.py
++++ b/sphinx/directives/other.py
+@@ -52,6 +52,30 @@ class TocTree(SphinxDirective):
+         'reversed': directives.flag,
+     }
+ 
++    def _is_special_toctree_entry(self, ref: str) -> bool:
++        """Check if a toctree entry refers to a special page that will be generated.
++        
++        Special pages include:
++        - 'genindex': General index page
++        - 'search': Search page  
++        - 'modindex': Module index page (from Python domain)
++        """
++        if ref == 'genindex':
++            # Check if general index will be generated
++            use_index = getattr(self.config, 'html_use_index', True)
++            return use_index
++        elif ref == 'search':
++            # Check if search page will be generated (default is True for HTML)
++            return True  # Search is generally available
++        elif ref == 'modindex':
++            # Check if any domain has a modindex
++            for domain in self.env.domains.values():
++                for index in domain.indices:
++                    if index.name == 'modindex':
++                        return True
++            return False
++        return False
++
+     def run(self) -> List[Node]:
+         subnode = addnodes.toctree()
+         subnode['parent'] = self.env.docname
+@@ -118,6 +142,9 @@ class TocTree(SphinxDirective):
+                 docname = docname_join(self.env.docname, docname)
+                 if url_re.match(ref) or ref == 'self':
+                     toctree['entries'].append((title, ref))
++                elif self._is_special_toctree_entry(ref):
++                    # Handle special pages like genindex, modindex, search
++                    toctree['entries'].append((title, ref))
+                 elif docname not in self.env.found_docs:
+                     if excluded(self.env.doc2path(docname, False)):
+                         message = __('toctree contains reference to excluded document %r')
+diff --git a/sphinx/environment/adapters/toctree.py b/sphinx/environment/adapters/toctree.py
+index 9678e3c7c..ad0e03704 100644
+--- a/sphinx/environment/adapters/toctree.py
++++ b/sphinx/environment/adapters/toctree.py
+@@ -6,7 +6,7 @@ from docutils import nodes
+ from docutils.nodes import Element, Node
+ 
+ from sphinx import addnodes
+-from sphinx.locale import __
++from sphinx.locale import _, __
+ from sphinx.util import logging, url_re
+ from sphinx.util.matching import Matcher
+ from sphinx.util.nodes import clean_astext, process_only_nodes
+@@ -23,6 +23,29 @@ class TocTree:
+     def __init__(self, env: "BuildEnvironment") -> None:
+         self.env = env
+ 
++    def _is_special_toctree_entry(self, ref: str, builder: "Builder") -> bool:
++        """Check if a toctree entry refers to a special page that will be generated.
++        
++        Special pages include:
++        - 'genindex': General index page
++        - 'search': Search page  
++        - 'modindex': Module index page (from Python domain)
++        """
++        if ref == 'genindex':
++            # Check if general index will be generated
++            return getattr(builder, 'use_index', False)
++        elif ref == 'search':
++            # Check if search page will be generated
++            return getattr(builder, 'search', False)
++        elif ref == 'modindex':
++            # Check if any domain has a modindex
++            for domain in self.env.domains.values():
++                for index in domain.indices:
++                    if index.name == 'modindex':
++                        return True
++            return False
++        return False
++
+     def note(self, docname: str, toctreenode: addnodes.toctree) -> None:
+         """Note a TOC tree directive in a document and gather information about
+         file relations from it.
+@@ -139,6 +162,25 @@ class TocTree:
+                         item = nodes.list_item('', para)
+                         # don't show subitems
+                         toc = nodes.bullet_list('', item)
++                    elif self._is_special_toctree_entry(ref, builder):
++                        # Handle special pages like genindex, modindex, search
++                        if not title:
++                            if ref == 'genindex':
++                                title = _('Index')
++                            elif ref == 'modindex':
++                                title = _('Module Index')
++                            elif ref == 'search':
++                                title = _('Search Page')
++                            else:
++                                title = ref
++                        reference = nodes.reference('', '', internal=True,
++                                                    refuri=ref,
++                                                    anchorname='',
++                                                    *[nodes.Text(title)])
++                        para = addnodes.compact_paragraph('', '', reference)
++                        item = nodes.list_item('', para)
++                        # don't show subitems for special pages
++                        toc = nodes.bullet_list('', item)
+                     else:
+                         if ref in parents:
+                             logger.warning(__('circular toctree references '
+diff --git a/tests/test_directive_other.py b/tests/test_directive_other.py
+index f221db075..11c6672bb 100644
+--- a/tests/test_directive_other.py
++++ b/tests/test_directive_other.py
+@@ -148,3 +148,20 @@ def test_toctree_twice(app):
+     assert_node(doctree[0][0],
+                 entries=[(None, 'foo'), (None, 'foo')],
+                 includefiles=['foo', 'foo'])
++
++
++@pytest.mark.sphinx(testroot='basic')
++def test_toctree_special_entries(app):
++    """Test that special toctree entries (genindex, modindex, search) are handled correctly."""
++    text = (".. toctree::\n"
++            "\n"
++            "   genindex\n"
++            "   modindex\n"
++            "   search\n")
++
++    app.env.find_files(app.config, app.builder)
++    doctree = restructuredtext.parse(app, text, 'index')
++    assert_node(doctree, [nodes.document, nodes.compound, addnodes.toctree])
++    assert_node(doctree[0][0],
++                entries=[(None, 'genindex'), (None, 'modindex'), (None, 'search')],
++                includefiles=[])

@@ -1,0 +1,170 @@
+diff --git a/sphinx/parsers.py b/sphinx/parsers.py
+index 3bcd69f52..b952cd4a6 100644
+--- a/sphinx/parsers.py
++++ b/sphinx/parsers.py
+@@ -82,8 +82,46 @@ class RSTParser(docutils.parsers.rst.Parser, Parser):
+ 
+     def decorate(self, content: StringList) -> None:
+         """Preprocess reST content before parsing."""
+-        prepend_prolog(content, self.config.rst_prolog)
+-        append_epilog(content, self.config.rst_epilog)
++        # Process the content to detect if it begins with a section title
++        # containing a domain directive
++        has_domain_directive_title = False
++        if len(content) >= 2:
++            first_line = content[0]
++            second_line = content[1]
++            
++            # Check if first line has a domain directive and second line is a section underline
++            if (first_line.strip().startswith(':') and '`' in first_line and
++                second_line.strip() and all(c in ['=', '-', '~'] for c in second_line.strip())):
++                has_domain_directive_title = True
++        
++        # For documents with domain directive titles, we need to be careful
++        # about where we insert the prolog
++        if has_domain_directive_title:
++            # First get the length of the content before adding anything
++            original_length = len(content)
++            
++            # Add epilog first (at the end, so won't affect title)
++            append_epilog(content, self.config.rst_epilog)
++            
++            # If we have a rst_prolog, insert it after the title + underline
++            if self.config.rst_prolog:
++                # Skip the title line (0) and underline line (1)
++                pos = 2
++                
++                # Insert a blank line after the underline
++                content.insert(pos, '', '<generated>', 0)
++                pos += 1
++                
++                # Insert prolog
++                for lineno, line in enumerate(self.config.rst_prolog.splitlines()):
++                    content.insert(pos + lineno, line, '<rst_prolog>', lineno)
++                
++                # Insert a blank line after prolog
++                content.insert(pos + lineno + 1, '', '<generated>', 0)
++        else:
++            # For normal documents, use the standard approach
++            prepend_prolog(content, self.config.rst_prolog)
++            append_epilog(content, self.config.rst_epilog)
+ 
+ 
+ def setup(app: Sphinx) -> dict[str, Any]:
+diff --git a/sphinx/util/rst.py b/sphinx/util/rst.py
+index 7a1538325..700ad6a73 100644
+--- a/sphinx/util/rst.py
++++ b/sphinx/util/rst.py
+@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
+ docinfo_re = re.compile(':\\w+:.*?')
+ symbols_re = re.compile(r'([!-\-/:-@\[-`{-~])')  # symbols without dot(0x2e)
+ SECTIONING_CHARS = ['=', '-', '~']
++# RE to detect domain directives like :mod:, which may appear in section titles
++domain_directive_re = re.compile(r'^\s*:[\w-]+:`[^`]+`')
+ 
+ # width of characters
+ WIDECHARS: dict[str, str] = defaultdict(lambda: "WF")  # WF: Wide + Full-width
+@@ -77,24 +79,46 @@ def default_role(docname: str, name: str) -> Generator[None, None, None]:
+ 
+ def prepend_prolog(content: StringList, prolog: str) -> None:
+     """Prepend a string to content body as prolog."""
+-    if prolog:
+-        pos = 0
+-        for line in content:
+-            if docinfo_re.match(line):
+-                pos += 1
+-            else:
+-                break
+-
+-        if pos > 0:
+-            # insert a blank line after docinfo
+-            content.insert(pos, '', '<generated>', 0)
+-            pos += 1
+-
+-        # insert prolog (after docinfo if exists)
+-        for lineno, line in enumerate(prolog.splitlines()):
+-            content.insert(pos + lineno, line, '<rst_prolog>', lineno)
+-
+-        content.insert(pos + lineno + 1, '', '<generated>', 0)
++    if not prolog:
++        return
++
++    # Find the end of docinfo section (if any)
++    docinfo_end = 0
++    for line in content:
++        if docinfo_re.match(line):
++            docinfo_end += 1
++        else:
++            break
++
++    # Check for a section title at the beginning of the document (after docinfo)
++    # A section title pattern: line of text followed by a line of =, -, or ~
++    has_section_title = False
++    
++    # Need at least 2 lines for a section title pattern
++    if len(content) >= docinfo_end + 2:
++        title_line = content[docinfo_end].strip()  # First line after docinfo
++        if title_line:  # Non-empty title line
++            underline = content[docinfo_end + 1].strip()
++            # Check for a valid section underline
++            if underline and all(c in SECTIONING_CHARS for c in underline):
++                has_section_title = True
++    
++    # If we have a section title at the beginning:
++    # - Keep the title and underline together by inserting after them
++    # - Otherwise insert after docinfo or at the beginning
++    insert_pos = docinfo_end + 2 if has_section_title else docinfo_end
++    
++    # Add a blank line before prolog if not at the beginning of the document
++    if insert_pos > 0:
++        content.insert(insert_pos, '', '<generated>', 0)
++        insert_pos += 1
++    
++    # Insert prolog lines
++    for lineno, line in enumerate(prolog.splitlines()):
++        content.insert(insert_pos + lineno, line, '<rst_prolog>', lineno)
++    
++    # Add a blank line after prolog
++    content.insert(insert_pos + lineno + 1, '', '<generated>', 0)
+ 
+ 
+ def append_epilog(content: StringList, epilog: str) -> None:
+diff --git a/tests/test_util_rst.py b/tests/test_util_rst.py
+index 40a2ee68b..cf6bdbc73 100644
+--- a/tests/test_util_rst.py
++++ b/tests/test_util_rst.py
+@@ -78,6 +78,34 @@ def test_prepend_prolog_without_CR(app):
+                                       ('dummy.rst', 1, 'Sphinx is a document generator')]
+ 
+ 
++def test_prepend_prolog_with_domain_directive(app):
++    # Test with a domain directive in the first heading
++    prolog = 'this is rst_prolog\nhello reST!'
++    content = StringList([':mod:`example`',
++                          '=============',
++                          '',
++                          'This is a test with domain directive in heading'],
++                         'dummy.rst')
++    
++    # Create a mock parser to test the special handling for domain directives
++    from sphinx.parsers import RSTParser
++    parser = RSTParser()
++    parser.config = type('obj', (object,), {'rst_prolog': prolog, 'rst_epilog': None})
++    
++    # Use the parser's decorate method to handle domain directives correctly
++    parser.decorate(content)
++    
++    # The prolog should be inserted after both the title and underline
++    assert list(content.xitems()) == [('dummy.rst', 0, ':mod:`example`'),
++                                      ('dummy.rst', 1, '============='),
++                                      ('<generated>', 0, ''),
++                                      ('<rst_prolog>', 0, 'this is rst_prolog'),
++                                      ('<rst_prolog>', 1, 'hello reST!'),
++                                      ('<generated>', 0, ''),
++                                      ('dummy.rst', 2, ''),
++                                      ('dummy.rst', 3, 'This is a test with domain directive in heading')]
++
++
+ def test_textwidth():
+     assert textwidth('Hello') == 5
+     assert textwidth('русский язык') == 12

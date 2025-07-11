@@ -1,0 +1,383 @@
+diff --git a/django/core/management/commands/loaddata.py b/django/core/management/commands/loaddata.py
+index ac97f13161..50850cbd7a 100644
+--- a/django/core/management/commands/loaddata.py
++++ b/django/core/management/commands/loaddata.py
+@@ -362,12 +362,14 @@ class Command(BaseCommand):
+         """
+         dirs = []
+         fixture_dirs = settings.FIXTURE_DIRS
+-        if len(fixture_dirs) != len(set(fixture_dirs)):
++        # Normalize paths for duplicate detection to handle both strings and Path instances
++        normalized_dirs = [os.path.realpath(str(d)) for d in fixture_dirs]
++        if len(normalized_dirs) != len(set(normalized_dirs)):
+             raise ImproperlyConfigured("settings.FIXTURE_DIRS contains duplicates.")
+         for app_config in apps.get_app_configs():
+             app_label = app_config.label
+             app_dir = os.path.join(app_config.path, "fixtures")
+-            if app_dir in fixture_dirs:
++            if os.path.realpath(app_dir) in normalized_dirs:
+                 raise ImproperlyConfigured(
+                     "'%s' is a default fixture directory for the '%s' app "
+                     "and cannot be listed in settings.FIXTURE_DIRS."
+@@ -380,7 +382,7 @@ class Command(BaseCommand):
+                 dirs.append(app_dir)
+         dirs.extend(fixture_dirs)
+         dirs.append("")
+-        return [os.path.realpath(d) for d in dirs]
++        return [os.path.realpath(str(d)) for d in dirs]
+ 
+     def parse_name(self, fixture_name):
+         """
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..cc41a60312
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the issue with FIXTURE_DIRS duplicates not being detected
++when directories are Path instances.
++"""
++
++import os
++import sys
++import tempfile
++import subprocess
++from pathlib import Path
++
++def test_case(fixture_dirs, test_name):
++    """Run a single test case in a separate process to avoid Django settings conflicts."""
++    
++    # Convert fixture_dirs to a format that can be reconstructed in the subprocess
++    fixture_dirs_repr = []
++    for d in fixture_dirs:
++        if isinstance(d, Path):
++            fixture_dirs_repr.append(f"Path('{d}')")
++        else:
++            fixture_dirs_repr.append(repr(d))
++    
++    fixture_dirs_str = "[" + ", ".join(fixture_dirs_repr) + "]"
++    
++    script_content = f'''
++import os
++import sys
++sys.path.insert(0, '/workspace/django__django__4.2')
++import django
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++from django.core.management import call_command
++from pathlib import Path
++
++print(f"Django path: {{django.__file__}}")
++print(f"Django version: {{django.get_version()}}")
++
++# Configure Django
++settings.configure(
++    DEBUG=True,
++    DATABASES={{
++        'default': {{
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }}
++    }},
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++    ],
++    FIXTURE_DIRS={fixture_dirs_str},
++    USE_TZ=True,
++)
++django.setup()
++
++try:
++    call_command('loaddata', 'test.json', verbosity=0)
++    print("ERROR: Duplicates not detected!")
++    sys.exit(1)
++except ImproperlyConfigured as e:
++    if "contains duplicates" in str(e):
++        print("✓ Duplicates correctly detected")
++        sys.exit(0)
++    else:
++        print(f"ERROR: Unexpected error: {{e}}")
++        sys.exit(1)
++except Exception as e:
++    print(f"ERROR: Unexpected error: {{e}}")
++    print(f"Exception type: {{type(e)}}")
++    import traceback
++    traceback.print_exc()
++    sys.exit(1)
++'''
++    
++    # Write the script to a temporary file
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write(script_content)
++        script_path = f.name
++    
++    try:
++        # Run the script in a subprocess
++        result = subprocess.run([sys.executable, script_path], 
++                              capture_output=True, text=True, cwd='/workspace/django__django__4.2')
++        
++        print(f"{test_name}:")
++        if result.stdout:
++            print(f"  {result.stdout.strip()}")
++        if result.stderr:
++            print(f"  STDERR: {result.stderr.strip()}")
++        
++        return result.returncode == 0
++        
++    finally:
++        # Clean up the temporary script
++        os.unlink(script_path)
++
++def test_fixture_dirs_duplicates():
++    """Test that demonstrates the issue with Path instances in FIXTURE_DIRS."""
++    
++    # Create a temporary directory for testing
++    with tempfile.TemporaryDirectory() as temp_dir:
++        fixture_dir = os.path.join(temp_dir, "fixtures")
++        os.makedirs(fixture_dir)
++        
++        # Create a simple fixture file
++        fixture_file = os.path.join(fixture_dir, "test.json")
++        with open(fixture_file, 'w') as f:
++            f.write('[]')  # Empty fixture
++        
++        print("Testing FIXTURE_DIRS duplicate detection...\n")
++        
++        # Test 1: String paths - should detect duplicates
++        test_case([fixture_dir, fixture_dir], "Test 1: Duplicate string paths")
++        
++        # Test 2: Path instances - should detect duplicates but currently doesn't
++        test_case([Path(fixture_dir), Path(fixture_dir)], "Test 2: Duplicate Path instances")
++        
++        # Test 3: Mixed string and Path - should detect duplicates but currently doesn't  
++        test_case([fixture_dir, Path(fixture_dir)], "Test 3: Mixed string and Path instances")
++
++if __name__ == '__main__':
++    test_fixture_dirs_duplicates()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..f7399814ef
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the FIXTURE_DIRS duplicate detection fix.
++"""
++
++import os
++import tempfile
++from pathlib import Path
++
++import django
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++from django.core.management import call_command
++from django.test import TestCase, override_settings
++
++# Configure Django for testing
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++
++class EdgeCasesTest(TestCase):
++    """Test edge cases for FIXTURE_DIRS duplicate detection."""
++    
++    def setUp(self):
++        # Create a temporary directory for testing
++        self.temp_dir = tempfile.mkdtemp()
++        self.fixture_dir = os.path.join(self.temp_dir, "fixtures")
++        os.makedirs(self.fixture_dir)
++        
++        # Create a simple fixture file
++        fixture_file = os.path.join(self.fixture_dir, "test.json")
++        with open(fixture_file, 'w') as f:
++            f.write('[]')  # Empty fixture
++    
++    def tearDown(self):
++        # Clean up the temporary directory
++        import shutil
++        shutil.rmtree(self.temp_dir)
++    
++    @override_settings(FIXTURE_DIRS=[])
++    def test_relative_and_absolute_paths_duplicates(self):
++        """Test that relative and absolute paths to the same directory are detected as duplicates."""
++        abs_path = os.path.abspath(self.fixture_dir)
++        
++        # Create a relative path that points to the same directory
++        current_dir = os.getcwd()
++        try:
++            os.chdir(os.path.dirname(abs_path))
++            rel_path = os.path.basename(abs_path)
++            
++            with override_settings(FIXTURE_DIRS=[abs_path, rel_path]):
++                with self.assertRaisesMessage(
++                    ImproperlyConfigured, "settings.FIXTURE_DIRS contains duplicates."
++                ):
++                    call_command('loaddata', 'test.json', verbosity=0)
++        finally:
++            os.chdir(current_dir)
++    
++    @override_settings(FIXTURE_DIRS=[])
++    def test_symlink_duplicates(self):
++        """Test that symlinks to the same directory are detected as duplicates."""
++        # Create a symlink to the fixture directory
++        symlink_path = os.path.join(self.temp_dir, "fixtures_symlink")
++        try:
++            os.symlink(self.fixture_dir, symlink_path)
++            
++            with override_settings(FIXTURE_DIRS=[self.fixture_dir, symlink_path]):
++                with self.assertRaisesMessage(
++                    ImproperlyConfigured, "settings.FIXTURE_DIRS contains duplicates."
++                ):
++                    call_command('loaddata', 'test.json', verbosity=0)
++        except OSError:
++            # Skip test if symlinks are not supported (e.g., on Windows without admin rights)
++            self.skipTest("Symlinks not supported on this system")
++    
++    @override_settings(FIXTURE_DIRS=[])
++    def test_path_with_dots_duplicates(self):
++        """Test that paths with . and .. components are normalized correctly."""
++        # Create paths with . and .. that point to the same directory
++        path_with_dots = os.path.join(self.fixture_dir, "..", "fixtures")
++        
++        with override_settings(FIXTURE_DIRS=[self.fixture_dir, path_with_dots]):
++            with self.assertRaisesMessage(
++                ImproperlyConfigured, "settings.FIXTURE_DIRS contains duplicates."
++            ):
++                call_command('loaddata', 'test.json', verbosity=0)
++    
++    @override_settings(FIXTURE_DIRS=[])
++    def test_mixed_types_with_normalization(self):
++        """Test mixed string and Path instances with path normalization."""
++        # Create paths that are different but point to the same directory
++        path_with_dots = os.path.join(self.fixture_dir, "..", "fixtures")
++        path_obj = Path(self.fixture_dir)
++        
++        with override_settings(FIXTURE_DIRS=[path_with_dots, path_obj]):
++            with self.assertRaisesMessage(
++                ImproperlyConfigured, "settings.FIXTURE_DIRS contains duplicates."
++            ):
++                call_command('loaddata', 'test.json', verbosity=0)
++    
++    @override_settings(FIXTURE_DIRS=[])
++    def test_no_duplicates_different_dirs(self):
++        """Test that different directories are not flagged as duplicates."""
++        # Create another fixture directory
++        fixture_dir2 = os.path.join(self.temp_dir, "fixtures2")
++        os.makedirs(fixture_dir2)
++        fixture_file2 = os.path.join(fixture_dir2, "test.json")
++        with open(fixture_file2, 'w') as f:
++            f.write('[]')
++        
++        # This should NOT raise an exception
++        with override_settings(FIXTURE_DIRS=[self.fixture_dir, Path(fixture_dir2)]):
++            try:
++                call_command('loaddata', 'test.json', verbosity=0)
++            except ImproperlyConfigured as e:
++                if "contains duplicates" in str(e):
++                    self.fail("Different directories incorrectly flagged as duplicates")
++                else:
++                    # Some other ImproperlyConfigured error is fine
++                    pass
++
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_mixed_path_duplicates.py b/test_mixed_path_duplicates.py
+new file mode 100644
+index 0000000000..7a7121aef9
+--- /dev/null
++++ b/test_mixed_path_duplicates.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python
++"""
++Test to reproduce the specific issue with mixed string and Path instances in FIXTURE_DIRS.
++"""
++
++import os
++import tempfile
++from pathlib import Path
++
++import django
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++from django.core.management import call_command
++from django.test import TestCase, override_settings
++
++# Configure Django for testing
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++    django.setup()
++
++
++class MixedPathDuplicatesTest(TestCase):
++    """Test case to reproduce the mixed string/Path duplicate detection issue."""
++    
++    def setUp(self):
++        # Create a temporary directory for testing
++        self.temp_dir = tempfile.mkdtemp()
++        self.fixture_dir = os.path.join(self.temp_dir, "fixtures")
++        os.makedirs(self.fixture_dir)
++        
++        # Create a simple fixture file
++        fixture_file = os.path.join(self.fixture_dir, "test.json")
++        with open(fixture_file, 'w') as f:
++            f.write('[]')  # Empty fixture
++    
++    def tearDown(self):
++        # Clean up the temporary directory
++        import shutil
++        shutil.rmtree(self.temp_dir)
++    
++    @override_settings(FIXTURE_DIRS=[])
++    def test_mixed_string_and_path_duplicates_should_be_detected(self):
++        """
++        Test that duplicates are detected when FIXTURE_DIRS contains
++        both string and Path instances pointing to the same directory.
++        """
++        # This should raise ImproperlyConfigured due to duplicates
++        with override_settings(FIXTURE_DIRS=[self.fixture_dir, Path(self.fixture_dir)]):
++            with self.assertRaisesMessage(
++                ImproperlyConfigured, "settings.FIXTURE_DIRS contains duplicates."
++            ):
++                call_command('loaddata', 'test.json', verbosity=0)
++
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file

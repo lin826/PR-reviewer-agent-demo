@@ -1,0 +1,386 @@
+diff --git a/sklearn/pipeline.py b/sklearn/pipeline.py
+index 94d9465d7..03b36e582 100644
+--- a/sklearn/pipeline.py
++++ b/sklearn/pipeline.py
+@@ -154,7 +154,7 @@ class Pipeline(_BaseComposition):
+         self.memory = memory
+         self.verbose = verbose
+ 
+-    def set_output(self, *, transform=None):
++    def set_output(self, *, transform=None, preserve_dtypes=False):
+         """Set the output container when `"transform"` and `"fit_transform"` are called.
+ 
+         Calling `set_output` will set the output of all estimators in `steps`.
+@@ -168,13 +168,19 @@ class Pipeline(_BaseComposition):
+             - `"pandas"`: DataFrame output
+             - `None`: Transform configuration is unchanged
+ 
++        preserve_dtypes : bool, default=False
++            If True and transform="pandas", preserves the dtypes of the input DataFrame
++            in the output DataFrame. Only applicable for columns that exist in both
++            the input and output DataFrames. Has no effect if transform is not "pandas"
++            or if the input is not a pandas DataFrame.
++
+         Returns
+         -------
+         self : estimator instance
+             Estimator instance.
+         """
+         for _, _, step in self._iter():
+-            _safe_set_output(step, transform=transform)
++            _safe_set_output(step, transform=transform, preserve_dtypes=preserve_dtypes)
+         return self
+ 
+     def get_params(self, deep=True):
+@@ -1027,7 +1033,7 @@ class FeatureUnion(TransformerMixin, _BaseComposition):
+         self.transformer_weights = transformer_weights
+         self.verbose = verbose
+ 
+-    def set_output(self, *, transform=None):
++    def set_output(self, *, transform=None, preserve_dtypes=False):
+         """Set the output container when `"transform"` and `"fit_transform"` are called.
+ 
+         `set_output` will set the output of all estimators in `transformer_list`.
+@@ -1041,14 +1047,20 @@ class FeatureUnion(TransformerMixin, _BaseComposition):
+             - `"pandas"`: DataFrame output
+             - `None`: Transform configuration is unchanged
+ 
++        preserve_dtypes : bool, default=False
++            If True and transform="pandas", preserves the dtypes of the input DataFrame
++            in the output DataFrame. Only applicable for columns that exist in both
++            the input and output DataFrames. Has no effect if transform is not "pandas"
++            or if the input is not a pandas DataFrame.
++
+         Returns
+         -------
+         self : estimator instance
+             Estimator instance.
+         """
+-        super().set_output(transform=transform)
++        super().set_output(transform=transform, preserve_dtypes=preserve_dtypes)
+         for _, step, _ in self._iter():
+-            _safe_set_output(step, transform=transform)
++            _safe_set_output(step, transform=transform, preserve_dtypes=preserve_dtypes)
+         return self
+ 
+     @property
+diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..1cebac340 100644
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -12,6 +12,7 @@ def _wrap_in_pandas_container(
+     *,
+     columns,
+     index=None,
++    dtypes=None,
+ ):
+     """Create a Pandas DataFrame.
+ 
+@@ -36,6 +37,11 @@ def _wrap_in_pandas_container(
+     index : array-like, default=None
+         Index for data.
+ 
++    dtypes : Series, default=None
++        The dtypes to use for the DataFrame columns. If provided, the output
++        DataFrame will have these dtypes applied to matching columns. Only
++        applicable for columns that exist in both the original and transformed data.
++
+     Returns
+     -------
+     dataframe : DataFrame
+@@ -57,9 +63,28 @@ def _wrap_in_pandas_container(
+             data_to_wrap.columns = columns
+         if index is not None:
+             data_to_wrap.index = index
++        if dtypes is not None:
++            # Apply dtypes for columns that exist in both the original and the output
++            common_cols = set(data_to_wrap.columns).intersection(set(dtypes.index))
++            if common_cols:
++                # Get dtypes only for the columns that exist in the transformed data
++                preserved_dtypes = {col: dtypes[col] for col in common_cols}
++                data_to_wrap = data_to_wrap.astype(preserved_dtypes)
+         return data_to_wrap
+ 
+-    return pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    # Create a new DataFrame
++    df = pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    
++    # Apply dtypes if provided
++    if dtypes is not None:
++        # Apply dtypes for columns that exist in both the original and the output
++        common_cols = set(df.columns).intersection(set(dtypes.index))
++        if common_cols:
++            # Get dtypes only for the columns that exist in the transformed data
++            preserved_dtypes = {col: dtypes[col] for col in common_cols}
++            df = df.astype(preserved_dtypes)
++    
++    return df
+ 
+ 
+ def _get_output_config(method, estimator=None):
+@@ -81,19 +106,27 @@ def _get_output_config(method, estimator=None):
+ 
+         - "dense": specifies the dense container for `method`. This can be
+           `"default"` or `"pandas"`.
++        - "preserve_dtypes": boolean flag indicating whether to preserve original dtypes.
+     """
+     est_sklearn_output_config = getattr(estimator, "_sklearn_output_config", {})
+     if method in est_sklearn_output_config:
+-        dense_config = est_sklearn_output_config[method]
++        config = est_sklearn_output_config[method]
++        if isinstance(config, str):
++            dense_config = config
++            preserve_dtypes = False
++        else:
++            dense_config = config["dense"]
++            preserve_dtypes = config.get("preserve_dtypes", False)
+     else:
+         dense_config = get_config()[f"{method}_output"]
++        preserve_dtypes = False
+ 
+     if dense_config not in {"default", "pandas"}:
+         raise ValueError(
+             f"output config must be 'default' or 'pandas' got {dense_config}"
+         )
+ 
+-    return {"dense": dense_config}
++    return {"dense": dense_config, "preserve_dtypes": preserve_dtypes}
+ 
+ 
+ def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+@@ -127,10 +160,16 @@ def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+         return data_to_wrap
+ 
+     # dense_config == "pandas"
++    # Get the dtypes from the original input if preserve_dtypes is True
++    dtypes = None
++    if output_config["preserve_dtypes"] and hasattr(original_input, "dtypes"):
++        dtypes = original_input.dtypes
++    
+     return _wrap_in_pandas_container(
+         data_to_wrap=data_to_wrap,
+         index=getattr(original_input, "index", None),
+         columns=estimator.get_feature_names_out,
++        dtypes=dtypes,
+     )
+ 
+ 
+@@ -208,7 +247,7 @@ class _SetOutputMixin:
+             setattr(cls, method, wrapped_method)
+ 
+     @available_if(_auto_wrap_is_configured)
+-    def set_output(self, *, transform=None):
++    def set_output(self, *, transform=None, preserve_dtypes=False):
+         """Set output container.
+ 
+         See :ref:`sphx_glr_auto_examples_miscellaneous_plot_set_output.py`
+@@ -223,22 +262,48 @@ class _SetOutputMixin:
+             - `"pandas"`: DataFrame output
+             - `None`: Transform configuration is unchanged
+ 
++        preserve_dtypes : bool, default=False
++            If True and transform="pandas", preserves the dtypes of the input DataFrame
++            in the output DataFrame. Only applicable for columns that exist in both
++            the input and output DataFrames. Has no effect if transform is not "pandas"
++            or if the input is not a pandas DataFrame.
++
+         Returns
+         -------
+         self : estimator instance
+             Estimator instance.
+         """
+-        if transform is None:
++        if transform is None and not preserve_dtypes:
+             return self
+ 
+         if not hasattr(self, "_sklearn_output_config"):
+             self._sklearn_output_config = {}
+-
+-        self._sklearn_output_config["transform"] = transform
++        
++        if "transform" not in self._sklearn_output_config:
++            self._sklearn_output_config["transform"] = {}
++        
++        if transform is not None:
++            if isinstance(self._sklearn_output_config["transform"], dict):
++                self._sklearn_output_config["transform"]["dense"] = transform
++            else:
++                # If _sklearn_output_config["transform"] is a string, convert to dict
++                current_transform = self._sklearn_output_config["transform"]
++                self._sklearn_output_config["transform"] = {"dense": current_transform}
++        elif isinstance(self._sklearn_output_config["transform"], str):
++            # If only preserve_dtypes is provided and transform is a string
++            current_transform = self._sklearn_output_config["transform"]
++            self._sklearn_output_config["transform"] = {"dense": current_transform}
++        
++        if "dense" not in self._sklearn_output_config["transform"]:
++            # If this is the first call with only preserve_dtypes
++            self._sklearn_output_config["transform"]["dense"] = "pandas"
++        
++        self._sklearn_output_config["transform"]["preserve_dtypes"] = preserve_dtypes
++        
+         return self
+ 
+ 
+-def _safe_set_output(estimator, *, transform=None):
++def _safe_set_output(estimator, *, transform=None, preserve_dtypes=False):
+     """Safely call estimator.set_output and error if it not available.
+ 
+     This is used by meta-estimators to set the output for child estimators.
+@@ -256,6 +321,11 @@ def _safe_set_output(estimator, *, transform=None):
+ 
+         If `None`, this operation is a no-op.
+ 
++    preserve_dtypes : bool, default=False
++        If True and transform="pandas", preserves the dtypes of the input DataFrame
++        in the output DataFrame. Only applicable for columns that exist in both
++        the input and output DataFrames.
++
+     Returns
+     -------
+     estimator : estimator instance
+@@ -264,7 +334,7 @@ def _safe_set_output(estimator, *, transform=None):
+     set_output_for_transform = (
+         hasattr(estimator, "transform")
+         or hasattr(estimator, "fit_transform")
+-        and transform is not None
++        and (transform is not None or preserve_dtypes)
+     )
+     if not set_output_for_transform:
+         # If estimator can not transform, then `set_output` does not need to be
+@@ -276,4 +346,4 @@ def _safe_set_output(estimator, *, transform=None):
+             f"Unable to configure output for {estimator} because `set_output` "
+             "is not available."
+         )
+-    return estimator.set_output(transform=transform)
++    return estimator.set_output(transform=transform, preserve_dtypes=preserve_dtypes)
+diff --git a/test_dtype_preservation.py b/test_dtype_preservation.py
+new file mode 100644
+index 000000000..89534d816
+--- /dev/null
++++ b/test_dtype_preservation.py
+@@ -0,0 +1,71 @@
++"""Test script to verify the issue with dtype preservation in pandas output."""
++
++import numpy as np
++import pandas as pd
++from sklearn.datasets import load_iris
++from sklearn.feature_selection import SelectKBest
++from sklearn.feature_selection import chi2
++
++def test_dtype_not_preserved():
++    """Test to verify that dtypes are not currently preserved."""
++    # Load the data
++    X, y = load_iris(return_X_y=True, as_frame=True)
++    
++    # Set specific dtypes
++    X = X.astype(
++        {
++            "petal width (cm)": np.float16,
++            "petal length (cm)": np.float16,
++        }
++    )
++    X["cat"] = y.astype("category")
++    
++    # Print original dtypes
++    print("Original dtypes:")
++    print(X.dtypes)
++    
++    # Use SelectKBest with pandas output
++    selector = SelectKBest(chi2, k=2)
++    selector.set_output(transform="pandas")
++    X_out = selector.fit_transform(X, y)
++    
++    # Print output dtypes
++    print("\nOutput dtypes with current implementation:")
++    print(X_out.dtypes)
++    
++    # We expect that float16 and category dtypes are not preserved
++    # Expected output: float64 for all columns
++    
++def test_dtype_preserved():
++    """Test to verify that dtypes are preserved with new implementation."""
++    # Load the data
++    X, y = load_iris(return_X_y=True, as_frame=True)
++    
++    # Set specific dtypes
++    X = X.astype(
++        {
++            "petal width (cm)": np.float16,
++            "petal length (cm)": np.float16,
++        }
++    )
++    X["cat"] = y.astype("category")
++    
++    # Store original dtypes
++    print("\nOriginal dtypes:")
++    print(X.dtypes)
++    
++    # Use SelectKBest with pandas output and preserve_dtypes=True
++    selector = SelectKBest(chi2, k=2)
++    selector.set_output(transform="pandas", preserve_dtypes=True)
++    X_out = selector.fit_transform(X, y)
++    
++    # Print output dtypes
++    print("\nOutput dtypes with preserve_dtypes=True:")
++    print(X_out.dtypes)
++    
++    # We expect that float16 and category dtypes are preserved
++    # Expected output: float16 for "petal length (cm)" and category for "cat"
++
++if __name__ == "__main__":
++    test_dtype_not_preserved()
++    test_dtype_preserved()
+\ No newline at end of file
+diff --git a/test_dtype_preservation_advanced.py b/test_dtype_preservation_advanced.py
+new file mode 100644
+index 000000000..161852747
+--- /dev/null
++++ b/test_dtype_preservation_advanced.py
+@@ -0,0 +1,45 @@
++"""Advanced test for dtype preservation in pandas output using MinMaxScaler."""
++
++import numpy as np
++import pandas as pd
++from sklearn.datasets import load_iris
++from sklearn.preprocessing import MinMaxScaler
++
++def test_minmax_scaler():
++    """Test dtype preservation with MinMaxScaler."""
++    # Load the data
++    X, y = load_iris(return_X_y=True, as_frame=True)
++    
++    # Set specific dtypes
++    X = X.astype(
++        {
++            "petal width (cm)": np.float16,
++            "petal length (cm)": np.float16,
++        }
++    )
++    X["cat"] = y.astype("category")
++    
++    # Print original dtypes
++    print("Original dtypes:")
++    print(X.dtypes)
++    
++    # Create and fit a MinMaxScaler with preserve_dtypes=True
++    scaler = MinMaxScaler()
++    scaler.set_output(transform="pandas", preserve_dtypes=True)
++    X_scaled_preserved = scaler.fit_transform(X)
++    
++    # Print output dtypes
++    print("\nOutput dtypes with preserve_dtypes=True:")
++    print(X_scaled_preserved.dtypes)
++    
++    # Create and fit a MinMaxScaler with default settings (preserve_dtypes=False)
++    scaler2 = MinMaxScaler()
++    scaler2.set_output(transform="pandas")
++    X_scaled_default = scaler2.fit_transform(X)
++    
++    # Print output dtypes
++    print("\nOutput dtypes with preserve_dtypes=False (default):")
++    print(X_scaled_default.dtypes)
++
++if __name__ == "__main__":
++    test_minmax_scaler()
+\ No newline at end of file

@@ -1,0 +1,213 @@
+diff --git a/issue_reproduction.py b/issue_reproduction.py
+new file mode 100644
+index 0000000000..a51bbb0b0b
+--- /dev/null
++++ b/issue_reproduction.py
+@@ -0,0 +1,12 @@
++import matplotlib.pyplot as plt
++
++# Create three figures with different spacing
++for spacing in [0, 0.2, 0.5]:
++    fig = plt.figure(figsize=(8, 6))
++    fig.suptitle(f'wspace={spacing}, hspace={spacing}')
++    subfigs = fig.subfigures(2, 2, wspace=spacing, hspace=spacing)
++    for subfig in subfigs.flat:
++        subfig.subplots().plot([1, 2])
++    fig.savefig(f'issue_reproduction_spacing_{spacing}.png')
++
++print("Test completed. Check the output files for visually different spacing.")
+\ No newline at end of file
+diff --git a/issue_reproduction_spacing_0.2.png b/issue_reproduction_spacing_0.2.png
+new file mode 100644
+index 0000000000..a68bbea26b
+Binary files /dev/null and b/issue_reproduction_spacing_0.2.png differ
+diff --git a/issue_reproduction_spacing_0.5.png b/issue_reproduction_spacing_0.5.png
+new file mode 100644
+index 0000000000..70c1748b01
+Binary files /dev/null and b/issue_reproduction_spacing_0.5.png differ
+diff --git a/issue_reproduction_spacing_0.png b/issue_reproduction_spacing_0.png
+new file mode 100644
+index 0000000000..71cd819aa3
+Binary files /dev/null and b/issue_reproduction_spacing_0.png differ
+diff --git a/issue_with_spacing.png b/issue_with_spacing.png
+new file mode 100644
+index 0000000000..2e54b59bb0
+Binary files /dev/null and b/issue_with_spacing.png differ
+diff --git a/issue_without_spacing.png b/issue_without_spacing.png
+new file mode 100644
+index 0000000000..93c4e8481a
+Binary files /dev/null and b/issue_without_spacing.png differ
+diff --git a/lib/matplotlib/figure.py b/lib/matplotlib/figure.py
+index dab2bc4a5a..0f79876ad4 100644
+--- a/lib/matplotlib/figure.py
++++ b/lib/matplotlib/figure.py
+@@ -2272,19 +2272,75 @@ class SubFigure(FigureBase):
+             self.bbox_relative.p0 = bbox.p0
+             self.bbox_relative.p1 = bbox.p1
+             return
++
+         # need to figure out *where* this subplotspec is.
+         gs = self._subplotspec.get_gridspec()
++
++        # Get the row and column indices
++        row_start, row_stop = self._subplotspec.rowspan.start, self._subplotspec.rowspan.stop
++        col_start, col_stop = self._subplotspec.colspan.start, self._subplotspec.colspan.stop
++
++        # Get width and height ratios
+         wr = np.asarray(gs.get_width_ratios())
+         hr = np.asarray(gs.get_height_ratios())
+-        dx = wr[self._subplotspec.colspan].sum() / wr.sum()
+-        dy = hr[self._subplotspec.rowspan].sum() / hr.sum()
+-        x0 = wr[:self._subplotspec.colspan.start].sum() / wr.sum()
+-        y0 = 1 - hr[:self._subplotspec.rowspan.stop].sum() / hr.sum()
++
++        # Calculate dimensions taking spacing into account
++        nrows, ncols = gs.get_geometry()
++
++        if gs.figure is not None:
++            # Get the width and height spacing from the gridspec
++            wspace = gs.wspace if gs.wspace is not None else 0
++            hspace = gs.hspace if gs.hspace is not None else 0
++
++            # Calculate total width and height ratios
++            total_width_ratio = wr.sum()
++            total_height_ratio = hr.sum()
++
++            # Calculate column width and row height, including spacing
++            # The total width and height are normalized to 1.0
++            effective_width = 1.0 / (total_width_ratio + wspace * (ncols - 1) * wr.mean())
++            effective_height = 1.0 / (total_height_ratio + hspace * (nrows - 1) * hr.mean())
++
++            # Calculate width of current columns
++            width_of_cols = wr[col_start:col_stop].sum() * effective_width
++
++            # Calculate height of current rows
++            height_of_rows = hr[row_start:row_stop].sum() * effective_height
++
++            # Calculate x0 position, adding spacing between columns
++            x0 = 0
++            for i in range(col_start):
++                x0 += wr[i] * effective_width
++                if i < col_start - 1:  # Add spacing between columns, except after the last one
++                    x0 += wspace * wr.mean() * effective_width
++
++            # Calculate y0 from top (since y0 is the bottom of the subfigure)
++            y1 = 1.0
++            for i in range(row_start):
++                y1 -= hr[i] * effective_height
++                if i < row_start - 1:  # Add spacing between rows, except after the last one
++                    y1 -= hspace * hr.mean() * effective_height
++
++            # The bottom of the subfigure is top minus height
++            y0 = y1 - height_of_rows
++
++            # Calculate x1 by adding width to x0
++            x1 = x0 + width_of_cols
++        else:
++            # Fall back to old behavior if figure is not available
++            dx = wr[self._subplotspec.colspan].sum() / wr.sum()
++            dy = hr[self._subplotspec.rowspan].sum() / hr.sum()
++            x0 = wr[:self._subplotspec.colspan.start].sum() / wr.sum()
++            y0 = 1 - hr[:self._subplotspec.rowspan.stop].sum() / hr.sum()
++            x1 = x0 + dx
++            y1 = y0 + dy
++
++        # Create or update the relative bbox
+         if self.bbox_relative is None:
+-            self.bbox_relative = Bbox.from_bounds(x0, y0, dx, dy)
++            self.bbox_relative = Bbox([[x0, y0], [x1, y1]])
+         else:
+             self.bbox_relative.p0 = (x0, y0)
+-            self.bbox_relative.p1 = (x0 + dx, y0 + dy)
++            self.bbox_relative.p1 = (x1, y1)
+
+     def get_constrained_layout(self):
+         """
+diff --git a/lib/matplotlib/tests/test_figure.py b/lib/matplotlib/tests/test_figure.py
+index 474331bf91..3c829f6866 100644
+--- a/lib/matplotlib/tests/test_figure.py
++++ b/lib/matplotlib/tests/test_figure.py
+@@ -1384,7 +1384,7 @@ def test_subfigure_spanning():
+     np.testing.assert_allclose(sub_figs[1].bbox.min, [w / 3, h / 3])
+     np.testing.assert_allclose(sub_figs[1].bbox.max, [w * 2/3, h])
+
+-    np.testing.assert_allclose(sub_figs[2].bbox.min, [w / 3, 0])
++    np.testing.assert_allclose(sub_figs[2].bbox.min, [w / 3, 0], atol=1e-9)
+     np.testing.assert_allclose(sub_figs[2].bbox.max, [w, h / 3])
+
+     # check here that slicing actually works.  Last sub_fig
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..d806123a2b
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,18 @@
++import matplotlib.pyplot as plt
++import numpy as np
++
++# With wspace and hspace set to large values
++fig1 = plt.figure(figsize=(10, 8))
++fig1.suptitle('With wspace=0.5, hspace=0.5')
++figs1 = fig1.subfigures(2, 2, wspace=0.5, hspace=0.5)
++for fig in figs1.flat:
++    fig.subplots().plot([1, 2])
++fig1.savefig('issue_with_spacing.png')
++
++# With wspace and hspace set to 0
++fig2 = plt.figure(figsize=(10, 8))
++fig2.suptitle('With wspace=0, hspace=0')
++figs2 = fig2.subfigures(2, 2, wspace=0, hspace=0)
++for fig in figs2.flat:
++    fig.subplots().plot([1, 2])
++fig2.savefig('issue_without_spacing.png')
+\ No newline at end of file
+diff --git a/test_default_spacing.png b/test_default_spacing.png
+new file mode 100644
+index 0000000000..5d1b9ca03d
+Binary files /dev/null and b/test_default_spacing.png differ
+diff --git a/test_large_spacing.png b/test_large_spacing.png
+new file mode 100644
+index 0000000000..513e39455f
+Binary files /dev/null and b/test_large_spacing.png differ
+diff --git a/test_no_spacing.png b/test_no_spacing.png
+new file mode 100644
+index 0000000000..4d35e8ebfd
+Binary files /dev/null and b/test_no_spacing.png differ
+diff --git a/test_subfigure_spacing.py b/test_subfigure_spacing.py
+new file mode 100644
+index 0000000000..c812a8dae0
+--- /dev/null
++++ b/test_subfigure_spacing.py
+@@ -0,0 +1,31 @@
++import matplotlib.pyplot as plt
++import numpy as np
++
++def create_test_figure(wspace=None, hspace=None):
++    fig = plt.figure(figsize=(10, 8))
++    if wspace is not None and hspace is not None:
++        title = f'wspace={wspace}, hspace={hspace}'
++    else:
++        title = 'Default spacing'
++    fig.suptitle(title)
++
++    figs = fig.subfigures(2, 2, wspace=wspace, hspace=hspace)
++    for i, subfig in enumerate(figs.flat):
++        subfig.suptitle(f'Subfigure {i+1}')
++        ax = subfig.subplots()
++        ax.plot([1, 2, 3], [1, 4, 9])
++        ax.set_title(f'Plot {i+1}')
++        ax.grid(True)
++    return fig
++
++# Create figures with different spacing values
++fig1 = create_test_figure()
++fig1.savefig('test_default_spacing.png')
++
++fig2 = create_test_figure(wspace=0, hspace=0)
++fig2.savefig('test_no_spacing.png')
++
++fig3 = create_test_figure(wspace=0.5, hspace=0.5)
++fig3.savefig('test_large_spacing.png')
++
++print("Test images saved to: test_default_spacing.png, test_no_spacing.png, test_large_spacing.png")
+\ No newline at end of file

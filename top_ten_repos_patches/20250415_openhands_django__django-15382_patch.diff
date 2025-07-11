@@ -1,0 +1,291 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..5515d39f08
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,122 @@
++import os
++import sys
++
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    USE_TZ=False,
++)
++
++import django
++django.setup()
++
++from django.db import models
++from django.core.management import call_command
++from django.core.exceptions import EmptyResultSet
++
++# Define the model
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test_app'
++        # This is needed for the model to be used in the tests
++        managed = False
++
++def test_negated_empty_exists():
++    print("\n1. Testing ~Exists(empty_queryset) filter issue:")
++    
++    # Create the query that reproduces the issue
++    qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++    
++    # This should no longer raise EmptyResultSet
++    try:
++        query_str = str(qs.query)
++        print("Query string:", query_str)
++        print("✅ SUCCESS: Query generates valid SQL with WHERE clause")
++    except Exception as e:
++        print("❌ FAILURE: Error:", str(e))
++        return False
++    
++    return True
++
++def test_non_negated_empty_exists():
++    print("\n2. Testing Exists(empty_queryset) filter:")
++    
++    # Test non-negated empty Exists
++    qs = MyModel.objects.filter(models.Exists(MyModel.objects.none()), name='test')
++    
++    try:
++        # This should still raise EmptyResultSet or create a query that always returns empty
++        qs.query
++        print("Query string:", qs.query)
++        print("✅ SUCCESS: Query with Exists(empty) properly generates SQL")
++    except EmptyResultSet:
++        print("✅ SUCCESS: EmptyResultSet raised as expected for Exists(empty)")
++        
++    return True
++
++def test_negated_non_empty_exists():
++    print("\n3. Testing ~Exists(non_empty_queryset) filter:")
++    
++    # Test negated non-empty Exists
++    qs = MyModel.objects.filter(~models.Exists(MyModel.objects.all()), name='test')
++    
++    try:
++        query_str = str(qs.query)
++        print("Query string:", query_str)
++        print("✅ SUCCESS: Query generates valid SQL")
++    except Exception as e:
++        print("❌ FAILURE: Error:", str(e))
++        return False
++    
++    return True
++
++def test_non_negated_non_empty_exists():
++    print("\n4. Testing Exists(non_empty_queryset) filter:")
++    
++    # Test non-negated non-empty Exists
++    qs = MyModel.objects.filter(models.Exists(MyModel.objects.all()), name='test')
++    
++    try:
++        query_str = str(qs.query)
++        print("Query string:", query_str)
++        print("✅ SUCCESS: Query generates valid SQL")
++    except Exception as e:
++        print("❌ FAILURE: Error:", str(e))
++        return False
++    
++    return True
++
++if __name__ == "__main__":
++    print("=== RUNNING COMPREHENSIVE TESTS ===")
++    
++    tests = [
++        test_negated_empty_exists,
++        test_non_negated_empty_exists,
++        test_negated_non_empty_exists,
++        test_non_negated_non_empty_exists,
++    ]
++    
++    results = [test() for test in tests]
++    
++    print("\n=== TEST SUMMARY ===")
++    print(f"Total tests: {len(results)}")
++    print(f"Passed: {sum(results)}")
++    print(f"Failed: {len(results) - sum(results)}")
++    
++    if all(results):
++        print("\n✅ ALL TESTS PASSED")
++        sys.exit(0)
++    else:
++        print("\n❌ SOME TESTS FAILED")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 81f8f79c71..03f018207a 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1211,16 +1211,24 @@ class Exists(Subquery):
+ 
+     def as_sql(self, compiler, connection, template=None, **extra_context):
+         query = self.query.exists(using=connection.alias)
+-        sql, params = super().as_sql(
+-            compiler,
+-            connection,
+-            template=template,
+-            query=query,
+-            **extra_context,
+-        )
+-        if self.negated:
+-            sql = 'NOT {}'.format(sql)
+-        return sql, params
++        try:
++            sql, params = super().as_sql(
++                compiler,
++                connection,
++                template=template,
++                query=query,
++                **extra_context,
++            )
++            if self.negated:
++                sql = 'NOT {}'.format(sql)
++            return sql, params
++        except EmptyResultSet:
++            if self.negated:
++                # An empty EXISTS when negated is equivalent to TRUE
++                return '1 = 1', []
++            else:
++                # An empty EXISTS is equivalent to FALSE
++                return '0 = 1', []
+ 
+     def select_format(self, compiler, sql, params):
+         # Wrap EXISTS() with a CASE WHEN expression if a database backend
+diff --git a/test_exists_issue.py b/test_exists_issue.py
+new file mode 100644
+index 0000000000..45492360d2
+--- /dev/null
++++ b/test_exists_issue.py
+@@ -0,0 +1,53 @@
++import os
++import sys
++
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    USE_TZ=False,
++)
++
++import django
++django.setup()
++
++from django.db import models
++from django.core.management import call_command
++from django.core.exceptions import EmptyResultSet
++
++# Define the model
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test_app'
++        # This is needed for the model to be used in the tests
++        managed = False
++
++def run_test():
++    print("Testing ~Exists(empty_queryset) filter issue...")
++    
++    # Create the query that reproduces the issue
++    qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++    
++    # This will raise EmptyResultSet error
++    try:
++        print("Trying to get qs.query as string...")
++        query_str = str(qs.query)
++        print("Query string:", query_str)
++    except EmptyResultSet as e:
++        print("Error:", str(e))
++        print("This confirms the issue: EmptyResultSet is raised when it shouldn't be")
++    
++    print("\nThe expected behavior would be to have a valid WHERE clause that includes the name='test' part.")
++
++if __name__ == "__main__":
++    run_test()
+\ No newline at end of file
+diff --git a/tests/expressions/test_ticket_specific.py b/tests/expressions/test_ticket_specific.py
+new file mode 100644
+index 0000000000..f04ea766f4
+--- /dev/null
++++ b/tests/expressions/test_ticket_specific.py
+@@ -0,0 +1,56 @@
++import os
++import sys
++
++# Add the parent directory to the Python path so we use the modified Django
++sys.path.insert(0, '/workspace/django__django__4.1')
++
++from django.conf import settings
++
++# Configure Django settings
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
++    USE_TZ=False,
++)
++
++import django
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++
++class MyModel(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test_app'
++        # This is needed for the model to be used in the tests
++        managed = False
++
++class TicketSpecificTestCase(TestCase):
++    def test_exists_empty_queryset_with_other_conditions(self):
++        """Test the specific issue from the ticket."""
++        # Create the query that reproduces the issue
++        qs = MyModel.objects.filter(~models.Exists(MyModel.objects.none()), name='test')
++        
++        # Get SQL - this should not raise EmptyResultSet
++        sql = str(qs.query)
++        
++        # Verify the SQL has both conditions
++        self.assertIn("1 = 1", sql)  # The negated empty Exists
++        self.assertIn("name", sql)   # The name filter
++        
++        # For negated empty Exists, should return '1 = 1' (TRUE)
++        self.assertIn("1 = 1", sql)
++
++if __name__ == "__main__":
++    from django.test.runner import DiscoverRunner
++    runner = DiscoverRunner(verbosity=2)
++    failures = runner.run_tests(['__main__'])
++    sys.exit(bool(failures))
+\ No newline at end of file

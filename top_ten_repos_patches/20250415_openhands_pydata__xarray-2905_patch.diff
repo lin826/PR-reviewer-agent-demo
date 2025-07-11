@@ -1,0 +1,63 @@
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 45553eb9..34cc9686 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -183,6 +183,38 @@ def _possibly_convert_objects(values):
+     validating that datetime64 and timedelta64 objects are within the valid date
+     range for ns precision, as pandas will raise an error if they are not.
+     """
++    # The issue is that pandas.Series(obj) will extract obj.values if that exists
++    # We need to protect objects with a .values property from conversion
++    
++    # If the array has object dtype, check elements for .values attributes
++    if values.dtype.kind == 'O':
++        # Check each element for a values property - we want to protect custom objects
++        flat_values = values.ravel().copy()
++        contains_values_attr = False
++        
++        for i, obj in enumerate(flat_values):
++            if obj is not None and hasattr(obj, 'values'):
++                # Skip pandas/numpy types which should have their values extracted
++                if not isinstance(obj, (pd.Series, pd.DataFrame, np.ndarray)):
++                    # This is a custom object with a values attribute
++                    contains_values_attr = True
++                    break
++        
++        if contains_values_attr:
++            # Important: Don't convert this array at all to avoid values extraction!
++            # Create a protective copy to ensure values aren't extracted
++            # Special handling for datetime and timedelta objects only
++            result = np.empty_like(values)
++            for idx, val in np.ndenumerate(values):
++                if isinstance(val, (pd.Timestamp, np.datetime64)):
++                    result[idx] = np.datetime64(pd.Timestamp(val).value, 'ns')
++                elif isinstance(val, (timedelta, np.timedelta64)):
++                    result[idx] = np.timedelta64(getattr(val, 'value', val), 'ns')
++                else:
++                    result[idx] = val
++            return result
++            
++    # Original implementation for all other cases
+     return np.asarray(pd.Series(values.ravel())).reshape(values.shape)
+ 
+ 
+@@ -217,8 +249,17 @@ def as_compatible_data(data, fastpath=False):
+     if isinstance(data, timedelta):
+         data = np.timedelta64(getattr(data, "value", data), "ns")
+ 
+-    # we don't want nested self-described arrays
+-    data = getattr(data, "values", data)
++    # We don't want nested self-described arrays
++    # Only extract .values from pandas and xarray types, but preserve custom objects with a values property
++    if hasattr(data, "values"):
++        from .dataarray import DataArray
++        
++        # Only extract .values from pandas and xarray types
++        if isinstance(data, (DataArray, pd.Series, pd.DataFrame)):
++            data = data.values
++        # The original code unconditionally extracted the values attribute:
++        # data = getattr(data, "values", data)
++        # We're now more selective to allow custom objects with .values property
+ 
+     if isinstance(data, np.ma.MaskedArray):
+         mask = np.ma.getmaskarray(data)

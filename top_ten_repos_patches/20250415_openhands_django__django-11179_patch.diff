@@ -1,0 +1,170 @@
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 92fe4affb9..883c09ef83 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -277,6 +277,8 @@ class Collector:
+             if self.can_fast_delete(instance):
+                 with transaction.mark_for_rollback_on_error():
+                     count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
++                # Set primary key to None
++                setattr(instance, model._meta.pk.attname, None)
+                 return count, {model._meta.label: count}
+ 
+         with transaction.atomic(using=self.using, savepoint=False):
+diff --git a/repro_script.py b/repro_script.py
+new file mode 100755
+index 0000000000..b1e0cef0bc
+--- /dev/null
++++ b/repro_script.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++
++# Add the parent directory to sys.path
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++# Set required settings before setup
++from django.conf import settings
++settings.configure(
++    SECRET_KEY='test_key',
++    INSTALLED_APPS=[],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    }
++)
++django.setup()
++
++# Import directly from the deletion module
++from django.db.models.deletion import Collector, sql
++from django.db import models, transaction
++
++# Create our test class - just a mock class with PK for testing
++class MockModel:
++    pk = 1
++    _meta = type('meta', (), {
++        'pk': type('pk', (), {'attname': 'pk'}),
++        'label': 'test_model',
++        'concrete_model': None,
++        'parents': {},
++        'private_fields': [],
++        'auto_created': False
++    })
++    
++    def __init__(self, pk=1):
++        self.pk = pk
++        
++    def __repr__(self):
++        return f"MockModel(pk={self.pk})"
++
++# Test the fast delete path by monkey patching
++def test_fast_delete():
++    # Create a test model instance
++    instance = MockModel(pk=42)
++    print(f"Before delete: instance.pk = {instance.pk}")
++    
++    # Store original method to restore later
++    original_delete_batch = sql.DeleteQuery.delete_batch
++    
++    # Replace delete_batch with a dummy function that returns 1
++    sql.DeleteQuery.delete_batch = lambda self, pk_list, using: 1
++    
++    # Create a collector
++    collector = Collector(using='default')
++    # Add our instance to the collector
++    collector.data[MockModel] = set([instance])
++    
++    try:
++        # Trick can_fast_delete to return True
++        collector.can_fast_delete = lambda obj: True
++        
++        # Call delete() which should take the fast path (line 275-280)
++        collector.delete()
++        
++        # Check if the PK was set to None
++        print(f"After delete: instance.pk = {instance.pk}")
++        
++        if instance.pk is None:
++            print("SUCCESS: PK is set to None after fast delete")
++        else:
++            print(f"FAILURE: PK is not set to None after fast delete, it's {instance.pk}")
++    finally:
++        # Restore original method
++        sql.DeleteQuery.delete_batch = original_delete_batch
++
++if __name__ == "__main__":
++    test_fast_delete()
+\ No newline at end of file
+diff --git a/test_project.py b/test_project.py
+new file mode 100644
+index 0000000000..84388e6ebe
+--- /dev/null
++++ b/test_project.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db import connection
++
++# Configure settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test-key',
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    }
++)
++
++django.setup()
++
++# Create a test model
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'contenttypes'  # Use an existing app
++    
++    def __str__(self):
++        return f"{self.name} (PK: {self.pk})"
++
++# Create the table in the database
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(TestModel)
++
++def test_delete_clears_pk():
++    # Create a test instance
++    instance = TestModel.objects.create(name="Test Instance")
++    print(f"Created instance: {instance}")
++    
++    # Get the PK before delete
++    pk_before = instance.pk
++    print(f"Before delete: instance.pk = {pk_before}")
++    
++    # Delete the instance
++    instance.delete()
++    
++    # Check if PK is None after delete
++    print(f"After delete: instance.pk = {instance.pk}")
++    
++    # Verify the result
++    if instance.pk is None:
++        print("SUCCESS: PK is set to None after delete")
++    else:
++        print(f"FAILURE: PK is not set to None after delete, it's {instance.pk}")
++        
++if __name__ == '__main__':
++    test_delete_clears_pk()
+\ No newline at end of file

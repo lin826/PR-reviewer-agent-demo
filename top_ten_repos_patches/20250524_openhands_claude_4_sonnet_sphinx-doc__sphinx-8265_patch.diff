@@ -1,0 +1,619 @@
+diff --git a/check_python_ast.py b/check_python_ast.py
+new file mode 100644
+index 000000000..133795997
+--- /dev/null
++++ b/check_python_ast.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++"""
++Check what Python's built-in AST unparser does.
++"""
++
++import ast
++import sys
++
++def check_python_ast():
++    """Check Python's built-in AST behavior."""
++    test_cases = [
++        "(1, 2, 3)",
++        "Tuple[int, int]",
++        "()",
++        "(1,)",
++    ]
++    
++    print(f"Python version: {sys.version}")
++    print()
++    
++    for case in test_cases:
++        print(f"Testing: {case}")
++        module = ast.parse(case)
++        node = module.body[0].value
++        
++        # Use Python's built-in unparser if available (Python 3.9+)
++        if hasattr(ast, 'unparse'):
++            python_result = ast.unparse(node)
++            print(f"  Python ast.unparse: '{python_result}'")
++        else:
++            print(f"  Python ast.unparse: Not available in Python {sys.version_info[:2]}")
++        
++        # Use Sphinx's unparser
++        from sphinx.pycode.ast import unparse
++        sphinx_result = unparse(node)
++        print(f"  Sphinx unparse:     '{sphinx_result}'")
++        print()
++
++if __name__ == "__main__":
++    check_python_ast()
+\ No newline at end of file
+diff --git a/debug_subscript.py b/debug_subscript.py
+new file mode 100644
+index 000000000..54b4847bb
+--- /dev/null
++++ b/debug_subscript.py
+@@ -0,0 +1,30 @@
++#!/usr/bin/env python3
++"""
++Debug the Tuple[int, int] case.
++"""
++
++import ast
++from sphinx.pycode.ast import unparse
++
++def debug_subscript():
++    """Debug the subscript case."""
++    source = "Tuple[int, int]"
++    module = ast.parse(source)
++    node = module.body[0].value
++    
++    print(f"Source: {source}")
++    print(f"AST node type: {type(node)}")
++    print(f"AST dump: {ast.dump(node)}")
++    
++    result = unparse(node)
++    print(f"Unparse result: '{result}'")
++    
++    # Let's also check the slice part
++    if hasattr(node, 'slice'):
++        print(f"Slice type: {type(node.slice)}")
++        print(f"Slice dump: {ast.dump(node.slice)}")
++        slice_result = unparse(node.slice)
++        print(f"Slice unparse: '{slice_result}'")
++
++if __name__ == "__main__":
++    debug_subscript()
+\ No newline at end of file
+diff --git a/sphinx/pycode/ast.py b/sphinx/pycode/ast.py
+index 9bafff11c..e58e912de 100644
+--- a/sphinx/pycode/ast.py
++++ b/sphinx/pycode/ast.py
+@@ -69,6 +69,9 @@ def unparse(node: Optional[ast.AST]) -> Optional[str]:
+ 
+ # a greatly cut-down version of `ast._Unparser`
+ class _UnparseVisitor(ast.NodeVisitor):
++    
++    def __init__(self):
++        self._in_subscript = False
+ 
+     def _visit_op(self, node: ast.AST) -> str:
+         return OPERATORS[node.__class__]
+@@ -166,16 +169,34 @@ class _UnparseVisitor(ast.NodeVisitor):
+         return "{" + ", ".join(self.visit(e) for e in node.elts) + "}"
+ 
+     def visit_Subscript(self, node: ast.Subscript) -> str:
+-        return "%s[%s]" % (self.visit(node.value), self.visit(node.slice))
++        # Set context flag when visiting the slice
++        old_in_subscript = self._in_subscript
++        self._in_subscript = True
++        try:
++            slice_str = self.visit(node.slice)
++        finally:
++            self._in_subscript = old_in_subscript
++        return "%s[%s]" % (self.visit(node.value), slice_str)
+ 
+     def visit_UnaryOp(self, node: ast.UnaryOp) -> str:
+         return "%s %s" % (self.visit(node.op), self.visit(node.operand))
+ 
+     def visit_Tuple(self, node: ast.Tuple) -> str:
+-        if node.elts:
+-            return ", ".join(self.visit(e) for e in node.elts)
+-        else:
++        if not node.elts:
+             return "()"
++        
++        elements = ", ".join(self.visit(e) for e in node.elts)
++        
++        # In subscript context, don't add parentheses
++        if self._in_subscript:
++            return elements
++        
++        # For single-element tuples, add trailing comma
++        if len(node.elts) == 1:
++            return "(" + elements + ",)"
++        
++        # For multi-element tuples, add parentheses
++        return "(" + elements + ")"
+ 
+     if sys.version_info >= (3, 6):
+         def visit_Constant(self, node: ast.Constant) -> str:
+diff --git a/test_ast_unparse.py b/test_ast_unparse.py
+new file mode 100644
+index 000000000..6543652d1
+--- /dev/null
++++ b/test_ast_unparse.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the AST unparse issue with tuples.
++"""
++
++import ast
++from sphinx.pycode.ast import unparse
++
++def test_ast_unparse_tuple():
++    """Test AST unparse with tuple."""
++    # Create an AST for a tuple (1, 1, 1)
++    tuple_ast = ast.parse("(1, 1, 1)").body[0].value
++    result = unparse(tuple_ast)
++    print(f"AST unparse of (1, 1, 1): '{result}'")
++    
++    # Test empty tuple
++    empty_tuple_ast = ast.parse("()").body[0].value
++    empty_result = unparse(empty_tuple_ast)
++    print(f"AST unparse of (): '{empty_result}'")
++    
++    # Test single element tuple
++    single_tuple_ast = ast.parse("(1,)").body[0].value
++    single_result = unparse(single_tuple_ast)
++    print(f"AST unparse of (1,): '{single_result}'")
++    
++    return result
++
++if __name__ == "__main__":
++    print("Testing AST unparse with tuples...")
++    result = test_ast_unparse_tuple()
++    
++    if result == "1, 1, 1":
++        print("✗ BUG CONFIRMED: Tuple parentheses missing in AST unparse")
++    elif result == "(1, 1, 1)":
++        print("✓ Tuple parentheses preserved in AST unparse")
++    else:
++        print(f"? Unexpected result: '{result}'")
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 000000000..b5a272415
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test for the tuple default argument fix.
++"""
++
++import tempfile
++import os
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++from typing import Tuple, List, Dict
++
++def func_with_tuple_default(color=(1, 1, 1), size=(100, 200)):
++    """Function with tuple default arguments."""
++    pass
++
++def func_with_single_tuple_default(point=(42,)):
++    """Function with single-element tuple default."""
++    pass
++
++def func_with_empty_tuple_default(empty=()):
++    """Function with empty tuple default."""
++    pass
++
++def func_with_nested_tuple_default(nested=((1, 2), (3, 4))):
++    """Function with nested tuple default."""
++    pass
++
++def func_with_type_annotation(data: Tuple[int, int, int]) -> None:
++    """Function with tuple type annotation."""
++    pass
++
++def func_with_both(color: Tuple[int, int, int] = (255, 255, 255)):
++    """Function with both tuple type annotation and tuple default."""
++    pass
++
++def test_comprehensive():
++    """Test comprehensive tuple handling."""
++    print("Testing comprehensive tuple handling...")
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = os.path.join(tmpdir, 'source')
++        outdir = os.path.join(tmpdir, 'build')
++        doctreedir = os.path.join(tmpdir, 'doctrees')
++        
++        os.makedirs(srcdir)
++        
++        # Create conf.py
++        conf_content = '''
++extensions = ['sphinx.ext.autodoc']
++'''
++        with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++            f.write(conf_content)
++        
++        # Create index.rst with autodoc directive
++        index_content = '''
++Test Documentation
++==================
++
++.. autofunction:: test_comprehensive.func_with_tuple_default
++
++.. autofunction:: test_comprehensive.func_with_single_tuple_default
++
++.. autofunction:: test_comprehensive.func_with_empty_tuple_default
++
++.. autofunction:: test_comprehensive.func_with_nested_tuple_default
++
++.. autofunction:: test_comprehensive.func_with_type_annotation
++
++.. autofunction:: test_comprehensive.func_with_both
++'''
++        with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++            f.write(index_content)
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++            app.build()
++        
++        # Read the generated HTML
++        html_file = os.path.join(outdir, 'index.html')
++        if os.path.exists(html_file):
++            with open(html_file, 'r') as f:
++                html_content = f.read()
++            
++            print("Generated HTML content (relevant parts):")
++            
++            # Extract lines with Tuple or default_value
++            lines = html_content.split('\n')
++            for line in lines:
++                if 'Tuple' in line or 'default_value' in line:
++                    print(f"  {line.strip()}")
++            
++            print()
++            
++            # Test cases to check
++            test_cases = [
++                ("(1, 1, 1)", "Multi-element tuple default"),
++                ("(100, 200)", "Another multi-element tuple default"),
++                ("(42,)", "Single-element tuple default"),
++                ("()", "Empty tuple default"),
++                ("((1, 2), (3, 4))", "Nested tuple default"),
++                ("(255, 255, 255)", "Tuple default with type annotation"),
++                ("Tuple", "Tuple type annotation (base)"),
++                ("[</span>int<span", "Tuple type annotation (elements)"),
++            ]
++            
++            all_passed = True
++            for expected, description in test_cases:
++                if expected in html_content:
++                    print(f"✓ {description}: Found '{expected}'")
++                else:
++                    print(f"✗ {description}: Missing '{expected}'")
++                    all_passed = False
++            
++            # Check for incorrect patterns
++            incorrect_patterns = [
++                ("=1, 1, 1", "Tuple without parentheses"),
++                ("=100, 200", "Another tuple without parentheses"),
++                ("=42,", "Single element without parentheses"),
++                ("Tuple[(int, int, int)]", "Type annotation with extra parentheses"),
++            ]
++            
++            for pattern, description in incorrect_patterns:
++                if pattern in html_content:
++                    print(f"✗ {description}: Found incorrect pattern '{pattern}'")
++                    all_passed = False
++                else:
++                    print(f"✓ {description}: Correctly avoided '{pattern}'")
++            
++            return all_passed
++        else:
++            print("HTML file not generated")
++            return False
++
++if __name__ == "__main__":
++    success = test_comprehensive()
++    if success:
++        print("\n🎉 All tests passed! The tuple default argument fix is working correctly.")
++    else:
++        print("\n❌ Some tests failed.")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..505dd341c
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for tuple default arguments.
++"""
++
++import ast
++from sphinx.pycode.ast import unparse
++
++def test_edge_cases():
++    """Test various tuple edge cases."""
++    test_cases = [
++        "(1, 1, 1)",      # Normal tuple
++        "()",             # Empty tuple
++        "(1,)",           # Single element tuple
++        "(1, 2)",         # Two element tuple
++        "((1, 2), 3)",    # Nested tuple
++        "(1, (2, 3))",    # Nested tuple variant
++        "(1, 2, 3, 4, 5)", # Longer tuple
++    ]
++    
++    print("Testing edge cases for tuple unparsing:")
++    for case in test_cases:
++        try:
++            tuple_ast = ast.parse(case).body[0].value
++            result = unparse(tuple_ast)
++            print(f"  {case:15} -> '{result}'")
++            
++            # Basic validation
++            if case == "()" and result != "()":
++                print(f"    ✗ ERROR: Empty tuple should be '()' but got '{result}'")
++            elif case != "()" and not (result.startswith("(") and result.endswith(")")):
++                print(f"    ✗ ERROR: Non-empty tuple should have parentheses")
++            else:
++                print(f"    ✓ OK")
++        except Exception as e:
++            print(f"  {case:15} -> ERROR: {e}")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_tuple_issue.py b/test_tuple_issue.py
+new file mode 100644
+index 000000000..4debe5653
+--- /dev/null
++++ b/test_tuple_issue.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the tuple default argument issue.
++"""
++
++import inspect
++import tempfile
++import os
++from sphinx.util.inspect import object_description, stringify_signature
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++def test_function(lines, color=(1, 1, 1), width=5, label=None, name=None):
++    """Test function with tuple default argument."""
++    pass
++
++class TestClass:
++    def add_lines(self, lines, color=(1, 1, 1), width=5, label=None, name=None):
++        """Test method with tuple default argument."""
++        pass
++
++def test_object_description():
++    """Test object_description function with tuple."""
++    tuple_value = (1, 1, 1)
++    result = object_description(tuple_value)
++    print(f"object_description((1, 1, 1)) = '{result}'")
++    return result
++
++def test_stringify_signature():
++    """Test stringify_signature function."""
++    sig = inspect.signature(test_function)
++    result = stringify_signature(sig)
++    print(f"stringify_signature result: '{result}'")
++    return result
++
++def test_autodoc_full_pipeline():
++    """Test the full autodoc pipeline with Sphinx."""
++    print("Testing full autodoc pipeline...")
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = os.path.join(tmpdir, 'source')
++        outdir = os.path.join(tmpdir, 'build')
++        doctreedir = os.path.join(tmpdir, 'doctrees')
++        
++        os.makedirs(srcdir)
++        
++        # Create conf.py
++        conf_content = '''
++extensions = ['sphinx.ext.autodoc']
++'''
++        with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++            f.write(conf_content)
++        
++        # Create index.rst with autodoc directive
++        index_content = '''
++Test Documentation
++==================
++
++.. autofunction:: test_tuple_issue.test_function
++
++.. automethod:: test_tuple_issue.TestClass.add_lines
++'''
++        with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++            f.write(index_content)
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++            app.build()
++        
++        # Read the generated HTML
++        html_file = os.path.join(outdir, 'index.html')
++        if os.path.exists(html_file):
++            with open(html_file, 'r') as f:
++                html_content = f.read()
++            
++            print("Generated HTML content (signature parts):")
++            # Look for the signature in the HTML
++            import re
++            sig_pattern = r'<em class="sig-param">.*?color.*?</em>'
++            matches = re.findall(sig_pattern, html_content, re.DOTALL)
++            for match in matches:
++                print(f"Found signature: {match}")
++            
++            # Check for the specific issue
++            if "color=1, 1, 1" in html_content:
++                print("✗ BUG CONFIRMED: Tuple parentheses missing in HTML output")
++                return False
++            elif "color=(1, 1, 1)" in html_content:
++                print("✓ Tuple parentheses preserved in HTML output")
++                return True
++            else:
++                print("? Could not find color parameter in HTML output")
++                return None
++        else:
++            print("HTML file not generated")
++            return None
++
++if __name__ == "__main__":
++    print("Testing tuple default argument issue...")
++    print()
++    
++    # Test object_description
++    obj_desc_result = test_object_description()
++    
++    # Test stringify_signature
++    sig_result = test_stringify_signature()
++    
++    print()
++    print("Expected: (lines, color=(1, 1, 1), width=5, label=None, name=None)")
++    print(f"Actual:   {sig_result}")
++    
++    # Check if the issue exists
++    if "(1, 1, 1)" in sig_result:
++        print("✓ Tuple parentheses are preserved in stringify_signature")
++    else:
++        print("✗ Tuple parentheses are missing in stringify_signature - BUG CONFIRMED")
++    
++    print()
++    
++    # Test full autodoc pipeline
++    test_autodoc_full_pipeline()
+\ No newline at end of file
+diff --git a/test_type_annotations.py b/test_type_annotations.py
+new file mode 100644
+index 000000000..e41b900b1
+--- /dev/null
++++ b/test_type_annotations.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""
++Test type annotations to see if our fix breaks them.
++"""
++
++import tempfile
++import os
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++from typing import Tuple
++
++def test_function_with_type_annotation(x: Tuple[int, int]) -> None:
++    """Test function with type annotation."""
++    pass
++
++def test_function_with_tuple_default_and_annotation(color: Tuple[int, int, int] = (1, 1, 1)) -> None:
++    """Test function with both type annotation and tuple default."""
++    pass
++
++def test_type_annotations():
++    """Test that type annotations still work correctly."""
++    print("Testing type annotations...")
++    
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        srcdir = os.path.join(tmpdir, 'source')
++        outdir = os.path.join(tmpdir, 'build')
++        doctreedir = os.path.join(tmpdir, 'doctrees')
++        
++        os.makedirs(srcdir)
++        
++        # Create conf.py
++        conf_content = '''
++extensions = ['sphinx.ext.autodoc']
++'''
++        with open(os.path.join(srcdir, 'conf.py'), 'w') as f:
++            f.write(conf_content)
++        
++        # Create index.rst with autodoc directive
++        index_content = '''
++Test Documentation
++==================
++
++.. autofunction:: test_type_annotations.test_function_with_type_annotation
++
++.. autofunction:: test_type_annotations.test_function_with_tuple_default_and_annotation
++'''
++        with open(os.path.join(srcdir, 'index.rst'), 'w') as f:
++            f.write(index_content)
++        
++        # Build the documentation
++        with docutils_namespace():
++            app = Sphinx(srcdir, srcdir, outdir, doctreedir, 'html')
++            app.build()
++        
++        # Read the generated HTML
++        html_file = os.path.join(outdir, 'index.html')
++        if os.path.exists(html_file):
++            with open(html_file, 'r') as f:
++                html_content = f.read()
++            
++            print("Generated HTML content (relevant parts):")
++            # Look for type annotations
++            import re
++            
++            # Extract relevant parts
++            lines = html_content.split('\n')
++            for line in lines:
++                if 'Tuple' in line or 'default_value' in line or 'sig-param' in line:
++                    print(f"  {line.strip()}")
++            
++            # Look for Tuple type annotations
++            if "Tuple[(int, int)]" in html_content:
++                print("✗ Type annotation has extra parentheses: Tuple[(int, int)]")
++                return False
++            elif "Tuple[int, int]" in html_content:
++                print("✓ Type annotation looks correct: Tuple[int, int]")
++            
++            # Look for default values
++            if "=(1, 1, 1)" in html_content:
++                print("✓ Default tuple value has parentheses: =(1, 1, 1)")
++                return True
++            elif "=1, 1, 1" in html_content:
++                print("✗ Default tuple value missing parentheses: =1, 1, 1")
++                return False
++            else:
++                print("? Could not find default tuple value")
++                return None
++        else:
++            print("HTML file not generated")
++            return None
++
++if __name__ == "__main__":
++    test_type_annotations()
+\ No newline at end of file
+diff --git a/tests/test_pycode_ast.py b/tests/test_pycode_ast.py
+index 9b12d24d5..61f6c5b8d 100644
+--- a/tests/test_pycode_ast.py
++++ b/tests/test_pycode_ast.py
+@@ -53,7 +53,7 @@ from sphinx.pycode import ast
+     ("+ a", "+ a"),                             # UAdd
+     ("- 1", "- 1"),                             # UnaryOp
+     ("- a", "- a"),                             # USub
+-    ("(1, 2, 3)", "1, 2, 3"),                   # Tuple
++    ("(1, 2, 3)", "(1, 2, 3)"),                 # Tuple
+     ("()", "()"),                               # Tuple (empty)
+ ])
+ def test_unparse(source, expected):

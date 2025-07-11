@@ -1,0 +1,83 @@
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -95,12 +95,80 @@
+     return data
+ 
+ 
++def _limit_choices_to_needs_distinct(limit_choices_to, model):
++    """
++    Check if applying limit_choices_to requires distinct() to avoid duplicates.
++    
++    Returns True if the limit_choices_to filter involves many-to-many relations
++    that could cause duplicate results when filtering.
++    """
++    if limit_choices_to is None:
++        return False
++    
++    # Import Q here to avoid circular imports
++    from django.db.models import Q
++    from django.db.models.constants import LOOKUP_SEP
++    from django.core.exceptions import FieldDoesNotExist
++    
++    def check_lookup_needs_distinct(lookup_path, opts):
++        """Check if a lookup path involves m2m relations."""
++        lookup_fields = lookup_path.split(LOOKUP_SEP)
++        # Go through the fields (following all relations) and look for an m2m.
++        for field_name in lookup_fields:
++            if field_name == 'pk':
++                field_name = opts.pk.name
++            try:
++                field = opts.get_field(field_name)
++            except FieldDoesNotExist:
++                # Ignore query lookups like __in, __exact, etc.
++                continue
++            else:
++                if hasattr(field, 'get_path_info'):
++                    # This field is a relation; update opts to follow the relation.
++                    path_info = field.get_path_info()
++                    opts = path_info[-1].to_opts
++                    if any(path.m2m for path in path_info):
++                        # This field is a m2m relation so distinct must be called.
++                        return True
++        return False
++    
++    def check_q_object(q_obj, opts):
++        """Recursively check Q object children for m2m lookups."""
++        if hasattr(q_obj, 'children'):
++            for child in q_obj.children:
++                if isinstance(child, Q):
++                    if check_q_object(child, opts):
++                        return True
++                elif isinstance(child, tuple) and len(child) == 2:
++                    # This is a lookup tuple (field_name, value)
++                    field_name = child[0]
++                    if check_lookup_needs_distinct(field_name, opts):
++                        return True
++        return False
++    
++    opts = model._meta
++    
++    if isinstance(limit_choices_to, Q):
++        return check_q_object(limit_choices_to, opts)
++    elif isinstance(limit_choices_to, dict):
++        # Check each key in the dictionary
++        for lookup_path in limit_choices_to.keys():
++            if check_lookup_needs_distinct(lookup_path, opts):
++                return True
++    
++    return False
++
++
+ def apply_limit_choices_to_to_formfield(formfield):
+     """Apply limit_choices_to to the formfield's queryset if needed."""
+     if hasattr(formfield, 'queryset') and hasattr(formfield, 'get_limit_choices_to'):
+         limit_choices_to = formfield.get_limit_choices_to()
+         if limit_choices_to is not None:
+             formfield.queryset = formfield.queryset.complex_filter(limit_choices_to)
++            
++            # Check if we need to call distinct() to avoid duplicates from joins
++            if _limit_choices_to_needs_distinct(limit_choices_to, formfield.queryset.model):
++                formfield.queryset = formfield.queryset.distinct()
+ 
+ 
+ def fields_for_model(model, fields=None, exclude=None, widgets=None,

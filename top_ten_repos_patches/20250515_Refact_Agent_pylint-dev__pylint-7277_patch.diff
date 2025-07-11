@@ -1,0 +1,101 @@
+diff --git a/Dockerfile b/Dockerfile
+index 7bde0a292..e79d16486 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,7 +1,30 @@
+-FROM python:3.10.0-alpine3.15
+ 
+-COPY ./ /tmp/build
+-WORKDIR /tmp/build
+-RUN python -m pip install . && rm -rf /tmp/build
++FROM swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-7277:latest
+ 
+-ENTRYPOINT ["pylint"]
++WORKDIR /install
++# Install docker cli
++# Add Docker's official GPG key:
++RUN apt-get update
++RUN apt-get install -y ca-certificates curl
++RUN install -m 0755 -d /etc/apt/keyrings
++RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
++RUN chmod a+r /etc/apt/keyrings/docker.asc
++
++# Add the repository to Apt sources:
++RUN echo   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu   $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" |   tee /etc/apt/sources.list.d/docker.list > /dev/null
++RUN apt-get update && apt-get install -y docker-ce-cli
++
++# Install required dependencies for SWE-bench (verification)
++RUN apt-get install -y -V ca-certificates lsb-release wget
++RUN wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
++RUN apt-get update
++RUN apt-get install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
++
++# Install SWE repo
++RUN git clone https://github.com/princeton-nlp/SWE-bench.git /SWE-bench
++WORKDIR /SWE-bench
++RUN apt-get install -y python3-venv
++RUN python3 -m venv .venv
++RUN . .venv/bin/activate      &&     pip install --upgrade pip &&     pip install . 
++
++WORKDIR /testbed
+diff --git a/pylint/__init__.py b/pylint/__init__.py
+index 9f3dd74e6..d8160a97d 100644
+--- a/pylint/__init__.py
++++ b/pylint/__init__.py
+@@ -86,7 +86,7 @@ def modify_sys_path() -> None:
+     stdlib or pylint's own modules.
+     CPython issue: https://bugs.python.org/issue33053
+ 
+-    - Remove the first entry. This will always be either "" or the working directory
++    - Remove the first entry if it is either "", "." or the working directory
+     - Remove the working directory from the second and third entries
+       if PYTHONPATH includes a ":" at the beginning or the end.
+       https://github.com/PyCQA/pylint/issues/3636
+@@ -96,13 +96,43 @@ def modify_sys_path() -> None:
+       if pylint is installed in an editable configuration (as the last item).
+       https://github.com/PyCQA/pylint/issues/4161
+     """
+-    sys.path.pop(0)
+-    env_pythonpath = os.environ.get("PYTHONPATH", "")
+     cwd = os.getcwd()
+-    if env_pythonpath.startswith(":") and env_pythonpath not in (f":{cwd}", ":."):
++
++    # ------------------------------------------------------------------ #
++    # 1.  Remove an implicit "current directory" entry if it is present
++    #     at the *front* of sys.path.  Do **not** touch any other value;
++    #     callers might have inserted their own directory at position 0.
++    # ------------------------------------------------------------------ #
++    if sys.path and sys.path[0] in ("", ".", cwd):
+         sys.path.pop(0)
++
++    env_pythonpath = os.environ.get("PYTHONPATH", "")
++
++    # ------------------------------------------------------------------ #
++    # 2.  If PYTHONPATH starts with ":" the interpreter prepends an extra
++    #     entry for CWD *after* the one handled above.  Conversely, when
++    #     PYTHONPATH ends with ":" an additional CWD entry is appended
++    #     right after the PYTHONPATH items – this lands at index 1 once
++    #     the first element has been stripped.
++    #
++    #     We want to drop *that* duplicate, but we must not remove an
++    #     unrelated user supplied path occupying index 0.
++    # ------------------------------------------------------------------ #
++    def _remove_duplicate_after_first() -> None:
++        """Remove CWD / '' / '.' if it sits in the 2nd slot (idx 1)."""
++        if len(sys.path) > 1 and sys.path[1] in ("", ".", cwd):
++            sys.path.pop(1)
++
++    if env_pythonpath.startswith(":") and env_pythonpath not in (f":{cwd}", ":."):
++        # Duplicate is now either at idx 0 (if the first pop above
++        # didn't run) or at idx 1 (if it did).  Prefer idx 0 but never
++        # delete a foreign entry.
++        if sys.path and sys.path[0] in ("", ".", cwd):
++            sys.path.pop(0)
++        else:
++            _remove_duplicate_after_first()
+     elif env_pythonpath.endswith(":") and env_pythonpath not in (f"{cwd}:", ".:"):
+-        sys.path.pop(1)
++        _remove_duplicate_after_first()
+ 
+ 
+ version = __version__

@@ -1,0 +1,99 @@
+diff --git a/changelog/5912.bugfix.rst b/changelog/5912.bugfix.rst
+new file mode 100644
+index 000000000..d92584c6b
+--- /dev/null
++++ b/changelog/5912.bugfix.rst
+@@ -0,0 +1,4 @@
++Regression fix: Only import ``__init__.py`` files selectively. Previously pytest 5.2.3 would
++try to import any ``__init__.py`` file under the current directory, even those that should be excluded from test
++collection. This could cause failures if any excluded ``__init__.py`` file contains code that is not compatible with
++the test environment (e.g. Windows-specific imports on a Linux environment).
+\ No newline at end of file
+diff --git a/src/_pytest/python.py b/src/_pytest/python.py
+index 306e5f217..cc7952842 100644
+--- a/src/_pytest/python.py
++++ b/src/_pytest/python.py
+@@ -508,6 +508,43 @@ class Module(nodes.File, PyCollector):
+     def _importtestmodule(self):
+         # we assume we are only called once per module
+         importmode = self.config.getoption("--import-mode")
++        
++        # Only attempt to import __init__.py if it matches the python_files pattern
++        # or it is being imported as part of a package path
++        # Check if we're dealing with a potentially problematic __init__.py file
++        if (self.fspath.basename == "__init__.py" and not self.session.isinitpath(self.fspath)):
++            # If this is a test directory, always import the __init__.py
++            # to support skipping packages with pytestmark
++            dirname = self.fspath.dirpath().basename
++            parent_path = self.parent.fspath
++            
++            # For Package parent (collecting a package), always import the __init__.py
++            if isinstance(self.parent, Package):
++                pass  # Always import package's __init__.py
++            # If we're in a directory containing test files, always import the __init__.py
++            # to support package-level pytestmark
++            elif path_matches_patterns(self.fspath, self.config.getini("python_files")):
++                pass  # Always import __init__.py files that match python_files patterns
++            else:
++                # Look for test files in the same directory
++                has_test_files = False
++                for sibling in self.fspath.dirpath().listdir():
++                    if (sibling.basename != "__init__.py" and 
++                        sibling.isfile() and 
++                        sibling.ext == ".py" and
++                        path_matches_patterns(sibling, self.config.getini("python_files"))):
++                        has_test_files = True
++                        break
++                        
++                # If this directory doesn't contain test files, don't import the __init__.py
++                if not has_test_files:
++                    from types import ModuleType
++                    
++                    # Create an empty module rather than actually importing it
++                    mod = ModuleType(self.fspath.purebasename)
++                    mod.__file__ = str(self.fspath)
++                    return mod
++            
+         try:
+             mod = self.fspath.pyimport(ensuresyspath=importmode)
+         except SyntaxError:
+diff --git a/testing/test_collection_init_py_regression.py b/testing/test_collection_init_py_regression.py
+new file mode 100644
+index 000000000..1a5789084
+--- /dev/null
++++ b/testing/test_collection_init_py_regression.py
+@@ -0,0 +1,33 @@
++"""
++Test for the issue where pytest tries to collect random __init__.py files.
++"""
++
++import os
++import sys
++import py
++
++
++def test_init_py_not_collected_in_non_test_dir(testdir):
++    """
++    Verify that pytest doesn't try to import __init__.py files in non-test directories.
++    """
++    # Create a module that will fail when imported
++    testdir.tmpdir.join("foobar").ensure(dir=True)
++    testdir.tmpdir.join("foobar", "__init__.py").write("assert False")
++    
++    # Create a test file
++    testdir.makepyfile(
++        test_foo="""
++        def test_foo():
++            assert True
++        """
++    )
++    
++    # Run pytest
++    result = testdir.runpytest()
++    
++    # Verify that the test passed
++    result.assert_outcomes(passed=1)
++    
++    # Verify that the __init__.py file was not imported
++    assert "E   AssertionError" not in result.stdout.str()
+\ No newline at end of file

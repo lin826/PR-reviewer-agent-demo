@@ -1,0 +1,896 @@
+diff --git a/debug_in_lookup.py b/debug_in_lookup.py
+new file mode 100644
+index 0000000000..71bcaf3199
+--- /dev/null
++++ b/debug_in_lookup.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Q, Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models similar to the issue description
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    created = models.DateTimeField(auto_now_add=True)
++    updated = models.DateTimeField(auto_now=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup, through='ManagementAgentPropertyGroup')
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    property_group = models.ForeignKey(PropertyGroup, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class TicketRating(models.Model):
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    rating = models.IntegerField()
++    date = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def main():
++    # Create tables
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(PropertyGroup)
++        schema_editor.create_model(ManagementAgent)
++        schema_editor.create_model(ManagementAgentPropertyGroup)
++        schema_editor.create_model(TicketRating)
++    
++    # Create test data
++    pg1 = PropertyGroup.objects.create(name="Group 1")
++    pg2 = PropertyGroup.objects.create(name="Group 2")
++    
++    agent1 = ManagementAgent.objects.create(name="Agent 1")
++    agent2 = ManagementAgent.objects.create(name="Agent 2")
++    
++    # Add property groups to agents
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent1, property_group=pg1)
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent2, property_group=pg2)
++    
++    # Create ticket ratings
++    TicketRating.objects.create(agent=agent1, rating=5)
++    TicketRating.objects.create(agent=agent2, rating=4)
++    
++    # Test the In lookup directly
++    property_groups = PropertyGroup.objects.all()
++    
++    print("=== Testing In lookup directly ===")
++    print("property_groups.query.has_select_fields:", property_groups.query.has_select_fields)
++    print("property_groups.query.default_cols:", property_groups.query.default_cols)
++    print("property_groups.query.select:", property_groups.query.select)
++    
++    # Let's manually test the In lookup logic
++    print("\n=== Testing In lookup logic ===")
++    
++    # Check the condition that should trigger the fix
++    has_select_fields_qs = getattr(property_groups, 'has_select_fields', True)
++    has_select_fields_query = getattr(property_groups.query, 'has_select_fields', True)
++    print("getattr(property_groups, 'has_select_fields', True):", has_select_fields_qs)
++    print("getattr(property_groups.query, 'has_select_fields', True):", has_select_fields_query)
++    
++    # The In lookup is using the wrong object!
++    print("QuerySet has has_select_fields attribute:", hasattr(property_groups, 'has_select_fields'))
++    print("Query has has_select_fields attribute:", hasattr(property_groups.query, 'has_select_fields'))
++    
++    if not has_select_fields_query:
++        print("Condition met - should clear select clause and add pk")
++        
++        # Make a copy to test
++        test_qs = property_groups._clone()
++        print("Before clear_select_clause:")
++        print("  has_select_fields:", test_qs.query.has_select_fields)
++        print("  default_cols:", test_qs.query.default_cols)
++        print("  select:", test_qs.query.select)
++        print("  query:", test_qs.query)
++        
++        test_qs.query.clear_select_clause()
++        test_qs.query.add_fields(['pk'])
++        
++        print("After clear_select_clause and add_fields(['pk']):")
++        print("  has_select_fields:", test_qs.query.has_select_fields)
++        print("  default_cols:", test_qs.query.default_cols)
++        print("  select:", test_qs.query.select)
++        print("  query:", test_qs.query)
++    else:
++        print("Condition not met - would not modify query")
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 5089737034..9bba640578 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -117,6 +117,11 @@ class Lookup:
+     def get_group_by_cols(self, alias=None):
+         cols = self.lhs.get_group_by_cols()
+         if hasattr(self.rhs, 'get_group_by_cols'):
++            # Apply the same fix as in In.process_rhs for subqueries
++            if hasattr(self.rhs, 'has_select_fields') and not self.rhs.has_select_fields:
++                # This is a Query object that should only select the primary key
++                self.rhs.clear_select_clause()
++                self.rhs.add_fields(['pk'])
+             cols.extend(self.rhs.get_group_by_cols())
+         return cols
+ 
+@@ -401,7 +406,15 @@ class In(FieldGetDbPrepValueIterableMixin, BuiltinLookup):
+             placeholder = '(' + ', '.join(sqls) + ')'
+             return (placeholder, sqls_params)
+         else:
+-            if not getattr(self.rhs, 'has_select_fields', True):
++            # Check if rhs is a QuerySet or Query object and get the appropriate has_select_fields
++            if hasattr(self.rhs, 'query'):
++                # self.rhs is a QuerySet
++                has_select_fields = self.rhs.query.has_select_fields
++            else:
++                # self.rhs is likely a Query object
++                has_select_fields = getattr(self.rhs, 'has_select_fields', True)
++            
++            if not has_select_fields:
+                 self.rhs.clear_select_clause()
+                 self.rhs.add_fields(['pk'])
+             return super().process_rhs(compiler, connection)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..92c0f86e11
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Q, Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models similar to the issue description
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    created = models.DateTimeField(auto_now_add=True)
++    updated = models.DateTimeField(auto_now=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup, through='ManagementAgentPropertyGroup')
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    property_group = models.ForeignKey(PropertyGroup, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class TicketRating(models.Model):
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    rating = models.IntegerField()
++    date = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def main():
++    # Create tables
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(PropertyGroup)
++        schema_editor.create_model(ManagementAgent)
++        schema_editor.create_model(ManagementAgentPropertyGroup)
++        schema_editor.create_model(TicketRating)
++    
++    # Create test data
++    pg1 = PropertyGroup.objects.create(name="Group 1")
++    pg2 = PropertyGroup.objects.create(name="Group 2")
++    
++    agent1 = ManagementAgent.objects.create(name="Agent 1")
++    agent2 = ManagementAgent.objects.create(name="Agent 2")
++    
++    # Add property groups to agents
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent1, property_group=pg1)
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent2, property_group=pg2)
++    
++    # Create ticket ratings
++    TicketRating.objects.create(agent=agent1, rating=5)
++    TicketRating.objects.create(agent=agent2, rating=4)
++    
++    # Test the problematic query
++    property_groups = PropertyGroup.objects.all()
++    
++    print("Testing the problematic query...")
++    print("property_groups QuerySet:", property_groups)
++    print("property_groups has_select_fields:", getattr(property_groups.query, 'has_select_fields', 'N/A'))
++    print("property_groups default_cols:", getattr(property_groups.query, 'default_cols', 'N/A'))
++    print("property_groups select:", getattr(property_groups.query, 'select', 'N/A'))
++    
++    # This should work (using id__in with values_list)
++    try:
++        print("\n=== Working query (using id__in with values_list) ===")
++        queryset = TicketRating.objects.annotate(Count("agent__property_groups"))
++        working_query = queryset.filter(
++            Q(agent__property_groups__id__in=property_groups.values_list("id", flat=True))
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++        print("Working query SQL:", working_query.query)
++        print("Working query results:", list(working_query))
++    except Exception as e:
++        print("Working query failed:", e)
++    
++    # This should fail (using __in with QuerySet)
++    try:
++        print("\n=== Problematic query (using __in with QuerySet) ===")
++        queryset = TicketRating.objects.annotate(Count("agent__property_groups"))
++        problematic_query = queryset.filter(
++            Q(agent__property_groups__in=property_groups)
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++        print("Problematic query SQL:", problematic_query.query)
++        
++        # Let's also check the compiler output
++        from django.db import connection
++        compiler = problematic_query.query.get_compiler(connection.alias)
++        sql, params = compiler.as_sql()
++        print("Compiled SQL:", sql)
++        print("Params:", params)
++        
++        # Check if the subquery has multiple columns
++        sql_str = str(problematic_query.query)
++        
++        # Split the SQL to analyze different parts
++        print("\n--- SQL Analysis ---")
++        
++        # Look for subqueries in GROUP BY
++        import re
++        group_by_subqueries = re.findall(r'GROUP BY[^H]+', sql_str)
++        if group_by_subqueries:
++            print("GROUP BY section:", group_by_subqueries[0])
++            
++        # Look for subqueries in HAVING
++        having_subqueries = re.findall(r'HAVING[^$]+', sql_str)
++        if having_subqueries:
++            print("HAVING section:", having_subqueries[0])
++        
++        # Look for the problematic pattern - subquery with multiple columns
++        multi_col_pattern = r'\(SELECT "[^"]+"\."[^"]+", "[^"]+"\."[^"]+"[^)]*\)'
++        multi_col_matches = re.findall(multi_col_pattern, sql_str)
++        
++        if multi_col_matches:
++            print("❌ BUG DETECTED: Found subqueries selecting multiple columns:")
++            for match in multi_col_matches:
++                print("  ", match)
++            print("This would cause 'subquery must return only one column' error in PostgreSQL")
++        else:
++            print("✅ Query looks correct - all subqueries only select single columns")
++            
++        print("Problematic query results:", list(problematic_query))
++    except Exception as e:
++        print("Problematic query failed:", e)
++        import traceback
++        traceback.print_exc()
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_cloning.py b/test_cloning.py
+new file mode 100644
+index 0000000000..35e9546a19
+--- /dev/null
++++ b/test_cloning.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Q, Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models similar to the issue description
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup, through='ManagementAgentPropertyGroup')
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    property_group = models.ForeignKey(PropertyGroup, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class TicketRating(models.Model):
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    rating = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++def main():
++    # Create tables
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(PropertyGroup)
++        schema_editor.create_model(ManagementAgent)
++        schema_editor.create_model(ManagementAgentPropertyGroup)
++        schema_editor.create_model(TicketRating)
++    
++    # Create test data
++    pg1 = PropertyGroup.objects.create(name="Group 1")
++    pg2 = PropertyGroup.objects.create(name="Group 2")
++    
++    agent1 = ManagementAgent.objects.create(name="Agent 1")
++    agent2 = ManagementAgent.objects.create(name="Agent 2")
++    
++    # Add property groups to agents
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent1, property_group=pg1)
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent2, property_group=pg2)
++    
++    # Create ticket ratings
++    TicketRating.objects.create(agent=agent1, rating=5)
++    TicketRating.objects.create(agent=agent2, rating=4)
++    
++    # Test a simpler case first - just the In lookup without OR
++    property_groups = PropertyGroup.objects.all()
++    
++    print("=== Testing simple In lookup ===")
++    simple_query = TicketRating.objects.filter(agent__property_groups__in=property_groups)
++    
++    from django.db import connection
++    compiler = simple_query.query.get_compiler(connection.alias)
++    sql, params = compiler.as_sql()
++    
++    print("Simple query SQL:")
++    print(sql)
++    
++    # Check if this works correctly
++    if 'SELECT "__main___propertygroup"."id", "__main___propertygroup"."name"' in sql:
++        print("❌ Simple query also has the issue")
++    else:
++        print("✅ Simple query works correctly")
++    
++    print("\n=== Testing OR query ===")
++    # Now test the OR query
++    or_query = TicketRating.objects.annotate(Count("agent__property_groups")).filter(
++        Q(agent__property_groups__in=property_groups) | Q(agent__property_groups__count=0)
++    )
++    
++    compiler = or_query.query.get_compiler(connection.alias)
++    sql, params = compiler.as_sql()
++    
++    print("OR query SQL:")
++    print(sql)
++    
++    # Check if this works correctly
++    if 'SELECT "__main___propertygroup"."id", "__main___propertygroup"."name"' in sql:
++        print("❌ OR query has the issue")
++    else:
++        print("✅ OR query works correctly")
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000000..7335147b11
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Q, Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models similar to the issue description
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    created = models.DateTimeField(auto_now_add=True)
++    updated = models.DateTimeField(auto_now=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup, through='ManagementAgentPropertyGroup')
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    property_group = models.ForeignKey(PropertyGroup, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class TicketRating(models.Model):
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    rating = models.IntegerField()
++    date = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def main():
++    # Create tables
++    from django.core.management import execute_from_command_line
++    from django.db import connection
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(PropertyGroup)
++        schema_editor.create_model(ManagementAgent)
++        schema_editor.create_model(ManagementAgentPropertyGroup)
++        schema_editor.create_model(TicketRating)
++    
++    # Create test data
++    pg1 = PropertyGroup.objects.create(name="Group 1")
++    pg2 = PropertyGroup.objects.create(name="Group 2")
++    
++    agent1 = ManagementAgent.objects.create(name="Agent 1")
++    agent2 = ManagementAgent.objects.create(name="Agent 2")
++    
++    # Add property groups to agents
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent1, property_group=pg1)
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent2, property_group=pg2)
++    
++    # Create ticket ratings
++    TicketRating.objects.create(agent=agent1, rating=5)
++    TicketRating.objects.create(agent=agent2, rating=4)
++    
++    # Test the fix by checking the compiled SQL
++    property_groups = PropertyGroup.objects.all()
++    
++    print("=== Testing the fix ===")
++    
++    # Create the problematic query
++    queryset = TicketRating.objects.annotate(Count("agent__property_groups"))
++    problematic_query = queryset.filter(
++        Q(agent__property_groups__in=property_groups)
++        | Q(agent__property_groups__count=0)
++    ).distinct()
++    
++    # Get the compiled SQL
++    from django.db import connection
++    compiler = problematic_query.query.get_compiler(connection.alias)
++    sql, params = compiler.as_sql()
++    
++    print("Compiled SQL:")
++    print(sql)
++    print("Params:", params)
++    
++    # Check if the fix worked
++    if '(SELECT "__main___propertygroup"."id", "__main___propertygroup"."name"' in sql:
++        print("❌ FIX FAILED: Subquery still selects multiple columns")
++        return False
++    elif '(SELECT "__main___propertygroup"."id" FROM "__main___propertygroup")' in sql:
++        print("✅ FIX SUCCESSFUL: Subquery only selects the primary key")
++        return True
++    else:
++        print("⚠️  UNCLEAR: Could not determine if fix worked")
++        return False
++
++if __name__ == '__main__':
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_q_object_in_or_regression.py b/test_q_object_in_or_regression.py
+new file mode 100644
+index 0000000000..f33d7ee493
+--- /dev/null
++++ b/test_q_object_in_or_regression.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python
++"""
++Test case for the Q object __in with QuerySet in OR operations issue.
++
++This test ensures that when using Q objects with OR operations and __in lookups
++that reference QuerySets, the generated subqueries only select the primary key
++and don't cause "subquery must return only one column" errors.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Q, Count
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models similar to the issue description
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    created = models.DateTimeField(auto_now_add=True)
++    updated = models.DateTimeField(auto_now=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup, through='ManagementAgentPropertyGroup')
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    property_group = models.ForeignKey(PropertyGroup, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class TicketRating(models.Model):
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    rating = models.IntegerField()
++    date = models.DateTimeField(auto_now_add=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class QObjectInOrRegressionTest(TestCase):
++    """Test case for Q object __in with QuerySet in OR operations."""
++    
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        # Create tables
++        from django.db import connection
++        from django.core.management import call_command
++        
++        # Use Django's migration system to create tables
++        call_command('migrate', verbosity=0, interactive=False, run_syncdb=True)
++    
++    def setUp(self):
++        # Create test data
++        self.pg1 = PropertyGroup.objects.create(name="Group 1")
++        self.pg2 = PropertyGroup.objects.create(name="Group 2")
++        
++        self.agent1 = ManagementAgent.objects.create(name="Agent 1")
++        self.agent2 = ManagementAgent.objects.create(name="Agent 2")
++        
++        # Add property groups to agents
++        ManagementAgentPropertyGroup.objects.create(management_agent=self.agent1, property_group=self.pg1)
++        ManagementAgentPropertyGroup.objects.create(management_agent=self.agent2, property_group=self.pg2)
++        
++        # Create ticket ratings
++        self.rating1 = TicketRating.objects.create(agent=self.agent1, rating=5)
++        self.rating2 = TicketRating.objects.create(agent=self.agent2, rating=4)
++    
++    def test_q_object_in_with_queryset_in_or_operation(self):
++        """
++        Test that Q objects with __in lookups using QuerySets in OR operations
++        generate correct SQL with single-column subqueries.
++        """
++        property_groups = PropertyGroup.objects.all()
++        
++        # This query should work without "subquery must return only one column" errors
++        queryset = TicketRating.objects.annotate(Count("agent__property_groups")).filter(
++            Q(agent__property_groups__in=property_groups)
++            | Q(agent__property_groups__count=0)
++        ).distinct()
++        
++        # Get the compiled SQL
++        from django.db import connection
++        compiler = queryset.query.get_compiler(connection.alias)
++        sql, params = compiler.as_sql()
++        
++        # Verify that all subqueries only select single columns
++        # There should be no subqueries with multiple columns like:
++        # SELECT "table"."id", "table"."name", "table"."created", "table"."updated"
++        self.assertNotIn('"name", "', sql, 
++                        "Subquery should not select multiple columns")
++        self.assertNotIn('"created", "', sql,
++                        "Subquery should not select multiple columns")
++        self.assertNotIn('"updated"', sql,
++                        "Subquery should not select multiple columns")
++        
++        # Verify that the query executes successfully
++        results = list(queryset)
++        self.assertEqual(len(results), 2)
++        self.assertIn(self.rating1, results)
++        self.assertIn(self.rating2, results)
++    
++    def test_simple_in_lookup_still_works(self):
++        """
++        Test that simple __in lookups (without OR) still work correctly.
++        """
++        property_groups = PropertyGroup.objects.all()
++        
++        # Simple __in lookup should work as before
++        queryset = TicketRating.objects.filter(agent__property_groups__in=property_groups)
++        
++        # Get the compiled SQL
++        from django.db import connection
++        compiler = queryset.query.get_compiler(connection.alias)
++        sql, params = compiler.as_sql()
++        
++        # Verify that the subquery only selects the primary key
++        self.assertIn('SELECT "__main___propertygroup"."id" FROM', sql)
++        self.assertNotIn('"name"', sql)
++        
++        # Verify that the query executes successfully
++        results = list(queryset)
++        self.assertEqual(len(results), 2)
++        self.assertIn(self.rating1, results)
++        self.assertIn(self.rating2, results)
++
++if __name__ == '__main__':
++    import unittest
++    unittest.main()
+\ No newline at end of file
+diff --git a/test_regression_simple.py b/test_regression_simple.py
+new file mode 100644
+index 0000000000..2c6919ff62
+--- /dev/null
++++ b/test_regression_simple.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python
++"""
++Simple test to verify the Q object __in with QuerySet in OR operations fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import Q, Count
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Define models similar to the issue description
++class PropertyGroup(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgent(models.Model):
++    name = models.CharField(max_length=100)
++    property_groups = models.ManyToManyField(PropertyGroup, through='ManagementAgentPropertyGroup')
++    
++    class Meta:
++        app_label = '__main__'
++
++class ManagementAgentPropertyGroup(models.Model):
++    management_agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    property_group = models.ForeignKey(PropertyGroup, on_delete=models.CASCADE)
++    
++    class Meta:
++        app_label = '__main__'
++
++class TicketRating(models.Model):
++    agent = models.ForeignKey(ManagementAgent, on_delete=models.CASCADE)
++    rating = models.IntegerField()
++    
++    class Meta:
++        app_label = '__main__'
++
++def test_q_object_in_or_fix():
++    """Test that the Q object __in with QuerySet in OR operations fix works."""
++    
++    # Create tables
++    from django.db import connection
++    
++    with connection.cursor() as cursor:
++        cursor.execute('PRAGMA foreign_keys = OFF')
++    
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(PropertyGroup)
++        schema_editor.create_model(ManagementAgent)
++        schema_editor.create_model(ManagementAgentPropertyGroup)
++        schema_editor.create_model(TicketRating)
++    
++    with connection.cursor() as cursor:
++        cursor.execute('PRAGMA foreign_keys = ON')
++    
++    # Create test data
++    pg1 = PropertyGroup.objects.create(name="Group 1")
++    pg2 = PropertyGroup.objects.create(name="Group 2")
++    
++    agent1 = ManagementAgent.objects.create(name="Agent 1")
++    agent2 = ManagementAgent.objects.create(name="Agent 2")
++    
++    # Add property groups to agents
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent1, property_group=pg1)
++    ManagementAgentPropertyGroup.objects.create(management_agent=agent2, property_group=pg2)
++    
++    # Create ticket ratings
++    TicketRating.objects.create(agent=agent1, rating=5)
++    TicketRating.objects.create(agent=agent2, rating=4)
++    
++    # Test the problematic query that should now work
++    property_groups = PropertyGroup.objects.all()
++    
++    queryset = TicketRating.objects.annotate(Count("agent__property_groups")).filter(
++        Q(agent__property_groups__in=property_groups)
++        | Q(agent__property_groups__count=0)
++    ).distinct()
++    
++    # Get the compiled SQL
++    compiler = queryset.query.get_compiler(connection.alias)
++    sql, params = compiler.as_sql()
++    
++    print("Generated SQL:")
++    print(sql)
++    print("Params:", params)
++    
++    # Check that all subqueries only select single columns
++    if '"name"' in sql and 'SELECT "__main___propertygroup"."id", "__main___propertygroup"."name"' in sql:
++        print("❌ FAIL: Subquery still selects multiple columns")
++        return False
++    else:
++        print("✅ PASS: All subqueries only select single columns")
++    
++    # Verify that the query executes successfully
++    try:
++        results = list(queryset)
++        print(f"✅ PASS: Query executed successfully, returned {len(results)} results")
++        return True
++    except Exception as e:
++        print(f"❌ FAIL: Query execution failed: {e}")
++        return False
++
++if __name__ == '__main__':
++    success = test_q_object_in_or_fix()
++    sys.exit(0 if success else 1)
+\ No newline at end of file

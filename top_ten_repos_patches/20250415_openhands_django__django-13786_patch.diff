@@ -1,0 +1,88 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index dddf7c679c..3a50a438e3 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -137,11 +137,20 @@ class CreateModel(ModelOperation):
+                 ),
+             ]
+         elif isinstance(operation, AlterModelOptions) and self.name_lower == operation.name_lower:
++            # First merge the options
++            merged_options = {**self.options, **operation.options}
++            
++            # Then remove any keys from ALTER_OPTION_KEYS that aren't in operation.options
++            # This is consistent with AlterModelOptions.state_forwards behavior
++            for key in AlterModelOptions.ALTER_OPTION_KEYS:
++                if key not in operation.options:
++                    merged_options.pop(key, None)
++            
+             return [
+                 CreateModel(
+                     self.name,
+                     fields=self.fields,
+-                    options={**self.options, **operation.options},
++                    options=merged_options,
+                     bases=self.bases,
+                     managers=self.managers,
+                 ),
+diff --git a/test_squash_migrations.py b/test_squash_migrations.py
+new file mode 100644
+index 0000000000..3da7949162
+--- /dev/null
++++ b/test_squash_migrations.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python
++import os
++import sys
++import unittest
++
++# Configure Django settings
++os.environ['DJANGO_SETTINGS_MODULE'] = 'django.conf.global_settings'
++import django
++from django.conf import settings
++settings.configure()
++django.setup()
++
++from django.db import migrations, models
++from django.db.migrations.operations.models import CreateModel, AlterModelOptions
++
++class TestMigrationSquash(unittest.TestCase):
++    """Test case to verify that squashmigrations correctly handles empty model options."""
++    
++    def test_create_model_reduce_with_empty_options(self):
++        """
++        Test that when AlterModelOptions with empty options is squashed into CreateModel,
++        the resulting CreateModel operation doesn't contain the original options.
++        """
++        # Create a model with verbose_name option
++        create_operation = CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            options={"verbose_name": "Test Model"}
++        )
++        
++        # Create an operation to clear the options
++        alter_operation = AlterModelOptions(
++            name="TestModel", 
++            options={}
++        )
++        
++        # Simulate squashing by reducing the operations
++        result = create_operation.reduce(alter_operation, "test_app")
++        
++        # The returned operation should be a CreateModel with no verbose_name option
++        self.assertIsInstance(result[0], CreateModel)
++        self.assertNotIn("verbose_name", result[0].options, 
++                        f"verbose_name should not be present in options: {result[0].options}")
++        
++        # Check if the result is equivalent to a CreateModel with empty options
++        expected = CreateModel(
++            name="TestModel",
++            fields=[("id", models.AutoField(primary_key=True))],
++            options={}
++        )
++        self.assertEqual(result[0].options, expected.options, 
++                        f"Options don't match. Got: {result[0].options}, Expected: {expected.options}")
++
++if __name__ == "__main__":
++    unittest.main()
+\ No newline at end of file

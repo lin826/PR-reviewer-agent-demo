@@ -1,0 +1,496 @@
+diff --git a/django/contrib/staticfiles/management/commands/collectstatic.py b/django/contrib/staticfiles/management/commands/collectstatic.py
+index f7e069b20b..1d65424531 100644
+--- a/django/contrib/staticfiles/management/commands/collectstatic.py
++++ b/django/contrib/staticfiles/management/commands/collectstatic.py
+@@ -130,7 +130,7 @@ class Command(BaseCommand):
+                     self.stderr.write("Post-processing '%s' failed!" % original_path)
+                     # Add a blank line before the traceback, otherwise it's
+                     # too easy to miss the relevant part of the error message.
+-                    self.stderr.write()
++                    self.stderr.write("\n")
+                     raise processed
+                 if processed:
+                     self.log("Post-processed '%s' as '%s'" %
+diff --git a/django/contrib/staticfiles/storage.py b/django/contrib/staticfiles/storage.py
+index 494890cc23..86da80df58 100644
+--- a/django/contrib/staticfiles/storage.py
++++ b/django/contrib/staticfiles/storage.py
+@@ -220,6 +220,8 @@ class HashedFilesMixin:
+ 
+         # where to store the new paths
+         hashed_files = {}
++        # Track final results for each file to avoid duplicate yields
++        final_results = {}
+ 
+         # build a list of adjustable files
+         adjustable_paths = [
+@@ -229,19 +231,24 @@ class HashedFilesMixin:
+         # Do a single pass first. Post-process all files once, then repeat for
+         # adjustable files.
+         for name, hashed_name, processed, _ in self._post_process(paths, adjustable_paths, hashed_files):
+-            yield name, hashed_name, processed
++            final_results[name] = (hashed_name, processed)
+ 
+         paths = {path: paths[path] for path in adjustable_paths}
+ 
+         for i in range(self.max_post_process_passes):
+             substitutions = False
+             for name, hashed_name, processed, subst in self._post_process(paths, adjustable_paths, hashed_files):
+-                yield name, hashed_name, processed
++                # Update the final result for this file
++                final_results[name] = (hashed_name, processed)
+                 substitutions = substitutions or subst
+ 
+             if not substitutions:
+                 break
+ 
++        # Yield final results for each file only once
++        for name, (hashed_name, processed) in final_results.items():
++            yield name, hashed_name, processed
++
+         if substitutions:
+             yield 'All', None, RuntimeError('Max post-process passes exceeded.')
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..3c813a7a5a
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,192 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the issue with HashedFilesMixin's post_process() 
++yielding multiple times for the same file.
++"""
++
++import os
++import tempfile
++import shutil
++from io import StringIO
++
++# Setup Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.contrib.staticfiles.management.commands.collectstatic import Command as CollectstaticCommand
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++from django.core.management import call_command
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATICFILES_FINDERS=[
++            'django.contrib.staticfiles.finders.FileSystemFinder',
++        ],
++        STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage',
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def create_test_files(temp_dir):
++    """Create test static files that will trigger the issue."""
++    static_dir = os.path.join(temp_dir, 'static')
++    os.makedirs(static_dir, exist_ok=True)
++    
++    # Create a CSS file that references another CSS file (adjustable file)
++    css_dir = os.path.join(static_dir, 'css')
++    os.makedirs(css_dir, exist_ok=True)
++    
++    # Main CSS file that imports another
++    with open(os.path.join(css_dir, 'main.css'), 'w') as f:
++        f.write('@import url("base.css");\nbody { color: red; }')
++    
++    # Base CSS file
++    with open(os.path.join(css_dir, 'base.css'), 'w') as f:
++        f.write('body { margin: 0; }')
++    
++    # A simple JS file (non-adjustable)
++    js_dir = os.path.join(static_dir, 'js')
++    os.makedirs(js_dir, exist_ok=True)
++    with open(os.path.join(js_dir, 'app.js'), 'w') as f:
++        f.write('console.log("Hello world");')
++    
++    return static_dir
++
++def test_post_process_duplicates():
++    """Test that demonstrates the duplicate yielding issue."""
++    with tempfile.TemporaryDirectory() as temp_dir:
++        static_dir = create_test_files(temp_dir)
++        static_root = os.path.join(temp_dir, 'collected')
++        
++        # Override settings for this test
++        from django.test import override_settings
++        
++        with override_settings(
++            STATICFILES_DIRS=[static_dir],
++            STATIC_ROOT=static_root,
++            STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
++        ):
++            # Capture stdout to see the duplicate messages
++            stdout = StringIO()
++            
++            # Create a custom command to track yielded files
++            class TrackingCollectstaticCommand(CollectstaticCommand):
++                def __init__(self, *args, **kwargs):
++                    super().__init__(*args, **kwargs)
++                    self.yielded_files = []
++                
++                def collect(self):
++                    """Override collect to track yielded files."""
++                    if self.symlink and not self.local:
++                        raise CommandError("Can't symlink to a remote destination.")
++
++                    if self.clear:
++                        self.clear_dir('')
++
++                    if self.symlink:
++                        handler = self.link_file
++                    else:
++                        handler = self.copy_file
++
++                    found_files = {}
++                    from django.contrib.staticfiles.finders import get_finders
++                    for finder in get_finders():
++                        for path, storage in finder.list(self.ignore_patterns):
++                            # Prefix the relative path if the source storage contains it
++                            if getattr(storage, 'prefix', None):
++                                prefixed_path = os.path.join(storage.prefix, path)
++                            else:
++                                prefixed_path = path
++
++                            if prefixed_path not in found_files:
++                                found_files[prefixed_path] = (storage, path)
++                                handler(path, prefixed_path, storage)
++
++                    # Storage backends may define a post_process() method.
++                    if self.post_process and hasattr(self.storage, 'post_process'):
++                        processor = self.storage.post_process(found_files, dry_run=self.dry_run)
++                        for original_path, processed_path, processed in processor:
++                            if isinstance(processed, Exception):
++                                self.stderr.write("Post-processing '%s' failed!" % original_path)
++                                self.stderr.write()
++                                raise processed
++                            if processed:
++                                self.log("Post-processed '%s' as '%s'" % (original_path, processed_path), level=2)
++                                self.post_processed_files.append(original_path)
++                                # Track yielded files
++                                self.yielded_files.append((original_path, processed_path))
++                            else:
++                                self.log("Skipped post-processing '%s'" % original_path)
++
++                    return {
++                        'modified': self.copied_files + self.symlinked_files,
++                        'unmodified': self.unmodified_files,
++                        'post_processed': self.post_processed_files,
++                    }
++            
++            # Run collectstatic with tracking
++            cmd = TrackingCollectstaticCommand()
++            cmd.set_options(
++                interactive=False,
++                verbosity=2,
++                link=False,
++                clear=True,
++                dry_run=False,
++                post_process=True,
++                use_default_ignore_patterns=True,
++                ignore_patterns=[],
++            )
++            cmd.stdout = stdout
++            
++            stats = cmd.collect()
++            
++            print("=== REPRODUCTION RESULTS ===")
++            print(f"Files copied/symlinked: {len(stats['modified'])}")
++            print(f"Files unmodified: {len(stats['unmodified'])}")
++            print(f"Files post-processed (count): {len(stats['post_processed'])}")
++            print(f"Unique files post-processed: {len(set(stats['post_processed']))}")
++            
++            print("\n=== POST-PROCESSED FILES LIST ===")
++            for i, file in enumerate(stats['post_processed'], 1):
++                print(f"{i}. {file}")
++            
++            print("\n=== YIELDED FILES (original -> processed) ===")
++            for i, (orig, proc) in enumerate(cmd.yielded_files, 1):
++                print(f"{i}. {orig} -> {proc}")
++            
++            print("\n=== STDOUT OUTPUT ===")
++            print(stdout.getvalue())
++            
++            # Check for duplicates
++            duplicates = []
++            seen = set()
++            for file in stats['post_processed']:
++                if file in seen:
++                    duplicates.append(file)
++                seen.add(file)
++            
++            if duplicates:
++                print(f"\n=== ISSUE CONFIRMED: DUPLICATE FILES ===")
++                for dup in duplicates:
++                    print(f"Duplicate: {dup}")
++                return True
++            else:
++                print("\n=== NO DUPLICATES FOUND ===")
++                return False
++
++if __name__ == '__main__':
++    has_duplicates = test_post_process_duplicates()
++    if has_duplicates:
++        print("\n✗ Issue reproduced: HashedFilesMixin yields duplicate files")
++        exit(1)
++    else:
++        print("\n✓ No issue found: No duplicate files yielded")
++        exit(0)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..dbab87ad51
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,237 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the HashedFilesMixin fix.
++"""
++
++import os
++import tempfile
++import shutil
++from io import StringIO
++
++# Setup Django
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.contrib.staticfiles.management.commands.collectstatic import Command as CollectstaticCommand
++from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
++from django.core.management import call_command
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        STATIC_URL='/static/',
++        STATICFILES_FINDERS=[
++            'django.contrib.staticfiles.finders.FileSystemFinder',
++        ],
++        STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage',
++        INSTALLED_APPS=[
++            'django.contrib.staticfiles',
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++def test_nested_references():
++    """Test files with deeply nested references."""
++    with tempfile.TemporaryDirectory() as temp_dir:
++        static_dir = os.path.join(temp_dir, 'static')
++        os.makedirs(static_dir, exist_ok=True)
++        
++        css_dir = os.path.join(static_dir, 'css')
++        os.makedirs(css_dir, exist_ok=True)
++        
++        # Create a chain of CSS imports: main -> base -> reset
++        with open(os.path.join(css_dir, 'main.css'), 'w') as f:
++            f.write('@import url("base.css");\nbody { color: red; }')
++        
++        with open(os.path.join(css_dir, 'base.css'), 'w') as f:
++            f.write('@import url("reset.css");\nbody { margin: 0; }')
++        
++        with open(os.path.join(css_dir, 'reset.css'), 'w') as f:
++            f.write('* { box-sizing: border-box; }')
++        
++        static_root = os.path.join(temp_dir, 'collected')
++        
++        from django.test import override_settings
++        
++        with override_settings(
++            STATICFILES_DIRS=[static_dir],
++            STATIC_ROOT=static_root,
++            STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
++        ):
++            stdout = StringIO()
++            
++            cmd = CollectstaticCommand()
++            cmd.set_options(
++                interactive=False,
++                verbosity=2,
++                link=False,
++                clear=True,
++                dry_run=False,
++                post_process=True,
++                use_default_ignore_patterns=True,
++                ignore_patterns=[],
++            )
++            cmd.stdout = stdout
++            
++            stats = cmd.collect()
++            
++            print("=== NESTED REFERENCES TEST ===")
++            print(f"Files copied: {len(stats['modified'])}")
++            print(f"Files post-processed: {len(stats['post_processed'])}")
++            print(f"Unique files post-processed: {len(set(stats['post_processed']))}")
++            
++            # Check for duplicates
++            duplicates = []
++            seen = set()
++            for file in stats['post_processed']:
++                if file in seen:
++                    duplicates.append(file)
++                seen.add(file)
++            
++            if duplicates:
++                print(f"❌ DUPLICATES FOUND: {duplicates}")
++                return False
++            else:
++                print("✅ No duplicates found")
++                return True
++
++def test_max_passes_exceeded():
++    """Test the max passes exceeded scenario."""
++    with tempfile.TemporaryDirectory() as temp_dir:
++        static_dir = os.path.join(temp_dir, 'static')
++        os.makedirs(static_dir, exist_ok=True)
++        
++        css_dir = os.path.join(static_dir, 'css')
++        os.makedirs(css_dir, exist_ok=True)
++        
++        # Create circular references that would cause max passes to be exceeded
++        with open(os.path.join(css_dir, 'a.css'), 'w') as f:
++            f.write('@import url("b.css");\n.a { color: red; }')
++        
++        with open(os.path.join(css_dir, 'b.css'), 'w') as f:
++            f.write('@import url("a.css");\n.b { color: blue; }')
++        
++        static_root = os.path.join(temp_dir, 'collected')
++        
++        from django.test import override_settings
++        
++        with override_settings(
++            STATICFILES_DIRS=[static_dir],
++            STATIC_ROOT=static_root,
++            STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
++        ):
++            stdout = StringIO()
++            stderr = StringIO()
++            
++            cmd = CollectstaticCommand()
++            cmd.set_options(
++                interactive=False,
++                verbosity=2,
++                link=False,
++                clear=True,
++                dry_run=False,
++                post_process=True,
++                use_default_ignore_patterns=True,
++                ignore_patterns=[],
++            )
++            cmd.stdout = stdout
++            cmd.stderr = stderr
++            
++            # Reduce max passes to trigger the error faster
++            from django.contrib.staticfiles import storage
++            original_max_passes = storage.staticfiles_storage.max_post_process_passes
++            storage.staticfiles_storage.max_post_process_passes = 2
++            
++            try:
++                stats = cmd.collect()
++                print("=== MAX PASSES EXCEEDED TEST ===")
++                print("❌ Expected RuntimeError but didn't get one")
++                return False
++            except RuntimeError as e:
++                print("=== MAX PASSES EXCEEDED TEST ===")
++                print(f"✅ Got expected RuntimeError: {e}")
++                return True
++            finally:
++                storage.staticfiles_storage.max_post_process_passes = original_max_passes
++
++def test_no_adjustable_files():
++    """Test with only non-adjustable files."""
++    with tempfile.TemporaryDirectory() as temp_dir:
++        static_dir = os.path.join(temp_dir, 'static')
++        os.makedirs(static_dir, exist_ok=True)
++        
++        # Create only non-adjustable files
++        js_dir = os.path.join(static_dir, 'js')
++        os.makedirs(js_dir, exist_ok=True)
++        
++        with open(os.path.join(js_dir, 'app.js'), 'w') as f:
++            f.write('console.log("Hello world");')
++        
++        with open(os.path.join(js_dir, 'utils.js'), 'w') as f:
++            f.write('function utils() { return true; }')
++        
++        static_root = os.path.join(temp_dir, 'collected')
++        
++        from django.test import override_settings
++        
++        with override_settings(
++            STATICFILES_DIRS=[static_dir],
++            STATIC_ROOT=static_root,
++            STATICFILES_STORAGE='django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
++        ):
++            stdout = StringIO()
++            
++            cmd = CollectstaticCommand()
++            cmd.set_options(
++                interactive=False,
++                verbosity=2,
++                link=False,
++                clear=True,
++                dry_run=False,
++                post_process=True,
++                use_default_ignore_patterns=True,
++                ignore_patterns=[],
++            )
++            cmd.stdout = stdout
++            
++            stats = cmd.collect()
++            
++            print("=== NO ADJUSTABLE FILES TEST ===")
++            print(f"Files copied: {len(stats['modified'])}")
++            print(f"Files post-processed: {len(stats['post_processed'])}")
++            print(f"Unique files post-processed: {len(set(stats['post_processed']))}")
++            
++            # Check for duplicates
++            duplicates = []
++            seen = set()
++            for file in stats['post_processed']:
++                if file in seen:
++                    duplicates.append(file)
++                seen.add(file)
++            
++            if duplicates:
++                print(f"❌ DUPLICATES FOUND: {duplicates}")
++                return False
++            else:
++                print("✅ No duplicates found")
++                return True
++
++if __name__ == '__main__':
++    print("Running edge case tests...\n")
++    
++    test1 = test_nested_references()
++    print()
++    test2 = test_max_passes_exceeded()
++    print()
++    test3 = test_no_adjustable_files()
++    
++    if test1 and test2 and test3:
++        print("\n🎉 All edge case tests passed!")
++        exit(0)
++    else:
++        print("\n❌ Some edge case tests failed!")
++        exit(1)
+\ No newline at end of file

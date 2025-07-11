@@ -1,0 +1,373 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 33cc636b22..5036335bec 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -748,7 +748,7 @@ class Query(BaseExpression):
+                     cur_model = source.related_model
+                 else:
+                     cur_model = source.remote_field.model
+-                opts = cur_model._meta
++                opts = cur_model._meta.concrete_model._meta
+                 # Even if we're "just passing through" this model, we must add
+                 # both the current model's pk and the related reference field
+                 # (if it's not a reverse relation) to the things we select.
+diff --git a/test_proxy_fix.py b/test_proxy_fix.py
+new file mode 100755
+index 0000000000..31c04c3aa9
+--- /dev/null
++++ b/test_proxy_fix.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""
++Simple script to test fix for QuerySet.only() after select_related() on proxy models.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import connection
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[],
++        DEFAULT_AUTO_FIELD='django.db.models.BigAutoField',
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models.query import get_related_populators
++
++
++# Define our test models
++class CustomModel(models.Model):
++    name = models.CharField(max_length=16)
++
++    class Meta:
++        # Make this a non-managed model so we don't need migrations
++        managed = False
++        app_label = 'test_app'
++
++
++class ProxyCustomModel(CustomModel):
++    class Meta:
++        proxy = True
++        managed = False
++        app_label = 'test_app'
++
++
++class AnotherModel(models.Model):
++    custom = models.ForeignKey(
++        ProxyCustomModel,
++        on_delete=models.SET_NULL,
++        null=True,
++        blank=True,
++    )
++
++    class Meta:
++        # Make this a non-managed model so we don't need migrations
++        managed = False
++        app_label = 'test_app'
++
++
++def main():
++    # Create the tables manually
++    with connection.cursor() as cursor:
++        cursor.execute("""
++        CREATE TABLE test_app_custommodel (
++            id INTEGER PRIMARY KEY,
++            name VARCHAR(16)
++        )
++        """)
++
++        cursor.execute("""
++        CREATE TABLE test_app_anothermodel (
++            id INTEGER PRIMARY KEY,
++            custom_id INTEGER REFERENCES test_app_custommodel(id)
++        )
++        """)
++
++    # Insert some test data
++    with connection.cursor() as cursor:
++        cursor.execute("INSERT INTO test_app_custommodel (id, name) VALUES (1, 'Test Model')")
++        cursor.execute("INSERT INTO test_app_anothermodel (id, custom_id) VALUES (1, 1)")
++
++    print("Running query with select_related() and only() on a proxy model...")
++
++    try:
++        # This is the query that was failing before
++        query = AnotherModel.objects.select_related("custom").only("custom__name")
++        # Force the query to execute
++        list(query)
++        print("SUCCESS: Query executed successfully!")
++
++        # Verify we can access the data
++        obj = AnotherModel.objects.select_related("custom").only("custom__name").get(id=1)
++        print(f"Retrieved related data: {obj.custom.name}")
++    except Exception as e:
++        print(f"ERROR: {e}")
++        raise
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_proxy_model_fix.py b/test_proxy_model_fix.py
+new file mode 100755
+index 0000000000..09173a655c
+--- /dev/null
++++ b/test_proxy_model_fix.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for QuerySet.only() after select_related() on proxy models.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings for testing
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            'test_proxy_app',  # Our test app
++        ],
++        DEBUG=True,
++    )
++
++# Set up Django
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++
++
++class CustomModel(models.Model):
++    name = models.CharField(max_length=16)
++
++    class Meta:
++        app_label = 'proxy_test'
++
++
++class ProxyCustomModel(CustomModel):
++    class Meta:
++        proxy = True
++        app_label = 'proxy_test'
++
++
++class AnotherModel(models.Model):
++    custom = models.ForeignKey(
++        ProxyCustomModel,
++        on_delete=models.SET_NULL,
++        null=True,
++        blank=True,
++    )
++
++    class Meta:
++        app_label = 'proxy_test'
++
++
++class ProxyModelTest(TestCase):
++    """Test for proxy model select_related with only."""
++
++    def setUp(self):
++        # Create a test instance
++        proxy_model = ProxyCustomModel.objects.create(name="Test Instance")
++        AnotherModel.objects.create(custom=proxy_model)
++
++    def test_only_after_select_related_with_proxy_model(self):
++        """Test that we can use only() after select_related() with a proxy model."""
++        try:
++            # This is the query that was failing before the fix
++            objs = list(AnotherModel.objects.select_related("custom").only("custom__name").all())
++            print("Success! The query executed without error.")
++            print(f"Retrieved {len(objs)} objects with proxy model relationship.")
++            # Check that we can access the related field
++            if objs:
++                print(f"Accessed related field: {objs[0].custom.name}")
++        except Exception as e:
++            print(f"Error: {e}")
++            raise
++
++
++if __name__ == "__main__":
++    # Create a test runner
++    from django.test.runner import DiscoverRunner
++    test_runner = DiscoverRunner(verbosity=2)
++
++    # Run the test
++    failures = test_runner.run_tests(['__main__.ProxyModelTest'])
++
++    sys.exit(bool(failures))
+\ No newline at end of file
+diff --git a/test_runner.py b/test_runner.py
+new file mode 100644
+index 0000000000..5326d25571
+--- /dev/null
++++ b/test_runner.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""
++Run specific Django tests to verify our fix doesn't break anything.
++"""
++
++import os
++import sys
++
++# Add the Django directory to Python's module path
++BASE_DIR = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, BASE_DIR)
++
++from django.conf import settings
++from django.test.runner import DiscoverRunner
++
++settings.configure(
++    DEBUG=True,
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'django.contrib.auth',
++        'django.contrib.sites',
++        'django.contrib.sessions',
++        'django.contrib.messages',
++        'django.contrib.admin.apps.SimpleAdminConfig',
++        'django.contrib.staticfiles',
++        'tests.select_related',
++        'tests.proxy_models',
++    ],
++    SECRET_KEY='django-tests-secret-key',
++    ROOT_URLCONF='tests.urls',
++    MIDDLEWARE=[
++        'django.middleware.security.SecurityMiddleware',
++        'django.contrib.sessions.middleware.SessionMiddleware',
++        'django.middleware.common.CommonMiddleware',
++        'django.middleware.csrf.CsrfViewMiddleware',
++        'django.contrib.auth.middleware.AuthenticationMiddleware',
++        'django.contrib.messages.middleware.MessageMiddleware',
++        'django.middleware.clickjacking.XFrameOptionsMiddleware',
++    ],
++    TEMPLATES=[
++        {
++            'BACKEND': 'django.template.backends.django.DjangoTemplates',
++            'APP_DIRS': True,
++        },
++    ],
++)
++
++import django
++django.setup()
++
++def main():
++    # Run select_related tests
++    test_runner = DiscoverRunner(verbosity=2, interactive=False)
++    failures = test_runner.run_tests(['select_related', 'proxy_models'])
++    sys.exit(bool(failures))
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/tests/proxy_models/test_select_related_foreign_key.py b/tests/proxy_models/test_select_related_foreign_key.py
+new file mode 100644
+index 0000000000..078d299480
+--- /dev/null
++++ b/tests/proxy_models/test_select_related_foreign_key.py
+@@ -0,0 +1,37 @@
++from django.test import TestCase
++
++from .models import Issue, ProxyTrackerUser, TrackerUser
++
++
++class SelectRelatedForeignKeyWithProxyModel(TestCase):
++    """Test the fixed behavior for select_related with only on a ForeignKey to a proxy model."""
++
++    def setUp(self):
++        # Create a test user
++        self.user = ProxyTrackerUser.objects.create(
++            name='testuser', status='active'
++        )
++
++        # Create an issue assigned to this user
++        self.issue = Issue.objects.create(
++            summary='Test Issue',
++            assignee=self.user
++        )
++
++    def test_select_related_with_only_on_foreignkey(self):
++        """
++        Test that we can use select_related().only() on a foreign key to a proxy model.
++        This is the exact case that was failing in the issue.
++        """
++        # This would raise a ValueError before the fix
++        issues = list(Issue.objects.select_related('assignee').only('assignee__name'))
++
++        self.assertEqual(len(issues), 1)
++        self.assertEqual(issues[0].summary, 'Test Issue')  # This will be loaded on-demand
++        self.assertEqual(issues[0].assignee.name, 'testuser')
++
++        # Test with other field combinations
++        issues = list(Issue.objects.select_related('assignee').only('assignee__name', 'summary'))
++        self.assertEqual(len(issues), 1)
++        self.assertEqual(issues[0].summary, 'Test Issue')
++        self.assertEqual(issues[0].assignee.name, 'testuser')
+\ No newline at end of file
+diff --git a/tests/proxy_models/test_select_related_only.py b/tests/proxy_models/test_select_related_only.py
+new file mode 100644
+index 0000000000..5f7aee6fa5
+--- /dev/null
++++ b/tests/proxy_models/test_select_related_only.py
+@@ -0,0 +1,31 @@
++from django.db import models
++from django.test import TestCase
++
++from .models import BaseUser, ProxyTrackerUser, TrackerUser
++
++
++class SelectRelatedWithProxyModel(TestCase):
++    """
++    Test for the bug fix where using select_related with only
++    on a proxy model would raise an error.
++    """
++
++    def setUp(self):
++        # Create a test user
++        self.user = TrackerUser.objects.create(name='testuser', status='active')
++
++
++    def test_select_related_with_only(self):
++        """
++        Test that using select_related with only on a proxy model works.
++        """
++        # This query would crash before the fix
++        proxies = list(ProxyTrackerUser.objects.select_related().only('name'))
++        self.assertEqual(len(proxies), 1)
++        self.assertEqual(proxies[0].name, 'testuser')
++
++        # Test with a more complex query
++        proxies = list(ProxyTrackerUser.objects.select_related().only('name', 'id'))
++        self.assertEqual(len(proxies), 1)
++        self.assertEqual(proxies[0].name, 'testuser')
++        self.assertEqual(proxies[0].id, self.user.id)
+\ No newline at end of file

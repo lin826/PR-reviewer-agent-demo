@@ -1,0 +1,214 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index f2ca8c8df9..9af9fa13ae 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -569,14 +569,44 @@ class BaseDatabaseSchemaEditor:
+             **constraint_kwargs,
+         )
+         if len(constraint_names) != 1:
+-            raise ValueError(
+-                "Found wrong number (%s) of constraints for %s(%s)"
+-                % (
+-                    len(constraint_names),
+-                    model._meta.db_table,
+-                    ", ".join(columns),
++            # Special case: if we're trying to delete a unique constraint on a field
++            # that is a primary key, there might be two constraints (PK and unique_together).
++            # In this case, filter out the primary key constraint.
++            if constraint_kwargs.get('unique') and any(
++                field for field in fields
++                if model._meta.get_field(field).primary_key
++            ):
++                # Get all constraints for these columns that are not primary keys
++                filtered_constraint_names = self._constraint_names(
++                    model,
++                    columns,
++                    unique=True,
++                    primary_key=False,
++                    exclude=meta_constraint_names | meta_index_names,
++                )
++                # If we've found exactly one non-primary key unique constraint, use that
++                if len(filtered_constraint_names) == 1:
++                    constraint_names = filtered_constraint_names
++                else:
++                    # Otherwise fall back to the original error
++                    raise ValueError(
++                        "Found wrong number (%s) of constraints for %s(%s)"
++                        % (
++                            len(constraint_names),
++                            model._meta.db_table,
++                            ", ".join(columns),
++                        )
++                    )
++            else:
++                # For other cases, keep the original error
++                raise ValueError(
++                    "Found wrong number (%s) of constraints for %s(%s)"
++                    % (
++                        len(constraint_names),
++                        model._meta.db_table,
++                        ", ".join(columns),
++                    )
+                 )
+-            )
+         self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))
+ 
+     def alter_db_table(self, model, old_db_table, new_db_table):
+diff --git a/test_unique_together_issue.py b/test_unique_together_issue.py
+new file mode 100644
+index 0000000000..ff873a9d97
+--- /dev/null
++++ b/test_unique_together_issue.py
+@@ -0,0 +1,151 @@
++"""
++Test script to reproduce the issue with trying to drop unique_together on a primary key field.
++This script:
++1. Creates a model with unique_together constraint on its primary key (id)
++2. Creates and applies a migration to create this model
++3. Modifies the model to remove the unique_together constraint
++4. Creates and applies a migration to remove the constraint
++"""
++import os
++import sys
++import tempfile
++import shutil
++import unittest
++from unittest.mock import patch
++
++# Add Django to sys.path
++sys.path.insert(0, os.path.abspath('.'))
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_unique_together_issue_settings')
++
++# Create a settings module
++settings_content = """
++SECRET_KEY = 'test'
++INSTALLED_APPS = [
++    'django.contrib.auth',
++    'django.contrib.contenttypes',
++    'django.contrib.sessions',
++    'django.contrib.messages',
++    'django.contrib.staticfiles',
++    'test_app',
++]
++
++DATABASES = {
++    'default': {
++        'ENGINE': 'django.db.backends.sqlite3',
++        'NAME': 'test_db.sqlite3',
++    }
++}
++
++USE_TZ = False
++"""
++
++with open('test_unique_together_issue_settings.py', 'w') as settings_file:
++    settings_file.write(settings_content)
++
++# Create a test app
++app_dir = 'test_app'
++migrations_dir = os.path.join(app_dir, 'migrations')
++
++os.makedirs(app_dir, exist_ok=True)
++os.makedirs(migrations_dir, exist_ok=True)
++
++# Create __init__.py files
++with open(os.path.join(app_dir, '__init__.py'), 'w') as f:
++    pass
++with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
++    pass
++
++# Create models.py
++models_content = """
++from django.db import models
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        # Initially set unique_together on the primary key
++        unique_together = (('id',),)
++"""
++
++with open(os.path.join(app_dir, 'models.py'), 'w') as models_file:
++    models_file.write(models_content)
++
++import django
++django.setup()
++
++from django.core.management.commands.makemigrations import Command as MakeMigrationsCommand
++from django.core.management import call_command
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++# Begin test execution
++print("Starting test for unique_together on primary key issue...")
++
++print("Step 1: Creating initial migration...")
++try:
++    # Force creation of migration
++    call_command('makemigrations', 'test_app', '--empty')
++    # Create actual model migration
++    call_command('makemigrations', 'test_app')
++except Exception as e:
++    print(f"Error creating initial migration: {e}")
++
++print("Step 2: Applying initial migration...")
++call_command('migrate', 'test_app')
++
++# Now modify the models to remove the unique_together
++models_content_updated = """
++from django.db import models
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        # Remove the unique_together setting
++        pass
++"""
++
++with open(os.path.join(app_dir, 'models.py'), 'w') as models_file:
++    models_file.write(models_content_updated)
++
++# Function to simulate the database reporting multiple constraints when dropping unique_together
++def mock_constraint_names(self, model, column_names=None, unique=None, primary_key=None, 
++                        index=None, foreign_key=None, check=None, type_=None, exclude=None):
++    # When looking up constraints for the 'id' column with unique=True, 
++    # simulate PostgreSQL reporting both PK and unique_together constraints
++    if (column_names == ['id'] and unique is True and primary_key is None):
++        return ['pk_constraint', 'unique_together_constraint']
++    
++    # When specifically filtering for non-primary key constraints, return just the unique_together
++    if (column_names == ['id'] and unique is True and primary_key is False):
++        return ['unique_together_constraint']
++        
++    # Default to normal behavior for other queries
++    # This will return an empty list for our test case since we're not actually connecting to PostgreSQL
++    return []
++
++print("Step 3: Testing with simulated PostgreSQL multiple constraints...")
++try:
++    # Patch the _constraint_names method to simulate multiple constraints for id
++    with patch.object(BaseDatabaseSchemaEditor, '_constraint_names', mock_constraint_names):
++        call_command('makemigrations', 'test_app')
++        call_command('migrate', 'test_app')
++    print("SUCCESS: The fix successfully handles the case of multiple constraints!")
++except Exception as e:
++    print(f"FAILED: The issue still occurs: {e}")
++    
++# Perform normal migrations without the mock to ensure everything works normally
++print("\nStep 4: Creating and applying migration normally...")
++try:
++    call_command('makemigrations', 'test_app')
++    call_command('migrate', 'test_app')
++    print("SUCCESS: Migration works normally!")
++except Exception as e:
++    print(f"FAILED: Normal migration fails: {e}")
++
++# Clean up
++print("\nCleaning up test files...")
++shutil.rmtree(app_dir)
++os.remove('test_unique_together_issue_settings.py')
++if os.path.exists('test_db.sqlite3'):
++    os.remove('test_db.sqlite3')
++print("Test completed.")
+\ No newline at end of file

@@ -1,0 +1,151 @@
+diff --git a/sympy/concrete/expr_with_limits.py b/sympy/concrete/expr_with_limits.py
+index e8f40563bc..1ef827ed1c 100644
+--- a/sympy/concrete/expr_with_limits.py
++++ b/sympy/concrete/expr_with_limits.py
+@@ -422,6 +422,18 @@ def _eval_factor(self, **hints):
+         return self
+
+     def _eval_expand_basic(self, **hints):
++        from sympy.core.singleton import S
++
++        # For MatrixExpr objects, use _entry_sum when available
++        if hasattr(self.function, 'is_Matrix') and self.function.is_Matrix:
++            if hasattr(self.function, '_entry_sum'):
++                # Get indices from the first and second limit
++                if len(self.limits) >= 1:
++                    i = self.limits[0][0]
++                    if len(self.limits) >= 2:
++                        j = self.limits[1][0]
++                        return self.function._entry_sum(i, j, self.limits)
++
+         summand = self.function.expand(**hints)
+         if summand.is_Add and summand.is_commutative:
+             return Add(*[self.func(i, *self.limits) for i in summand.args])
+diff --git a/sympy/concrete/summations.py b/sympy/concrete/summations.py
+index 372487664c..de97aa31b0 100644
+--- a/sympy/concrete/summations.py
++++ b/sympy/concrete/summations.py
+@@ -173,7 +173,7 @@ def doit(self, **hints):
+             f = self.function.doit(**hints)
+         else:
+             f = self.function
+-
++
+         if self.function.is_Matrix:
+             return self.expand().doit()
+
+@@ -854,6 +854,28 @@ def eval_sum(f, limits):
+         return f*(b - a + 1)
+     if a == b:
+         return f.subs(i, a)
++
++    # Special case for Piecewise resulting from KroneckerDelta summation
++    # From summing over an Identity matrix entry
++    if isinstance(f, Piecewise) and len(f.args) == 2:
++        # Check if we have a Piecewise like (1, condition), (0, True) from KroneckerDelta
++        # This means the condition is within current summation range
++        if f.args[0][0] == S.One and f.args[1][0] == S.Zero and f.args[1][1] is S.true:
++            condition = f.args[0][1]
++            if isinstance(condition, And):
++                # Look for conditions like (a <= i) & (i <= b) from KroneckerDelta
++                # For Identity matrix entries, this happens to be the bound variable being within range
++                if len(condition.args) == 2:
++                    lower_bound = condition.args[0]
++                    upper_bound = condition.args[1]
++
++                    # If the bounds match our summation range, then we're summing a KroneckerDelta
++                    # over the whole range (e.g., counting the diagonal of an Identity matrix)
++                    # which equals the dimension
++                    if (lower_bound.rhs == a or lower_bound.lhs == a) and \
++                       (upper_bound.rhs == b or upper_bound.lhs == b):
++                        return b - a + 1
++
+     if isinstance(f, Piecewise):
+         if not any(i in arg.args[1].free_symbols for arg in f.args):
+             # Piecewise conditions do not depend on the dummy summation variable,
+diff --git a/sympy/matrices/expressions/matexpr.py b/sympy/matrices/expressions/matexpr.py
+index b4d759836e..ea7429dfd5 100644
+--- a/sympy/matrices/expressions/matexpr.py
++++ b/sympy/matrices/expressions/matexpr.py
+@@ -200,6 +200,35 @@ def _eval_adjoint(self):
+     def _entry(self, i, j):
+         raise NotImplementedError(
+             "Indexing not implemented for %s" % self.__class__.__name__)
++
++    def _entry_sum(self, i, j, ranges):
++        """
++        Calculate the sum of i, j entries over the given ranges.
++
++        This method is implemented by subclasses to handle summations efficiently.
++        The default implementation uses explicit summation via Sum.
++
++        For matrices with special structure (like Identity), this can be overridden
++        to provide a more efficient computation.
++        """
++        from sympy.concrete.summations import Sum
++
++        # Check if this matrix might be an Identity matrix (e.g., from an orthogonal matrix product)
++        if hasattr(self, 'is_Identity') and self.is_Identity:
++            if len(ranges) == 2:
++                i_var, i_start, i_end = ranges[0]
++                j_var, j_start, j_end = ranges[1]
++
++                # If we're summing over the entire matrix, the result is the dimension
++                if (i_start == 0 and i_end == self.rows-1 and
++                    j_start == 0 and j_end == self.cols-1):
++                    return self.rows
++
++        # Default behavior: just create a nested Sum
++        expr = self[i, j]
++        for index_range in ranges:
++            expr = Sum(expr, index_range)
++        return expr
+
+     def adjoint(self):
+         return adjoint(self)
+@@ -476,6 +505,13 @@ def conjugate(self):
+         return self
+
+     def _entry(self, i, j):
++        from sympy.functions import KroneckerDelta
++
++        # Use KroneckerDelta for symbolic indices
++        if isinstance(i, Symbol) or isinstance(j, Symbol):
++            return KroneckerDelta(i, j)
++
++        # For concrete indices
+         if i == j:
+             return S.One
+         else:
+@@ -483,6 +519,31 @@ def _entry(self, i, j):
+
+     def _eval_determinant(self):
+         return S.One
++
++    def _entry_sum(self, i, j, ranges):
++        """
++        Calculate the sum of i, j entries over the given ranges.
++
++        This method is used by sympy.concrete.expr_with_limits.AddWithLimits._eval_expand_basic
++        when handling summations over matrices.
++
++        For an identity matrix, the sum of all entries is equal to the trace (n).
++        """
++        from sympy.concrete.summations import Sum
++
++        # If we're summing over the entire matrix
++        if len(ranges) == 2:
++            (i_var, i_start, i_end), (j_var, j_start, j_end) = ranges
++
++            if (i_start == 0 and i_end == self.rows - 1 and
++                j_start == 0 and j_end == self.cols - 1):
++                return self.rows
++
++        # Otherwise, fall back to the default behavior
++        expr = self[i, j]
++        for index_range in ranges:
++            expr = Sum(expr, index_range)
++        return expr
+
+
+ class ZeroMatrix(MatrixExpr):

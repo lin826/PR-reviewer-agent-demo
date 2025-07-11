@@ -1,0 +1,1653 @@
+diff --git a/pylint/checkers/similar.py b/pylint/checkers/similar.py
+index c65b1c893..3ca3c3c0f 100644
+--- a/pylint/checkers/similar.py
++++ b/pylint/checkers/similar.py
+@@ -830,6 +830,8 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+ 
+     def close(self):
+         """compute and display similarities on closing (i.e. end of parsing)"""
++        if self.min_lines <= 0:
++            return
+         total = sum(len(lineset) for lineset in self.linesets)
+         duplicated = 0
+         stats = self.stats
+diff --git a/test_checker_similarity.py b/test_checker_similarity.py
+new file mode 100644
+index 000000000..b510ac6d9
+--- /dev/null
++++ b/test_checker_similarity.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++Test the SimilarChecker class specifically to reproduce the min-similarity-lines=0 issue.
++"""
++
++import tempfile
++import os
++from pylint.checkers.similar import SimilarChecker
++from pylint.lint import PyLinter
++from pylint.testutils import GenericTestReporter
++
++def test_similar_checker_min_lines_zero():
++    """Test that SimilarChecker with min_similarity_lines=0 should disable similarity checking."""
++    
++    # Create test content with duplicate lines
++    content1 = """def function_a():
++    x = 1
++    y = 2
++    z = x + y
++    w = z * 2
++    v = w + 1
++    return v
++
++def other_function():
++    pass
++"""
++    
++    content2 = """def function_b():
++    x = 1
++    y = 2
++    z = x + y
++    w = z * 2
++    v = w + 1
++    return v
++
++def another_function():
++    pass
++"""
++    
++    # Create temporary files
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f1:
++        f1.write(content1)
++        f1_name = f1.name
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f2:
++        f2.write(content2)
++        f2_name = f2.name
++    
++    try:
++        # Test with min_similarity_lines=0
++        print("Testing SimilarChecker with min_similarity_lines=0:")
++        
++        linter = PyLinter(reporter=GenericTestReporter())
++        checker = SimilarChecker(linter)
++        
++        # Set min_similarity_lines to 0
++        checker.config.min_similarity_lines = 0
++        checker.set_option("min-similarity-lines", 0)
++        
++        print(f"Checker min_lines: {checker.min_lines}")
++        
++        # Add streams
++        with open(f1_name, 'r') as stream1:
++            checker.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            checker.append_stream(f2_name, stream2)
++        
++        # Simulate the close() method behavior
++        print("Calling _compute_sims()...")
++        sims = list(checker._compute_sims())
++        print(f"Number of similarity groups found: {len(sims)}")
++        
++        for i, (num, couples) in enumerate(sims):
++            print(f"  Group {i+1}: {num} similar lines in {len(couples)} locations")
++        
++        # Test with min_similarity_lines=4
++        print("\nTesting SimilarChecker with min_similarity_lines=4:")
++        
++        linter2 = PyLinter(reporter=GenericTestReporter())
++        checker2 = SimilarChecker(linter2)
++        
++        # Set min_similarity_lines to 4
++        checker2.config.min_similarity_lines = 4
++        checker2.set_option("min-similarity-lines", 4)
++        
++        print(f"Checker min_lines: {checker2.min_lines}")
++        
++        # Add streams
++        with open(f1_name, 'r') as stream1:
++            checker2.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            checker2.append_stream(f2_name, stream2)
++        
++        # Simulate the close() method behavior
++        print("Calling _compute_sims()...")
++        sims2 = list(checker2._compute_sims())
++        print(f"Number of similarity groups found: {len(sims2)}")
++        
++        for i, (num, couples) in enumerate(sims2):
++            print(f"  Group {i+1}: {num} similar lines in {len(couples)} locations")
++        
++        # Analysis
++        print("\nAnalysis:")
++        if len(sims) > 0:
++            print("❌ ISSUE CONFIRMED: min_similarity_lines=0 still reports similarities (should be disabled)")
++        else:
++            print("✅ GOOD: min_similarity_lines=0 correctly disables similarity checking")
++            
++        if len(sims2) > 0:
++            print("✅ GOOD: min_similarity_lines=4 correctly detects similarities")
++        else:
++            print("⚠️  WARNING: min_similarity_lines=4 should detect similarities but didn't")
++        
++        return len(sims) > 0, len(sims2) > 0
++        
++    finally:
++        # Clean up
++        os.unlink(f1_name)
++        os.unlink(f2_name)
++
++if __name__ == "__main__":
++    test_similar_checker_min_lines_zero()
+\ No newline at end of file
+diff --git a/test_edge_case.py b/test_edge_case.py
+new file mode 100644
+index 000000000..e63b68d7c
+--- /dev/null
++++ b/test_edge_case.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for min_lines=0 to see if we can reproduce the "every line is duplicate" issue.
++"""
++
++from pylint.checkers.similar import Similar, hash_lineset, LineSet
++
++def test_edge_cases():
++    """Test various edge cases with min_lines=0."""
++    
++    print("Testing edge cases for min_lines=0...")
++    
++    # Test 1: Empty files
++    print("\n1. Testing with empty files:")
++    similar = Similar(min_lines=0)
++    from io import StringIO
++    similar.append_stream("empty1", StringIO(""))
++    similar.append_stream("empty2", StringIO(""))
++    sims = list(similar._compute_sims())
++    print(f"Empty files similarities: {len(sims)}")
++    
++    # Test 2: Single line files
++    print("\n2. Testing with single line files:")
++    similar = Similar(min_lines=0)
++    similar.append_stream("single1", StringIO("line1\n"))
++    similar.append_stream("single2", StringIO("line1\n"))
++    sims = list(similar._compute_sims())
++    print(f"Single line similarities: {len(sims)}")
++    
++    # Test 3: Files with only whitespace/comments
++    print("\n3. Testing with whitespace/comment files:")
++    similar = Similar(min_lines=0)
++    similar.append_stream("ws1", StringIO("   \n# comment\n\n"))
++    similar.append_stream("ws2", StringIO("   \n# comment\n\n"))
++    sims = list(similar._compute_sims())
++    print(f"Whitespace/comment similarities: {len(sims)}")
++    
++    # Test 4: Check what happens with hash_lineset directly
++    print("\n4. Testing hash_lineset with min_common_lines=0:")
++    lines = ["line1", "line2", "line3"]
++    lineset = LineSet("test", lines, False, False, False, False)
++    
++    print(f"Lineset stripped_lines: {[ls.text for ls in lineset.stripped_lines]}")
++    
++    hash2index, index2lines = hash_lineset(lineset, 0)
++    print(f"hash2index: {dict(hash2index)}")
++    print(f"index2lines: {dict(index2lines)}")
++    
++    # Test 5: What happens when we have range(0) in the shifted_lines creation?
++    print("\n5. Testing range(0) behavior:")
++    min_common_lines = 0
++    lines = ["line1", "line2", "line3"]
++    shifted_lines = [iter(lines[i:]) for i in range(min_common_lines)]
++    print(f"shifted_lines with range(0): {shifted_lines}")
++    
++    # This should be an empty list, so zip(*shifted_lines) should be zip() which returns an empty iterator
++    zipped = list(zip(*shifted_lines))
++    print(f"zip(*shifted_lines): {zipped}")
++    
++    # Test 6: Check if the issue might be in a different scenario
++    print("\n6. Testing with min_lines=0 but non-empty hash results (hypothetical):")
++    # This is to understand what would happen if somehow hash2index was not empty
++    
++    print("All tests completed.")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_edge_cases_fix.py b/test_edge_cases_fix.py
+new file mode 100644
+index 000000000..73166b3e7
+--- /dev/null
++++ b/test_edge_cases_fix.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the min-similarity-lines=0 fix.
++"""
++
++import tempfile
++import os
++import subprocess
++import sys
++
++def test_edge_cases():
++    """Test various edge cases for the fix."""
++    
++    # Create a simple test file
++    content = """
++def simple_function():
++    return 42
++"""
++    
++    test_dir = tempfile.mkdtemp()
++    file_path = os.path.join(test_dir, "test.py")
++    
++    with open(file_path, 'w') as f:
++        f.write(content)
++    
++    try:
++        # Test various min-similarity-lines values
++        test_values = [-5, -1, 0, 1, 2, 3, 4, 5]
++        
++        for value in test_values:
++            print(f"\nTesting min-similarity-lines={value}:")
++            
++            # Create pylintrc
++            pylintrc_path = os.path.join(test_dir, f"pylintrc_{value}")
++            with open(pylintrc_path, 'w') as f:
++                f.write(f"""
++[SIMILARITIES]
++min-similarity-lines = {value}
++
++[MESSAGES CONTROL]
++disable = all
++enable = duplicate-code
++""")
++            
++            # Run pylint
++            cmd = [
++                sys.executable, "-m", "pylint",
++                "--rcfile", pylintrc_path,
++                file_path
++            ]
++            
++            env = os.environ.copy()
++            env['PYTHONPATH'] = "/workspace/pylint-dev__pylint__2.10"
++            
++            result = subprocess.run(
++                cmd,
++                capture_output=True,
++                text=True,
++                cwd="/workspace/pylint-dev__pylint__2.10",
++                env=env
++            )
++            
++            has_r0801 = "R0801" in result.stdout or "duplicate-code" in result.stdout
++            
++            if value <= 0:
++                if not has_r0801:
++                    print(f"  ✅ min-similarity-lines={value} correctly disables checking")
++                else:
++                    print(f"  ❌ min-similarity-lines={value} should disable checking but didn't")
++            else:
++                print(f"  ℹ️  min-similarity-lines={value} completed (R0801: {has_r0801})")
++        
++        print("\n" + "="*50)
++        print("EDGE CASE TEST COMPLETED")
++        print("="*50)
++        
++    finally:
++        # Clean up
++        import shutil
++        shutil.rmtree(test_dir)
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_end_to_end.py b/test_end_to_end.py
+new file mode 100644
+index 000000000..91f1f59de
+--- /dev/null
++++ b/test_end_to_end.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""
++End-to-end test using actual pylint command to verify the fix works in practice.
++"""
++
++import tempfile
++import os
++import subprocess
++import sys
++
++def test_end_to_end():
++    """Test the fix using actual pylint commands."""
++    
++    # Create test files with duplicate content
++    content1 = """
++def function_a():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++"""
++    
++    content2 = """
++def function_b():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++"""
++    
++    # Create temporary directory and files
++    test_dir = tempfile.mkdtemp()
++    file1_path = os.path.join(test_dir, "test1.py")
++    file2_path = os.path.join(test_dir, "test2.py")
++    
++    with open(file1_path, 'w') as f:
++        f.write(content1)
++    with open(file2_path, 'w') as f:
++        f.write(content2)
++    
++    # Create pylintrc files
++    pylintrc_zero = os.path.join(test_dir, "pylintrc_zero")
++    with open(pylintrc_zero, 'w') as f:
++        f.write("""
++[SIMILARITIES]
++min-similarity-lines = 0
++
++[MESSAGES CONTROL]
++disable = all
++enable = duplicate-code
++""")
++    
++    pylintrc_four = os.path.join(test_dir, "pylintrc_four")
++    with open(pylintrc_four, 'w') as f:
++        f.write("""
++[SIMILARITIES]
++min-similarity-lines = 4
++
++[MESSAGES CONTROL]
++disable = all
++enable = duplicate-code
++""")
++    
++    try:
++        # Test with min-similarity-lines=0
++        print("Testing with min-similarity-lines=0 (should disable duplicate code checking):")
++        
++        cmd_zero = [
++            sys.executable, "-m", "pylint",
++            "--rcfile", pylintrc_zero,
++            file1_path, file2_path
++        ]
++        
++        env = os.environ.copy()
++        env['PYTHONPATH'] = "/workspace/pylint-dev__pylint__2.10"
++        
++        result_zero = subprocess.run(
++            cmd_zero,
++            capture_output=True,
++            text=True,
++            cwd="/workspace/pylint-dev__pylint__2.10",
++            env=env
++        )
++        
++        print(f"Return code: {result_zero.returncode}")
++        print(f"Stdout: {result_zero.stdout}")
++        if result_zero.stderr:
++            print(f"Stderr: {result_zero.stderr}")
++        
++        # Check for R0801 messages
++        has_r0801_zero = "R0801" in result_zero.stdout or "duplicate-code" in result_zero.stdout
++        
++        # Test with min-similarity-lines=4
++        print("\nTesting with min-similarity-lines=4 (should detect duplicate code):")
++        
++        cmd_four = [
++            sys.executable, "-m", "pylint",
++            "--rcfile", pylintrc_four,
++            file1_path, file2_path
++        ]
++        
++        result_four = subprocess.run(
++            cmd_four,
++            capture_output=True,
++            text=True,
++            cwd="/workspace/pylint-dev__pylint__2.10",
++            env=env
++        )
++        
++        print(f"Return code: {result_four.returncode}")
++        print(f"Stdout: {result_four.stdout}")
++        if result_four.stderr:
++            print(f"Stderr: {result_four.stderr}")
++        
++        # Check for R0801 messages
++        has_r0801_four = "R0801" in result_four.stdout or "duplicate-code" in result_four.stdout
++        
++        # Analysis
++        print("\n" + "="*60)
++        print("END-TO-END TEST RESULTS:")
++        print("="*60)
++        
++        if not has_r0801_zero:
++            print("✅ SUCCESS: min-similarity-lines=0 correctly disables duplicate code checking")
++        else:
++            print("❌ FAILURE: min-similarity-lines=0 still reports duplicate code")
++        
++        if has_r0801_four:
++            print("✅ SUCCESS: min-similarity-lines=4 correctly detects duplicate code")
++        else:
++            print("⚠️  INFO: min-similarity-lines=4 didn't detect duplicate code (may be expected)")
++        
++        return not has_r0801_zero and has_r0801_four
++        
++    finally:
++        # Clean up
++        import shutil
++        shutil.rmtree(test_dir)
++
++if __name__ == "__main__":
++    success = test_end_to_end()
++    
++    if success:
++        print("\n🎉 END-TO-END TEST PASSED: The fix is working correctly in practice!")
++    else:
++        print("\n❌ END-TO-END TEST FAILED: The fix may not be working correctly")
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 000000000..ff033d795
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,223 @@
++#!/usr/bin/env python3
++"""
++Comprehensive test to verify that the fix for min-similarity-lines=0 works correctly.
++"""
++
++import tempfile
++import os
++import time
++from pylint.checkers.similar import SimilarChecker
++from pylint.lint import PyLinter
++from pylint.testutils import GenericTestReporter
++
++def test_min_lines_zero_performance():
++    """Test that min_lines=0 completely skips similarity computation for performance."""
++    
++    # Create test content with many duplicate lines
++    content_template = """
++def function_{}():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++
++def another_function_{}():
++    x = 10
++    y = 20
++    z = 30
++    return x + y + z
++"""
++    
++    # Create multiple files with duplicate content
++    test_files = []
++    for i in range(5):  # Create 5 files with similar content
++        content = content_template.format(i, i)
++        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++            f.write(content)
++            test_files.append(f.name)
++    
++    try:
++        # Test 1: min_lines=0 should skip computation entirely
++        print("Test 1: Verifying min_lines=0 skips computation...")
++        
++        linter = PyLinter(reporter=GenericTestReporter())
++        checker = SimilarChecker(linter)
++        checker.config.min_similarity_lines = 0
++        checker.set_option("min-similarity-lines", 0)
++        
++        # Add streams
++        for file_path in test_files:
++            with open(file_path, 'r') as stream:
++                checker.append_stream(file_path, stream)
++        
++        # Measure time for close() method
++        start_time = time.time()
++        checker.close()
++        zero_time = time.time() - start_time
++        
++        print(f"Time with min_lines=0: {zero_time:.6f} seconds")
++        print("✅ min_lines=0 completed (should be very fast)")
++        
++        # Test 2: min_lines=4 should perform computation
++        print("\nTest 2: Verifying min_lines=4 performs computation...")
++        
++        linter2 = PyLinter(reporter=GenericTestReporter())
++        checker2 = SimilarChecker(linter2)
++        checker2.config.min_similarity_lines = 4
++        checker2.set_option("min-similarity-lines", 4)
++        
++        # Add streams
++        for file_path in test_files:
++            with open(file_path, 'r') as stream:
++                checker2.append_stream(file_path, stream)
++        
++        # Measure time for close() method
++        start_time = time.time()
++        checker2.close()
++        four_time = time.time() - start_time
++        
++        print(f"Time with min_lines=4: {four_time:.6f} seconds")
++        print("✅ min_lines=4 completed (should take longer)")
++        
++        # Test 3: Verify negative values also skip computation
++        print("\nTest 3: Verifying min_lines=-1 skips computation...")
++        
++        linter3 = PyLinter(reporter=GenericTestReporter())
++        checker3 = SimilarChecker(linter3)
++        checker3.config.min_similarity_lines = -1
++        checker3.set_option("min-similarity-lines", -1)
++        
++        # Add streams
++        for file_path in test_files:
++            with open(file_path, 'r') as stream:
++                checker3.append_stream(file_path, stream)
++        
++        # Measure time for close() method
++        start_time = time.time()
++        checker3.close()
++        negative_time = time.time() - start_time
++        
++        print(f"Time with min_lines=-1: {negative_time:.6f} seconds")
++        print("✅ min_lines=-1 completed (should be very fast)")
++        
++        # Analysis
++        print("\nPerformance Analysis:")
++        if zero_time < four_time:
++            print("✅ GOOD: min_lines=0 is faster than min_lines=4 (computation skipped)")
++        else:
++            print("⚠️  WARNING: min_lines=0 should be faster than min_lines=4")
++        
++        if negative_time < four_time:
++            print("✅ GOOD: min_lines=-1 is faster than min_lines=4 (computation skipped)")
++        else:
++            print("⚠️  WARNING: min_lines=-1 should be faster than min_lines=4")
++        
++        print(f"Performance improvement: {(four_time - zero_time) / four_time * 100:.1f}% faster")
++        
++        return zero_time, four_time, negative_time
++        
++    finally:
++        # Clean up
++        for file_path in test_files:
++            os.unlink(file_path)
++
++def test_functionality_preserved():
++    """Test that the fix doesn't break existing functionality."""
++    
++    print("\nTesting that existing functionality is preserved...")
++    
++    # Create test content with actual duplicates
++    content1 = """
++def function_a():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++"""
++    
++    content2 = """
++def function_b():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++"""
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f1:
++        f1.write(content1)
++        f1_name = f1.name
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f2:
++        f2.write(content2)
++        f2_name = f2.name
++    
++    try:
++        # Test with min_lines=4 (should detect duplicates)
++        linter = PyLinter(reporter=GenericTestReporter())
++        checker = SimilarChecker(linter)
++        checker.config.min_similarity_lines = 4
++        checker.set_option("min-similarity-lines", 4)
++        
++        with open(f1_name, 'r') as stream1:
++            checker.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            checker.append_stream(f2_name, stream2)
++        
++        # Count similarities before close()
++        sims_before = list(checker._compute_sims())
++        
++        # Call close() (this should add messages to the linter)
++        checker.close()
++        
++        print(f"Similarities detected with min_lines=4: {len(sims_before)}")
++        
++        if len(sims_before) > 0:
++            print("✅ GOOD: min_lines=4 correctly detects similarities")
++        else:
++            print("⚠️  WARNING: min_lines=4 should detect similarities")
++        
++        return len(sims_before) > 0
++        
++    finally:
++        os.unlink(f1_name)
++        os.unlink(f2_name)
++
++if __name__ == "__main__":
++    print("Verifying the fix for min-similarity-lines=0...")
++    
++    # Test performance improvement
++    zero_time, four_time, negative_time = test_min_lines_zero_performance()
++    
++    # Test functionality preservation
++    functionality_works = test_functionality_preserved()
++    
++    print("\n" + "="*60)
++    print("FINAL VERIFICATION RESULTS:")
++    print("="*60)
++    
++    if zero_time < four_time and negative_time < four_time:
++        print("✅ PERFORMANCE: min_lines<=0 successfully skips computation")
++    else:
++        print("❌ PERFORMANCE: min_lines<=0 does not skip computation as expected")
++    
++    if functionality_works:
++        print("✅ FUNCTIONALITY: Existing similarity detection still works")
++    else:
++        print("❌ FUNCTIONALITY: Existing similarity detection is broken")
++    
++    print("\nFix verification completed!")
+\ No newline at end of file
+diff --git a/test_hash_lineset.py b/test_hash_lineset.py
+new file mode 100644
+index 000000000..01d63ee98
+--- /dev/null
++++ b/test_hash_lineset.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++"""
++Test the hash_lineset function specifically with min_common_lines=0.
++"""
++
++from pylint.checkers.similar import hash_lineset, LineSet
++
++def test_hash_lineset_zero():
++    """Test hash_lineset with min_common_lines=0."""
++    
++    # Create a simple lineset
++    lines = ["line1", "line2", "line3", "line4"]
++    lineset = LineSet("test", lines, False, False, False, False)
++    
++    print("Testing hash_lineset with min_common_lines=0:")
++    try:
++        hash2index, index2lines = hash_lineset(lineset, 0)
++        print(f"hash2index: {dict(hash2index)}")
++        print(f"index2lines: {dict(index2lines)}")
++        print("✅ No error occurred")
++    except Exception as e:
++        print(f"❌ Error occurred: {e}")
++        print(f"Error type: {type(e)}")
++    
++    print("\nTesting hash_lineset with min_common_lines=1:")
++    try:
++        hash2index, index2lines = hash_lineset(lineset, 1)
++        print(f"hash2index keys: {len(hash2index)}")
++        print(f"index2lines keys: {len(index2lines)}")
++        print("✅ No error occurred")
++    except Exception as e:
++        print(f"❌ Error occurred: {e}")
++        print(f"Error type: {type(e)}")
++
++if __name__ == "__main__":
++    test_hash_lineset_zero()
+\ No newline at end of file
+diff --git a/test_issue_reproduction.py b/test_issue_reproduction.py
+new file mode 100644
+index 000000000..6e7e82f6c
+--- /dev/null
++++ b/test_issue_reproduction.py
+@@ -0,0 +1,220 @@
++#!/usr/bin/env python3
++"""
++Try to reproduce the exact issue described: 
++"Setting min-similarity-lines to 0 in the rcfile doesn't disable checking for duplicate code, 
++it instead treats every line of code as duplicate and raises many errors."
++"""
++
++import tempfile
++import os
++import subprocess
++import sys
++
++def create_test_files_with_many_lines():
++    """Create test files that would trigger many false positives if every line is treated as duplicate."""
++    
++    content1 = """
++import os
++import sys
++import json
++
++def function_one():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++
++def function_two():
++    x = 10
++    y = 20
++    z = 30
++    return x + y + z
++
++class MyClass:
++    def __init__(self):
++        self.value = 42
++    
++    def method_one(self):
++        return self.value * 2
++    
++    def method_two(self):
++        return self.value * 3
++
++if __name__ == "__main__":
++    obj = MyClass()
++    print(obj.method_one())
++    print(obj.method_two())
++"""
++
++    content2 = """
++import os
++import sys
++import json
++
++def function_three():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++
++def function_four():
++    m = 1000
++    n = 2000
++    o = 3000
++    return m + n + o
++
++class AnotherClass:
++    def __init__(self):
++        self.data = 99
++    
++    def method_a(self):
++        return self.data * 5
++    
++    def method_b(self):
++        return self.data * 7
++
++if __name__ == "__main__":
++    obj = AnotherClass()
++    print(obj.method_a())
++    print(obj.method_b())
++"""
++    
++    return content1, content2
++
++def create_pylintrc_file(test_dir, min_similarity_lines):
++    """Create a pylintrc file with the specified min-similarity-lines setting."""
++    pylintrc_content = f"""
++[SIMILARITIES]
++min-similarity-lines = {min_similarity_lines}
++
++[MESSAGES CONTROL]
++disable = all
++enable = duplicate-code
++"""
++    
++    pylintrc_path = os.path.join(test_dir, "pylintrc")
++    with open(pylintrc_path, 'w') as f:
++        f.write(pylintrc_content)
++    
++    return pylintrc_path
++
++def run_pylint_with_config(files, pylintrc_path):
++    """Run pylint with the given configuration."""
++    cmd = [
++        sys.executable, "-m", "pylint",
++        "--rcfile", pylintrc_path
++    ] + files
++    
++    env = os.environ.copy()
++    env['PYTHONPATH'] = "/workspace/pylint-dev__pylint__2.10"
++    
++    try:
++        result = subprocess.run(
++            cmd, 
++            capture_output=True, 
++            text=True, 
++            cwd="/workspace/pylint-dev__pylint__2.10",
++            env=env
++        )
++        return result.returncode, result.stdout, result.stderr
++    except Exception as e:
++        return -1, "", str(e)
++
++def test_issue_reproduction():
++    """Test to reproduce the issue described in the GitHub issue."""
++    
++    print("Reproducing the issue: min-similarity-lines=0 should disable duplicate code checking")
++    
++    # Create test directory and files
++    test_dir = tempfile.mkdtemp()
++    content1, content2 = create_test_files_with_many_lines()
++    
++    file1_path = os.path.join(test_dir, "test1.py")
++    file2_path = os.path.join(test_dir, "test2.py")
++    
++    with open(file1_path, 'w') as f:
++        f.write(content1)
++    with open(file2_path, 'w') as f:
++        f.write(content2)
++    
++    try:
++        # Test with min-similarity-lines=0
++        print("\n1. Testing with min-similarity-lines=0 (should disable duplicate code checking):")
++        pylintrc_zero = create_pylintrc_file(test_dir, 0)
++        returncode_zero, stdout_zero, stderr_zero = run_pylint_with_config([file1_path, file2_path], pylintrc_zero)
++        
++        print(f"Return code: {returncode_zero}")
++        print(f"Stdout length: {len(stdout_zero)} characters")
++        print(f"Stderr length: {len(stderr_zero)} characters")
++        
++        # Count R0801 messages
++        r0801_count_zero = stdout_zero.count("R0801") + stderr_zero.count("R0801")
++        duplicate_code_count_zero = stdout_zero.count("duplicate-code") + stderr_zero.count("duplicate-code")
++        
++        print(f"R0801 messages: {r0801_count_zero}")
++        print(f"duplicate-code messages: {duplicate_code_count_zero}")
++        
++        if stdout_zero.strip():
++            print("Stdout preview:")
++            print(stdout_zero[:500] + ("..." if len(stdout_zero) > 500 else ""))
++        
++        if stderr_zero.strip():
++            print("Stderr preview:")
++            print(stderr_zero[:500] + ("..." if len(stderr_zero) > 500 else ""))
++        
++        # Test with min-similarity-lines=4
++        print("\n2. Testing with min-similarity-lines=4 (should detect some duplicates):")
++        pylintrc_four = create_pylintrc_file(test_dir, 4)
++        returncode_four, stdout_four, stderr_four = run_pylint_with_config([file1_path, file2_path], pylintrc_four)
++        
++        print(f"Return code: {returncode_four}")
++        print(f"Stdout length: {len(stdout_four)} characters")
++        print(f"Stderr length: {len(stderr_four)} characters")
++        
++        # Count R0801 messages
++        r0801_count_four = stdout_four.count("R0801") + stderr_four.count("R0801")
++        duplicate_code_count_four = stdout_four.count("duplicate-code") + stderr_four.count("duplicate-code")
++        
++        print(f"R0801 messages: {r0801_count_four}")
++        print(f"duplicate-code messages: {duplicate_code_count_four}")
++        
++        if stdout_four.strip():
++            print("Stdout preview:")
++            print(stdout_four[:500] + ("..." if len(stdout_four) > 500 else ""))
++        
++        # Analysis
++        print("\n3. Analysis:")
++        has_duplicates_zero = r0801_count_zero > 0 or duplicate_code_count_zero > 0
++        has_duplicates_four = r0801_count_four > 0 or duplicate_code_count_four > 0
++        
++        if has_duplicates_zero:
++            print("❌ ISSUE CONFIRMED: min-similarity-lines=0 still reports duplicate code (should be disabled)")
++            print(f"   Found {r0801_count_zero} R0801 messages and {duplicate_code_count_zero} duplicate-code messages")
++        else:
++            print("✅ GOOD: min-similarity-lines=0 correctly disables duplicate code checking")
++            
++        if has_duplicates_four:
++            print("✅ GOOD: min-similarity-lines=4 correctly detects duplicate code")
++            print(f"   Found {r0801_count_four} R0801 messages and {duplicate_code_count_four} duplicate-code messages")
++        else:
++            print("⚠️  INFO: min-similarity-lines=4 didn't detect duplicates (may be expected for this test case)")
++        
++        return has_duplicates_zero, has_duplicates_four
++        
++    finally:
++        # Clean up
++        import shutil
++        shutil.rmtree(test_dir)
++
++if __name__ == "__main__":
++    test_issue_reproduction()
+\ No newline at end of file
+diff --git a/test_min_similarity_zero.py b/test_min_similarity_zero.py
+new file mode 100644
+index 000000000..e65512593
+--- /dev/null
++++ b/test_min_similarity_zero.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the min-similarity-lines=0 issue.
++This script creates test files and runs pylint with min-similarity-lines=0
++to verify the issue and test the fix.
++"""
++
++import os
++import tempfile
++import subprocess
++import sys
++from pathlib import Path
++
++def create_test_files():
++    """Create test files with some duplicate code."""
++    # Create temporary directory
++    test_dir = tempfile.mkdtemp()
++    
++    # Create first test file
++    file1_content = '''
++def function_a():
++    x = 1
++    y = 2
++    z = x + y
++    return z
++
++def function_b():
++    a = 10
++    b = 20
++    c = a + b
++    return c
++'''
++    
++    # Create second test file with some duplicate lines
++    file2_content = '''
++def function_c():
++    x = 1
++    y = 2
++    z = x + y
++    return z
++
++def function_d():
++    p = 100
++    q = 200
++    r = p + q
++    return r
++'''
++    
++    file1_path = os.path.join(test_dir, "test1.py")
++    file2_path = os.path.join(test_dir, "test2.py")
++    
++    with open(file1_path, 'w') as f:
++        f.write(file1_content)
++    
++    with open(file2_path, 'w') as f:
++        f.write(file2_content)
++    
++    return test_dir, file1_path, file2_path
++
++def create_pylintrc(test_dir, min_similarity_lines):
++    """Create a pylintrc file with specified min-similarity-lines."""
++    pylintrc_content = f'''
++[SIMILARITIES]
++min-similarity-lines={min_similarity_lines}
++'''
++    
++    pylintrc_path = os.path.join(test_dir, "pylintrc")
++    with open(pylintrc_path, 'w') as f:
++        f.write(pylintrc_content)
++    
++    return pylintrc_path
++
++def run_pylint(files, pylintrc_path):
++    """Run pylint with the given configuration and return the output."""
++    cmd = [
++        sys.executable, "-m", "pylint",
++        "--rcfile", pylintrc_path,
++        "--disable=all",
++        "--enable=duplicate-code"
++    ] + files
++    
++    try:
++        result = subprocess.run(cmd, capture_output=True, text=True, cwd="/workspace/pylint-dev__pylint__2.10")
++        return result.returncode, result.stdout, result.stderr
++    except Exception as e:
++        return -1, "", str(e)
++
++def test_min_similarity_lines_zero():
++    """Test that min-similarity-lines=0 disables duplicate code checking."""
++    print("Testing min-similarity-lines=0 behavior...")
++    
++    # Create test files
++    test_dir, file1, file2 = create_test_files()
++    
++    try:
++        # Test with min-similarity-lines=0 (should disable checking)
++        print("\n1. Testing with min-similarity-lines=0 (should disable duplicate code checking):")
++        pylintrc_zero = create_pylintrc(test_dir, 0)
++        returncode_zero, stdout_zero, stderr_zero = run_pylint([file1, file2], pylintrc_zero)
++        
++        print(f"Return code: {returncode_zero}")
++        print(f"Stdout: {stdout_zero}")
++        print(f"Stderr: {stderr_zero}")
++        
++        # Check if R0801 (duplicate code) messages are present
++        has_duplicate_code_msgs = "R0801" in stdout_zero or "duplicate-code" in stdout_zero
++        print(f"Has duplicate code messages: {has_duplicate_code_msgs}")
++        
++        # Test with min-similarity-lines=4 (should detect duplicates)
++        print("\n2. Testing with min-similarity-lines=4 (should detect duplicate code):")
++        pylintrc_four = create_pylintrc(test_dir, 4)
++        returncode_four, stdout_four, stderr_four = run_pylint([file1, file2], pylintrc_four)
++        
++        print(f"Return code: {returncode_four}")
++        print(f"Stdout: {stdout_four}")
++        print(f"Stderr: {stderr_four}")
++        
++        has_duplicate_code_msgs_four = "R0801" in stdout_four or "duplicate-code" in stdout_four
++        print(f"Has duplicate code messages: {has_duplicate_code_msgs_four}")
++        
++        # Analyze results
++        print("\n3. Analysis:")
++        if has_duplicate_code_msgs:
++            print("❌ ISSUE CONFIRMED: min-similarity-lines=0 still reports duplicate code (should be disabled)")
++        else:
++            print("✅ GOOD: min-similarity-lines=0 correctly disables duplicate code checking")
++            
++        if has_duplicate_code_msgs_four:
++            print("✅ GOOD: min-similarity-lines=4 correctly detects duplicate code")
++        else:
++            print("⚠️  WARNING: min-similarity-lines=4 should detect duplicate code but didn't")
++        
++        return has_duplicate_code_msgs, has_duplicate_code_msgs_four
++        
++    finally:
++        # Clean up
++        import shutil
++        shutil.rmtree(test_dir)
++
++if __name__ == "__main__":
++    test_min_similarity_lines_zero()
+\ No newline at end of file
+diff --git a/test_min_similarity_zero_feature.py b/test_min_similarity_zero_feature.py
+new file mode 100644
+index 000000000..b6cd57623
+--- /dev/null
++++ b/test_min_similarity_zero_feature.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python3
++"""
++Test specifically for the new feature: min-similarity-lines=0 should disable duplicate code checking.
++This test can be added to the test suite to ensure the feature works correctly.
++"""
++
++import tempfile
++import os
++from pylint.checkers.similar import SimilarChecker
++from pylint.lint import PyLinter
++from pylint.testutils import GenericTestReporter
++
++def test_min_similarity_lines_zero_disables_checking():
++    """Test that setting min-similarity-lines to 0 disables duplicate code checking entirely."""
++    
++    # Create test content with obvious duplicates
++    duplicate_content = """
++def function_with_duplicates():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++"""
++    
++    # Create temporary files with identical content
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f1:
++        f1.write(duplicate_content)
++        f1_name = f1.name
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f2:
++        f2.write(duplicate_content)
++        f2_name = f2.name
++    
++    try:
++        # Test 1: Verify that min_similarity_lines=4 detects duplicates
++        linter = PyLinter(reporter=GenericTestReporter())
++        checker = SimilarChecker(linter)
++        checker.config.min_similarity_lines = 4
++        checker.set_option("min-similarity-lines", 4)
++        
++        with open(f1_name, 'r') as stream1:
++            checker.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            checker.append_stream(f2_name, stream2)
++        
++        similarities_with_4 = list(checker._compute_sims())
++        
++        # Test 2: Verify that min_similarity_lines=0 disables checking
++        linter2 = PyLinter(reporter=GenericTestReporter())
++        checker2 = SimilarChecker(linter2)
++        checker2.config.min_similarity_lines = 0
++        checker2.set_option("min-similarity-lines", 0)
++        
++        with open(f1_name, 'r') as stream1:
++            checker2.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            checker2.append_stream(f2_name, stream2)
++        
++        similarities_with_0 = list(checker2._compute_sims())
++        
++        # Test 3: Verify that negative values also disable checking
++        linter3 = PyLinter(reporter=GenericTestReporter())
++        checker3 = SimilarChecker(linter3)
++        checker3.config.min_similarity_lines = -1
++        checker3.set_option("min-similarity-lines", -1)
++        
++        with open(f1_name, 'r') as stream1:
++            checker3.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            checker3.append_stream(f2_name, stream2)
++        
++        similarities_with_negative = list(checker3._compute_sims())
++        
++        # Assertions
++        assert len(similarities_with_4) > 0, "min_similarity_lines=4 should detect duplicates"
++        assert len(similarities_with_0) == 0, "min_similarity_lines=0 should not detect any duplicates"
++        assert len(similarities_with_negative) == 0, "min_similarity_lines=-1 should not detect any duplicates"
++        
++        print("✅ All assertions passed!")
++        print(f"   - min_similarity_lines=4: {len(similarities_with_4)} similarities found")
++        print(f"   - min_similarity_lines=0: {len(similarities_with_0)} similarities found")
++        print(f"   - min_similarity_lines=-1: {len(similarities_with_negative)} similarities found")
++        
++        return True
++        
++    except AssertionError as e:
++        print(f"❌ Assertion failed: {e}")
++        return False
++    except Exception as e:
++        print(f"❌ Unexpected error: {e}")
++        return False
++    finally:
++        # Clean up
++        os.unlink(f1_name)
++        os.unlink(f2_name)
++
++def test_min_similarity_lines_zero_close_method():
++    """Test that the close() method returns early when min_similarity_lines <= 0."""
++    
++    # Create a mock linter and config
++    class MockLinter:
++        def __init__(self):
++            self.stats = {}
++        
++        def add_stats(self, **kwargs):
++            self.stats.update(kwargs)
++            return self.stats
++    
++    class MockConfig:
++        def __init__(self, min_similarity_lines):
++            self.min_similarity_lines = min_similarity_lines
++    
++    # Test with min_similarity_lines=0
++    mock_linter = MockLinter()
++    checker = SimilarChecker()
++    checker.linter = mock_linter
++    checker.config = MockConfig(0)
++    checker.set_option("min-similarity-lines", 0)
++    checker.stats = mock_linter.add_stats(nb_duplicated_lines=0, percent_duplicated_lines=0)
++    
++    # Add some linesets to make sure they would be processed if not for early return
++    from pylint.checkers.similar import LineSet
++    checker.linesets = [
++        LineSet("test1", ["line1", "line2", "line3", "line4", "line5"], False, False, False, False),
++        LineSet("test2", ["line1", "line2", "line3", "line4", "line5"], False, False, False, False)
++    ]
++    
++    # Call close() - should return early and not process similarities
++    try:
++        checker.close()
++        # If we get here without exception, the early return worked
++        print("✅ close() method with min_similarity_lines=0 returned early successfully")
++        return True
++    except Exception as e:
++        print(f"❌ close() method failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    print("Testing min-similarity-lines=0 feature...")
++    
++    test1_passed = test_min_similarity_lines_zero_disables_checking()
++    test2_passed = test_min_similarity_lines_zero_close_method()
++    
++    print("\n" + "="*60)
++    print("FEATURE TEST RESULTS:")
++    print("="*60)
++    
++    if test1_passed and test2_passed:
++        print("✅ SUCCESS: min-similarity-lines=0 feature is working correctly!")
++        print("   - Similarity computation is disabled when min_similarity_lines <= 0")
++        print("   - close() method returns early for performance")
++        print("   - Existing functionality is preserved")
++    else:
++        print("❌ FAILURE: min-similarity-lines=0 feature is not working correctly")
++        if not test1_passed:
++            print("   - Similarity computation test failed")
++        if not test2_passed:
++            print("   - close() method early return test failed")
++    
++    print("\nFeature test completed!")
+\ No newline at end of file
+diff --git a/test_simple_fix_verification.py b/test_simple_fix_verification.py
+new file mode 100644
+index 000000000..e9e0443d6
+--- /dev/null
++++ b/test_simple_fix_verification.py
+@@ -0,0 +1,252 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify that the fix for min-similarity-lines=0 works correctly.
++"""
++
++import tempfile
++import os
++import time
++from pylint.checkers.similar import Similar
++
++def test_fix_verification():
++    """Test that min_lines=0 completely skips similarity computation."""
++    
++    print("Verifying the fix for min-similarity-lines=0...")
++    
++    # Create test content with duplicate lines
++    content1 = """
++def function_a():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++
++def other_function():
++    x = 10
++    y = 20
++    z = 30
++    return x + y + z
++"""
++    
++    content2 = """
++def function_b():
++    a = 1
++    b = 2
++    c = 3
++    d = 4
++    e = 5
++    f = 6
++    g = 7
++    h = 8
++    return a + b + c + d + e + f + g + h
++
++def another_function():
++    m = 100
++    n = 200
++    o = 300
++    return m + n + o
++"""
++    
++    # Create temporary files
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f1:
++        f1.write(content1)
++        f1_name = f1.name
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f2:
++        f2.write(content2)
++        f2_name = f2.name
++    
++    try:
++        # Test 1: min_lines=0 should return no similarities (and be fast)
++        print("\n1. Testing min_lines=0 (should skip computation):")
++        
++        similar_zero = Similar(min_lines=0)
++        
++        with open(f1_name, 'r') as stream1:
++            similar_zero.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            similar_zero.append_stream(f2_name, stream2)
++        
++        start_time = time.time()
++        sims_zero = list(similar_zero._compute_sims())
++        zero_time = time.time() - start_time
++        
++        print(f"Similarities found with min_lines=0: {len(sims_zero)}")
++        print(f"Time taken: {zero_time:.6f} seconds")
++        
++        # Test 2: min_lines=4 should detect similarities
++        print("\n2. Testing min_lines=4 (should detect similarities):")
++        
++        similar_four = Similar(min_lines=4)
++        
++        with open(f1_name, 'r') as stream1:
++            similar_four.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            similar_four.append_stream(f2_name, stream2)
++        
++        start_time = time.time()
++        sims_four = list(similar_four._compute_sims())
++        four_time = time.time() - start_time
++        
++        print(f"Similarities found with min_lines=4: {len(sims_four)}")
++        print(f"Time taken: {four_time:.6f} seconds")
++        
++        # Test 3: min_lines=-1 should also return no similarities
++        print("\n3. Testing min_lines=-1 (should skip computation):")
++        
++        similar_negative = Similar(min_lines=-1)
++        
++        with open(f1_name, 'r') as stream1:
++            similar_negative.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            similar_negative.append_stream(f2_name, stream2)
++        
++        start_time = time.time()
++        sims_negative = list(similar_negative._compute_sims())
++        negative_time = time.time() - start_time
++        
++        print(f"Similarities found with min_lines=-1: {len(sims_negative)}")
++        print(f"Time taken: {negative_time:.6f} seconds")
++        
++        # Analysis
++        print("\n" + "="*50)
++        print("ANALYSIS:")
++        print("="*50)
++        
++        if len(sims_zero) == 0:
++            print("✅ GOOD: min_lines=0 returns no similarities")
++        else:
++            print("❌ ISSUE: min_lines=0 should return no similarities")
++        
++        if len(sims_four) > 0:
++            print("✅ GOOD: min_lines=4 detects similarities")
++        else:
++            print("⚠️  INFO: min_lines=4 found no similarities (may be expected)")
++        
++        if len(sims_negative) == 0:
++            print("✅ GOOD: min_lines=-1 returns no similarities")
++        else:
++            print("❌ ISSUE: min_lines=-1 should return no similarities")
++        
++        # Performance comparison
++        if zero_time < four_time:
++            improvement = (four_time - zero_time) / four_time * 100
++            print(f"✅ PERFORMANCE: min_lines=0 is {improvement:.1f}% faster")
++        else:
++            print("⚠️  PERFORMANCE: min_lines=0 should be faster than min_lines=4")
++        
++        if negative_time < four_time:
++            print("✅ PERFORMANCE: min_lines=-1 is also faster")
++        else:
++            print("⚠️  PERFORMANCE: min_lines=-1 should be faster than min_lines=4")
++        
++        # Test the SimilarChecker close() method behavior
++        print("\n4. Testing SimilarChecker.close() method:")
++        test_similar_checker_close()
++        
++        return len(sims_zero) == 0 and len(sims_negative) == 0
++        
++    finally:
++        # Clean up
++        os.unlink(f1_name)
++        os.unlink(f2_name)
++
++def test_similar_checker_close():
++    """Test that SimilarChecker.close() method respects the min_lines=0 setting."""
++    
++    from pylint.checkers.similar import SimilarChecker
++    
++    # Create a mock linter-like object
++    class MockLinter:
++        def __init__(self):
++            self.stats = {}
++        
++        def add_stats(self, **kwargs):
++            self.stats.update(kwargs)
++            return self.stats
++    
++    # Create a mock config
++    class MockConfig:
++        def __init__(self, min_similarity_lines):
++            self.min_similarity_lines = min_similarity_lines
++    
++    # Test with min_lines=0
++    print("Testing SimilarChecker.close() with min_lines=0...")
++    
++    mock_linter = MockLinter()
++    checker = SimilarChecker()
++    checker.linter = mock_linter
++    checker.config = MockConfig(0)
++    checker.set_option("min-similarity-lines", 0)
++    checker.stats = mock_linter.add_stats(nb_duplicated_lines=0, percent_duplicated_lines=0)
++    
++    # Add some linesets (this would normally happen during processing)
++    from pylint.checkers.similar import LineSet
++    checker.linesets = [
++        LineSet("test1", ["line1", "line2", "line3"], False, False, False, False),
++        LineSet("test2", ["line1", "line2", "line3"], False, False, False, False)
++    ]
++    
++    # Call close() - this should return early due to min_lines=0
++    start_time = time.time()
++    checker.close()
++    close_time = time.time() - start_time
++    
++    print(f"SimilarChecker.close() with min_lines=0 took: {close_time:.6f} seconds")
++    print("✅ SimilarChecker.close() completed (should return early)")
++    
++    # Test with min_lines=4 for comparison
++    print("Testing SimilarChecker.close() with min_lines=4...")
++    
++    mock_linter2 = MockLinter()
++    checker2 = SimilarChecker()
++    checker2.linter = mock_linter2
++    checker2.config = MockConfig(4)
++    checker2.set_option("min-similarity-lines", 4)
++    checker2.stats = mock_linter2.add_stats(nb_duplicated_lines=0, percent_duplicated_lines=0)
++    
++    # Add the same linesets
++    checker2.linesets = [
++        LineSet("test1", ["line1", "line2", "line3"], False, False, False, False),
++        LineSet("test2", ["line1", "line2", "line3"], False, False, False, False)
++    ]
++    
++    # Call close() - this should do the full computation
++    start_time = time.time()
++    try:
++        checker2.close()
++    except Exception as e:
++        # We expect this to fail because we don't have a full linter setup,
++        # but it should at least get past the early return check
++        print(f"Expected error in full computation: {type(e).__name__}")
++    
++    close_time2 = time.time() - start_time
++    print(f"SimilarChecker.close() with min_lines=4 took: {close_time2:.6f} seconds")
++    
++    if close_time < close_time2:
++        print("✅ PERFORMANCE: min_lines=0 close() is faster (early return works)")
++    else:
++        print("⚠️  PERFORMANCE: min_lines=0 close() should be faster")
++
++if __name__ == "__main__":
++    success = test_fix_verification()
++    
++    print("\n" + "="*60)
++    print("FINAL VERIFICATION RESULT:")
++    print("="*60)
++    
++    if success:
++        print("✅ SUCCESS: Fix is working correctly!")
++        print("   - min_lines=0 returns no similarities")
++        print("   - min_lines=-1 returns no similarities") 
++        print("   - Performance improvement achieved")
++        print("   - SimilarChecker.close() early return works")
++    else:
++        print("❌ FAILURE: Fix is not working as expected")
++    
++    print("\nFix verification completed!")
+\ No newline at end of file
+diff --git a/test_simple_similarity.py b/test_simple_similarity.py
+new file mode 100644
+index 000000000..528fbd31e
+--- /dev/null
++++ b/test_simple_similarity.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""
++Simple test to reproduce the min-similarity-lines=0 issue using the similar module directly.
++"""
++
++import tempfile
++import os
++from pylint.checkers.similar import Similar
++
++def test_min_similarity_zero():
++    """Test that min_lines=0 should disable similarity checking."""
++    
++    # Create test content with duplicate lines (more than 4 lines)
++    content1 = """def function_a():
++    x = 1
++    y = 2
++    z = x + y
++    w = z * 2
++    v = w + 1
++    return v
++
++def other_function():
++    pass
++"""
++    
++    content2 = """def function_b():
++    x = 1
++    y = 2
++    z = x + y
++    w = z * 2
++    v = w + 1
++    return v
++
++def another_function():
++    pass
++"""
++    
++    # Test with min_lines=0 (should disable checking)
++    print("Testing with min_lines=0 (should disable similarity checking):")
++    similar_zero = Similar(min_lines=0)
++    
++    # Create temporary files
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f1:
++        f1.write(content1)
++        f1_name = f1.name
++    
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f2:
++        f2.write(content2)
++        f2_name = f2.name
++    
++    try:
++        # Add streams to Similar
++        with open(f1_name, 'r') as stream1:
++            similar_zero.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            similar_zero.append_stream(f2_name, stream2)
++        
++        # Compute similarities
++        sims_zero = list(similar_zero._compute_sims())
++        print(f"Number of similarities found with min_lines=0: {len(sims_zero)}")
++        
++        # Test with min_lines=4 (should detect similarities)
++        print("\nTesting with min_lines=4 (should detect similarities):")
++        similar_four = Similar(min_lines=4)
++        
++        with open(f1_name, 'r') as stream1:
++            similar_four.append_stream(f1_name, stream1)
++        with open(f2_name, 'r') as stream2:
++            similar_four.append_stream(f2_name, stream2)
++        
++        sims_four = list(similar_four._compute_sims())
++        print(f"Number of similarities found with min_lines=4: {len(sims_four)}")
++        
++        # Analysis
++        print("\nAnalysis:")
++        if len(sims_zero) > 0:
++            print("❌ ISSUE CONFIRMED: min_lines=0 still reports similarities (should be disabled)")
++            print(f"   Found {len(sims_zero)} similarity groups")
++            for i, (num, couples) in enumerate(sims_zero):
++                print(f"   Group {i+1}: {num} similar lines in {len(couples)} locations")
++        else:
++            print("✅ GOOD: min_lines=0 correctly disables similarity checking")
++            
++        if len(sims_four) > 0:
++            print("✅ GOOD: min_lines=4 correctly detects similarities")
++            print(f"   Found {len(sims_four)} similarity groups")
++        else:
++            print("⚠️  WARNING: min_lines=4 should detect similarities but didn't")
++        
++        return len(sims_zero) > 0, len(sims_four) > 0
++        
++    finally:
++        # Clean up
++        os.unlink(f1_name)
++        os.unlink(f2_name)
++
++if __name__ == "__main__":
++    test_min_similarity_zero()
+\ No newline at end of file

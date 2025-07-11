@@ -1,0 +1,903 @@
+diff --git a/debug_inheritance.py b/debug_inheritance.py
+new file mode 100644
+index 000000000..e196050b6
+--- /dev/null
++++ b/debug_inheritance.py
+@@ -0,0 +1,170 @@
++#!/usr/bin/env python3
++"""
++Debug script to understand how inheritance diagram URLs are generated.
++"""
++
++import tempfile
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def create_debug_project():
++    """Create a test project for debugging."""
++    
++    temp_dir = Path(tempfile.mkdtemp())
++    src_dir = temp_dir / "source"
++    src_dir.mkdir()
++    
++    # Create package directory
++    pkg_dir = src_dir / "my_package"
++    pkg_dir.mkdir()
++    
++    # Create conf.py
++    conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.inheritance_diagram', 'sphinx.ext.graphviz', 'sphinx.ext.autodoc']
++graphviz_output_format = 'svg'
++'''
++    (src_dir / "conf.py").write_text(conf_content)
++    
++    # Create Python modules
++    (src_dir / "my_module.py").write_text('''
++class MyClass1:
++    """First test class."""
++    pass
++
++class MyClass2(MyClass1):
++    """Second test class that inherits from MyClass1."""
++    pass
++''')
++    
++    (src_dir / "nested_module.py").write_text('''
++class NestedClass1:
++    """Nested class 1."""
++    pass
++
++class NestedClass2(NestedClass1):
++    """Nested class 2 that inherits from NestedClass1."""
++    pass
++''')
++    
++    # Create root index.rst
++    root_index_content = '''
++Root Documentation
++==================
++
++.. inheritance-diagram:: my_module.MyClass1 my_module.MyClass2
++
++.. toctree::
++   :maxdepth: 2
++   
++   my_package/index
++'''
++    (src_dir / "index.rst").write_text(root_index_content)
++    
++    # Create nested_class_1.rst in my_package
++    (pkg_dir / "nested_class_1.rst").write_text('''
++NestedClass1 Documentation
++==========================
++
++.. autoclass:: nested_module.NestedClass1
++   :members:
++''')
++    
++    # Create nested_class_2.rst in my_package  
++    (pkg_dir / "nested_class_2.rst").write_text('''
++NestedClass2 Documentation
++==========================
++
++.. autoclass:: nested_module.NestedClass2
++   :members:
++''')
++    
++    # Create nested index.rst with different classes
++    nested_index_content = '''
++Package Documentation
++=====================
++
++.. inheritance-diagram:: nested_module.NestedClass1 nested_module.NestedClass2
++
++.. toctree::
++   :maxdepth: 2
++   
++   nested_class_1
++   nested_class_2
++'''
++    (pkg_dir / "index.rst").write_text(nested_index_content)
++    
++    return temp_dir, src_dir
++
++
++def debug_inheritance_urls():
++    """Debug the URL generation process."""
++    
++    # Monkey patch to debug URL generation
++    from sphinx.ext.inheritance_diagram import html_visit_inheritance_diagram
++    
++    original_visit = html_visit_inheritance_diagram
++    
++    def debug_visit(self, node):
++        import os
++        print(f"\n=== DEBUG: Processing inheritance diagram ===")
++        print(f"Current docname: {self.builder.current_docname}")
++        print(f"Output suffix: {self.builder.out_suffix}")
++        print(f"Imgpath: {self.builder.imgpath}")
++        print(f"Outdir: {self.builder.outdir}")
++        print(f"Outdir basename: {os.path.basename(self.builder.outdir)}")
++        
++        # Get pending xrefs
++        from typing import cast, Iterable
++        from sphinx import addnodes
++        pending_xrefs = cast(Iterable[addnodes.pending_xref], node)
++        
++        print(f"Pending xrefs:")
++        for i, child in enumerate(pending_xrefs):
++            refuri = child.get('refuri')
++            print(f"  {i}: refuri={refuri}, refid={child.get('refid')}, reftitle={child.get('reftitle')}")
++            
++            # Show URL calculation
++            if refuri:
++                from os.path import join, dirname
++                current_dir = dirname(self.builder.current_docname)
++                print(f"    current_dir: '{current_dir}'")
++                if current_dir:
++                    calculated_url = join(current_dir, refuri)
++                    print(f"    calculated URL: {calculated_url}")
++                else:
++                    print(f"    calculated URL: {refuri}")
++        
++        # Call original function
++        return original_visit(self, node)
++    
++    # Apply monkey patch
++    import sphinx.ext.inheritance_diagram
++    sphinx.ext.inheritance_diagram.html_visit_inheritance_diagram = debug_visit
++    
++    temp_dir, src_dir = create_debug_project()
++    out_dir = temp_dir / "build"
++    
++    print(f"Building in: {temp_dir}")
++    
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(src_dir),
++            confdir=str(src_dir),
++            outdir=str(out_dir),
++            doctreedir=str(out_dir / ".doctrees"),
++            buildername="html",
++            confoverrides={'graphviz_output_format': 'svg'}
++        )
++        app.build()
++    
++    return temp_dir
++
++
++if __name__ == "__main__":
++    debug_inheritance_urls()
+\ No newline at end of file
+diff --git a/sphinx/ext/graphviz.py b/sphinx/ext/graphviz.py
+index 8b21d9e3b..cadf6c92e 100644
+--- a/sphinx/ext/graphviz.py
++++ b/sphinx/ext/graphviz.py
+@@ -234,11 +234,12 @@ def fix_svg_relative_paths(self: SphinxTranslator, filepath: str) -> None:
+             # not a relative link
+             continue
+ 
+-        old_path = path.join(self.builder.outdir, url)
+-        new_path = path.relpath(
+-            old_path,
+-            start=path.join(self.builder.outdir, self.builder.imgpath),
+-        )
++        # Resolve URL relative to current document, then make it absolute
++        doc_dir = path.join(self.builder.outdir, path.dirname(self.builder.current_docname))
++        old_path = path.normpath(path.join(doc_dir, url))
++        # imgpath is relative to the document, so resolve it relative to doc_dir
++        img_dir = path.normpath(path.join(doc_dir, self.builder.imgpath))
++        new_path = path.relpath(old_path, start=img_dir)
+         modified_url = urlunsplit((scheme, hostname, new_path, query, fragment))
+ 
+         element.set(href_name, modified_url)
+diff --git a/sphinx/ext/inheritance_diagram.py b/sphinx/ext/inheritance_diagram.py
+index 6e3985512..fc7b15896 100644
+--- a/sphinx/ext/inheritance_diagram.py
++++ b/sphinx/ext/inheritance_diagram.py
+@@ -412,13 +412,10 @@ def html_visit_inheritance_diagram(self: HTML5Translator, node: inheritance_diag
+     pending_xrefs = cast(Iterable[addnodes.pending_xref], node)
+     for child in pending_xrefs:
+         if child.get('refuri') is not None:
+-            if graphviz_output_format == 'SVG':
+-                urls[child['reftitle']] = "../" + child.get('refuri')
+-            else:
+-                urls[child['reftitle']] = child.get('refuri')
++            urls[child['reftitle']] = child.get('refuri')
+         elif child.get('refid') is not None:
+             if graphviz_output_format == 'SVG':
+-                urls[child['reftitle']] = '../' + current_filename + '#' + child.get('refid')
++                urls[child['reftitle']] = current_filename + '#' + child.get('refid')
+             else:
+                 urls[child['reftitle']] = '#' + child.get('refid')
+ 
+diff --git a/test_png_format.py b/test_png_format.py
+new file mode 100644
+index 000000000..b386c5c29
+--- /dev/null
++++ b/test_png_format.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""
++Test to verify PNG format still works correctly.
++"""
++
++import tempfile
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def test_png_format():
++    """Test that PNG format still works correctly."""
++    
++    temp_dir = Path(tempfile.mkdtemp())
++    src_dir = temp_dir / "source"
++    src_dir.mkdir()
++    
++    # Create package directory
++    pkg_dir = src_dir / "my_package"
++    pkg_dir.mkdir()
++    
++    # Create conf.py
++    conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.inheritance_diagram', 'sphinx.ext.graphviz', 'sphinx.ext.autodoc']
++graphviz_output_format = 'png'  # Use PNG format
++'''
++    (src_dir / "conf.py").write_text(conf_content)
++    
++    # Create Python module
++    (src_dir / "my_module.py").write_text('''
++class MyClass1:
++    """First test class."""
++    pass
++
++class MyClass2(MyClass1):
++    """Second test class that inherits from MyClass1."""
++    pass
++''')
++    
++    # Create root index.rst
++    root_index_content = '''
++Root Documentation
++==================
++
++.. inheritance-diagram:: my_module.MyClass1 my_module.MyClass2
++
++.. toctree::
++   :maxdepth: 2
++   
++   my_package/index
++'''
++    (src_dir / "index.rst").write_text(root_index_content)
++    
++    # Create nested index.rst
++    nested_index_content = '''
++Package Documentation
++=====================
++
++.. inheritance-diagram:: my_module.MyClass1 my_module.MyClass2
++'''
++    (pkg_dir / "index.rst").write_text(nested_index_content)
++    
++    out_dir = temp_dir / "build"
++    
++    print(f"Building PNG test project in: {temp_dir}")
++    
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(src_dir),
++            confdir=str(src_dir),
++            outdir=str(out_dir),
++            doctreedir=str(out_dir / ".doctrees"),
++            buildername="html",
++            confoverrides={'graphviz_output_format': 'png'}
++        )
++        app.build()
++    
++    # Check that PNG files are generated
++    png_files = list(out_dir.rglob("*.png"))
++    print(f"Found {len(png_files)} PNG files")
++    
++    # Check that no SVG files are generated
++    svg_files = list(out_dir.rglob("*.svg"))
++    print(f"Found {len(svg_files)} SVG files")
++    
++    # Check HTML files contain image tags (not object tags)
++    html_files = [f for f in out_dir.rglob("*.html") if 'inheritance' in f.read_text()]
++    
++    success = True
++    for html_file in html_files:
++        content = html_file.read_text()
++        
++        # Should contain img tags for PNG
++        if '<img src="_images/inheritance-' not in content and '<img src="../_images/inheritance-' not in content:
++            print(f"ERROR: {html_file} does not contain expected img tag")
++            success = False
++        
++        # Should not contain object tags for SVG
++        if '<object data=' in content:
++            print(f"ERROR: {html_file} contains unexpected object tag")
++            success = False
++    
++    if success and len(png_files) > 0 and len(svg_files) == 0:
++        print("✅ SUCCESS: PNG format works correctly!")
++        return True
++    else:
++        print("❌ FAILURE: PNG format test failed!")
++        return False
++
++
++if __name__ == "__main__":
++    success = test_png_format()
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_svg_bug_reproduction.py b/test_svg_bug_reproduction.py
+new file mode 100644
+index 000000000..c4b4c6781
+--- /dev/null
++++ b/test_svg_bug_reproduction.py
+@@ -0,0 +1,179 @@
++#!/usr/bin/env python3
++"""
++Reproduction script for inheritance-diagram 404 links with SVG issue.
++This script creates a minimal test case to reproduce the bug.
++"""
++
++import os
++import tempfile
++import shutil
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def create_test_project():
++    """Create a minimal test project that reproduces the SVG link issue."""
++    
++    # Create temporary directory
++    temp_dir = Path(tempfile.mkdtemp())
++    print(f"Creating test project in: {temp_dir}")
++    
++    # Create source directory structure
++    src_dir = temp_dir / "source"
++    src_dir.mkdir()
++    
++    # Create package directory
++    pkg_dir = src_dir / "my_package"
++    pkg_dir.mkdir()
++    
++    # Create conf.py
++    conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.inheritance_diagram', 'sphinx.ext.graphviz', 'sphinx.ext.autodoc']
++graphviz_output_format = 'svg'
++'''
++    (src_dir / "conf.py").write_text(conf_content)
++    
++    # Create Python module files
++    (src_dir / "my_module.py").write_text('''
++class MyClass1:
++    """First test class."""
++    pass
++
++class MyClass2(MyClass1):
++    """Second test class that inherits from MyClass1."""
++    pass
++''')
++    
++    # Create root index.rst
++    root_index_content = '''
++Root Documentation
++==================
++
++.. inheritance-diagram:: my_module.MyClass1 my_module.MyClass2
++   :caption: Root inheritance diagram
++
++Classes:
++
++.. autoclass:: my_module.MyClass1
++
++.. autoclass:: my_module.MyClass2
++'''
++    (src_dir / "index.rst").write_text(root_index_content)
++    
++    # Create nested index.rst
++    nested_index_content = '''
++Package Documentation
++=====================
++
++.. inheritance-diagram:: my_module.MyClass1 my_module.MyClass2
++   :caption: Nested inheritance diagram
++
++Classes:
++
++.. autoclass:: my_module.MyClass1
++
++.. autoclass:: my_module.MyClass2
++'''
++    (pkg_dir / "index.rst").write_text(nested_index_content)
++    
++    return temp_dir, src_dir
++
++
++def build_docs(src_dir, out_dir):
++    """Build the documentation using Sphinx."""
++    
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(src_dir),
++            confdir=str(src_dir),
++            outdir=str(out_dir),
++            doctreedir=str(out_dir / ".doctrees"),
++            buildername="html",
++            confoverrides={'graphviz_output_format': 'svg'}
++        )
++        app.build()
++    
++    return app
++
++
++def check_svg_links(out_dir):
++    """Check the generated SVG files for correct links."""
++    
++    print("\n=== Checking SVG Links ===")
++    
++    # Find SVG files
++    svg_files = list(Path(out_dir).rglob("*.svg"))
++    print(f"Found SVG files: {svg_files}")
++    
++    for svg_file in svg_files:
++        print(f"\nAnalyzing: {svg_file}")
++        content = svg_file.read_text()
++        
++        # Look for xlink:href attributes
++        import re
++        links = re.findall(r'xlink:href="([^"]*)"', content)
++        print(f"Links found: {links}")
++        
++        # Check if links are relative to the SVG file location
++        svg_dir = svg_file.parent
++        for link in links:
++            if link.startswith('#'):
++                continue  # Skip fragment-only links
++            
++            target_path = svg_dir / link
++            print(f"  Link: {link}")
++            print(f"  Resolves to: {target_path}")
++            print(f"  Exists: {target_path.exists()}")
++
++
++def main():
++    """Main function to reproduce the issue."""
++    
++    print("=== SVG Inheritance Diagram Bug Reproduction ===")
++    
++    # Create test project
++    temp_dir, src_dir = create_test_project()
++    out_dir = temp_dir / "build"
++    
++    try:
++        # Build documentation
++        print(f"\nBuilding documentation...")
++        print(f"Source: {src_dir}")
++        print(f"Output: {out_dir}")
++        
++        app = build_docs(src_dir, out_dir)
++        
++        # Check the results
++        check_svg_links(out_dir)
++        
++        # Check HTML files for SVG embedding
++        print("\n=== Checking HTML Files ===")
++        html_files = list(out_dir.rglob("*.html"))
++        for html_file in html_files:
++            print(f"\nAnalyzing: {html_file}")
++            content = html_file.read_text()
++            if 'inheritance' in content and 'svg' in content:
++                # Extract SVG object tags
++                import re
++                svg_objects = re.findall(r'<object[^>]*data="([^"]*)"[^>]*>', content)
++                print(f"SVG objects: {svg_objects}")
++        
++        print(f"\nTest project created in: {temp_dir}")
++        print("You can manually inspect the files to see the issue.")
++        
++        return temp_dir
++        
++    except Exception as e:
++        print(f"Error: {e}")
++        import traceback
++        traceback.print_exc()
++        return None
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_svg_fix_verification.py b/test_svg_fix_verification.py
+new file mode 100644
+index 000000000..503ac08cb
+--- /dev/null
++++ b/test_svg_fix_verification.py
+@@ -0,0 +1,196 @@
++#!/usr/bin/env python3
++"""
++Test to verify the SVG inheritance diagram fix works correctly.
++"""
++
++import tempfile
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def create_test_project():
++    """Create a test project that demonstrates the fix."""
++    
++    temp_dir = Path(tempfile.mkdtemp())
++    src_dir = temp_dir / "source"
++    src_dir.mkdir()
++    
++    # Create nested package directory
++    pkg_dir = src_dir / "my_package"
++    pkg_dir.mkdir()
++    
++    # Create conf.py
++    conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.inheritance_diagram', 'sphinx.ext.graphviz', 'sphinx.ext.autodoc']
++graphviz_output_format = 'svg'
++'''
++    (src_dir / "conf.py").write_text(conf_content)
++    
++    # Create Python modules with different classes
++    (src_dir / "root_module.py").write_text('''
++class RootClass1:
++    """Root class 1."""
++    pass
++
++class RootClass2(RootClass1):
++    """Root class 2 that inherits from RootClass1."""
++    pass
++''')
++    
++    (src_dir / "nested_module.py").write_text('''
++class NestedClass1:
++    """Nested class 1."""
++    pass
++
++class NestedClass2(NestedClass1):
++    """Nested class 2 that inherits from NestedClass1."""
++    pass
++''')
++    
++    # Create root index.rst
++    root_index_content = '''
++Root Documentation
++==================
++
++.. inheritance-diagram:: root_module.RootClass1 root_module.RootClass2
++
++Classes:
++
++.. autoclass:: root_module.RootClass1
++
++.. autoclass:: root_module.RootClass2
++
++.. toctree::
++   :maxdepth: 2
++   
++   my_package/index
++'''
++    (src_dir / "index.rst").write_text(root_index_content)
++    
++    # Create class documentation files in nested directory
++    (pkg_dir / "nested_class_1.rst").write_text('''
++NestedClass1 Documentation
++==========================
++
++.. autoclass:: nested_module.NestedClass1
++   :members:
++''')
++    
++    (pkg_dir / "nested_class_2.rst").write_text('''
++NestedClass2 Documentation
++==========================
++
++.. autoclass:: nested_module.NestedClass2
++   :members:
++''')
++    
++    # Create nested index.rst with different classes
++    nested_index_content = '''
++Package Documentation
++=====================
++
++.. inheritance-diagram:: nested_module.NestedClass1 nested_module.NestedClass2
++
++Classes:
++
++.. toctree::
++   :maxdepth: 2
++   
++   nested_class_1
++   nested_class_2
++'''
++    (pkg_dir / "index.rst").write_text(nested_index_content)
++    
++    return temp_dir, src_dir
++
++
++def test_svg_links():
++    """Test that SVG links work correctly in both root and nested directories."""
++    
++    temp_dir, src_dir = create_test_project()
++    out_dir = temp_dir / "build"
++    
++    print(f"Building test project in: {temp_dir}")
++    
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(src_dir),
++            confdir=str(src_dir),
++            outdir=str(out_dir),
++            doctreedir=str(out_dir / ".doctrees"),
++            buildername="html",
++            confoverrides={'graphviz_output_format': 'svg'}
++        )
++        app.build()
++    
++    # Find SVG files
++    svg_files = list(out_dir.rglob("*.svg"))
++    print(f"\nFound {len(svg_files)} SVG files")
++    
++    success = True
++    
++    for svg_file in svg_files:
++        print(f"\n=== Checking {svg_file.relative_to(out_dir)} ===")
++        content = svg_file.read_text()
++        
++        # Extract links
++        import re
++        links = re.findall(r'ns1:href="([^"]*)"', content)
++        
++        print(f"Links in SVG:")
++        for link in links:
++            print(f"  {link}")
++            
++            # Check if link resolves correctly
++            if not link.startswith('http'):
++                link_without_fragment = link.split('#')[0]
++                resolved_path = (svg_file.parent / link_without_fragment).resolve()
++                exists = resolved_path.exists()
++                print(f"    -> {resolved_path}")
++                print(f"    Exists: {exists}")
++                
++                if not exists:
++                    success = False
++                    print(f"    ERROR: Link target does not exist!")
++    
++    # Check HTML files that contain inheritance diagrams
++    print(f"\n=== Checking HTML Files ===")
++    html_files = [f for f in out_dir.rglob("*.html") if 'inheritance' in f.read_text()]
++    
++    for html_file in html_files:
++        print(f"\nHTML file: {html_file.relative_to(out_dir)}")
++        content = html_file.read_text()
++        
++        # Find SVG object tags
++        svg_objects = re.findall(r'<object[^>]*data="([^"]*)"[^>]*>', content)
++        for svg_obj in svg_objects:
++            print(f"  References SVG: {svg_obj}")
++            
++            # Resolve SVG path relative to HTML file
++            svg_path = (html_file.parent / svg_obj).resolve()
++            exists = svg_path.exists()
++            print(f"    SVG resolves to: {svg_path}")
++            print(f"    SVG exists: {exists}")
++            
++            if not exists:
++                success = False
++                print(f"    ERROR: SVG file does not exist!")
++    
++    print(f"\n=== Test Result ===")
++    if success:
++        print("✅ SUCCESS: All SVG links resolve correctly!")
++    else:
++        print("❌ FAILURE: Some SVG links are broken!")
++    
++    return success, temp_dir
++
++
++if __name__ == "__main__":
++    success, temp_dir = test_svg_links()
++    print(f"\nTest project available at: {temp_dir}")
++    exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_svg_links_detailed.py b/test_svg_links_detailed.py
+new file mode 100644
+index 000000000..b4e927b96
+--- /dev/null
++++ b/test_svg_links_detailed.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++"""
++Detailed test to show the SVG link issue.
++"""
++
++import tempfile
++from pathlib import Path
++from sphinx.application import Sphinx
++from sphinx.util.docutils import docutils_namespace
++
++
++def create_test_project():
++    """Create a test project with proper structure."""
++    
++    temp_dir = Path(tempfile.mkdtemp())
++    src_dir = temp_dir / "source"
++    src_dir.mkdir()
++    
++    # Create package directory
++    pkg_dir = src_dir / "my_package"
++    pkg_dir.mkdir()
++    
++    # Create conf.py
++    conf_content = '''
++import sys
++import os
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.inheritance_diagram', 'sphinx.ext.graphviz', 'sphinx.ext.autodoc']
++graphviz_output_format = 'svg'
++'''
++    (src_dir / "conf.py").write_text(conf_content)
++    
++    # Create Python module
++    (src_dir / "my_module.py").write_text('''
++class MyClass1:
++    """First test class."""
++    pass
++
++class MyClass2(MyClass1):
++    """Second test class that inherits from MyClass1."""
++    pass
++''')
++    
++    # Create root index.rst
++    root_index_content = '''
++Root Documentation
++==================
++
++.. inheritance-diagram:: my_module.MyClass1 my_module.MyClass2
++   :caption: Root inheritance diagram
++
++.. toctree::
++   :maxdepth: 2
++   
++   my_package/index
++'''
++    (src_dir / "index.rst").write_text(root_index_content)
++    
++    # Create my_class_1.rst in my_package
++    (pkg_dir / "my_class_1.rst").write_text('''
++MyClass1 Documentation
++======================
++
++.. autoclass:: my_module.MyClass1
++   :members:
++''')
++    
++    # Create my_class_2.rst in my_package  
++    (pkg_dir / "my_class_2.rst").write_text('''
++MyClass2 Documentation
++======================
++
++.. autoclass:: my_module.MyClass2
++   :members:
++''')
++    
++    # Create nested index.rst
++    nested_index_content = '''
++Package Documentation
++=====================
++
++.. inheritance-diagram:: my_module.MyClass1 my_module.MyClass2
++   :caption: Nested inheritance diagram
++
++.. toctree::
++   :maxdepth: 2
++   
++   my_class_1
++   my_class_2
++'''
++    (pkg_dir / "index.rst").write_text(nested_index_content)
++    
++    return temp_dir, src_dir
++
++
++def build_and_analyze():
++    """Build docs and analyze the SVG links."""
++    
++    temp_dir, src_dir = create_test_project()
++    out_dir = temp_dir / "build"
++    
++    print(f"Building in: {temp_dir}")
++    
++    with docutils_namespace():
++        app = Sphinx(
++            srcdir=str(src_dir),
++            confdir=str(src_dir),
++            outdir=str(out_dir),
++            doctreedir=str(out_dir / ".doctrees"),
++            buildername="html",
++            confoverrides={'graphviz_output_format': 'svg'}
++        )
++        app.build()
++    
++    # Find SVG files
++    svg_files = list(out_dir.rglob("*.svg"))
++    print(f"\nFound SVG files: {len(svg_files)}")
++    
++    for svg_file in svg_files:
++        print(f"\n=== Analyzing {svg_file.relative_to(out_dir)} ===")
++        content = svg_file.read_text()
++        
++        # Extract links
++        import re
++        links = re.findall(r'ns1:href="([^"]*)"', content)
++        
++        print(f"SVG file location: {svg_file}")
++        print(f"Links in SVG:")
++        for link in links:
++            print(f"  {link}")
++            
++            # Check if link would resolve correctly
++            if not link.startswith('http'):
++                # Resolve relative to SVG file location (without fragment)
++                link_without_fragment = link.split('#')[0]
++                resolved_path = (svg_file.parent / link_without_fragment).resolve()
++                print(f"    Resolves to: {resolved_path}")
++                print(f"    Exists: {resolved_path.exists()}")
++    
++    # Check HTML files
++    print(f"\n=== HTML Files ===")
++    html_files = [f for f in out_dir.rglob("*.html") if 'inheritance' in f.read_text()]
++    
++    for html_file in html_files:
++        print(f"\nHTML file: {html_file.relative_to(out_dir)}")
++        content = html_file.read_text()
++        
++        # Find SVG object tags
++        svg_objects = re.findall(r'<object[^>]*data="([^"]*)"[^>]*>', content)
++        for svg_obj in svg_objects:
++            print(f"  References SVG: {svg_obj}")
++            
++            # Resolve SVG path relative to HTML file
++            svg_path = (html_file.parent / svg_obj).resolve()
++            print(f"    SVG resolves to: {svg_path}")
++            print(f"    SVG exists: {svg_path.exists()}")
++    
++    return temp_dir
++
++
++if __name__ == "__main__":
++    build_and_analyze()
+\ No newline at end of file

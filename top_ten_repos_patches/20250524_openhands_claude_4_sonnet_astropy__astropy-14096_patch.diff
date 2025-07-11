@@ -1,0 +1,637 @@
+diff --git a/astropy/coordinates/sky_coordinate.py b/astropy/coordinates/sky_coordinate.py
+index ab475f7d0d..ee84d9f86f 100644
+--- a/astropy/coordinates/sky_coordinate.py
++++ b/astropy/coordinates/sky_coordinate.py
+@@ -894,7 +894,21 @@ class SkyCoord(ShapedLikeNDArray):
+             if frame_cls is not None and self.frame.is_transformable_to(frame_cls):
+                 return self.transform_to(attr)
+ 
+-        # Fail
++        # Check if the attribute is a property in the class hierarchy.
++        # If it is, then the AttributeError should come from the property itself,
++        # not from this __getattr__ method. We need to try calling the property
++        # and let its AttributeError propagate.
++        for cls in self.__class__.__mro__:
++            if attr in cls.__dict__ and isinstance(cls.__dict__[attr], property):
++                # The attribute is a property that raised AttributeError.
++                # Try to call it again to get the original error.
++                try:
++                    return cls.__dict__[attr].__get__(self, type(self))
++                except AttributeError:
++                    # Re-raise the AttributeError from the property
++                    raise
++        
++        # Fail - the attribute is not a property, so we can raise our own error
+         raise AttributeError(
+             f"'{self.__class__.__name__}' object has no attribute '{attr}'"
+         )
+diff --git a/debug_issue.py b/debug_issue.py
+new file mode 100644
+index 0000000000..b34da49e6a
+--- /dev/null
++++ b/debug_issue.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python
++"""
++Debug script to understand the attribute access flow.
++"""
++
++import astropy.coordinates as coord
++
++
++class DebugSkyCoord(coord.SkyCoord):
++    def __getattr__(self, attr):
++        print(f"__getattr__ called with attr='{attr}'")
++        try:
++            result = super().__getattr__(attr)
++            print(f"__getattr__ succeeded for '{attr}'")
++            return result
++        except AttributeError as e:
++            print(f"__getattr__ failed for '{attr}' with: {e}")
++            raise
++
++
++class custom_coord(DebugSkyCoord):
++    @property
++    def prop(self):
++        print("Inside prop getter, about to access self.random_attr")
++        return self.random_attr
++
++
++def test_debug():
++    """Debug the attribute access flow."""
++    print("Creating custom_coord instance...")
++    c = custom_coord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    print("\nAccessing the property that tries to access a non-existent attribute...")
++    try:
++        result = c.prop
++        print(f"Unexpected success: {result}")
++    except AttributeError as e:
++        print(f"Final AttributeError: {e}")
++
++
++if __name__ == "__main__":
++    test_debug()
+\ No newline at end of file
+diff --git a/debug_issue2.py b/debug_issue2.py
+new file mode 100644
+index 0000000000..d0b725112e
+--- /dev/null
++++ b/debug_issue2.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python
++"""
++Debug script to understand property existence.
++"""
++
++import astropy.coordinates as coord
++
++
++class custom_coord(coord.SkyCoord):
++    @property
++    def prop(self):
++        return self.random_attr
++
++
++def test_debug():
++    """Debug property existence."""
++    c = custom_coord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    print("Checking if 'prop' exists in class:")
++    print(f"hasattr(custom_coord, 'prop'): {hasattr(custom_coord, 'prop')}")
++    print(f"'prop' in dir(custom_coord): {'prop' in dir(custom_coord)}")
++    print(f"type(getattr(custom_coord, 'prop', None)): {type(getattr(custom_coord, 'prop', None))}")
++    
++    print("\nChecking if 'prop' exists in instance:")
++    print(f"hasattr(c, 'prop'): {hasattr(c, 'prop')}")  # This will trigger the error
++    
++
++if __name__ == "__main__":
++    test_debug()
+\ No newline at end of file
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..af9ffa11c1
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python
++"""
++Final verification that the SkyCoord subclass attribute access issue is resolved.
++"""
++
++import astropy.coordinates as coord
++
++
++class custom_coord(coord.SkyCoord):
++    @property
++    def prop(self):
++        return self.random_attr
++
++
++def main():
++    """Demonstrate the fix for the original issue."""
++    print("=" * 60)
++    print("FINAL VERIFICATION: SkyCoord Subclass Property Error Fix")
++    print("=" * 60)
++    
++    print("\nOriginal issue:")
++    print("When a subclassed SkyCoord has a property that tries to access")
++    print("a non-existent attribute, the error message was misleading.")
++    print("It said the property doesn't exist instead of the actual missing attribute.")
++    
++    print("\nTesting the fix...")
++    
++    # Create the problematic scenario from the issue
++    c = custom_coord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    print(f"Created custom_coord: {c}")
++    print("Accessing c.prop (which tries to access self.random_attr)...")
++    
++    try:
++        result = c.prop
++        print(f"❌ UNEXPECTED: Got result {result}")
++        return False
++    except AttributeError as e:
++        error_msg = str(e)
++        print(f"AttributeError raised: {error_msg}")
++        
++        # Check if the error message is correct
++        if "random_attr" in error_msg and "prop" not in error_msg:
++            print("✅ SUCCESS: Error message correctly identifies 'random_attr' as missing")
++            print("✅ SUCCESS: Error message does not mention 'prop'")
++            return True
++        elif "prop" in error_msg:
++            print("❌ FAILURE: Error message incorrectly mentions 'prop'")
++            return False
++        else:
++            print(f"❓ UNCLEAR: Error message doesn't mention either attribute: {error_msg}")
++            return False
++
++
++if __name__ == "__main__":
++    success = main()
++    print("\n" + "=" * 60)
++    if success:
++        print("🎉 ISSUE COMPLETELY RESOLVED!")
++        print("The fix correctly preserves the original AttributeError from properties.")
++    else:
++        print("❌ ISSUE NOT RESOLVED!")
++        print("The fix did not work as expected.")
++    print("=" * 60)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..fe4a6383c3
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the SkyCoord subclass attribute access issue.
++"""
++
++import astropy.coordinates as coord
++
++
++class custom_coord(coord.SkyCoord):
++    @property
++    def prop(self):
++        return self.random_attr
++
++
++def test_issue():
++    """Test the issue described in the bug report."""
++    print("Creating custom_coord instance...")
++    c = custom_coord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    print("Accessing the property that tries to access a non-existent attribute...")
++    try:
++        result = c.prop
++        print(f"Unexpected success: {result}")
++    except AttributeError as e:
++        print(f"AttributeError caught: {e}")
++        # Check if the error message is misleading
++        if "prop" in str(e):
++            print("❌ ISSUE CONFIRMED: Error message mentions 'prop' instead of 'random_attr'")
++            return False
++        elif "random_attr" in str(e):
++            print("✅ ISSUE FIXED: Error message correctly mentions 'random_attr'")
++            return True
++        else:
++            print(f"❓ UNEXPECTED: Error message doesn't mention either attribute: {e}")
++            return False
++
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..46c48724c3
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python
++"""
++Comprehensive test for the SkyCoord subclass attribute access fix.
++"""
++
++import astropy.coordinates as coord
++
++
++class TestSkyCoord(coord.SkyCoord):
++    @property
++    def prop_with_missing_attr(self):
++        """Property that accesses a non-existent attribute."""
++        return self.missing_attribute
++    
++    @property
++    def prop_with_existing_attr(self):
++        """Property that accesses an existing attribute."""
++        return self.ra
++    
++    @property
++    def prop_with_chained_missing(self):
++        """Property that accesses another property that fails."""
++        return self.prop_with_missing_attr
++    
++    def regular_method(self):
++        """Regular method for comparison."""
++        return self.ra
++
++
++def test_property_with_missing_attr():
++    """Test property that accesses missing attribute."""
++    print("Test 1: Property with missing attribute")
++    c = TestSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    try:
++        result = c.prop_with_missing_attr
++        print(f"❌ Unexpected success: {result}")
++        return False
++    except AttributeError as e:
++        if "missing_attribute" in str(e):
++            print(f"✅ Correct error: {e}")
++            return True
++        else:
++            print(f"❌ Wrong error: {e}")
++            return False
++
++
++def test_property_with_existing_attr():
++    """Test property that accesses existing attribute."""
++    print("\nTest 2: Property with existing attribute")
++    c = TestSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    try:
++        result = c.prop_with_existing_attr
++        print(f"✅ Success: {result}")
++        return True
++    except Exception as e:
++        print(f"❌ Unexpected error: {e}")
++        return False
++
++
++def test_property_with_chained_missing():
++    """Test property that accesses another failing property."""
++    print("\nTest 3: Property with chained missing attribute")
++    c = TestSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    try:
++        result = c.prop_with_chained_missing
++        print(f"❌ Unexpected success: {result}")
++        return False
++    except AttributeError as e:
++        if "missing_attribute" in str(e):
++            print(f"✅ Correct error: {e}")
++            return True
++        else:
++            print(f"❌ Wrong error: {e}")
++            return False
++
++
++def test_regular_method():
++    """Test regular method for comparison."""
++    print("\nTest 4: Regular method")
++    c = TestSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    try:
++        result = c.regular_method()
++        print(f"✅ Success: {result}")
++        return True
++    except Exception as e:
++        print(f"❌ Unexpected error: {e}")
++        return False
++
++
++def test_missing_attribute_directly():
++    """Test accessing missing attribute directly."""
++    print("\nTest 5: Missing attribute directly")
++    c = TestSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    try:
++        result = c.completely_missing_attr
++        print(f"❌ Unexpected success: {result}")
++        return False
++    except AttributeError as e:
++        if "completely_missing_attr" in str(e):
++            print(f"✅ Correct error: {e}")
++            return True
++        else:
++            print(f"❌ Wrong error: {e}")
++            return False
++
++
++def test_existing_skycoord_functionality():
++    """Test that existing SkyCoord functionality still works."""
++    print("\nTest 6: Existing SkyCoord functionality")
++    c = TestSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    try:
++        # Test some existing attributes
++        ra = c.ra
++        dec = c.dec
++        galactic = c.galactic
++        print(f"✅ RA: {ra}, Dec: {dec}, Galactic: {galactic.l}, {galactic.b}")
++        return True
++    except Exception as e:
++        print(f"❌ Unexpected error: {e}")
++        return False
++
++
++if __name__ == "__main__":
++    tests = [
++        test_property_with_missing_attr,
++        test_property_with_existing_attr,
++        test_property_with_chained_missing,
++        test_regular_method,
++        test_missing_attribute_directly,
++        test_existing_skycoord_functionality,
++    ]
++    
++    results = []
++    for test in tests:
++        results.append(test())
++    
++    print(f"\n{'='*50}")
++    print(f"Results: {sum(results)}/{len(results)} tests passed")
++    if all(results):
++        print("🎉 All tests passed!")
++    else:
++        print("❌ Some tests failed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..1a482efe7d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the SkyCoord subclass attribute access fix.
++"""
++
++import astropy.coordinates as coord
++
++
++class EdgeCaseSkyCoord(coord.SkyCoord):
++    @property
++    def prop_returns_none(self):
++        """Property that returns None."""
++        return None
++    
++    @property
++    def prop_returns_value(self):
++        """Property that returns a value."""
++        return 42
++    
++    @property
++    def prop_raises_other_error(self):
++        """Property that raises a different error."""
++        raise ValueError("This is a ValueError")
++    
++    @property
++    def prop_accesses_private_attr(self):
++        """Property that accesses a private attribute."""
++        return self._private_attr
++
++
++def test_edge_cases():
++    """Test various edge cases."""
++    c = EdgeCaseSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    # Test property that returns None
++    print("Test 1: Property that returns None")
++    try:
++        result = c.prop_returns_none
++        print(f"✅ Success: {result}")
++    except Exception as e:
++        print(f"❌ Unexpected error: {e}")
++    
++    # Test property that returns a value
++    print("\nTest 2: Property that returns a value")
++    try:
++        result = c.prop_returns_value
++        print(f"✅ Success: {result}")
++    except Exception as e:
++        print(f"❌ Unexpected error: {e}")
++    
++    # Test property that raises a different error
++    print("\nTest 3: Property that raises ValueError")
++    try:
++        result = c.prop_raises_other_error
++        print(f"❌ Unexpected success: {result}")
++    except ValueError as e:
++        print(f"✅ Correct error type: {e}")
++    except Exception as e:
++        print(f"❌ Wrong error type: {e}")
++    
++    # Test property that accesses private attribute
++    print("\nTest 4: Property that accesses private attribute")
++    try:
++        result = c.prop_accesses_private_attr
++        print(f"❌ Unexpected success: {result}")
++    except AttributeError as e:
++        if "_private_attr" in str(e):
++            print(f"✅ Correct error: {e}")
++        else:
++            print(f"❌ Wrong error: {e}")
++    except Exception as e:
++        print(f"❌ Wrong error type: {e}")
++    
++    # Test accessing non-existent regular attribute
++    print("\nTest 5: Non-existent regular attribute")
++    try:
++        result = c.totally_missing
++        print(f"❌ Unexpected success: {result}")
++    except AttributeError as e:
++        if "totally_missing" in str(e):
++            print(f"✅ Correct error: {e}")
++        else:
++            print(f"❌ Wrong error: {e}")
++    except Exception as e:
++        print(f"❌ Wrong error type: {e}")
++
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_inheritance.py b/test_inheritance.py
+new file mode 100644
+index 0000000000..ef733a4cc2
+--- /dev/null
++++ b/test_inheritance.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python
++"""
++Test inheritance scenarios for the SkyCoord subclass attribute access fix.
++"""
++
++import astropy.coordinates as coord
++
++
++class BaseSkyCoord(coord.SkyCoord):
++    @property
++    def base_prop(self):
++        """Property in base class."""
++        return self.missing_base_attr
++
++
++class DerivedSkyCoord(BaseSkyCoord):
++    @property
++    def derived_prop(self):
++        """Property in derived class."""
++        return self.missing_derived_attr
++
++
++class MultiLevelSkyCoord(DerivedSkyCoord):
++    @property
++    def multilevel_prop(self):
++        """Property in multi-level derived class."""
++        return self.missing_multilevel_attr
++
++
++def test_inheritance():
++    """Test inheritance scenarios."""
++    
++    # Test base class
++    print("Test 1: Base class property")
++    c1 = BaseSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    try:
++        result = c1.base_prop
++        print(f"❌ Unexpected success: {result}")
++    except AttributeError as e:
++        if "missing_base_attr" in str(e):
++            print(f"✅ Correct error: {e}")
++        else:
++            print(f"❌ Wrong error: {e}")
++    
++    # Test derived class - own property
++    print("\nTest 2: Derived class own property")
++    c2 = DerivedSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    try:
++        result = c2.derived_prop
++        print(f"❌ Unexpected success: {result}")
++    except AttributeError as e:
++        if "missing_derived_attr" in str(e):
++            print(f"✅ Correct error: {e}")
++        else:
++            print(f"❌ Wrong error: {e}")
++    
++    # Test derived class - inherited property
++    print("\nTest 3: Derived class inherited property")
++    try:
++        result = c2.base_prop
++        print(f"❌ Unexpected success: {result}")
++    except AttributeError as e:
++        if "missing_base_attr" in str(e):
++            print(f"✅ Correct error: {e}")
++        else:
++            print(f"❌ Wrong error: {e}")
++    
++    # Test multi-level inheritance
++    print("\nTest 4: Multi-level inheritance")
++    c3 = MultiLevelSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    try:
++        result = c3.multilevel_prop
++        print(f"❌ Unexpected success: {result}")
++    except AttributeError as e:
++        if "missing_multilevel_attr" in str(e):
++            print(f"✅ Correct error: {e}")
++        else:
++            print(f"❌ Wrong error: {e}")
++    
++    # Test multi-level inheritance - inherited properties
++    print("\nTest 5: Multi-level inheritance - base property")
++    try:
++        result = c3.base_prop
++        print(f"❌ Unexpected success: {result}")
++    except AttributeError as e:
++        if "missing_base_attr" in str(e):
++            print(f"✅ Correct error: {e}")
++        else:
++            print(f"❌ Wrong error: {e}")
++    
++    print("\nTest 6: Multi-level inheritance - derived property")
++    try:
++        result = c3.derived_prop
++        print(f"❌ Unexpected success: {result}")
++    except AttributeError as e:
++        if "missing_derived_attr" in str(e):
++            print(f"✅ Correct error: {e}")
++        else:
++            print(f"❌ Wrong error: {e}")
++
++
++if __name__ == "__main__":
++    test_inheritance()
+\ No newline at end of file
+diff --git a/test_subclass_property_error.py b/test_subclass_property_error.py
+new file mode 100644
+index 0000000000..a044d386be
+--- /dev/null
++++ b/test_subclass_property_error.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python
++"""
++Test case for the SkyCoord subclass property AttributeError fix.
++This test can be added to the official test suite.
++"""
++
++import pytest
++import astropy.coordinates as coord
++
++
++class CustomSkyCoord(coord.SkyCoord):
++    @property
++    def prop_with_missing_attr(self):
++        """Property that accesses a non-existent attribute."""
++        return self.missing_attribute
++
++
++def test_subclass_property_attribute_error():
++    """
++    Test that when a subclassed SkyCoord property raises AttributeError,
++    the error message correctly identifies the missing attribute, not the property name.
++    
++    This is a regression test for the issue where accessing a property that
++    internally tries to access a non-existent attribute would give a misleading
++    error message saying the property doesn't exist instead of the actual
++    missing attribute.
++    """
++    c = CustomSkyCoord('00h42m30s', '+41d12m00s', frame='icrs')
++    
++    with pytest.raises(AttributeError) as excinfo:
++        c.prop_with_missing_attr
++    
++    # The error message should mention the actual missing attribute, not the property
++    assert "missing_attribute" in str(excinfo.value)
++    assert "prop_with_missing_attr" not in str(excinfo.value)
++
++
++if __name__ == "__main__":
++    test_subclass_property_attribute_error()
++    print("✅ Test passed!")
+\ No newline at end of file

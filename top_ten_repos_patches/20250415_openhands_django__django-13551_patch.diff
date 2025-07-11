@@ -1,0 +1,199 @@
+diff --git a/django/contrib/auth/tokens.py b/django/contrib/auth/tokens.py
+index 93e2d71af2..da217da5d6 100644
+--- a/django/contrib/auth/tokens.py
++++ b/django/contrib/auth/tokens.py
+@@ -85,6 +85,8 @@ class PasswordResetTokenGenerator:
+            same password is chosen, due to password salting).
+         2. The last_login field will usually be updated very shortly after
+            a password reset.
++        3. The email field (if the user has one) will be included to invalidate
++           the token if the email address is changed.
+         Failing those things, settings.PASSWORD_RESET_TIMEOUT eventually
+         invalidates the token.
+ 
+@@ -94,7 +96,12 @@ class PasswordResetTokenGenerator:
+         # Truncate microseconds so that tokens are consistent even if the
+         # database doesn't support microseconds.
+         login_timestamp = '' if user.last_login is None else user.last_login.replace(microsecond=0, tzinfo=None)
+-        return str(user.pk) + user.password + str(login_timestamp) + str(timestamp)
++        
++        # Include the user's email in the hash if the user model has an email field.
++        email_field_name = user.__class__.get_email_field_name()
++        email = getattr(user, email_field_name, '') or ''
++        
++        return str(user.pk) + user.password + str(login_timestamp) + str(timestamp) + email
+ 
+     def _num_seconds(self, dt):
+         return int((dt - datetime(2001, 1, 1)).total_seconds())
+diff --git a/test_email_change_token.py b/test_email_change_token.py
+new file mode 100644
+index 0000000000..7895ad98e4
+--- /dev/null
++++ b/test_email_change_token.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python
++"""
++Test script to verify the issue with password reset tokens not being invalidated
++when a user changes their email address.
++
++The expected behavior:
++1. Create a user with email foo@example.com
++2. Generate a password reset token for this user
++3. Change the user's email to bar@example.com
++4. The token should become invalid, but currently it remains valid
++"""
++
++import django
++import os
++import sys
++from datetime import datetime
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++os.environ['DJANGO_SETTINGS_MODULE'] = 'django.conf.global_settings'
++
++# Configure settings before calling django.setup()
++from django.conf import settings
++settings.configure(
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++    PASSWORD_RESET_TIMEOUT=3600,  # 1 hour
++    SECRET_KEY='djangotestkey',
++    DEFAULT_HASHING_ALGORITHM='sha256',
++)
++django.setup()
++
++# Set up database and run migrations
++from django.db import connection
++from django.core.management import call_command
++call_command('migrate', verbosity=0)
++
++from django.contrib.auth import get_user_model
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++def run_test():
++    """Run the test to demonstrate the issue."""
++    User = get_user_model()
++    
++    # Create a user
++    user = User.objects.create_user(
++        username='testuser',
++        email='foo@example.com',
++        password='testpassword'
++    )
++    user_id = user.id
++    
++    # Generate a password reset token
++    token_generator = PasswordResetTokenGenerator()
++    token = token_generator.make_token(user)
++    
++    print(f"Created user with email: {user.email}")
++    print(f"Generated token: {token}")
++    
++    # Verify token is valid
++    is_valid = token_generator.check_token(user, token)
++    print(f"Token valid before email change: {is_valid}")
++    
++    # Change the email
++    user.email = 'bar@example.com'
++    user.save()
++    
++    # Reload the user to simulate fetching from DB in a separate request
++    user = User.objects.get(id=user_id)
++    print(f"Changed user email to: {user.email}")
++    
++    # Check if token is still valid (it should not be, but currently is)
++    is_valid = token_generator.check_token(user, token)
++    print(f"Token valid after email change: {is_valid}")
++    print(f"ISSUE CONFIRMED: {is_valid}")  # Should be False after fix
++    
++    # Clean up
++    user.delete()
++    
++    return is_valid
++
++if __name__ == '__main__':
++    run_test()
+\ No newline at end of file
+diff --git a/test_no_email_token.py b/test_no_email_token.py
+new file mode 100644
+index 0000000000..33a3160c55
+--- /dev/null
++++ b/test_no_email_token.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python
++"""
++Test script to verify that our fix works correctly when a user doesn't have an email address.
++"""
++
++import django
++import os
++import sys
++from datetime import datetime
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django.conf.global_settings')
++os.environ['DJANGO_SETTINGS_MODULE'] = 'django.conf.global_settings'
++
++# Configure settings before calling django.setup()
++from django.conf import settings
++settings.configure(
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++    PASSWORD_RESET_TIMEOUT=3600,  # 1 hour
++    SECRET_KEY='djangotestkey',
++    DEFAULT_HASHING_ALGORITHM='sha256',
++)
++django.setup()
++
++# Set up database and run migrations
++from django.db import connection
++from django.core.management import call_command
++call_command('migrate', verbosity=0)
++
++from django.contrib.auth import get_user_model
++from django.contrib.auth.tokens import PasswordResetTokenGenerator
++
++def run_test():
++    """Run the test with a user that has no email."""
++    User = get_user_model()
++    
++    # Create a user with no email
++    user = User.objects.create_user(
++        username='noemailuser',
++        email=None,  # No email
++        password='testpassword'
++    )
++    user_id = user.id
++    
++    # Generate a password reset token
++    token_generator = PasswordResetTokenGenerator()
++    token = token_generator.make_token(user)
++    
++    print(f"Created user with no email")
++    print(f"Generated token: {token}")
++    
++    # Verify token is valid
++    is_valid = token_generator.check_token(user, token)
++    print(f"Token valid for user with no email: {is_valid}")
++    
++    # Change some other field to verify token still works
++    user.username = 'updatedusernomail'
++    user.save()
++    
++    # Reload the user
++    user = User.objects.get(id=user_id)
++    print(f"Changed username to: {user.username}")
++    
++    # Check if token is still valid
++    is_valid = token_generator.check_token(user, token)
++    print(f"Token still valid after username change (should be True): {is_valid}")
++    
++    # Clean up
++    user.delete()
++    
++    return is_valid
++
++if __name__ == '__main__':
++    run_test()
+\ No newline at end of file

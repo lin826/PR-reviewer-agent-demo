@@ -1,0 +1,109 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 422bc5d178..e03a3803cd 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -1188,7 +1188,7 @@ class ModelChoiceField(ChoiceField):
+     # This class is a subclass of ChoiceField for purity, but it doesn't
+     # actually use any of ChoiceField's implementation.
+     default_error_messages = {
+-        'invalid_choice': _('Select a valid choice. That choice is not one of'
++        'invalid_choice': _('Select a valid choice. %(value)s is not one of'
+                             ' the available choices.'),
+     }
+     iterator = ModelChoiceIterator
+@@ -1284,7 +1284,11 @@ class ModelChoiceField(ChoiceField):
+                 value = getattr(value, key)
+             value = self.queryset.get(**{key: value})
+         except (ValueError, TypeError, self.queryset.model.DoesNotExist):
+-            raise ValidationError(self.error_messages['invalid_choice'], code='invalid_choice')
++            raise ValidationError(
++                self.error_messages['invalid_choice'],
++                code='invalid_choice',
++                params={'value': value},
++            )
+         return value
+ 
+     def validate(self, value):
+diff --git a/test_model_choice_field.py b/test_model_choice_field.py
+new file mode 100644
+index 0000000000..6fe10ad0f2
+--- /dev/null
++++ b/test_model_choice_field.py
+@@ -0,0 +1,76 @@
++import os
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++    django.setup()
++
++from django.test import TestCase
++from django.core.exceptions import ValidationError
++from django.forms import ModelChoiceField
++from django.forms.models import ModelMultipleChoiceField
++from django.contrib.auth.models import User  # Using available models
++
++class ModelChoiceFieldTest(TestCase):
++    def setUp(self):
++        # Create a user for testing
++        self.user = User.objects.create_user(username='testuser', password='12345')
++    
++    def test_model_choice_field_error_message(self):
++        # Create a ModelChoiceField
++        field = ModelChoiceField(queryset=User.objects.all())
++        
++        # Try to clean an invalid value (this should raise ValidationError)
++        try:
++            field.clean('999')  # Non-existent user ID
++            self.fail("ValidationError was not raised")
++        except ValidationError as e:
++            # After fix - error message should include the value
++            print(f"ModelChoiceField error message: {e}")
++            print(f"Error params: {getattr(e, 'params', None)}")
++            # New behavior should include the value in error message
++            self.assertEqual(str(e), "['Select a valid choice. 999 is not one of the available choices.']")
++            # The error should have params with the value
++            self.assertTrue(hasattr(e, 'params') and 'value' in e.params)
++            self.assertEqual(e.params['value'], '999')
++    
++    def test_model_multiple_choice_field_error_message(self):
++        # Create a ModelMultipleChoiceField
++        field = ModelMultipleChoiceField(queryset=User.objects.all())
++        
++        # Try to clean an invalid value (this should raise ValidationError)
++        try:
++            field.clean(['999'])  # Non-existent user ID
++            self.fail("ValidationError was not raised")
++        except ValidationError as e:
++            # Current behavior - error message does include the value
++            print(f"ModelMultipleChoiceField error message: {e}")
++            print(f"Error params: {e.params}")
++            # This should have the value in the error message
++            self.assertTrue('999' in str(e) or '999' in str(getattr(e, 'params', None) or {}))
++            self.assertIsNotNone(getattr(e, 'params', {}).get('value', None))
++
++if __name__ == '__main__':
++    from django.test.runner import DiscoverRunner
++    test_runner = DiscoverRunner(verbosity=2)
++    test_runner.setup_test_environment()
++    old_config = test_runner.setup_databases()
++    try:
++        test_suite = test_runner.test_loader.loadTestsFromTestCase(ModelChoiceFieldTest)
++        test_runner.run_suite(test_suite)
++    finally:
++        test_runner.teardown_databases(old_config)
++        test_runner.teardown_test_environment()
+\ No newline at end of file

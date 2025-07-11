@@ -1,0 +1,725 @@
+diff --git a/CHANGES_SUMMARY.md b/CHANGES_SUMMARY.md
+new file mode 100644
+index 000000000..ebaef77c2
+--- /dev/null
++++ b/CHANGES_SUMMARY.md
+@@ -0,0 +1,43 @@
++# Fix for bad-names-rgxs Issue with Commas in Regular Expressions
++
++## Problem
++The `bad-names-rgxs` option in pylint was incorrectly splitting regex patterns on commas, even when those commas were part of valid regex syntax (like quantifiers `{1,3}`, character classes `[a,b,c]`, etc.). This caused pylint to crash when trying to compile the incorrectly split regex fragments.
++
++## Root Cause
++The `_regexp_csv_transfomer` function used `_csv_transformer` which blindly splits on commas without understanding regex syntax. For example:
++- Input: `(foo{1,3})`
++- Incorrect split: `["(foo{1", "3})"]`
++- Result: `(foo{1` is an invalid regex (unterminated subpattern)
++
++## Solution
++Created a new `_regex_csv_transformer` function that intelligently parses comma-separated regex patterns by:
++
++1. **Tracking regex construct depth**: Monitors parentheses `()`, brackets `[]`, and braces `{}` to avoid splitting inside regex constructs
++2. **Handling escape sequences**: Properly processes escaped characters including escaped commas
++3. **Maintaining backward compatibility**: Still splits on commas when they're not inside regex constructs
++
++## Files Modified
++
++### `/workspace/pylint-dev__pylint__3.0/pylint/config/argument.py`
++- Added `_regex_csv_transformer()` function (lines 114-176)
++- Updated `_regexp_csv_transfomer()` to use the new function (lines 179-184)
++
++### `/workspace/pylint-dev__pylint__3.0/tests/config/test_config.py`
++- Updated `test_csv_regex_error()` to test with actually invalid regex (lines 134-147)
++- Added `test_csv_regex_with_comma_quantifiers()` to verify the fix (lines 150-160)
++
++## Test Results
++✅ **Original issue fixed**: `bad-names-rgxs = "(foo{1,3})"` now works without crashing
++✅ **Backward compatibility**: `bad-names-rgxs = "foo.*,bar.*"` still works as expected
++✅ **Complex patterns**: All regex constructs with commas work correctly
++✅ **All existing tests pass**: No regressions introduced
++
++## Examples of Fixed Patterns
++- `(foo{1,3})` - Quantifier in group
++- `[a,b,c]` - Character class with commas  
++- `foo{1,3},bar{2,4}` - Multiple patterns with quantifiers
++- `(test|bad)_.*` - Alternation in group
++- `foo\,bar` - Escaped comma
++
++## Impact
++This fix resolves the crash described in the issue while maintaining full backward compatibility and supporting all valid regex syntax in the `bad-names-rgxs` option.
+\ No newline at end of file
+diff --git a/pylint/config/argument.py b/pylint/config/argument.py
+index 30a5fd175..2ef43505c 100644
+--- a/pylint/config/argument.py
++++ b/pylint/config/argument.py
+@@ -111,10 +111,75 @@ def _regex_transformer(value: str) -> Pattern[str]:
+         raise argparse.ArgumentTypeError(msg) from e
+ 
+ 
++def _regex_csv_transformer(value: str) -> Sequence[str]:
++    """Transforms a comma separated list of regular expressions.
++    
++    This function splits on commas but respects regex syntax, avoiding
++    splits inside regex constructs like {n,m}, [a,b,c], etc.
++    """
++    if not value.strip():
++        return []
++    
++    patterns = []
++    current_pattern = ""
++    i = 0
++    paren_depth = 0
++    bracket_depth = 0
++    brace_depth = 0
++    in_escape = False
++    
++    while i < len(value):
++        char = value[i]
++        
++        if in_escape:
++            # If we're in an escape sequence, add the character and continue
++            current_pattern += char
++            in_escape = False
++        elif char == '\\':
++            # Start of escape sequence
++            current_pattern += char
++            in_escape = True
++        elif char == '(':
++            current_pattern += char
++            paren_depth += 1
++        elif char == ')':
++            current_pattern += char
++            paren_depth = max(0, paren_depth - 1)
++        elif char == '[':
++            current_pattern += char
++            bracket_depth += 1
++        elif char == ']':
++            current_pattern += char
++            bracket_depth = max(0, bracket_depth - 1)
++        elif char == '{':
++            current_pattern += char
++            brace_depth += 1
++        elif char == '}':
++            current_pattern += char
++            brace_depth = max(0, brace_depth - 1)
++        elif char == ',' and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
++            # Only split on comma if we're not inside any regex constructs
++            pattern = current_pattern.strip()
++            if pattern:  # Only add non-empty patterns
++                patterns.append(pattern)
++            current_pattern = ""
++        else:
++            current_pattern += char
++        
++        i += 1
++    
++    # Add the last pattern
++    pattern = current_pattern.strip()
++    if pattern:
++        patterns.append(pattern)
++    
++    return patterns
++
++
+ def _regexp_csv_transfomer(value: str) -> Sequence[Pattern[str]]:
+     """Transforms a comma separated list of regular expressions."""
+     patterns: list[Pattern[str]] = []
+-    for pattern in _csv_transformer(value):
++    for pattern in _regex_csv_transformer(value):
+         patterns.append(_regex_transformer(pattern))
+     return patterns
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 000000000..3e6521e8e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""Script to reproduce the bad-names-rgxs issue with commas in regex patterns."""
++
++import tempfile
++import os
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path so we can import pylint
++sys.path.insert(0, '/workspace/pylint-dev__pylint__3.0')
++
++from pylint.lint import Run as LintRun
++
++def test_bad_names_rgxs_with_comma():
++    """Test that demonstrates the issue with commas in regex patterns."""
++    
++    # Create a temporary Python file to lint
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write("""
++# Test file with a variable that should match our regex
++foo = 1
++fooo = 2  # This should match (foo{1,3})
++foooo = 3  # This should match (foo{1,3})
++fooooo = 4  # This should NOT match (foo{1,3})
++""")
++        temp_file = f.name
++
++    try:
++        print("Testing bad-names-rgxs with comma in regex pattern...")
++        print(f"Regex pattern: (foo{{1,3}})")
++        print(f"Temp file: {temp_file}")
++        
++        # This should fail due to the comma splitting issue
++        result = LintRun([
++            temp_file,
++            '--bad-names-rgxs=(foo{1,3})',
++            '--disable=all',
++            '--enable=disallowed-name'
++        ], exit=False)
++        
++        print("SUCCESS: No crash occurred!")
++        
++    except Exception as e:
++        print(f"ERROR: {e}")
++        print("This demonstrates the issue - the regex pattern gets mangled by comma splitting")
++        
++    finally:
++        # Clean up
++        os.unlink(temp_file)
++
++def test_current_behavior():
++    """Test the current behavior to understand how the regex gets split."""
++    from pylint.config.argument import _regexp_csv_transfomer, _regex_csv_transformer
++    
++    print("\nTesting current _regexp_csv_transfomer behavior:")
++    
++    test_cases = [
++        "(foo{1,3})",  # This should now work
++        "foo.*,bar.*",  # This should work (two separate regexes)
++        "foo{1,3}",     # This should now work (no parentheses but still has comma)
++        "foo.*",        # This should work (no comma)
++        "[a,b,c]",      # This should work (comma inside character class)
++        "(a|b,c)",      # This should work (comma inside group)
++        "foo{1,3},bar{2,4}",  # This should work (two patterns with commas)
++        "foo\\,bar",    # This should work (escaped comma)
++    ]
++    
++    for pattern in test_cases:
++        print(f"\nTesting pattern: {pattern}")
++        
++        # First test the CSV splitting
++        try:
++            csv_result = _regex_csv_transformer(pattern)
++            print(f"  CSV split: {csv_result}")
++        except Exception as e:
++            print(f"  CSV split ERROR: {e}")
++            continue
++            
++        # Then test the full regex compilation
++        try:
++            result = _regexp_csv_transfomer(pattern)
++            print(f"  SUCCESS: Compiled to {len(result)} regex(es)")
++            for i, regex in enumerate(result):
++                print(f"    {i+1}: {regex.pattern}")
++        except Exception as e:
++            print(f"  ERROR: {e}")
++
++if __name__ == "__main__":
++    test_current_behavior()
++    test_bad_names_rgxs_with_comma()
+\ No newline at end of file
+diff --git a/test_argparse_behavior.py b/test_argparse_behavior.py
+new file mode 100644
+index 000000000..ba4c28746
+--- /dev/null
++++ b/test_argparse_behavior.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++"""Test argparse abbreviation behavior."""
++
++import sys
++sys.path.insert(0, '/workspace/pylint-dev__pylint__3.0')
++
++from pylint.lint import Run as LintRun
++import tempfile
++import os
++
++# Create a temporary Python file to lint
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write("foo = 1\n")
++    temp_file = f.name
++
++try:
++    # Test various abbreviations
++    abbreviations = [
++        '--bad-names-rgxs',
++        '--bad-names-rgx',
++        '--bad-names-r',
++        '--bad-names',
++        '--bad-name',
++    ]
++    
++    for abbrev in abbreviations:
++        print(f"Testing {abbrev}...")
++        try:
++            result = LintRun([temp_file, f'{abbrev}=foo'], exit=False)
++            print(f"  SUCCESS: {abbrev} works")
++        except SystemExit as e:
++            if e.code == 2:  # Argument parsing error
++                print(f"  ERROR: {abbrev} not recognized")
++            else:
++                print(f"  OTHER: {abbrev} exit code {e.code}")
++        except Exception as e:
++            print(f"  EXCEPTION: {abbrev} - {e}")
++
++finally:
++    os.unlink(temp_file)
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 000000000..3dd3137e1
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,138 @@
++#!/usr/bin/env python3
++"""Final verification that the fix works correctly."""
++
++import tempfile
++import os
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path so we can import pylint
++sys.path.insert(0, '/workspace/pylint-dev__pylint__3.0')
++
++from pylint.lint import Run as LintRun
++
++def test_original_issue():
++    """Test the exact scenario from the original issue."""
++    
++    # Create a temporary Python file to lint
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write("foo = 1\n")
++        temp_file = f.name
++
++    try:
++        print("Testing the original issue scenario...")
++        print("Pattern: (foo{1,3})")
++        
++        # This was the exact command that failed in the issue
++        result = LintRun([
++            temp_file,
++            '--bad-names-rgxs=(foo{1,3})',
++        ], exit=False)
++        
++        print("✅ SUCCESS: No crash occurred! The issue is fixed.")
++        return True
++        
++    except Exception as e:
++        print(f"❌ FAILED: {e}")
++        return False
++        
++    finally:
++        # Clean up
++        os.unlink(temp_file)
++
++def test_backward_compatibility():
++    """Test that existing comma-separated patterns still work."""
++    
++    # Create a temporary Python file to lint
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write("""
++foo = 1
++bar = 2
++baz = 3
++""")
++        temp_file = f.name
++
++    try:
++        print("\nTesting backward compatibility...")
++        print("Pattern: foo.*,bar.*")
++        
++        result = LintRun([
++            temp_file,
++            '--bad-names-rgxs=foo.*,bar.*',
++            '--disable=all',
++            '--enable=disallowed-name'
++        ], exit=False)
++        
++        print("✅ SUCCESS: Backward compatibility maintained.")
++        return True
++        
++    except Exception as e:
++        print(f"❌ FAILED: {e}")
++        return False
++        
++    finally:
++        # Clean up
++        os.unlink(temp_file)
++
++def test_complex_patterns():
++    """Test complex regex patterns with various comma constructs."""
++    
++    # Create a temporary Python file to lint
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write("test_var = 1\n")
++        temp_file = f.name
++
++    test_cases = [
++        ("(foo{1,3})", "Quantifier in group"),
++        ("[a,e,i,o,u].*", "Character class with commas"),
++        ("foo{1,3},bar{2,4}", "Multiple patterns with quantifiers"),
++        ("(test|bad)_.*", "Alternation in group"),
++        ("foo\\,bar", "Escaped comma"),
++    ]
++
++    all_passed = True
++    
++    for pattern, description in test_cases:
++        try:
++            print(f"\nTesting: {description}")
++            print(f"Pattern: {pattern}")
++            
++            result = LintRun([
++                temp_file,
++                f'--bad-names-rgxs={pattern}',
++                '--disable=all',
++                '--enable=disallowed-name'
++            ], exit=False)
++            
++            print("✅ SUCCESS")
++            
++        except Exception as e:
++            print(f"❌ FAILED: {e}")
++            all_passed = False
++    
++    # Clean up
++    os.unlink(temp_file)
++    return all_passed
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("FINAL VERIFICATION OF THE FIX")
++    print("=" * 60)
++    
++    test1 = test_original_issue()
++    test2 = test_backward_compatibility()
++    test3 = test_complex_patterns()
++    
++    print("\n" + "=" * 60)
++    print("SUMMARY")
++    print("=" * 60)
++    
++    if test1 and test2 and test3:
++        print("🎉 ALL TESTS PASSED! The fix is working correctly.")
++        print("\nThe issue has been successfully resolved:")
++        print("- Regex patterns with commas no longer crash pylint")
++        print("- Backward compatibility is maintained")
++        print("- Complex regex patterns work correctly")
++    else:
++        print("❌ Some tests failed. Please review the implementation.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 000000000..d2430b0d0
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""Comprehensive test of the fix for bad-names-rgxs with commas."""
++
++import tempfile
++import os
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path so we can import pylint
++sys.path.insert(0, '/workspace/pylint-dev__pylint__3.0')
++
++from pylint.lint import Run as LintRun
++
++def test_regex_patterns():
++    """Test various regex patterns that should now work."""
++    
++    # Create a temporary Python file to lint
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write("""
++# Test file with various variable names
++foo = 1
++bar = 2
++test_var = 3
++bad_name = 4
++""")
++        temp_file = f.name
++
++    test_cases = [
++        {
++            'pattern': '^foo{1,3}$',  # Should match only 'foo' exactly
++            'description': 'Exact match with quantifier'
++        },
++        {
++            'pattern': 'foo.*,bar.*',  # Should match foo* and bar*
++            'description': 'Two separate patterns'
++        },
++        {
++            'pattern': '[a,e,i,o,u].*',  # Should match names starting with vowels
++            'description': 'Character class with commas'
++        },
++        {
++            'pattern': '(test|bad)_.*',  # Should match test_* and bad_*
++            'description': 'Group with alternation'
++        }
++    ]
++    
++    for test_case in test_cases:
++        pattern = test_case['pattern']
++        description = test_case['description']
++        
++        print(f"\nTesting: {description}")
++        print(f"Pattern: {pattern}")
++        
++        try:
++            result = LintRun([
++                temp_file,
++                f'--bad-names-rgxs={pattern}',
++                '--disable=all',
++                '--enable=disallowed-name'
++            ], exit=False)
++            
++            print("SUCCESS: Pattern compiled and executed without errors")
++            
++        except SystemExit as e:
++            if e.code != 0:
++                print(f"ERROR: SystemExit with code {e.code}")
++            else:
++                print("SUCCESS: Normal exit")
++        except Exception as e:
++            print(f"ERROR: {e}")
++    
++    # Clean up
++    os.unlink(temp_file)
++
++def test_edge_cases():
++    """Test edge cases for the regex CSV parser."""
++    from pylint.config.argument import _regex_csv_transformer
++    
++    print("\n" + "="*50)
++    print("Testing edge cases for regex CSV parser")
++    print("="*50)
++    
++    edge_cases = [
++        ("", "Empty string"),
++        ("   ", "Whitespace only"),
++        ("foo", "Single pattern"),
++        ("foo,bar", "Simple comma separation"),
++        ("foo{1,3}", "Quantifier with comma"),
++        ("(foo{1,3})", "Quantifier in group"),
++        ("[a,b,c]", "Character class with commas"),
++        ("foo{1,3},bar{2,4}", "Multiple patterns with quantifiers"),
++        ("foo\\,bar", "Escaped comma"),
++        ("(a|b,c)", "Alternation with comma"),
++        ("foo{1,3},bar.*,[x,y,z]", "Complex mixed patterns"),
++        ("((nested{1,2}))", "Nested groups with quantifier"),
++        ("[a-z,A-Z]", "Character range with comma"),
++        ("foo{1,3},,bar", "Empty pattern in middle"),
++        (",foo,bar,", "Leading and trailing commas"),
++    ]
++    
++    for pattern, description in edge_cases:
++        print(f"\nTesting: {description}")
++        print(f"Input: '{pattern}'")
++        try:
++            result = _regex_csv_transformer(pattern)
++            print(f"Output: {result}")
++        except Exception as e:
++            print(f"ERROR: {e}")
++
++if __name__ == "__main__":
++    test_edge_cases()
++    test_regex_patterns()
+\ No newline at end of file
+diff --git a/test_issue_config.py b/test_issue_config.py
+new file mode 100644
+index 000000000..3dd7c650a
+--- /dev/null
++++ b/test_issue_config.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""Test the exact configuration from the issue description."""
++
++import tempfile
++import os
++import sys
++from pathlib import Path
++
++# Add the current directory to Python path so we can import pylint
++sys.path.insert(0, '/workspace/pylint-dev__pylint__3.0')
++
++from pylint.lint import Run as LintRun
++
++def test_issue_config():
++    """Test using a config file like in the issue description."""
++    
++    # Create a temporary Python file to lint
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++        f.write("""
++# Test file with a variable that should match our regex
++foo = 1
++fooo = 2  # This should match (foo{1,3})
++foooo = 3  # This should match (foo{1,3})
++fooooo = 4  # This should NOT match (foo{1,3}) exactly, but will match partially
++""")
++        temp_file = f.name
++
++    # Create a temporary config file
++    with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
++        f.write("""
++[tool.pylint.basic]
++# capture group ensures that the part after the comma is an invalid regular
++# expression, causing pylint to crash
++bad-names-rgxs = "(foo{1,3})"
++""")
++        config_file = f.name
++
++    try:
++        print("Testing with config file (like in the issue description)...")
++        print(f"Config file content: bad-names-rgxs = \"(foo{{1,3}})\"")
++        print(f"Python file: {temp_file}")
++        print(f"Config file: {config_file}")
++        
++        # This was the exact scenario that failed in the issue
++        result = LintRun([
++            temp_file,
++            f'--rcfile={config_file}',
++        ], exit=False)
++        
++        print("✅ SUCCESS: No crash occurred! The issue is completely fixed.")
++        return True
++        
++    except Exception as e:
++        print(f"❌ FAILED: {e}")
++        return False
++        
++    finally:
++        # Clean up
++        os.unlink(temp_file)
++        os.unlink(config_file)
++
++if __name__ == "__main__":
++    print("=" * 60)
++    print("TESTING EXACT ISSUE CONFIGURATION")
++    print("=" * 60)
++    
++    success = test_issue_config()
++    
++    if success:
++        print("\n🎉 The exact issue scenario now works perfectly!")
++    else:
++        print("\n❌ The issue scenario still fails.")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/test_option_names.py b/test_option_names.py
+new file mode 100644
+index 000000000..515b68b52
+--- /dev/null
++++ b/test_option_names.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++"""Test to check which option names are valid."""
++
++import sys
++sys.path.insert(0, '/workspace/pylint-dev__pylint__3.0')
++
++from pylint.lint import Run as LintRun
++import tempfile
++import os
++
++# Create a temporary Python file to lint
++with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
++    f.write("foo = 1\n")
++    temp_file = f.name
++
++try:
++    print("Testing --bad-names-rgx (singular)...")
++    try:
++        result = LintRun([temp_file, '--bad-names-rgx=foo'], exit=False)
++        print("SUCCESS: --bad-names-rgx works")
++    except SystemExit as e:
++        if "unrecognized arguments" in str(e) or e.code == 2:
++            print("ERROR: --bad-names-rgx not recognized")
++        else:
++            print(f"OTHER ERROR: {e}")
++    except Exception as e:
++        print(f"EXCEPTION: {e}")
++
++    print("\nTesting --bad-names-rgxs (plural)...")
++    try:
++        result = LintRun([temp_file, '--bad-names-rgxs=foo'], exit=False)
++        print("SUCCESS: --bad-names-rgxs works")
++    except SystemExit as e:
++        if "unrecognized arguments" in str(e) or e.code == 2:
++            print("ERROR: --bad-names-rgxs not recognized")
++        else:
++            print(f"OTHER ERROR: {e}")
++    except Exception as e:
++        print(f"EXCEPTION: {e}")
++
++finally:
++    os.unlink(temp_file)
+\ No newline at end of file
+diff --git a/test_regex.py b/test_regex.py
+new file mode 100644
+index 000000000..74a8d4de0
+--- /dev/null
++++ b/test_regex.py
+@@ -0,0 +1,14 @@
++#!/usr/bin/env python3
++"""Test the regex pattern to make sure it works as expected."""
++
++import re
++
++pattern = re.compile(r"(foo{1,3})")
++
++test_names = ["foo", "fooo", "foooo", "fooooo"]
++
++for name in test_names:
++    match = pattern.match(name)
++    print(f"'{name}' matches: {match is not None}")
++    if match:
++        print(f"  Match: {match.group()}")
+\ No newline at end of file
+diff --git a/tests/config/test_config.py b/tests/config/test_config.py
+index 83c8b072e..08de5661e 100644
+--- a/tests/config/test_config.py
++++ b/tests/config/test_config.py
+@@ -137,16 +137,29 @@ def test_csv_regex_error(capsys: CaptureFixture) -> None:
+     """
+     with pytest.raises(SystemExit):
+         Run(
+-            [str(EMPTY_MODULE), r"--bad-names-rgx=(foo{1,3})"],
++            [str(EMPTY_MODULE), r"--bad-names-rgx=valid_pattern,*invalid*"],
+             exit=False,
+         )
+     output = capsys.readouterr()
+     assert (
+-        r"Error in provided regular expression: (foo{1 beginning at index 0: missing ), unterminated subpattern"
++        r"Error in provided regular expression: *invalid* beginning at index 0: nothing to repeat"
+         in output.err
+     )
+ 
+ 
++def test_csv_regex_with_comma_quantifiers() -> None:
++    """Check that regex patterns with comma quantifiers work correctly.
++    
++    This test verifies the fix for the issue where regex patterns containing
++    commas (like {1,3}) were incorrectly split by the CSV parser.
++    """
++    # This should not raise an exception - the pattern should be parsed correctly
++    Run(
++        [str(EMPTY_MODULE), r"--bad-names-rgx=(foo{1,3})"],
++        exit=False,
++    )
++
++
+ def test_short_verbose(capsys: CaptureFixture) -> None:
+     """Check that we correctly handle the -v flag."""
+     Run([str(EMPTY_MODULE), "-v"], exit=False)

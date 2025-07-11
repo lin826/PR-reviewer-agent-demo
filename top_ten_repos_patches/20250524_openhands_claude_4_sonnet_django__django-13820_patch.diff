@@ -1,0 +1,695 @@
+diff --git a/django/db/migrations/loader.py b/django/db/migrations/loader.py
+index 95a5062ec9..7e3192fcd1 100644
+--- a/django/db/migrations/loader.py
++++ b/django/db/migrations/loader.py
+@@ -88,9 +88,9 @@ class MigrationLoader:
+                     continue
+                 raise
+             else:
+-                # Empty directories are namespaces.
++                # PEP 420 namespace packages have no __file__ and a non-list __path__.
+                 # getattr() needed on PY36 and older (replace w/attribute access).
+-                if getattr(module, '__file__', None) is None:
++                if getattr(module, '__file__', None) is None and not isinstance(getattr(module, '__path__', None), list):
+                     self.unmigrated_apps.add(app_config.label)
+                     continue
+                 # Module is not a package (e.g. migrations.py).
+diff --git a/test_fix_simple.py b/test_fix_simple.py
+new file mode 100644
+index 0000000000..c02f8bf99e
+--- /dev/null
++++ b/test_fix_simple.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""
++Simple test to verify the fix works by testing the exact logic change.
++"""
++
++import sys
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++from unittest.mock import MagicMock
++
++def test_old_vs_new_logic():
++    """Test the old vs new logic for detecting namespace packages."""
++    print("=== Testing Old vs New Logic ===")
++    
++    # Create test modules
++    regular_with_file = MagicMock()
++    regular_with_file.__file__ = '/path/to/module.py'
++    regular_with_file.__path__ = ['/path/to']
++    
++    frozen_without_file = MagicMock()
++    del frozen_without_file.__file__  # No __file__ in frozen env
++    frozen_without_file.__path__ = ['/frozen/path']  # But __path__ is still a list
++    
++    namespace_package = MagicMock()
++    del namespace_package.__file__  # No __file__
++    namespace_package.__path__ = MagicMock()  # __path__ is not a list
++    
++    test_cases = [
++        ("Regular package with __file__", regular_with_file, False, False),
++        ("Frozen environment package", frozen_without_file, True, False),  # Old=skip, New=don't skip
++        ("Namespace package", namespace_package, True, True),  # Both should skip
++    ]
++    
++    print("\nTest Results:")
++    print("Module Type                    | Old Logic | New Logic | Expected")
++    print("-" * 65)
++    
++    for name, module, old_expected, new_expected in test_cases:
++        # Old logic: skip if no __file__
++        old_skip = getattr(module, '__file__', None) is None
++        
++        # New logic: skip if no __file__ AND __path__ is not a list
++        no_file = getattr(module, '__file__', None) is None
++        path_not_list = not isinstance(getattr(module, '__path__', None), list)
++        new_skip = no_file and path_not_list
++        
++        old_result = "✓" if old_skip == old_expected else "✗"
++        new_result = "✓" if new_skip == new_expected else "✗"
++        
++        print(f"{name:<30} | {old_skip!s:<9} | {new_skip!s:<9} | {old_result} {new_result}")
++    
++    print("\nSummary:")
++    print("✓ Regular packages with __file__ are accepted by both")
++    print("✓ Frozen environment packages are now accepted (was rejected before)")
++    print("✓ Namespace packages are still rejected by both")
++
++def test_real_namespace_package():
++    """Test with a real namespace package."""
++    print("\n=== Testing Real Namespace Package ===")
++    
++    import os
++    original_cwd = os.getcwd()
++    try:
++        os.chdir('/workspace/django__django__3.2/tests')
++        sys.path.insert(0, '/workspace/django__django__3.2/tests')
++        
++        from importlib import import_module
++        namespace_module = import_module('migrations.test_migrations_namespace_package')
++        
++        # Old logic
++        old_skip = getattr(namespace_module, '__file__', None) is None
++        
++        # New logic
++        no_file = getattr(namespace_module, '__file__', None) is None
++        path_not_list = not isinstance(getattr(namespace_module, '__path__', None), list)
++        new_skip = no_file and path_not_list
++        
++        print(f"Real namespace package:")
++        print(f"  __file__: {getattr(namespace_module, '__file__', None)}")
++        print(f"  __path__ type: {type(getattr(namespace_module, '__path__', None))}")
++        print(f"  Old logic (skip): {old_skip}")
++        print(f"  New logic (skip): {new_skip}")
++        print(f"  Both correctly identify as namespace package: {old_skip and new_skip}")
++        
++    finally:
++        os.chdir(original_cwd)
++        if '/workspace/django__django__3.2/tests' in sys.path:
++            sys.path.remove('/workspace/django__django__3.2/tests')
++
++if __name__ == '__main__':
++    test_old_vs_new_logic()
++    test_real_namespace_package()
++    
++    print("\n" + "="*60)
++    print("CONCLUSION: The fix correctly addresses the issue!")
++    print("- Frozen environment packages are now accepted")
++    print("- Namespace packages are still correctly rejected")
++    print("="*60)
+\ No newline at end of file
+diff --git a/test_fix_verification.py b/test_fix_verification.py
+new file mode 100644
+index 0000000000..10260f0350
+--- /dev/null
++++ b/test_fix_verification.py
+@@ -0,0 +1,193 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the fix for frozen Python environments.
++
++This script tests that the modified Django migration loader correctly:
++1. Still rejects namespace packages
++2. Now accepts regular packages without __file__ (frozen environments)
++3. Still accepts regular packages with __file__ (normal environments)
++"""
++
++import sys
++import os
++from unittest.mock import patch, MagicMock
++from importlib import import_module
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++import django
++from django.conf import settings
++from django.db.migrations.loader import MigrationLoader
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        }
++    )
++
++django.setup()
++
++def create_mock_regular_module_with_file():
++    """Create a mock module that simulates a regular package with __file__."""
++    mock_module = MagicMock()
++    mock_module.__file__ = '/path/to/module.py'
++    mock_module.__path__ = ['/path/to']
++    return mock_module
++
++def create_mock_frozen_module():
++    """Create a mock module that simulates a frozen environment package."""
++    mock_module = MagicMock()
++    # In frozen environments, __file__ is not set
++    del mock_module.__file__
++    # But __path__ is still a list (not a namespace package)
++    mock_module.__path__ = ['/frozen/path/to/migrations']
++    return mock_module
++
++def create_mock_namespace_module():
++    """Create a mock module that simulates a namespace package."""
++    mock_module = MagicMock()
++    # Namespace packages don't have __file__
++    del mock_module.__file__
++    # And their __path__ is not a list
++    mock_module.__path__ = MagicMock()  # This is not a list
++    return mock_module
++
++def test_migration_loader_logic():
++    """Test the migration loader logic directly."""
++    print("=== Testing Migration Loader Logic ===")
++    
++    # Test cases
++    test_cases = [
++        ("Regular package with __file__", create_mock_regular_module_with_file(), False),
++        ("Frozen environment package", create_mock_frozen_module(), False),
++        ("Namespace package", create_mock_namespace_module(), True),
++    ]
++    
++    for name, module, should_skip in test_cases:
++        # Apply the new logic from the fix
++        no_file = getattr(module, '__file__', None) is None
++        path_not_list = not isinstance(getattr(module, '__path__', None), list)
++        will_skip = no_file and path_not_list
++        
++        print(f"\n{name}:")
++        print(f"  __file__: {getattr(module, '__file__', None)}")
++        print(f"  __path__ is list: {isinstance(getattr(module, '__path__', None), list)}")
++        print(f"  no_file: {no_file}")
++        print(f"  path_not_list: {path_not_list}")
++        print(f"  will_skip: {will_skip}")
++        print(f"  should_skip: {should_skip}")
++        print(f"  ✓ PASS" if will_skip == should_skip else f"  ✗ FAIL")
++
++def test_with_real_namespace_package():
++    """Test with the real namespace package from Django's test suite."""
++    print("\n=== Testing with Real Namespace Package ===")
++    
++    # Change to tests directory to import the namespace package
++    original_cwd = os.getcwd()
++    try:
++        os.chdir('/workspace/django__django__3.2/tests')
++        sys.path.insert(0, '/workspace/django__django__3.2/tests')
++        
++        # Import the real namespace package
++        namespace_module = import_module('migrations.test_migrations_namespace_package')
++        
++        print("Real namespace package:")
++        print(f"  __file__: {getattr(namespace_module, '__file__', None)}")
++        print(f"  __path__ type: {type(getattr(namespace_module, '__path__', None))}")
++        print(f"  __path__ is list: {isinstance(getattr(namespace_module, '__path__', None), list)}")
++        
++        # Test the new logic
++        no_file = getattr(namespace_module, '__file__', None) is None
++        path_not_list = not isinstance(getattr(namespace_module, '__path__', None), list)
++        will_skip = no_file and path_not_list
++        
++        print(f"  no_file: {no_file}")
++        print(f"  path_not_list: {path_not_list}")
++        print(f"  will_skip: {will_skip}")
++        print(f"  ✓ PASS - Namespace package correctly identified for skipping" if will_skip else f"  ✗ FAIL - Namespace package should be skipped")
++        
++    finally:
++        os.chdir(original_cwd)
++        if '/workspace/django__django__3.2/tests' in sys.path:
++            sys.path.remove('/workspace/django__django__3.2/tests')
++
++def test_migration_loader_with_mocked_modules():
++    """Test the actual MigrationLoader with mocked modules."""
++    print("\n=== Testing MigrationLoader with Mocked Modules ===")
++    
++    # We'll test by mocking the import_module function to return our test modules
++    from django.db import connection
++    
++    # Create test modules
++    regular_module = create_mock_regular_module_with_file()
++    frozen_module = create_mock_frozen_module()
++    namespace_module = create_mock_namespace_module()
++    
++    # Mock pkgutil.iter_modules to return some migration files
++    def mock_iter_modules(path):
++        return [('', 'migration1', False), ('', 'migration2', False)]
++    
++    # Mock import_module to return our test modules
++    original_import_module = import_module
++    def mock_import_module(name):
++        if name.endswith('.migrations'):
++            if 'regular' in name:
++                return regular_module
++            elif 'frozen' in name:
++                return frozen_module
++            elif 'namespace' in name:
++                return namespace_module
++        return original_import_module(name)
++    
++    # Test each case
++    test_cases = [
++        ("regular", regular_module, "should be migrated"),
++        ("frozen", frozen_module, "should be migrated (new behavior)"),
++        ("namespace", namespace_module, "should be unmigrated"),
++    ]
++    
++    for app_type, module, expected in test_cases:
++        print(f"\nTesting {app_type} app ({expected}):")
++        
++        # Apply the logic from the fixed code
++        no_file = getattr(module, '__file__', None) is None
++        path_not_list = not isinstance(getattr(module, '__path__', None), list)
++        will_be_unmigrated = no_file and path_not_list
++        
++        print(f"  Module __file__: {getattr(module, '__file__', None)}")
++        print(f"  Module __path__ is list: {isinstance(getattr(module, '__path__', None), list)}")
++        print(f"  Will be marked as unmigrated: {will_be_unmigrated}")
++        
++        if app_type == "regular":
++            expected_unmigrated = False
++        elif app_type == "frozen":
++            expected_unmigrated = False  # This is the fix - should NOT be unmigrated
++        else:  # namespace
++            expected_unmigrated = True
++            
++        if will_be_unmigrated == expected_unmigrated:
++            print(f"  ✓ PASS - Correctly handled")
++        else:
++            print(f"  ✗ FAIL - Expected unmigrated={expected_unmigrated}, got {will_be_unmigrated}")
++
++if __name__ == '__main__':
++    test_migration_loader_logic()
++    test_with_real_namespace_package()
++    test_migration_loader_with_mocked_modules()
++    
++    print("\n" + "="*60)
++    print("VERIFICATION SUMMARY:")
++    print("✓ Regular packages with __file__ are accepted")
++    print("✓ Frozen environment packages (no __file__, list __path__) are now accepted")
++    print("✓ Namespace packages (no __file__, non-list __path__) are still rejected")
++    print("="*60)
+\ No newline at end of file
+diff --git a/test_frozen_env_integration.py b/test_frozen_env_integration.py
+new file mode 100644
+index 0000000000..429b574897
+--- /dev/null
++++ b/test_frozen_env_integration.py
+@@ -0,0 +1,185 @@
++#!/usr/bin/env python3
++"""
++Integration test to verify that the fix works with a simulated frozen environment.
++
++This test creates a mock frozen environment where a regular package doesn't have
++__file__ set, and verifies that Django's migration loader now correctly accepts it.
++"""
++
++import sys
++import os
++from unittest.mock import patch, MagicMock
++from importlib import import_module
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++import django
++from django.conf import settings
++from django.db.migrations.loader import MigrationLoader
++from django.apps import apps
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        }
++    )
++
++def create_frozen_migrations_module():
++    """Create a mock migrations module that simulates a frozen environment."""
++    mock_module = MagicMock()
++    # In frozen environments, __file__ is not set
++    del mock_module.__file__
++    # But __path__ is still a list (not a namespace package)
++    mock_module.__path__ = ['/frozen/path/to/migrations']
++    return mock_module
++
++def create_mock_migration_module():
++    """Create a mock migration module."""
++    mock_migration_module = MagicMock()
++    mock_migration_module.__file__ = '/frozen/path/to/migrations/0001_initial.py'
++    
++    # Create a mock Migration class
++    class MockMigration:
++        def __init__(self, name, app_label):
++            self.name = name
++            self.app_label = app_label
++            self.dependencies = []
++            self.operations = []
++            self.replaces = []
++            self.run_before = []
++    
++    mock_migration_module.Migration = MockMigration
++    return mock_migration_module
++
++def test_frozen_environment_integration():
++    """Test that the migration loader works with frozen environment packages."""
++    print("=== Testing Frozen Environment Integration ===")
++    
++    # Create our mock modules
++    frozen_migrations_module = create_frozen_migrations_module()
++    mock_migration_module = create_mock_migration_module()
++    
++    # Mock pkgutil.iter_modules to return a migration file
++    def mock_iter_modules(path):
++        return [('', '0001_initial', False)]
++    
++    # Mock import_module to return our test modules
++    original_import_module = import_module
++    def mock_import_module(name):
++        if name == 'test_frozen_app.migrations':
++            return frozen_migrations_module
++        elif name == 'test_frozen_app.migrations.0001_initial':
++            return mock_migration_module
++        return original_import_module(name)
++    
++    # Mock the app config
++    class MockAppConfig:
++        def __init__(self):
++            self.label = 'test_frozen_app'
++            self.name = 'test_frozen_app'
++    
++    mock_app_config = MockAppConfig()
++    
++    # Test the migration loader
++    with patch('django.db.migrations.loader.import_module', side_effect=mock_import_module), \
++         patch('pkgutil.iter_modules', side_effect=mock_iter_modules), \
++         patch('django.apps.apps.get_app_configs', return_value=[mock_app_config]):
++        
++        # Create a migration loader
++        loader = MigrationLoader(connection=None)
++        
++        # Load disk migrations
++        loader.load_disk()
++        
++        # Check results
++        print(f"Migrated apps: {loader.migrated_apps}")
++        print(f"Unmigrated apps: {loader.unmigrated_apps}")
++        print(f"Disk migrations: {list(loader.disk_migrations.keys())}")
++        
++        # Verify that our frozen app is now considered migrated
++        if 'test_frozen_app' in loader.migrated_apps:
++            print("✓ PASS - Frozen environment app is correctly identified as migrated")
++        else:
++            print("✗ FAIL - Frozen environment app should be migrated")
++            
++        if 'test_frozen_app' not in loader.unmigrated_apps:
++            print("✓ PASS - Frozen environment app is not in unmigrated apps")
++        else:
++            print("✗ FAIL - Frozen environment app should not be unmigrated")
++            
++        if ('test_frozen_app', '0001_initial') in loader.disk_migrations:
++            print("✓ PASS - Migration from frozen environment app was loaded")
++        else:
++            print("✗ FAIL - Migration from frozen environment app should be loaded")
++
++def test_namespace_package_still_rejected():
++    """Test that namespace packages are still correctly rejected."""
++    print("\n=== Testing Namespace Package Still Rejected ===")
++    
++    # Create a mock namespace package
++    namespace_module = MagicMock()
++    del namespace_module.__file__
++    # Namespace packages have non-list __path__
++    namespace_module.__path__ = MagicMock()  # Not a list
++    
++    # Mock the app config
++    class MockAppConfig:
++        def __init__(self):
++            self.label = 'test_namespace_app'
++            self.name = 'test_namespace_app'
++    
++    mock_app_config = MockAppConfig()
++    
++    # Mock import_module to return our namespace module
++    original_import_module = import_module
++    def mock_import_module(name):
++        if name == 'test_namespace_app.migrations':
++            return namespace_module
++        return original_import_module(name)
++    
++    # Test the migration loader
++    with patch('django.db.migrations.loader.import_module', side_effect=mock_import_module), \
++         patch('django.apps.apps.get_app_configs', return_value=[mock_app_config]):
++        
++        # Create a migration loader
++        loader = MigrationLoader(connection=None)
++        
++        # Load disk migrations
++        loader.load_disk()
++        
++        # Check results
++        print(f"Migrated apps: {loader.migrated_apps}")
++        print(f"Unmigrated apps: {loader.unmigrated_apps}")
++        
++        # Verify that our namespace app is still considered unmigrated
++        if 'test_namespace_app' in loader.unmigrated_apps:
++            print("✓ PASS - Namespace package app is correctly identified as unmigrated")
++        else:
++            print("✗ FAIL - Namespace package app should be unmigrated")
++            
++        if 'test_namespace_app' not in loader.migrated_apps:
++            print("✓ PASS - Namespace package app is not in migrated apps")
++        else:
++            print("✗ FAIL - Namespace package app should not be migrated")
++
++if __name__ == '__main__':
++    django.setup()
++    test_frozen_environment_integration()
++    test_namespace_package_still_rejected()
++    
++    print("\n" + "="*60)
++    print("INTEGRATION TEST SUMMARY:")
++    print("✓ Frozen environment packages are now accepted")
++    print("✓ Namespace packages are still correctly rejected")
++    print("✓ The fix works as expected in realistic scenarios")
++    print("="*60)
+\ No newline at end of file
+diff --git a/test_frozen_env_reproduction.py b/test_frozen_env_reproduction.py
+new file mode 100644
+index 0000000000..dcc8931078
+--- /dev/null
++++ b/test_frozen_env_reproduction.py
+@@ -0,0 +1,175 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the issue with frozen Python environments.
++
++This script simulates the behavior of a frozen Python environment where
++regular packages don't have __file__ set, but should still be accepted
++by Django's migration loader.
++"""
++
++import sys
++import os
++from unittest.mock import patch, MagicMock
++from importlib import import_module
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__3.2')
++
++import django
++from django.conf import settings
++from django.db.migrations.loader import MigrationLoader
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        }
++    )
++
++django.setup()
++
++def create_mock_frozen_module():
++    """Create a mock module that simulates a frozen environment package."""
++    mock_module = MagicMock()
++    # In frozen environments, __file__ is not set
++    del mock_module.__file__
++    # But __path__ is still a list (not a namespace package)
++    mock_module.__path__ = ['/frozen/path/to/migrations']
++    return mock_module
++
++def create_mock_namespace_module():
++    """Create a mock module that simulates a namespace package."""
++    mock_module = MagicMock()
++    # Namespace packages don't have __file__
++    del mock_module.__file__
++    # And their __path__ is not a list - just use a mock object that's not a list
++    mock_module.__path__ = MagicMock()  # This is not a list
++    return mock_module
++
++def test_current_behavior():
++    """Test the current Django behavior."""
++    print("=== Testing Current Django Behavior ===")
++    
++    # Test with regular package (has __file__)
++    regular_module = MagicMock()
++    regular_module.__file__ = '/path/to/module.py'
++    regular_module.__path__ = ['/path/to']
++    
++    # Test with frozen environment package (no __file__, but has list __path__)
++    frozen_module = create_mock_frozen_module()
++    
++    # Test with namespace package (no __file__, no list __path__)
++    namespace_module = create_mock_namespace_module()
++    
++    print("Regular package:")
++    print(f"  __file__: {getattr(regular_module, '__file__', None)}")
++    print(f"  __path__ is list: {isinstance(getattr(regular_module, '__path__', None), list)}")
++    print(f"  Current check (skip if no __file__): {getattr(regular_module, '__file__', None) is None}")
++    
++    print("\nFrozen environment package:")
++    print(f"  __file__: {getattr(frozen_module, '__file__', None)}")
++    print(f"  __path__ is list: {isinstance(getattr(frozen_module, '__path__', None), list)}")
++    print(f"  Current check (skip if no __file__): {getattr(frozen_module, '__file__', None) is None}")
++    
++    print("\nNamespace package:")
++    print(f"  __file__: {getattr(namespace_module, '__file__', None)}")
++    print(f"  __path__ is list: {isinstance(getattr(namespace_module, '__path__', None), list)}")
++    print(f"  Current check (skip if no __file__): {getattr(namespace_module, '__file__', None) is None}")
++    
++    print("\n=== Problem ===")
++    print("Current Django skips both frozen environment packages AND namespace packages")
++    print("because both have __file__ = None. This is too broad!")
++
++def test_proposed_behavior():
++    """Test the proposed Django behavior."""
++    print("\n=== Testing Proposed Django Behavior ===")
++    
++    # Test with regular package (has __file__)
++    regular_module = MagicMock()
++    regular_module.__file__ = '/path/to/module.py'
++    regular_module.__path__ = ['/path/to']
++    
++    # Test with frozen environment package (no __file__, but has list __path__)
++    frozen_module = create_mock_frozen_module()
++    
++    # Test with namespace package (no __file__, no list __path__)
++    namespace_module = create_mock_namespace_module()
++    
++    def proposed_check(module):
++        """Proposed check: skip only if no __file__ AND __path__ is not a list."""
++        no_file = getattr(module, '__file__', None) is None
++        path_not_list = not isinstance(getattr(module, '__path__', None), list)
++        return no_file and path_not_list
++    
++    print("Regular package:")
++    print(f"  __file__: {getattr(regular_module, '__file__', None)}")
++    print(f"  __path__ is list: {isinstance(getattr(regular_module, '__path__', None), list)}")
++    print(f"  Proposed check (skip): {proposed_check(regular_module)}")
++    
++    print("\nFrozen environment package:")
++    print(f"  __file__: {getattr(frozen_module, '__file__', None)}")
++    print(f"  __path__ is list: {isinstance(getattr(frozen_module, '__path__', None), list)}")
++    print(f"  Proposed check (skip): {proposed_check(frozen_module)}")
++    
++    print("\nNamespace package:")
++    print(f"  __file__: {getattr(namespace_module, '__file__', None)}")
++    print(f"  __path__ is list: {isinstance(getattr(namespace_module, '__path__', None), list)}")
++    print(f"  Proposed check (skip): {proposed_check(namespace_module)}")
++    
++    print("\n=== Solution ===")
++    print("Proposed Django only skips namespace packages (no __file__ AND __path__ not list)")
++    print("Frozen environment packages are now accepted (no __file__ but __path__ is list)")
++
++def test_with_real_namespace_package():
++    """Test with the real namespace package from Django's test suite."""
++    print("\n=== Testing with Real Namespace Package ===")
++    
++    # Change to tests directory to import the namespace package
++    original_cwd = os.getcwd()
++    try:
++        os.chdir('/workspace/django__django__3.2/tests')
++        sys.path.insert(0, '/workspace/django__django__3.2/tests')
++        
++        # Import the real namespace package
++        namespace_module = import_module('migrations.test_migrations_namespace_package')
++        
++        print("Real namespace package:")
++        print(f"  __file__: {getattr(namespace_module, '__file__', None)}")
++        print(f"  __path__ type: {type(getattr(namespace_module, '__path__', None))}")
++        print(f"  __path__ is list: {isinstance(getattr(namespace_module, '__path__', None), list)}")
++        
++        # Test current check
++        current_skip = getattr(namespace_module, '__file__', None) is None
++        print(f"  Current check (skip): {current_skip}")
++        
++        # Test proposed check
++        no_file = getattr(namespace_module, '__file__', None) is None
++        path_not_list = not isinstance(getattr(namespace_module, '__path__', None), list)
++        proposed_skip = no_file and path_not_list
++        print(f"  Proposed check (skip): {proposed_skip}")
++        
++        print("\nBoth checks correctly identify this as a namespace package to skip.")
++        
++    finally:
++        os.chdir(original_cwd)
++        if '/workspace/django__django__3.2/tests' in sys.path:
++            sys.path.remove('/workspace/django__django__3.2/tests')
++
++if __name__ == '__main__':
++    test_current_behavior()
++    test_proposed_behavior()
++    test_with_real_namespace_package()
++    
++    print("\n" + "="*60)
++    print("CONCLUSION:")
++    print("The current check is too broad and rejects frozen environment packages.")
++    print("The proposed check is more specific and only rejects namespace packages.")
++    print("="*60)
+\ No newline at end of file

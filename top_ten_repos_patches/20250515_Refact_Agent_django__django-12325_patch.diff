@@ -1,0 +1,61 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 8ea6c05ef9..92a6f24540 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -265,7 +265,12 @@ class ModelBase(type):
+                         new_class.add_to_class(attr_name, field)
+                 else:
+                     field = None
+-                new_class._meta.parents[base] = field
++                # Only replace an existing parent link if this field is explicitly
++                # marked as the parent_link or if there's no existing link yet
++                previous = new_class._meta.parents.get(base)
++                if previous is None or (field is not None and hasattr(field, 'remote_field') and 
++                                       hasattr(field.remote_field, 'parent_link') and field.remote_field.parent_link):
++                    new_class._meta.parents[base] = field
+             else:
+                 base_parents = base._meta.parents.copy()
+ 
+diff --git a/django/db/models/options.py b/django/db/models/options.py
+index a375f6ba1d..b8e882f97f 100644
+--- a/django/db/models/options.py
++++ b/django/db/models/options.py
+@@ -10,6 +10,7 @@ from django.db import connections
+ from django.db.models import Manager
+ from django.db.models.fields import AutoField
+ from django.db.models.fields.proxy import OrderWrt
++from django.db.models.fields.related import OneToOneField
+ from django.db.models.query_utils import PathInfo
+ from django.utils.datastructures import ImmutableList, OrderedSet
+ from django.utils.functional import cached_property
+@@ -240,9 +241,27 @@ class Options:
+ 
+         if self.pk is None:
+             if self.parents:
+-                # Promote the first parent link in lieu of adding yet another
+-                # field.
+-                field = next(iter(self.parents.values()))
++                # Promote the parent_link field (if any) in lieu of adding yet another
++                # field. If no field is explicitly marked as parent_link=True,
++                # fall back to the first one (historical behavior).
++                parent_link_fields = []
++                for f in self.local_fields:
++                    if (isinstance(f, OneToOneField) and 
++                        hasattr(f, 'remote_field') and 
++                        hasattr(f.remote_field, 'model') and
++                        f.remote_field.model in self.parents and
++                        hasattr(f.remote_field, 'parent_link') and 
++                        f.remote_field.parent_link):
++                        parent_link_fields.append(f)
++                
++                if parent_link_fields:
++                    # Use the first field explicitly marked as parent_link
++                    field = parent_link_fields[0]
++                    # Update parents dict to ensure it points to the correct field
++                    self.parents[field.remote_field.model] = field
++                else:
++                    # No field with parent_link=True - fall back to the first one
++                    field = next(iter(self.parents.values()))
+                 # Look for a local field with the same name as the
+                 # first parent link. If a local field has already been
+                 # created, use it instead of promoting the parent

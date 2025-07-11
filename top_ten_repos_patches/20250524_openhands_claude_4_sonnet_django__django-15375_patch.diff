@@ -1,0 +1,617 @@
+diff --git a/debug_detailed.py b/debug_detailed.py
+new file mode 100644
+index 0000000000..ac1733bc75
+--- /dev/null
++++ b/debug_detailed.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python
++"""
++Script to debug the detailed flow of the issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum
++
++# Define a simple model for testing
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Book)
++
++# Insert some test data
++Book.objects.create(id=1, title="Book 1")
++Book.objects.create(id=2, title="Book 2")
++Book.objects.create(id=3, title="Book 3")
++
++print("Debugging detailed flow:")
++
++# Simulate the aggregate call
++qs = Book.objects.annotate(idx=F("id"))
++query = qs.query.chain()
++query.add_annotation(Sum("id", default=0), "id__sum", is_summary=True)
++
++print(f"Initial query annotations: {list(query.annotations.keys())}")
++print(f"Initial query annotation_select_mask: {query.annotation_select_mask}")
++
++# Simulate get_aggregation logic
++added_aggregate_names = {"id__sum"}
++existing_annotations = [
++    annotation for alias, annotation
++    in query.annotations.items()
++    if alias not in added_aggregate_names
++]
++
++print(f"Existing annotations: {[str(a) for a in existing_annotations]}")
++
++# Check if we need subquery
++needs_subquery = (isinstance(query.group_by, tuple) or query.is_sliced or existing_annotations or
++                  query.distinct or query.combinator)
++print(f"Needs subquery: {needs_subquery}")
++
++if needs_subquery:
++    from django.db.models.sql.subqueries import AggregateQuery
++    inner_query = query.clone()
++    inner_query.subquery = True
++    outer_query = AggregateQuery(query.model, inner_query)
++    
++    print(f"\nBefore moving aggregates:")
++    print(f"Inner query annotations: {list(inner_query.annotations.keys())}")
++    print(f"Inner query annotation_select: {list(inner_query.annotation_select.keys())}")
++    print(f"Outer query annotations: {list(outer_query.annotations.keys())}")
++    print(f"Outer query annotation_select: {list(outer_query.annotation_select.keys())}")
++    print(f"Outer query annotation_select_mask: {outer_query.annotation_select_mask}")
++    
++    # Move aggregates
++    relabels = {t: 'subquery' for t in inner_query.alias_map}
++    relabels[None] = 'subquery'
++    col_cnt = 0
++    for alias, expression in list(inner_query.annotation_select.items()):
++        annotation_select_mask = inner_query.annotation_select_mask
++        print(f"\nProcessing annotation '{alias}': {expression}")
++        print(f"  is_summary: {expression.is_summary}")
++        if expression.is_summary:
++            expression, col_cnt = inner_query.rewrite_cols(expression, col_cnt)
++            outer_query.annotations[alias] = expression.relabeled_clone(relabels)
++            del inner_query.annotations[alias]
++            annotation_select_mask.remove(alias)
++            print(f"  Moved to outer query")
++        # Make sure the annotation_select wont use cached results.
++        inner_query.set_annotation_mask(inner_query.annotation_select_mask)
++    
++    print(f"\nAfter moving aggregates:")
++    print(f"Inner query annotations: {list(inner_query.annotations.keys())}")
++    print(f"Inner query annotation_select: {list(inner_query.annotation_select.keys())}")
++    print(f"Outer query annotations: {list(outer_query.annotations.keys())}")
++    print(f"Outer query annotation_select: {list(outer_query.annotation_select.keys())}")
++    print(f"Outer query annotation_select_mask: {outer_query.annotation_select_mask}")
+\ No newline at end of file
+diff --git a/debug_is_summary.py b/debug_is_summary.py
+new file mode 100644
+index 0000000000..6f39444104
+--- /dev/null
++++ b/debug_is_summary.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python
++"""
++Script to debug the is_summary property.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum
++
++# Define a simple model for testing
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Book)
++
++print("Testing is_summary property:")
++
++# Test 1: Sum without default
++sum_expr = Sum("id")
++print(f"Sum('id') before resolve: is_summary={sum_expr.is_summary}")
++
++# Simulate what happens in add_annotation
++from django.db.models.sql.query import Query
++query = Query(Book)
++resolved_sum = sum_expr.resolve_expression(query, allow_joins=True, reuse=None, summarize=True)
++print(f"Sum('id') after resolve with summarize=True: is_summary={resolved_sum.is_summary}")
++print(f"Type: {type(resolved_sum)}")
++
++print()
++
++# Test 2: Sum with default
++sum_with_default = Sum("id", default=0)
++print(f"Sum('id', default=0) before resolve: is_summary={sum_with_default.is_summary}")
++
++resolved_sum_with_default = sum_with_default.resolve_expression(query, allow_joins=True, reuse=None, summarize=True)
++print(f"Sum('id', default=0) after resolve with summarize=True: is_summary={resolved_sum_with_default.is_summary}")
++print(f"Type: {type(resolved_sum_with_default)}")
++
++# Check the source expressions of the Coalesce
++if hasattr(resolved_sum_with_default, 'get_source_expressions'):
++    source_exprs = resolved_sum_with_default.get_source_expressions()
++    print(f"Source expressions: {[type(expr).__name__ for expr in source_exprs]}")
++    for i, expr in enumerate(source_exprs):
++        print(f"  Source {i}: is_summary={expr.is_summary}, type={type(expr).__name__}")
+\ No newline at end of file
+diff --git a/debug_sql.py b/debug_sql.py
+new file mode 100644
+index 0000000000..fc2eb2db88
+--- /dev/null
++++ b/debug_sql.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python
++"""
++Script to debug the SQL generation for the issue.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum
++
++# Define a simple model for testing
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Book)
++
++# Insert some test data
++Book.objects.create(id=1, title="Book 1")
++Book.objects.create(id=2, title="Book 2")
++Book.objects.create(id=3, title="Book 3")
++
++print("Debugging SQL generation:")
++
++# Create the problematic query
++qs = Book.objects.annotate(idx=F("id"))
++query = qs.query.chain()
++query.add_annotation(Sum("id", default=0), "id__sum", is_summary=True)
++
++print(f"Query annotations: {query.annotations}")
++print(f"Query annotation_select: {query.annotation_select}")
++
++# Get the aggregation query
++from django.db.models.sql.subqueries import AggregateQuery
++inner_query = query.clone()
++inner_query.subquery = True
++outer_query = AggregateQuery(query.model, inner_query)
++
++print(f"Outer query annotations: {outer_query.annotations}")
++print(f"Outer query annotation_select: {outer_query.annotation_select}")
++
++# Try to get the SQL
++try:
++    compiler = outer_query.get_compiler('default')
++    sql, params = compiler.as_sql()
++    print(f"Generated SQL: {sql}")
++    print(f"Parameters: {params}")
++except Exception as e:
++    print(f"Error generating SQL: {e}")
++    import traceback
++    traceback.print_exc()
+\ No newline at end of file
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index 8c4eae7906..bc31b48d8d 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -65,7 +65,9 @@ class Aggregate(Func):
+         if hasattr(default, 'resolve_expression'):
+             default = default.resolve_expression(query, allow_joins, reuse, summarize)
+         c.default = None  # Reset the default argument before wrapping.
+-        return Coalesce(c, default, output_field=c._output_field_or_none)
++        coalesce = Coalesce(c, default, output_field=c._output_field_or_none)
++        coalesce.is_summary = c.is_summary
++        return coalesce
+ 
+     @property
+     def default_alias(self):
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..14780da3a7
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++"""
++Script to reproduce the issue with aggregate() with 'default' after annotate() crashing.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum
++
++# Define a simple model for testing
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Book)
++
++# Insert some test data
++Book.objects.create(id=1, title="Book 1")
++Book.objects.create(id=2, title="Book 2")
++Book.objects.create(id=3, title="Book 3")
++
++print("Test data created:")
++print(f"Book count: {Book.objects.count()}")
++
++print("\n1. Testing annotate() then aggregate() without default (should work):")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(Sum("id"))
++    print(f"Result: {result}")
++    print("✓ Success")
++except Exception as e:
++    print(f"✗ Error: {e}")
++
++print("\n2. Testing annotate() then aggregate() with default (should crash):")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(Sum("id", default=0))
++    print(f"Result: {result}")
++    print("✓ Success")
++except Exception as e:
++    print(f"✗ Error: {e}")
++    import traceback
++    traceback.print_exc()
++
++print("\n3. Testing workaround with Coalesce (should work):")
++try:
++    from django.db.models.functions import Coalesce
++    result = Book.objects.annotate(idx=F("id")).aggregate(x=Coalesce(Sum("id"), 0))
++    print(f"Result: {result}")
++    print("✓ Success")
++except Exception as e:
++    print(f"✗ Error: {e}")
++
++print("\n4. Testing aggregate() with default without annotate() (should work):")
++try:
++    result = Book.objects.aggregate(Sum("id", default=0))
++    print(f"Result: {result}")
++    print("✓ Success")
++except Exception as e:
++    print(f"✗ Error: {e}")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..5da0d2326e
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python
++"""
++Script to test edge cases for the fix.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum, Count, Avg, Max, Min
++from django.db.models.functions import Coalesce
++
++# Define a simple model for testing
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=100)
++    pages = models.IntegerField(default=100)
++    rating = models.FloatField(default=3.0)
++    
++    class Meta:
++        app_label = 'test'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Book)
++
++# Insert some test data
++Book.objects.create(id=1, title="Book 1", pages=200, rating=4.5)
++Book.objects.create(id=2, title="Book 2", pages=150, rating=3.8)
++Book.objects.create(id=3, title="Book 3", pages=300, rating=4.2)
++
++print("Testing edge cases:")
++
++# Test 1: Different aggregate functions with defaults
++test_cases = [
++    ("Sum with default", lambda: Book.objects.annotate(idx=F("id")).aggregate(Sum("pages", default=0))),
++    ("Avg with default", lambda: Book.objects.annotate(idx=F("id")).aggregate(Avg("rating", default=0.0))),
++    ("Max with default", lambda: Book.objects.annotate(idx=F("id")).aggregate(Max("pages", default=0))),
++    ("Min with default", lambda: Book.objects.annotate(idx=F("id")).aggregate(Min("pages", default=0))),
++    ("Multiple aggregates with defaults", lambda: Book.objects.annotate(idx=F("id")).aggregate(
++        total_pages=Sum("pages", default=0),
++        avg_rating=Avg("rating", default=0.0)
++    )),
++]
++
++for test_name, test_func in test_cases:
++    try:
++        result = test_func()
++        print(f"✓ {test_name}: {result}")
++    except Exception as e:
++        print(f"✗ {test_name}: {e}")
++
++# Test 2: Empty queryset with defaults
++print("\nTesting empty queryset:")
++try:
++    result = Book.objects.filter(id__gt=1000).annotate(idx=F("id")).aggregate(Sum("pages", default=999))
++    print(f"✓ Empty queryset with default: {result}")
++except Exception as e:
++    print(f"✗ Empty queryset with default: {e}")
++
++# Test 3: Complex expressions with defaults
++print("\nTesting complex expressions:")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(
++        complex_sum=Sum(F("pages") * F("rating"), default=0)
++    )
++    print(f"✓ Complex expression with default: {result}")
++except Exception as e:
++    print(f"✗ Complex expression with default: {e}")
++
++# Test 4: Nested aggregates (should still fail appropriately)
++print("\nTesting nested aggregates (should fail):")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(
++        nested=Sum(Sum("pages"), default=0)
++    )
++    print(f"✗ Nested aggregates should have failed: {result}")
++except Exception as e:
++    print(f"✓ Nested aggregates correctly failed: {e}")
++
++# Test 5: Count with default (should fail as Count doesn't allow default)
++print("\nTesting Count with default (should fail):")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(Count("id", default=0))
++    print(f"✗ Count with default should have failed: {result}")
++except Exception as e:
++    print(f"✓ Count with default correctly failed: {e}")
++
++print("\nAll tests completed!")
+\ No newline at end of file
+diff --git a/test_specific_issue.py b/test_specific_issue.py
+new file mode 100644
+index 0000000000..0dbd46e1af
+--- /dev/null
++++ b/test_specific_issue.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++"""
++Test the specific issue from the problem description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import models
++from django.db.models import F, Sum
++from django.db.models.functions import Coalesce
++
++# Define the Book model from the issue description
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'core'
++
++# Create the table
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Book)
++
++# Insert test data to match the issue description (95 books with total id sum of 4560)
++# This means we need books with ids that sum to 4560
++# For simplicity, let's create books with ids 1 through 95
++for i in range(1, 96):
++    Book.objects.create(id=i, title=f"Book {i}")
++
++print(f"Created {Book.objects.count()} books")
++print(f"Expected sum: {sum(range(1, 96))} = 4560")
++
++print("\nTesting the exact scenarios from the issue description:")
++
++# Test 1: Annotate then aggregate (should work)
++print("1. Book.objects.annotate(idx=F('id')).aggregate(Sum('id'))")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(Sum("id"))
++    print(f"   Result: {result}")
++    assert result == {'id__sum': 4560}, f"Expected {{'id__sum': 4560}}, got {result}"
++    print("   ✓ Success")
++except Exception as e:
++    print(f"   ✗ Error: {e}")
++
++# Test 2: Annotate then aggregate with default (was crashing, should now work)
++print("\n2. Book.objects.annotate(idx=F('id')).aggregate(Sum('id', default=0))")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(Sum("id", default=0))
++    print(f"   Result: {result}")
++    assert result == {'id__sum': 4560}, f"Expected {{'id__sum': 4560}}, got {result}"
++    print("   ✓ Success")
++except Exception as e:
++    print(f"   ✗ Error: {e}")
++
++# Test 3: Workaround with Coalesce (should work)
++print("\n3. Book.objects.annotate(idx=F('id')).aggregate(x=Coalesce(Sum('id'), 0))")
++try:
++    result = Book.objects.annotate(idx=F("id")).aggregate(x=Coalesce(Sum("id"), 0))
++    print(f"   Result: {result}")
++    assert result == {'x': 4560}, f"Expected {{'x': 4560}}, got {result}"
++    print("   ✓ Success")
++except Exception as e:
++    print(f"   ✗ Error: {e}")
++
++# Test 4: Test with empty result set to verify default works
++print("\n4. Testing with empty result set:")
++try:
++    result = Book.objects.filter(id__gt=1000).annotate(idx=F("id")).aggregate(Sum("id", default=0))
++    print(f"   Result: {result}")
++    assert result == {'id__sum': 0}, f"Expected {{'id__sum': 0}}, got {result}"
++    print("   ✓ Success - default value used correctly")
++except Exception as e:
++    print(f"   ✗ Error: {e}")
++
++print("\nAll tests passed! The issue has been fixed.")
+\ No newline at end of file

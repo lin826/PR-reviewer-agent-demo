@@ -1,0 +1,158 @@
+diff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py
+index 32b24ef1..7718a16f 100644
+--- a/xarray/core/dataarray.py
++++ b/xarray/core/dataarray.py
+@@ -196,6 +196,27 @@ class _LocIndexer:
+             # expand the indexer so we can handle Ellipsis
+             labels = indexing.expanded_indexer(key, self.data_array.ndim)
+             key = dict(zip(self.data_array.dims, labels))
++            
++        # Special handling for dimensions named 'method' or 'tolerance'
++        # which conflict with parameter names in pandas indexing
++        method_param = None  # Don't use a method for inexact matches
++        tolerance_param = None  # Don't use tolerance for inexact matches
++        
++        # Handle the special case of 'method' dimension name explicitly
++        if 'method' in key and 'method' in self.data_array.dims:
++            # We need to ensure we don't pass the method dimension value as a method parameter
++            # Create a new dictionary with all keys
++            all_keys = key.copy()
++            # Call sel with indexers dict instead of kwargs to avoid conflict
++            return self.data_array.sel(indexers=all_keys, method=method_param, tolerance=tolerance_param)
++            
++        # Handle tolerance similarly if needed
++        if 'tolerance' in key and 'tolerance' in self.data_array.dims:
++            # Same approach as method
++            all_keys = key.copy()
++            return self.data_array.sel(indexers=all_keys, method=method_param, tolerance=tolerance_param)
++            
++        # Normal case - no special dimension names
+         return self.data_array.sel(**key)
+ 
+     def __setitem__(self, key, value) -> None:
+@@ -204,7 +225,19 @@ class _LocIndexer:
+             labels = indexing.expanded_indexer(key, self.data_array.ndim)
+             key = dict(zip(self.data_array.dims, labels))
+ 
+-        pos_indexers, _ = remap_label_indexers(self.data_array, key)
++        # Handle special case for 'method' and 'tolerance' dimension names
++        method_param = None  # Don't use a method for inexact matches 
++        
++        # If 'method' is used as a dimension name, handle it specially
++        if 'method' in key and 'method' in self.data_array.dims:
++            pos_indexers, _ = remap_label_indexers(self.data_array, key, method=method_param)
++        # Same for 'tolerance'
++        elif 'tolerance' in key and 'tolerance' in self.data_array.dims:
++            pos_indexers, _ = remap_label_indexers(self.data_array, key, method=method_param)
++        # Normal case - no special dimension names
++        else:
++            pos_indexers, _ = remap_label_indexers(self.data_array, key)
++            
+         self.data_array[pos_indexers] = value
+ 
+ 
+@@ -1196,11 +1229,34 @@ class DataArray(AbstractArray, DataWithCoords):
+         DataArray.isel
+ 
+         """
++        # Special handling for 'method' and 'tolerance' dimension names
++        # We need to avoid confusion between dimension names and method parameters
++        
++        # First collect all indexers into a single dictionary
++        all_indexers = {}
++        if indexers is not None:
++            all_indexers.update(indexers)
++        all_indexers.update(indexers_kwargs)
++        
++        # Check for conflict with 'method' and 'tolerance' parameters
++        method_param, tolerance_param = method, tolerance
++        
++        # If 'method' is used as a dimension name and provided as an indexer,
++        # we need to handle it specially
++        if 'method' in all_indexers and 'method' in self.dims:
++            # In this case, we want to use the indexer's value for the 'method' dimension,
++            # not as the fill method parameter
++            method_param = None
++            
++        # Same for tolerance
++        if 'tolerance' in all_indexers and 'tolerance' in self.dims:
++            tolerance_param = None
++            
+         ds = self._to_temp_dataset().sel(
+             indexers=indexers,
+             drop=drop,
+-            method=method,
+-            tolerance=tolerance,
++            method=method_param,
++            tolerance=tolerance_param,
+             **indexers_kwargs,
+         )
+         return self._from_temp_dataset(ds)
+diff --git a/xarray/core/dataset.py b/xarray/core/dataset.py
+index dbac288c..31b7df98 100644
+--- a/xarray/core/dataset.py
++++ b/xarray/core/dataset.py
+@@ -2228,8 +2228,25 @@ class Dataset(Mapping, ImplementsDatasetReduce, DataWithCoords):
+         DataArray.sel
+         """
+         indexers = either_dict_or_kwargs(indexers, indexers_kwargs, "sel")
++        
++        # Check if any dimension has the same name as the method/tolerance parameters
++        # If so, we need to handle this specially to avoid confusion between
++        # dimension names and method parameters
++        method_param, tolerance_param = method, tolerance
++        
++        # If 'method' is used as a dimension name and provided as an indexer,
++        # we need to handle it specially
++        if 'method' in indexers and 'method' in self.dims:
++            # In this case, we want to use the indexer's value for the 'method' dimension,
++            # not as the fill method parameter
++            method_param = None
++            
++        # Same for tolerance
++        if 'tolerance' in indexers and 'tolerance' in self.dims:
++            tolerance_param = None
++            
+         pos_indexers, new_indexes = remap_label_indexers(
+-            self, indexers=indexers, method=method, tolerance=tolerance
++            self, indexers=indexers, method=method_param, tolerance=tolerance_param
+         )
+         result = self.isel(indexers=pos_indexers, drop=drop)
+         return result._overwrite_indexes(new_indexes)
+diff --git a/xarray/core/indexing.py b/xarray/core/indexing.py
+index 843feb04..5c0c6add 100644
+--- a/xarray/core/indexing.py
++++ b/xarray/core/indexing.py
+@@ -100,7 +100,14 @@ def get_indexer_nd(index, labels, method=None, tolerance=None):
+     labels
+     """
+     flat_labels = np.ravel(labels)
+-    flat_indexer = index.get_indexer(flat_labels, method=method, tolerance=tolerance)
++    # Use a safer approach to call get_indexer to prevent conflicts
++    kwargs = {}
++    if method is not None:
++        kwargs['method'] = method
++    if tolerance is not None:
++        kwargs['tolerance'] = tolerance
++        
++    flat_indexer = index.get_indexer(flat_labels, **kwargs)
+     indexer = flat_indexer.reshape(labels.shape)
+     return indexer
+ 
+@@ -188,7 +195,15 @@ def convert_label_indexer(index, label, index_name="", method=None, tolerance=No
+                     )
+                 indexer = index.get_loc(label_value)
+             else:
+-                indexer = index.get_loc(label_value, method=method, tolerance=tolerance)
++                # Use a safer approach to call get_loc to prevent conflicts between
++                # dimension names and pandas method parameters
++                kwargs = {}
++                if method is not None:
++                    kwargs['method'] = method
++                if tolerance is not None:
++                    kwargs['tolerance'] = tolerance
++                
++                indexer = index.get_loc(label_value, **kwargs)
+         elif label.dtype.kind == "b":
+             indexer = label
+         else:

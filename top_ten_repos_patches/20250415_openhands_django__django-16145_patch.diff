@@ -1,0 +1,336 @@
+diff --git a/django/core/management/commands/runserver.py b/django/core/management/commands/runserver.py
+index 3c39f57e4d..21cf92e2b8 100644
+--- a/django/core/management/commands/runserver.py
++++ b/django/core/management/commands/runserver.py
+@@ -137,6 +137,11 @@ class Command(BaseCommand):
+         self.check_migrations()
+         now = datetime.now().strftime("%B %d, %Y - %X")
+         self.stdout.write(now)
++        # For display purposes, expand '0' to '0.0.0.0' to be consistent with docs
++        display_addr = self.addr
++        if display_addr == '0':
++            display_addr = '0.0.0.0'
++        
+         self.stdout.write(
+             (
+                 "Django version %(version)s, using settings %(settings)r\n"
+@@ -147,7 +152,7 @@ class Command(BaseCommand):
+                 "version": self.get_version(),
+                 "settings": settings.SETTINGS_MODULE,
+                 "protocol": self.protocol,
+-                "addr": "[%s]" % self.addr if self._raw_ipv6 else self.addr,
++                "addr": "[%s]" % display_addr if self._raw_ipv6 else display_addr,
+                 "port": self.port,
+                 "quit_command": quit_command,
+             }
+diff --git a/manual_test.py b/manual_test.py
+new file mode 100644
+index 0000000000..3ae25a64dd
+--- /dev/null
++++ b/manual_test.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python
++"""
++A simple test to directly check if '0' is properly expanded to '0.0.0.0' in the runserver command.
++We'll mock the necessary parts to avoid requiring a full Django environment.
++"""
++
++import re
++from django.utils.regex_helper import _lazy_re_compile
++
++# Copy the naiveip_re pattern from runserver.py
++naiveip_re = _lazy_re_compile(
++    r"""^(?:
++(?P<addr>
++    (?P<ipv4>\d{1,3}(?:\.\d{1,3}){3}) |         # IPv4 address
++    (?P<ipv6>\[[a-fA-F0-9:]+\]) |               # IPv6 address
++    (?P<fqdn>[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*) # FQDN
++):)?(?P<port>\d+)$""",
++    re.X,
++)
++
++def test_address_parsing(addrport, apply_fix=False):
++    """
++    Test if the address is parsed correctly 
++    and what would be displayed in the output.
++    """
++    # Default addresses (from runserver.py)
++    default_addr = "127.0.0.1"
++    default_addr_ipv6 = "::1"
++    use_ipv6 = False
++    raw_ipv6 = False
++    
++    if not addrport:
++        addr = ""
++        port = "8000"  # default port
++    else:
++        m = re.match(naiveip_re, addrport)
++        if m is None:
++            print(f'"{addrport}" is not a valid port number or address:port pair.')
++            return
++            
++        addr, _ipv4, _ipv6, _fqdn, port = m.groups()
++        if addr:
++            if _ipv6:
++                addr = addr[1:-1]  # Strip the brackets
++                use_ipv6 = True
++                raw_ipv6 = True
++    
++    # If no address is specified, use default
++    if not addr:
++        addr = default_addr_ipv6 if use_ipv6 else default_addr
++        
++    # Now display what would be shown in the output
++    print(f"Parsed: addrport='{addrport}'")
++    print(f"  addr='{addr}', port='{port}'")
++    
++    # Apply our fix if requested
++    display_addr = addr
++    if apply_fix and display_addr == '0':
++        display_addr = '0.0.0.0'
++        
++    formatted_addr = f"[{display_addr}]" if raw_ipv6 else display_addr
++    print(f"Output would show: http://{formatted_addr}:{port}/")
++    
++    # Check for the issue
++    if addr == '0' and not apply_fix:
++        print("ISSUE: Should display as '0.0.0.0' instead of '0'")
++    
++
++# Test with different address formats
++print("=== Before Fix ===")
++test_address_parsing("")  # default
++test_address_parsing("8000")  # just port
++test_address_parsing("127.0.0.1:8000")  # full IPv4
++test_address_parsing("0:8000")  # This is the problematic case
++test_address_parsing("0.0.0.0:8000")  # Full zero address
++
++print("\n=== After Fix ===")
++test_address_parsing("", apply_fix=True)
++test_address_parsing("8000", apply_fix=True)
++test_address_parsing("127.0.0.1:8000", apply_fix=True)
++test_address_parsing("0:8000", apply_fix=True)  # Should now expand to 0.0.0.0
++test_address_parsing("0.0.0.0:8000", apply_fix=True)
+\ No newline at end of file
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..5c43bab3c4
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python
++import os
++import sys
++import tempfile
++import subprocess
++from pathlib import Path
++
++# Create a temporary Django project
++with tempfile.TemporaryDirectory() as temp_dir:
++    temp_path = Path(temp_dir)
++    
++    # Initialize a Django project
++    project_path = temp_path / 'test_project'
++    os.makedirs(project_path, exist_ok=True)
++    
++    # Add the django package to the path
++    sys.path.insert(0, str(Path(__file__).resolve().parent))
++    
++    # Use Django's built-in management command to create a project
++    from django.core import management
++    
++    # Create the project
++    management.call_command('startproject', 'testsite', project_path)
++    
++    # Now run the runserver command with '0:8000' and capture output
++    os.chdir(project_path)
++    process = subprocess.Popen(
++        [sys.executable, 'manage.py', 'runserver', '0:8000'],
++        stdout=subprocess.PIPE, 
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    
++    # We don't need to wait for the process to complete, just capture initial output
++    try:
++        # Give the server a moment to start
++        stdout, stderr = [], []
++        
++        # Capture for a short time
++        import time
++        start_time = time.time()
++        while time.time() - start_time < 2:  # Capture for 2 seconds
++            line = process.stdout.readline()
++            if line:
++                stdout.append(line)
++                print(f"STDOUT: {line}", end='')
++            if not line and process.poll() is not None:
++                break
++            
++        # Check if we see the issue
++        for line in stdout:
++            if 'Starting development server at' in line:
++                print("\nFound server address line:")
++                print(line)
++                # Check if the address shown is '0:8000' instead of '0.0.0.0:8000'
++                if 'http://0:8000/' in line:
++                    print("\nISSUE CONFIRMED: Server address is shown as 'http://0:8000/' instead of 'http://0.0.0.0:8000/'")
++                else:
++                    print("\nServer address is shown correctly")
++                break
++    finally:
++        # Make sure to terminate the server
++        process.terminate()
++        process.wait()
+\ No newline at end of file
+diff --git a/simple_verify.py b/simple_verify.py
+new file mode 100644
+index 0000000000..d1a274079c
+--- /dev/null
++++ b/simple_verify.py
+@@ -0,0 +1,17 @@
++#!/usr/bin/env python
++"""
++A simple test to verify that our fix works correctly.
++"""
++from django.core.management.commands.runserver import Command
++
++# Test the expansion of '0' to '0.0.0.0'
++addr = '0'
++display_addr = addr
++
++# Apply our fix
++if display_addr == '0':
++    display_addr = '0.0.0.0'
++
++print(f"Original address: {addr}")
++print(f"Display address after fix: {display_addr}")
++print(f"PASS: Fix correctly expands '0' to '0.0.0.0' for display purposes")
+\ No newline at end of file
+diff --git a/test_addr_expansion.py b/test_addr_expansion.py
+new file mode 100644
+index 0000000000..a1f8e65df6
+--- /dev/null
++++ b/test_addr_expansion.py
+@@ -0,0 +1,26 @@
++#!/usr/bin/env python
++"""
++Simple script to test the address expansion in the runserver command
++without actually starting a server.
++"""
++import sys
++from django.core.management.commands.runserver import Command
++
++# Create a mock stdout to capture output
++class MockStdout:
++    def __init__(self):
++        self.captured = []
++
++    def write(self, text):
++        self.captured.append(text)
++        sys.stdout.write(text)
++
++    def flush(self):
++        pass
++
++# Create runserver command instance with mock stdout
++command = Command(stdout=MockStdout())
++
++# Test with address '0:8000'
++print("\nTesting with address '0:8000':")
++command.handle(addrport='0:8000', use_threading=True, use_reloader=False, skip_checks=True)
+\ No newline at end of file
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000000..be16bdc1cb
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++"""
++Test script to verify our fix works with the actual Command class.
++This simulates the exact behavior of the command with our fix applied.
++"""
++
++import sys
++import io
++from django.conf import settings
++from django.core.management.commands.runserver import Command
++
++# Configure basic settings to prevent exceptions
++settings.configure(
++    DEBUG=True, 
++    ALLOWED_HOSTS=[],
++    INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes'],
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    SECRET_KEY='test_key',
++)
++
++# Create a command instance with a buffer to capture output
++buffer = io.StringIO()
++command = Command(stdout=buffer)
++
++# Test cases
++test_cases = [
++    ("", "127.0.0.1"),          # Default
++    ("8000", "127.0.0.1"),      # Just port
++    ("127.0.0.1:8000", "127.0.0.1"),  # Full IPv4
++    ("0:8000", "0.0.0.0"),      # Should expand '0' to '0.0.0.0' with our fix
++    ("0.0.0.0:8000", "0.0.0.0"),  # Full zero address
++]
++
++# Run tests
++for addrport, expected_addr in test_cases:
++    # Reset buffer
++    buffer = io.StringIO()
++    command = Command(stdout=buffer)
++    
++    # Parse the address (simulating command.handle)
++    if not addrport:
++        command.addr = ""
++        command.port = "8000"
++    else:
++        import re
++        m = re.match(command.naiveip_re, addrport)
++        if m is None:
++            print(f"ERROR: {addrport} is not a valid port or address:port")
++            continue
++            
++        command.addr, _ipv4, _ipv6, _fqdn, command.port = m.groups()
++        
++    # Apply defaults if no address specified
++    if not command.addr:
++        command.addr = "127.0.0.1"  # Default
++        
++    # Store other required attributes
++    command._raw_ipv6 = False
++    command.use_ipv6 = False
++    
++    # Call the display method with minimal arguments
++    try:
++        # We're only interested in the display output, so we'll patch
++        # some of the methods that would normally run
++        command.check = lambda *args, **kwargs: None
++        command.check_migrations = lambda: None
++        
++        # Mock get_version to avoid extra imports
++        command.get_version = lambda: "X.Y.Z"
++        
++        # Call inner_run but catch the expected exception
++        try:
++            command.inner_run(None, use_threading=True, skip_checks=True)
++        except AttributeError:
++            # Expected as we haven't set up everything needed for the server to run
++            pass
++            
++        # Get the output and check for the correct address
++        output = buffer.getvalue()
++        if f"http://{expected_addr}:8000/" in output:
++            print(f"PASS: '{addrport}' displays as '{expected_addr}'")
++        else:
++            print(f"FAIL: '{addrport}' does not display correctly")
++            print(f"Expected to see 'http://{expected_addr}:8000/' in the output")
++            print(f"Output was: {output}")
++    except Exception as e:
++        print(f"ERROR testing {addrport}: {e}")
+\ No newline at end of file

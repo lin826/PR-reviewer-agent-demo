@@ -1,0 +1,290 @@
+diff --git a/django/contrib/contenttypes/fields.py b/django/contrib/contenttypes/fields.py
+index ed98ecb48c..6098b71a39 100644
+--- a/django/contrib/contenttypes/fields.py
++++ b/django/contrib/contenttypes/fields.py
+@@ -202,7 +202,7 @@ class GenericForeignKey(FieldCacheMixin):
+             else:
+                 model = self.get_content_type(id=ct_id,
+                                               using=obj._state.db).model_class()
+-                return (model._meta.pk.get_prep_value(getattr(obj, self.fk_field)),
++                return (model._meta.pk.to_python(getattr(obj, self.fk_field)),
+                         model)
+ 
+         return (
+diff --git a/tests/contenttypes_tests/test_gfk_uuid.py b/tests/contenttypes_tests/test_gfk_uuid.py
+new file mode 100644
+index 0000000000..9a8732022c
+--- /dev/null
++++ b/tests/contenttypes_tests/test_gfk_uuid.py
+@@ -0,0 +1,64 @@
++"""
++Test for reproducing the issue with GenericForeignKey and UUID primary keys.
++"""
++import uuid
++from django.test import TestCase
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++
++# Define test models
++class UUIDModel(models.Model):
++    """Model with UUID as primary key."""
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++    
++
++class GFKModel(models.Model):
++    """Model with GenericForeignKey to any model."""
++    content_type = models.ForeignKey(
++        ContentType, on_delete=models.CASCADE)
++    object_id = models.CharField(max_length=255)
++    content_object = GenericForeignKey('content_type', 'object_id')
++    name = models.CharField(max_length=100)
++
++
++class GenericForeignKeyUUIDTest(TestCase):
++    """Test for GFK with UUID primary keys."""
++    
++    @classmethod
++    def setUpTestData(cls):
++        # Create UUID models
++        cls.uuid_obj1 = UUIDModel.objects.create(name="UUID Object 1")
++        cls.uuid_obj2 = UUIDModel.objects.create(name="UUID Object 2")
++        
++        # Create GFK models pointing to UUID models
++        cls.ct = ContentType.objects.get_for_model(UUIDModel)
++        cls.gfk1 = GFKModel.objects.create(
++            content_type=cls.ct,
++            object_id=str(cls.uuid_obj1.id),
++            name="GFK Object 1"
++        )
++        cls.gfk2 = GFKModel.objects.create(
++            content_type=cls.ct,
++            object_id=str(cls.uuid_obj2.id),
++            name="GFK Object 2"
++        )
++    
++    def test_direct_access(self):
++        """Test direct access to the GenericForeignKey relation."""
++        gfk1 = GFKModel.objects.get(pk=self.gfk1.pk)
++        gfk2 = GFKModel.objects.get(pk=self.gfk2.pk)
++        
++        # This should work
++        self.assertEqual(gfk1.content_object, self.uuid_obj1)
++        self.assertEqual(gfk2.content_object, self.uuid_obj2)
++    
++    def test_prefetch_related(self):
++        """Test prefetch_related with GenericForeignKey to UUID models."""
++        # Prefetch the content_object relation
++        gfk_list = list(GFKModel.objects.all().prefetch_related('content_object'))
++        
++        # This will fail if the issue exists
++        self.assertEqual(gfk_list[0].content_object, self.uuid_obj1)
++        self.assertEqual(gfk_list[1].content_object, self.uuid_obj2)
+\ No newline at end of file
+diff --git a/tests/repro_gfk_uuid.py b/tests/repro_gfk_uuid.py
+new file mode 100644
+index 0000000000..85bf3b3fad
+--- /dev/null
++++ b/tests/repro_gfk_uuid.py
+@@ -0,0 +1,123 @@
++"""
++This script reproduces the issue where prefetch_related is not working when used
++with GenericForeignKey for a model that uses UUID field as primary key.
++"""
++import uuid
++import os
++import sys
++
++# Add Django to path
++sys.path.insert(0, "/workspace/django__django__3.0")
++
++# Set up Django settings
++from django.conf import settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='not-a-real-secret-key-just-for-testing',
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++        'repro_test',
++    ],
++)
++
++# Initialize Django
++import django
++django.setup()
++
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++
++# Define the models as described in the issue
++class FooModel(models.Model):
++    """Model with UUID as primary key."""
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return f"FooModel: {self.name} (UUID: {self.id})"
++        
++    class Meta:
++        app_label = 'repro_test'
++    
++class BarModel(models.Model):
++    """Model with GenericForeignKey to any model (including FooModel)."""
++    foo_content_type = models.ForeignKey(
++        ContentType, related_name='actor',
++        on_delete=models.CASCADE, db_index=True
++    )
++    foo_object_id = models.CharField(max_length=255, db_index=True)
++    foo = GenericForeignKey('foo_content_type', 'foo_object_id')
++    name = models.CharField(max_length=100)
++    
++    def __str__(self):
++        return f"BarModel: {self.name} (related to: {self.foo if self.foo else 'None'})"
++        
++    class Meta:
++        app_label = 'repro_test'
++
++# Create the necessary database tables
++from django.db import connection
++
++# Create ContentType table if it doesn't exist yet
++from django.contrib.contenttypes.models import ContentType
++from django.db.migrations.executor import MigrationExecutor
++executor = MigrationExecutor(connection)
++executor.migrate([('contenttypes', '0001_initial')])
++
++# Create our custom model tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(FooModel)
++    schema_editor.create_model(BarModel)
++
++# Create test data
++foo1 = FooModel.objects.create(name="Foo 1")
++foo2 = FooModel.objects.create(name="Foo 2")
++
++foo_ct = ContentType.objects.get_for_model(FooModel)
++
++# Create BarModel instances linking to FooModel instances
++bar1 = BarModel.objects.create(
++    foo_content_type=foo_ct,
++    foo_object_id=str(foo1.id),  # Convert UUID to string
++    name="Bar 1"
++)
++
++bar2 = BarModel.objects.create(
++    foo_content_type=foo_ct,
++    foo_object_id=str(foo2.id),  # Convert UUID to string
++    name="Bar 2"
++)
++
++print("\nCreated data:")
++print(f"Foo1: {foo1.id} ({type(foo1.id).__name__})")
++print(f"Foo2: {foo2.id} ({type(foo2.id).__name__})")
++print(f"Bar1: {bar1.foo_object_id} ({type(bar1.foo_object_id).__name__})")
++print(f"Bar2: {bar2.foo_object_id} ({type(bar2.foo_object_id).__name__})")
++
++# Try accessing the related objects directly first (without prefetch)
++print("\nDirect access (without prefetch_related):")
++for bar in BarModel.objects.all():
++    print(f"{bar.name} --> foo: {bar.foo}")
++
++# Now attempt to use prefetch_related
++print("\nTesting prefetch_related with GenericForeignKey to UUID model...")
++bars = list(BarModel.objects.all().prefetch_related('foo'))
++
++print("\nResults with prefetch_related:")
++for bar in bars:
++    # Print the foo attribute to see if it's properly prefetched
++    print(f"{bar.name} --> foo: {bar.foo}")
++
++print("\nTest complete.")
++
++# Clean up
++with connection.schema_editor() as schema_editor:
++    schema_editor.delete_model(BarModel)
++    schema_editor.delete_model(FooModel)
+\ No newline at end of file
+diff --git a/tests/test_gfk_uuid.py b/tests/test_gfk_uuid.py
+new file mode 100644
+index 0000000000..665a248874
+--- /dev/null
++++ b/tests/test_gfk_uuid.py
+@@ -0,0 +1,69 @@
++"""
++Test for reproducing the issue with GenericForeignKey and UUID primary keys.
++"""
++import uuid
++from django.test import TestCase
++from django.db import models
++from django.contrib.contenttypes.fields import GenericForeignKey
++from django.contrib.contenttypes.models import ContentType
++
++# Define test models
++class UUIDModel(models.Model):
++    """Model with UUID as primary key."""
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'contenttypes_tests'
++
++class GFKModel(models.Model):
++    """Model with GenericForeignKey to any model."""
++    content_type = models.ForeignKey(
++        ContentType, on_delete=models.CASCADE)
++    object_id = models.CharField(max_length=255)
++    content_object = GenericForeignKey('content_type', 'object_id')
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'contenttypes_tests'
++
++# Create test case
++class GenericForeignKeyUUIDTest(TestCase):
++    """Test for GFK with UUID primary keys."""
++    
++    @classmethod
++    def setUpTestData(cls):
++        # Create UUID models
++        cls.uuid_obj1 = UUIDModel.objects.create(name="UUID Object 1")
++        cls.uuid_obj2 = UUIDModel.objects.create(name="UUID Object 2")
++        
++        # Create GFK models pointing to UUID models
++        cls.ct = ContentType.objects.get_for_model(UUIDModel)
++        cls.gfk1 = GFKModel.objects.create(
++            content_type=cls.ct,
++            object_id=str(cls.uuid_obj1.id),
++            name="GFK Object 1"
++        )
++        cls.gfk2 = GFKModel.objects.create(
++            content_type=cls.ct,
++            object_id=str(cls.uuid_obj2.id),
++            name="GFK Object 2"
++        )
++    
++    def test_direct_access(self):
++        """Test direct access to the GenericForeignKey relation."""
++        gfk1 = GFKModel.objects.get(pk=self.gfk1.pk)
++        gfk2 = GFKModel.objects.get(pk=self.gfk2.pk)
++        
++        # This should work
++        self.assertEqual(gfk1.content_object, self.uuid_obj1)
++        self.assertEqual(gfk2.content_object, self.uuid_obj2)
++    
++    def test_prefetch_related(self):
++        """Test prefetch_related with GenericForeignKey to UUID models."""
++        # Prefetch the content_object relation
++        gfk_list = list(GFKModel.objects.all().prefetch_related('content_object'))
++        
++        # This will fail if the issue exists
++        self.assertEqual(gfk_list[0].content_object, self.uuid_obj1)
++        self.assertEqual(gfk_list[1].content_object, self.uuid_obj2)
+\ No newline at end of file

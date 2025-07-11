@@ -1,0 +1,740 @@
+diff --git a/debug_fix.py b/debug_fix.py
+new file mode 100644
+index 0000000000..ab5b7593e8
+--- /dev/null
++++ b/debug_fix.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python
++"""
++Debug script to understand why the fix isn't working.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++
++class MyIntWrapper:
++    """A simple wrapper class to demonstrate the issue."""
++    def __init__(self, value):
++        self.value = int(value)
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++    
++    def __int__(self):
++        return self.value
++
++
++class MyAutoField(models.BigAutoField):
++    """Custom AutoField that wraps values in MyIntWrapper."""
++    
++    def from_db_value(self, value, expression, connection):
++        print(f"from_db_value called with value={value}, expression={expression}")
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++
++class AutoModel(models.Model):
++    """Test model using the custom auto field."""
++    id = MyAutoField(primary_key=True)
++    name = models.CharField(max_length=100, default="test")
++    
++    class Meta:
++        app_label = 'test'
++
++
++def debug_create():
++    """Debug the create operation."""
++    print("Creating database tables...")
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    print("\n=== Debugging Model.objects.create() ===")
++    
++    # Check what fields are considered returning fields
++    print(f"db_returning_fields: {AutoModel._meta.db_returning_fields}")
++    
++    # Test create
++    print("Calling AutoModel.objects.create()...")
++    obj = AutoModel.objects.create(name="test")
++    print(f"Created object id: {obj.id!r} (type: {type(obj.id)})")
++    print(f"Is MyIntWrapper: {isinstance(obj.id, MyIntWrapper)}")
++
++
++if __name__ == "__main__":
++    debug_create()
+\ No newline at end of file
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 55b1691166..6dfa234c90 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -872,7 +872,7 @@ class Model(metaclass=ModelBase):
+             results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+             if results:
+                 for value, field in zip(results[0], returning_fields):
+-                    setattr(self, field.attname, value)
++                    setattr(self, field.attname, self._apply_field_converters(value, field, using))
+         return updated
+ 
+     def _do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):
+@@ -912,6 +912,16 @@ class Model(metaclass=ModelBase):
+             using=using, raw=raw,
+         )
+ 
++    def _apply_field_converters(self, value, field, using):
++        """
++        Apply database converters (including from_db_value) to a field value.
++        """
++        from django.db import connections
++        from django.db.models.query import _apply_field_converters
++        
++        connection = connections[using]
++        return _apply_field_converters(value, field, connection)
++
+     def _prepare_related_fields_for_save(self, operation_name):
+         # Ensure that a model instance without a PK hasn't been assigned to
+         # a ForeignKey or OneToOneField on this model. If the field is
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 387deca527..63d200e866 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -28,6 +28,38 @@ from django.utils.functional import cached_property, partition
+ # The maximum number of results to fetch in a get() query.
+ MAX_GET_RESULTS = 21
+ 
++
++def _apply_field_converters(value, field, connection):
++    """
++    Apply database converters (including from_db_value) to a field value.
++    """
++    if value is None:
++        return value
++        
++    # Get backend converters - some backends expect an expression with output_field
++    # For returning fields, we only need field converters anyway
++    try:
++        # Create a simple expression wrapper for the field
++        class FieldExpression:
++            def __init__(self, field):
++                self.output_field = field
++        
++        expression = FieldExpression(field)
++        backend_converters = connection.ops.get_db_converters(expression)
++    except (AttributeError, TypeError):
++        # If backend converters fail, just use field converters
++        backend_converters = []
++    
++    # Get field converters (includes from_db_value)
++    field_converters = field.get_db_converters(connection)
++    
++    # Apply all converters
++    converters = backend_converters + field_converters
++    for converter in converters:
++        value = converter(value, field, connection)
++    
++    return value
++
+ # The maximum number of items to display in a QuerySet.__repr__
+ REPR_OUTPUT_SIZE = 20
+ 
+@@ -505,7 +537,7 @@ class QuerySet:
+                 for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+                     for result, field in zip(results, opts.db_returning_fields):
+                         if field != opts.pk:
+-                            setattr(obj_with_pk, field.attname, result)
++                            setattr(obj_with_pk, field.attname, _apply_field_converters(result, field, connection))
+                 for obj_with_pk in objs_with_pk:
+                     obj_with_pk._state.adding = False
+                     obj_with_pk._state.db = self.db
+@@ -518,7 +550,7 @@ class QuerySet:
+                     assert len(returned_columns) == len(objs_without_pk)
+                 for obj_without_pk, results in zip(objs_without_pk, returned_columns):
+                     for result, field in zip(results, opts.db_returning_fields):
+-                        setattr(obj_without_pk, field.attname, result)
++                        setattr(obj_without_pk, field.attname, _apply_field_converters(result, field, connection))
+                     obj_without_pk._state.adding = False
+                     obj_without_pk._state.db = self.db
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..93afe61c6e
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the from_db_value issue with insert operations.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++
++class MyIntWrapper:
++    """A simple wrapper class to demonstrate the issue."""
++    def __init__(self, value):
++        self.value = int(value)
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++    
++    def __int__(self):
++        return self.value
++
++
++class MyAutoField(models.BigAutoField):
++    """Custom AutoField that wraps values in MyIntWrapper."""
++    
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++
++class AutoModel(models.Model):
++    """Test model using the custom auto field."""
++    id = MyAutoField(primary_key=True)
++    name = models.CharField(max_length=100, default="test")
++    
++    class Meta:
++        app_label = 'test'
++
++
++def test_issue():
++    """Test the from_db_value issue."""
++    print("Creating database tables...")
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    print("\n=== Testing from_db_value behavior ===")
++    
++    # Test 1: Regular query (should work correctly)
++    print("\n1. Testing regular query after manual insert...")
++    with connection.cursor() as cursor:
++        cursor.execute("INSERT INTO test_automodel (name) VALUES ('manual')")
++    
++    am_query = AutoModel.objects.first()
++    print(f"   Queried instance id: {am_query.id!r}")
++    print(f"   Type: {type(am_query.id)}")
++    print(f"   Is MyIntWrapper: {isinstance(am_query.id, MyIntWrapper)}")
++    
++    # Test 2: Model.objects.create() (should fail - this is the bug)
++    print("\n2. Testing Model.objects.create()...")
++    am_create = AutoModel.objects.create(name="created")
++    print(f"   Created instance id: {am_create.id!r}")
++    print(f"   Type: {type(am_create.id)}")
++    print(f"   Is MyIntWrapper: {isinstance(am_create.id, MyIntWrapper)}")
++    
++    # Test 3: bulk_create() (should fail - this is the bug)
++    print("\n3. Testing bulk_create()...")
++    objs = [AutoModel(name="bulk1"), AutoModel(name="bulk2")]
++    AutoModel.objects.bulk_create(objs)
++    print(f"   Bulk created instance 1 id: {objs[0].id!r}")
++    print(f"   Type: {type(objs[0].id)}")
++    print(f"   Is MyIntWrapper: {isinstance(objs[0].id, MyIntWrapper)}")
++    print(f"   Bulk created instance 2 id: {objs[1].id!r}")
++    print(f"   Type: {type(objs[1].id)}")
++    print(f"   Is MyIntWrapper: {isinstance(objs[1].id, MyIntWrapper)}")
++    
++    # Test 4: Verify that querying the created objects works correctly
++    print("\n4. Testing query of created objects...")
++    all_objects = list(AutoModel.objects.all())
++    for i, obj in enumerate(all_objects):
++        print(f"   Object {i+1} id: {obj.id!r}")
++        print(f"   Type: {type(obj.id)}")
++        print(f"   Is MyIntWrapper: {isinstance(obj.id, MyIntWrapper)}")
++    
++    print("\n=== Summary ===")
++    print("Expected: All id values should be MyIntWrapper instances")
++    print("Actual: Only queried objects have MyIntWrapper, created objects have plain int")
++
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/test_bulk_create_fix.py b/test_bulk_create_fix.py
+new file mode 100644
+index 0000000000..ab4c41e05f
+--- /dev/null
++++ b/test_bulk_create_fix.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python
++"""
++Test script to verify bulk_create fix with a mock that simulates PostgreSQL behavior.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from unittest.mock import patch
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++
++class MyIntWrapper:
++    """A simple wrapper class to demonstrate the issue."""
++    def __init__(self, value):
++        self.value = int(value)
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++    
++    def __int__(self):
++        return self.value
++
++
++class MyAutoField(models.BigAutoField):
++    """Custom AutoField that wraps values in MyIntWrapper."""
++    
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++
++class AutoModel(models.Model):
++    """Test model using the custom auto field."""
++    id = MyAutoField(primary_key=True)
++    name = models.CharField(max_length=100, default="test")
++    
++    class Meta:
++        app_label = 'test'
++
++
++def test_bulk_create_with_mock():
++    """Test bulk_create with mocked PostgreSQL-like behavior."""
++    print("Creating database tables...")
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    print("\n=== Testing bulk_create with mocked returning support ===")
++    
++    # Mock the database features to simulate PostgreSQL behavior
++    with patch.object(connection.features, 'can_return_rows_from_bulk_insert', True):
++        # Mock the _batched_insert to return fake results
++        def mock_batched_insert(self, objs, fields, batch_size=None, ignore_conflicts=False):
++            # Simulate returning primary key values for each object
++            print(f"Mock _batched_insert called with {len(objs)} objects")
++            results = []
++            for i, obj in enumerate(objs):
++                # Simulate database returning an ID (starting from 100 for clarity)
++                # Return a list with one value per db_returning_field
++                results.append([100 + i])
++            print(f"Mock returning {len(results)} results")
++            return results
++        
++        with patch('django.db.models.query.QuerySet._batched_insert', side_effect=mock_batched_insert):
++            print("Testing bulk_create with mocked returning support...")
++            objs = [AutoModel(name="bulk1"), AutoModel(name="bulk2"), AutoModel(name="bulk3")]
++            AutoModel.objects.bulk_create(objs)
++            
++            print(f"   Bulk created instance 1 id: {objs[0].id!r}")
++            print(f"   Type: {type(objs[0].id)}")
++            print(f"   Is MyIntWrapper: {isinstance(objs[0].id, MyIntWrapper)}")
++            
++            print(f"   Bulk created instance 2 id: {objs[1].id!r}")
++            print(f"   Type: {type(objs[1].id)}")
++            print(f"   Is MyIntWrapper: {isinstance(objs[1].id, MyIntWrapper)}")
++            
++            print(f"   Bulk created instance 3 id: {objs[2].id!r}")
++            print(f"   Type: {type(objs[2].id)}")
++            print(f"   Is MyIntWrapper: {isinstance(objs[2].id, MyIntWrapper)}")
++            
++            # Verify all instances have the correct type
++            all_correct = all(isinstance(obj.id, MyIntWrapper) for obj in objs)
++            print(f"\n   All instances have MyIntWrapper: {all_correct}")
++            
++            if all_correct:
++                print("   ✅ SUCCESS: bulk_create now applies from_db_value converters!")
++            else:
++                print("   ❌ FAILURE: bulk_create still not applying converters")
++
++
++if __name__ == "__main__":
++    test_bulk_create_with_mock()
+\ No newline at end of file
+diff --git a/test_converter_fix.py b/test_converter_fix.py
+new file mode 100644
+index 0000000000..5a170a267d
+--- /dev/null
++++ b/test_converter_fix.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python
++"""
++Direct test of the field converter fix.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from django.db.models.query import _apply_field_converters
++
++
++class MyIntWrapper:
++    """A simple wrapper class to demonstrate the issue."""
++    def __init__(self, value):
++        self.value = int(value)
++    
++    def __repr__(self):
++        return f"<MyIntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, MyIntWrapper):
++            return self.value == other.value
++        return self.value == other
++    
++    def __int__(self):
++        return self.value
++
++
++class MyAutoField(models.BigAutoField):
++    """Custom AutoField that wraps values in MyIntWrapper."""
++    
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++
++def test_converter_function():
++    """Test the _apply_field_converters function directly."""
++    print("=== Testing _apply_field_converters function ===")
++    
++    # Create a field instance
++    field = MyAutoField()
++    
++    # Test with a raw integer value
++    raw_value = 42
++    converted_value = _apply_field_converters(raw_value, field, connection)
++    
++    print(f"Raw value: {raw_value!r} (type: {type(raw_value)})")
++    print(f"Converted value: {converted_value!r} (type: {type(converted_value)})")
++    print(f"Is MyIntWrapper: {isinstance(converted_value, MyIntWrapper)}")
++    
++    # Test with None
++    none_value = None
++    converted_none = _apply_field_converters(none_value, field, connection)
++    print(f"None value: {none_value!r} -> {converted_none!r}")
++    
++    # Test that the conversion actually works
++    if isinstance(converted_value, MyIntWrapper) and converted_value.value == 42:
++        print("✅ SUCCESS: _apply_field_converters works correctly!")
++        return True
++    else:
++        print("❌ FAILURE: _apply_field_converters not working")
++        return False
++
++
++def test_model_save():
++    """Test that Model.save() now applies converters."""
++    print("\n=== Testing Model.save() with converters ===")
++    
++    class TestModel(models.Model):
++        id = MyAutoField(primary_key=True)
++        name = models.CharField(max_length=100, default="test")
++        
++        class Meta:
++            app_label = 'test'
++    
++    # Create table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Test create
++    obj = TestModel.objects.create(name="test")
++    print(f"Created object id: {obj.id!r} (type: {type(obj.id)})")
++    print(f"Is MyIntWrapper: {isinstance(obj.id, MyIntWrapper)}")
++    
++    if isinstance(obj.id, MyIntWrapper):
++        print("✅ SUCCESS: Model.objects.create() now applies converters!")
++        return True
++    else:
++        print("❌ FAILURE: Model.objects.create() not applying converters")
++        return False
++
++
++if __name__ == "__main__":
++    success1 = test_converter_function()
++    success2 = test_model_save()
++    
++    if success1 and success2:
++        print("\n🎉 All tests passed! The fix is working correctly.")
++    else:
++        print("\n💥 Some tests failed. The fix needs more work.")
+\ No newline at end of file
+diff --git a/test_debug.py b/test_debug.py
+new file mode 100644
+index 0000000000..20be480a79
+--- /dev/null
++++ b/test_debug.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python
++"""
++Debug the test model specifically.
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add tests directory to path
++sys.path.insert(0, '/workspace/django__django__4.0/tests')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            'from_db_value',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++from from_db_value.models import AutoModel, IntWrapper
++
++
++def test_model():
++    """Test the model from the test suite."""
++    print("Creating database tables...")
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(AutoModel)
++    
++    print(f"db_returning_fields: {AutoModel._meta.db_returning_fields}")
++    
++    # Test create
++    print("Calling AutoModel.objects.create()...")
++    obj = AutoModel.objects.create(name="test")
++    print(f"Created object id: {obj.id!r} (type: {type(obj.id)})")
++    print(f"Is IntWrapper: {isinstance(obj.id, IntWrapper)}")
++
++
++if __name__ == "__main__":
++    test_model()
+\ No newline at end of file
+diff --git a/tests/from_db_value/models.py b/tests/from_db_value/models.py
+index 58e8ec3a27..ca5f1fb5b8 100644
+--- a/tests/from_db_value/models.py
++++ b/tests/from_db_value/models.py
+@@ -21,3 +21,43 @@ class CashField(models.DecimalField):
+ 
+ class CashModel(models.Model):
+     cash = CashField()
++
++
++class IntWrapper:
++    """A wrapper for integer values to test AutoField from_db_value."""
++    def __init__(self, value):
++        self.value = int(value)
++        self.vendor = None
++    
++    def __repr__(self):
++        return f"<IntWrapper: {self.value}>"
++    
++    def __eq__(self, other):
++        if isinstance(other, IntWrapper):
++            return self.value == other.value
++        return self.value == other
++    
++    def __int__(self):
++        return self.value
++
++
++class CustomAutoField(models.BigAutoField):
++    """Custom AutoField that wraps values in IntWrapper."""
++    
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        wrapper = IntWrapper(value)
++        wrapper.vendor = connection.vendor
++        return wrapper
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++
++class AutoModel(models.Model):
++    """Model with custom AutoField to test returning_fields conversion."""
++    id = CustomAutoField(primary_key=True)
++    name = models.CharField(max_length=100, default="test")
+diff --git a/tests/from_db_value/tests.py b/tests/from_db_value/tests.py
+index ab92f37ccf..2f371369d2 100644
+--- a/tests/from_db_value/tests.py
++++ b/tests/from_db_value/tests.py
+@@ -2,7 +2,7 @@ from django.db import connection
+ from django.db.models import Max
+ from django.test import TestCase
+ 
+-from .models import Cash, CashModel
++from .models import Cash, CashModel, IntWrapper, AutoModel
+ 
+ 
+ class FromDBValueTest(TestCase):
+@@ -33,3 +33,30 @@ class FromDBValueTest(TestCase):
+     def test_connection(self):
+         instance = CashModel.objects.get()
+         self.assertEqual(instance.cash.vendor, connection.vendor)
++
++
++
++
++
++    def test_create_autofield(self):
++        """Test that from_db_value is called for AutoField on create()."""
++        instance = AutoModel.objects.create(name='test')
++        self.assertIsInstance(instance.id, IntWrapper)
++        self.assertEqual(instance.id.vendor, connection.vendor)
++
++    def test_bulk_create_autofield(self):
++        """Test that from_db_value is called for AutoField on bulk_create()."""
++        objs = [AutoModel(name='test1'), AutoModel(name='test2')]
++        AutoModel.objects.bulk_create(objs)
++        
++        # On databases that support returning rows from bulk insert,
++        # the from_db_value should be called for the AutoField
++        if connection.features.can_return_rows_from_bulk_insert:
++            for obj in objs:
++                self.assertIsInstance(obj.id, IntWrapper)
++                self.assertEqual(obj.id.vendor, connection.vendor)
++        else:
++            # On databases that don't support it, the IDs won't be set
++            # This is expected behavior and not part of the bug fix
++            for obj in objs:
++                self.assertIsNone(obj.id)

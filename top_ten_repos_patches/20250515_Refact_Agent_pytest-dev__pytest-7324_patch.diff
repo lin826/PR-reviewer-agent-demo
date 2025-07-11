@@ -1,0 +1,67 @@
+diff --git a/src/_pytest/mark/expression.py b/src/_pytest/mark/expression.py
+index 04c73411a..2857a1a12 100644
+--- a/src/_pytest/mark/expression.py
++++ b/src/_pytest/mark/expression.py
+@@ -129,7 +129,8 @@ class Scanner:
+ 
+ def expression(s: Scanner) -> ast.Expression:
+     if s.accept(TokenType.EOF):
+-        ret = ast.NameConstant(False)  # type: ast.expr
++        # Use ast.Constant instead of ast.NameConstant for better compatibility
++        ret = ast.Constant(value=False)  # type: ast.expr
+     else:
+         ret = expr(s)
+         s.accept(TokenType.EOF, reject=True)
+@@ -161,7 +162,16 @@ def not_expr(s: Scanner) -> ast.expr:
+         return ret
+     ident = s.accept(TokenType.IDENT)
+     if ident:
+-        return ast.Name(ident.value, ast.Load())
++        # Handle Python's special constants to avoid AST validation errors in debug builds
++        if ident.value == "True":
++            # Rename the Python constants to avoid AST validation errors
++            return ast.Name(id="_pytest_True", ctx=ast.Load())
++        elif ident.value == "False":
++            return ast.Name(id="_pytest_False", ctx=ast.Load())
++        elif ident.value == "None":
++            return ast.Name(id="_pytest_None", ctx=ast.Load())
++        else:
++            return ast.Name(ident.value, ast.Load())
+     s.reject((TokenType.NOT, TokenType.LPAREN, TokenType.IDENT))
+ 
+ 
+@@ -212,7 +222,33 @@ class Expression:
+ 
+         Returns whether the expression matches or not.
+         """
++        # Create a wrapper for the matcher that handles special constants
++        def safe_matcher(ident):
++            try:
++                return matcher(ident)
++            except (KeyError, TypeError):
++                # If the matcher doesn't handle this identifier, return False
++                return False
++        
++        # Create a mapping for our renamed Python constants
++        special_constants = {
++            "_pytest_True": safe_matcher("True"),
++            "_pytest_False": safe_matcher("False"),
++            "_pytest_None": safe_matcher("None"),
++        }
++        
++        # Create a custom locals dict that includes our special constants
++        class CustomLocals(MatcherAdapter):
++            def __init__(self, matcher, special_constants):
++                super().__init__(matcher)
++                self.special_constants = special_constants
++                
++            def __getitem__(self, key):
++                if key in self.special_constants:
++                    return self.special_constants[key]
++                return super().__getitem__(key)
++        
+         ret = eval(
+-            self.code, {"__builtins__": {}}, MatcherAdapter(matcher)
++            self.code, {"__builtins__": {}}, CustomLocals(matcher, special_constants)
+         )  # type: bool
+         return ret

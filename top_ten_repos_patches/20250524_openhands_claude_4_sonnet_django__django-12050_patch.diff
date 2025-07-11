@@ -1,0 +1,566 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index ea51912e8b..90475d6fb9 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1073,7 +1073,7 @@ class Query(BaseExpression):
+                         ))
+                 else:
+                     resolved_values.append(sub_value)
+-            value = tuple(resolved_values)
++            value = type(value)(resolved_values)
+         return value
+ 
+     def solve_lookup_type(self, lookup):
+diff --git a/final_comprehensive_test.py b/final_comprehensive_test.py
+new file mode 100644
+index 0000000000..0e7cffd791
+--- /dev/null
++++ b/final_comprehensive_test.py
+@@ -0,0 +1,168 @@
++#!/usr/bin/env python
++"""
++Final comprehensive test to verify the fix works correctly
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import F
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import connection
++from django.db.models.sql.query import Query
++
++
++class TypeSensitiveField(models.Field):
++    """Field that requires exact type matching"""
++    
++    def get_internal_type(self):
++        return 'TextField'
++    
++    def to_python(self, value):
++        if value is None:
++            return value
++        if isinstance(value, str):
++            if value.startswith('list:'):
++                return eval(value[5:])
++            elif value.startswith('tuple:'):
++                return eval(value[6:])
++        return value
++    
++    def from_db_value(self, value, expression, connection):
++        return self.to_python(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return value
++        if isinstance(value, list):
++            return f'list:{repr(value)}'
++        elif isinstance(value, tuple):
++            return f'tuple:{repr(value)}'
++        return str(value)
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    data = TypeSensitiveField()
++    number = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def run_comprehensive_test():
++    """Run comprehensive test of the fix"""
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    print("=== COMPREHENSIVE TEST OF LIST/TUPLE PRESERVATION FIX ===\n")
++    
++    # Test 1: Basic type preservation
++    print("1. Testing basic type preservation:")
++    query = Query(TestModel)
++    
++    test_cases = [
++        ([1, 2, 3], "list"),
++        ((1, 2, 3), "tuple"),
++        ([], "empty list"),
++        ((), "empty tuple"),
++        ([42], "single item list"),
++        ((42,), "single item tuple"),
++    ]
++    
++    for value, description in test_cases:
++        resolved = query.resolve_lookup_value(value, set(), True, False)
++        type_match = type(value) == type(resolved)
++        print(f"  {description}: {value!r} -> {resolved!r} (type preserved: {type_match})")
++        assert type_match, f"Type not preserved for {description}"
++    
++    # Test 2: F expressions still work
++    print("\n2. Testing F expressions in iterables:")
++    f_test_cases = [
++        ([F('number'), 42], "list with F"),
++        ((F('number'), 42), "tuple with F"),
++        ([F('number'), F('id'), 100], "list with multiple F"),
++        ((F('number'), F('id'), 100), "tuple with multiple F"),
++    ]
++    
++    for value, description in f_test_cases:
++        resolved = query.resolve_lookup_value(value, set(), True, False)
++        type_match = type(value) == type(resolved)
++        print(f"  {description}: type preserved: {type_match}, F resolved: {hasattr(resolved[0], 'target')}")
++        assert type_match, f"Type not preserved for {description}"
++    
++    # Test 3: Real database queries
++    print("\n3. Testing real database queries:")
++    
++    # Create test data
++    list_data = [1, 2, 3]
++    tuple_data = (4, 5, 6)
++    
++    obj1 = TestModel.objects.create(name='list_obj', data=list_data, number=10)
++    obj2 = TestModel.objects.create(name='tuple_obj', data=tuple_data, number=20)
++    
++    # Query with list - should find the list object
++    list_results = TestModel.objects.filter(data=list_data)
++    print(f"  Query with list {list_data}: found {len(list_results)} objects")
++    assert len(list_results) == 1, "Should find exactly 1 object with list query"
++    assert list_results[0].name == 'list_obj', "Should find the list object"
++    
++    # Query with tuple - should find the tuple object
++    tuple_results = TestModel.objects.filter(data=tuple_data)
++    print(f"  Query with tuple {tuple_data}: found {len(tuple_results)} objects")
++    assert len(tuple_results) == 1, "Should find exactly 1 object with tuple query"
++    assert tuple_results[0].name == 'tuple_obj', "Should find the tuple object"
++    
++    # Cross-query should not work (list query shouldn't find tuple object)
++    cross_results = TestModel.objects.filter(data=(1, 2, 3))  # tuple version of list data
++    print(f"  Cross-query with tuple (1, 2, 3) for list data: found {len(cross_results)} objects")
++    assert len(cross_results) == 0, "Cross-query should not find objects"
++    
++    # Test 4: __in queries with lists and tuples
++    print("\n4. Testing __in queries:")
++    
++    # Test __in with list
++    in_list_results = TestModel.objects.filter(number__in=[10, 30])
++    print(f"  __in with list [10, 30]: found {len(in_list_results)} objects")
++    assert len(in_list_results) == 1, "Should find 1 object with __in list query"
++    
++    # Test __in with tuple
++    in_tuple_results = TestModel.objects.filter(number__in=(20, 30))
++    print(f"  __in with tuple (20, 30): found {len(in_tuple_results)} objects")
++    assert len(in_tuple_results) == 1, "Should find 1 object with __in tuple query"
++    
++    print("\n=== ALL TESTS PASSED! ===")
++    print("✅ List types are preserved")
++    print("✅ Tuple types are preserved")
++    print("✅ F expressions still work correctly")
++    print("✅ Database queries work with type-sensitive fields")
++    print("✅ __in queries work with both lists and tuples")
++    print("✅ Original #30687 functionality is preserved")
++    print("✅ Issue requirements are fully satisfied")
++
++
++if __name__ == '__main__':
++    run_comprehensive_test()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..6ed2f47516
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the list/tuple preservation fix
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import F
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import connection
++from django.db.models.sql.query import Query
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    number = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def test_edge_cases():
++    """Test edge cases for resolve_lookup_value"""
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create test objects
++    obj1 = TestModel.objects.create(name='test1', number=1)
++    obj2 = TestModel.objects.create(name='test2', number=2)
++    
++    query = Query(TestModel)
++    
++    print("Testing edge cases for resolve_lookup_value:")
++    
++    # Test 1: Empty list
++    empty_list = []
++    resolved = query.resolve_lookup_value(empty_list, set(), True, False)
++    print(f"Empty list: {empty_list!r} -> {resolved!r} (type: {type(resolved)})")
++    assert type(resolved) == list, f"Expected list, got {type(resolved)}"
++    
++    # Test 2: Empty tuple
++    empty_tuple = ()
++    resolved = query.resolve_lookup_value(empty_tuple, set(), True, False)
++    print(f"Empty tuple: {empty_tuple!r} -> {resolved!r} (type: {type(resolved)})")
++    assert type(resolved) == tuple, f"Expected tuple, got {type(resolved)}"
++    
++    # Test 3: Single item list
++    single_list = [42]
++    resolved = query.resolve_lookup_value(single_list, set(), True, False)
++    print(f"Single list: {single_list!r} -> {resolved!r} (type: {type(resolved)})")
++    assert type(resolved) == list, f"Expected list, got {type(resolved)}"
++    
++    # Test 4: Single item tuple
++    single_tuple = (42,)
++    resolved = query.resolve_lookup_value(single_tuple, set(), True, False)
++    print(f"Single tuple: {single_tuple!r} -> {resolved!r} (type: {type(resolved)})")
++    assert type(resolved) == tuple, f"Expected tuple, got {type(resolved)}"
++    
++    # Test 5: List with F expressions (this was the original issue being fixed)
++    list_with_f = [F('number'), 42]
++    resolved = query.resolve_lookup_value(list_with_f, set(), True, False)
++    print(f"List with F: {list_with_f!r} -> {resolved!r} (type: {type(resolved)})")
++    assert type(resolved) == list, f"Expected list, got {type(resolved)}"
++    
++    # Test 6: Tuple with F expressions
++    tuple_with_f = (F('number'), 42)
++    resolved = query.resolve_lookup_value(tuple_with_f, set(), True, False)
++    print(f"Tuple with F: {tuple_with_f!r} -> {resolved!r} (type: {type(resolved)})")
++    assert type(resolved) == tuple, f"Expected tuple, got {type(resolved)}"
++    
++    # Test 7: Non-iterable values (should be unchanged)
++    single_value = 42
++    resolved = query.resolve_lookup_value(single_value, set(), True, False)
++    print(f"Single value: {single_value!r} -> {resolved!r} (type: {type(resolved)})")
++    assert resolved == single_value, f"Expected {single_value}, got {resolved}"
++    
++    # Test 8: String (should not be treated as iterable in this context)
++    string_value = "test"
++    resolved = query.resolve_lookup_value(string_value, set(), True, False)
++    print(f"String value: {string_value!r} -> {resolved!r} (type: {type(resolved)})")
++    assert resolved == string_value, f"Expected {string_value}, got {resolved}"
++    
++    print("\nAll edge case tests passed!")
++
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_f_expressions.py b/test_f_expressions.py
+new file mode 100644
+index 0000000000..510a85dc5e
+--- /dev/null
++++ b/test_f_expressions.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python
++"""
++Test that F expressions in iterables still work correctly after our fix
++This verifies that we didn't break the original functionality from #30687
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.db.models import F
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import connection
++from django.db.models.sql.query import Query
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    number = models.IntegerField(default=0)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def test_f_expressions_in_iterables():
++    """Test that F expressions in iterables are resolved correctly"""
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Create test objects
++    obj1 = TestModel.objects.create(name='test1', number=1)
++    obj2 = TestModel.objects.create(name='test2', number=2)
++    obj3 = TestModel.objects.create(name='test3', number=3)
++    
++    query = Query(TestModel)
++    
++    print("Testing F expressions in iterables:")
++    
++    # Test 1: List with F expression
++    list_with_f = [F('number'), 42]
++    resolved = query.resolve_lookup_value(list_with_f, set(), True, False)
++    print(f"List with F: {list_with_f!r}")
++    print(f"Resolved: {resolved!r} (type: {type(resolved)})")
++    print(f"First item type: {type(resolved[0])}")
++    print(f"Second item: {resolved[1]}")
++    assert type(resolved) == list, f"Expected list, got {type(resolved)}"
++    assert resolved[1] == 42, f"Expected 42, got {resolved[1]}"
++    
++    # Test 2: Tuple with F expression
++    tuple_with_f = (F('number'), 42)
++    resolved = query.resolve_lookup_value(tuple_with_f, set(), True, False)
++    print(f"\nTuple with F: {tuple_with_f!r}")
++    print(f"Resolved: {resolved!r} (type: {type(resolved)})")
++    print(f"First item type: {type(resolved[0])}")
++    print(f"Second item: {resolved[1]}")
++    assert type(resolved) == tuple, f"Expected tuple, got {type(resolved)}"
++    assert resolved[1] == 42, f"Expected 42, got {resolved[1]}"
++    
++    # Test 3: Multiple F expressions in list
++    multi_f_list = [F('number'), F('id'), 100]
++    resolved = query.resolve_lookup_value(multi_f_list, set(), True, False)
++    print(f"\nMultiple F in list: {multi_f_list!r}")
++    print(f"Resolved: {resolved!r} (type: {type(resolved)})")
++    assert type(resolved) == list, f"Expected list, got {type(resolved)}"
++    assert resolved[2] == 100, f"Expected 100, got {resolved[2]}"
++    
++    # Test 4: Multiple F expressions in tuple
++    multi_f_tuple = (F('number'), F('id'), 100)
++    resolved = query.resolve_lookup_value(multi_f_tuple, set(), True, False)
++    print(f"\nMultiple F in tuple: {multi_f_tuple!r}")
++    print(f"Resolved: {resolved!r} (type: {type(resolved)})")
++    assert type(resolved) == tuple, f"Expected tuple, got {type(resolved)}"
++    assert resolved[2] == 100, f"Expected 100, got {resolved[2]}"
++    
++    print("\nAll F expression tests passed!")
++    print("The original #30687 functionality is preserved while fixing the list/tuple coercion issue!")
++
++
++if __name__ == '__main__':
++    test_f_expressions_in_iterables()
+\ No newline at end of file
+diff --git a/test_list_tuple_issue.py b/test_list_tuple_issue.py
+new file mode 100644
+index 0000000000..28c49f1667
+--- /dev/null
++++ b/test_list_tuple_issue.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the list/tuple coercion issue in Query.resolve_lookup_value
++"""
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++from django.test import TestCase
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',  # This module
++        ],
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++from django.db import connection
++
++
++class ListSensitiveField(models.Field):
++    """
++    A custom field that is sensitive to the exact type of the value.
++    This simulates fields like PickledField that need exact type matching.
++    """
++    
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++    
++    def get_internal_type(self):
++        return 'TextField'
++    
++    def to_python(self, value):
++        if value is None:
++            return value
++        if isinstance(value, str):
++            # Simple serialization for testing
++            if value.startswith('list:'):
++                return eval(value[5:])  # Convert back to list
++            elif value.startswith('tuple:'):
++                return eval(value[6:])  # Convert back to tuple
++        return value
++    
++    def from_db_value(self, value, expression, connection):
++        return self.to_python(value)
++    
++    def get_prep_value(self, value):
++        if value is None:
++            return value
++        if isinstance(value, list):
++            return f'list:{repr(value)}'
++        elif isinstance(value, tuple):
++            return f'tuple:{repr(value)}'
++        return str(value)
++
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    data = ListSensitiveField()
++    
++    class Meta:
++        app_label = '__main__'
++
++
++def test_list_tuple_preservation():
++    """Test that list values are not coerced to tuples in queries"""
++    
++    # Create the table
++    with connection.schema_editor() as schema_editor:
++        schema_editor.create_model(TestModel)
++    
++    # Test data
++    list_data = [1, 2, 3]
++    tuple_data = (4, 5, 6)
++    
++    # Create test objects
++    obj1 = TestModel.objects.create(name='list_obj', data=list_data)
++    obj2 = TestModel.objects.create(name='tuple_obj', data=tuple_data)
++    
++    print("Created objects:")
++    print(f"obj1.data = {obj1.data!r} (type: {type(obj1.data)})")
++    print(f"obj2.data = {obj2.data!r} (type: {type(obj2.data)})")
++    
++    # Test querying with list - this should work but currently fails
++    print("\nTesting query with list value:")
++    try:
++        result = TestModel.objects.filter(data=list_data)
++        found_objects = list(result)
++        print(f"Query with list found {len(found_objects)} objects")
++        if found_objects:
++            print(f"Found: {found_objects[0].name}")
++        else:
++            print("ERROR: No objects found when querying with list!")
++    except Exception as e:
++        print(f"ERROR querying with list: {e}")
++    
++    # Test querying with tuple - this should work
++    print("\nTesting query with tuple value:")
++    try:
++        result = TestModel.objects.filter(data=tuple_data)
++        found_objects = list(result)
++        print(f"Query with tuple found {len(found_objects)} objects")
++        if found_objects:
++            print(f"Found: {found_objects[0].name}")
++    except Exception as e:
++        print(f"ERROR querying with tuple: {e}")
++    
++    # Let's also test the resolve_lookup_value method directly
++    print("\nTesting resolve_lookup_value directly:")
++    from django.db.models.sql.query import Query
++    
++    query = Query(TestModel)
++    
++    # Test with list
++    list_input = [1, 2, 3]
++    resolved_list = query.resolve_lookup_value(list_input, set(), True, False)
++    print(f"Input: {list_input!r} (type: {type(list_input)})")
++    print(f"Resolved: {resolved_list!r} (type: {type(resolved_list)})")
++    print(f"Types match: {type(list_input) == type(resolved_list)}")
++    
++    # Test with tuple
++    tuple_input = (4, 5, 6)
++    resolved_tuple = query.resolve_lookup_value(tuple_input, set(), True, False)
++    print(f"\nInput: {tuple_input!r} (type: {type(tuple_input)})")
++    print(f"Resolved: {resolved_tuple!r} (type: {type(resolved_tuple)})")
++    print(f"Types match: {type(tuple_input) == type(resolved_tuple)}")
++
++
++if __name__ == '__main__':
++    test_list_tuple_preservation()
+\ No newline at end of file

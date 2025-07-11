@@ -1,0 +1,1651 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index c5d87f647a..8c87368978 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -62,6 +62,7 @@ and two directions (forward and reverse) for a total of six combinations.
+    If you're looking for ``ForwardManyToManyDescriptor`` or
+    ``ReverseManyToManyDescriptor``, use ``ManyToManyDescriptor`` instead.
+ """
++from asgiref.sync import sync_to_async
+ 
+ from django.core.exceptions import FieldError
+ from django.db import (
+@@ -809,6 +810,21 @@ def create_reverse_many_to_one_manager(superclass, rel):
+ 
+         update_or_create.alters_data = True
+ 
++        async def acreate(self, **kwargs):
++            return await sync_to_async(self.create)(**kwargs)
++
++        acreate.alters_data = True
++
++        async def aget_or_create(self, **kwargs):
++            return await sync_to_async(self.get_or_create)(**kwargs)
++
++        aget_or_create.alters_data = True
++
++        async def aupdate_or_create(self, **kwargs):
++            return await sync_to_async(self.update_or_create)(**kwargs)
++
++        aupdate_or_create.alters_data = True
++
+         # remove() and clear() are only provided if the ForeignKey can have a
+         # value of null.
+         if rel.field.null:
+@@ -1217,6 +1233,27 @@ def create_forward_many_to_many_manager(superclass, rel, reverse):
+ 
+         update_or_create.alters_data = True
+ 
++        async def acreate(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.create)(
++                through_defaults=through_defaults, **kwargs
++            )
++
++        acreate.alters_data = True
++
++        async def aget_or_create(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.get_or_create)(
++                through_defaults=through_defaults, **kwargs
++            )
++
++        aget_or_create.alters_data = True
++
++        async def aupdate_or_create(self, *, through_defaults=None, **kwargs):
++            return await sync_to_async(self.update_or_create)(
++                through_defaults=through_defaults, **kwargs
++            )
++
++        aupdate_or_create.alters_data = True
++
+         def _get_target_ids(self, target_field_name, objs):
+             """
+             Return the set of ids of `objs` that the target field references.
+diff --git a/test_async_fix_verification.py b/test_async_fix_verification.py
+new file mode 100644
+index 0000000000..d7aa2610fe
+--- /dev/null
++++ b/test_async_fix_verification.py
+@@ -0,0 +1,233 @@
++#!/usr/bin/env python
++"""
++Test to verify the async related manager fix works correctly.
++"""
++import asyncio
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.db import models
++from django.db.models.query import QuerySet
++
++
++# Create test models
++class TestAuthor(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestBook(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(TestAuthor, on_delete=models.CASCADE, related_name='books')
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestCategory(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestArticle(models.Model):
++    title = models.CharField(max_length=100)
++    categories = models.ManyToManyField(TestCategory, related_name='articles')
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++def setup_database():
++    """Set up test database."""
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        try:
++            schema_editor.create_model(TestAuthor)
++            schema_editor.create_model(TestBook)
++            schema_editor.create_model(TestCategory)
++            schema_editor.create_model(TestArticle)
++            
++            # Create the many-to-many through table
++            through_model = TestArticle._meta.get_field('categories').remote_field.through
++            schema_editor.create_model(through_model)
++        except Exception as e:
++            pass  # Tables may already exist
++
++
++async def test_reverse_many_to_one_async_methods():
++    """Test async methods on reverse many-to-one related manager."""
++    print("Testing reverse many-to-one async methods...")
++    
++    # Create an author
++    author = await TestAuthor.objects.acreate(name="Test Author")
++    print(f"Created author: {author.name}")
++    
++    # Test acreate on related manager
++    book = await author.books.acreate(title="Test Book")
++    print(f"Created book via acreate: {book.title}")
++    
++    # Check if the foreign key was set correctly
++    if book.author_id == author.id:
++        print("✓ Foreign key set correctly via acreate")
++    else:
++        print(f"✗ Foreign key NOT set correctly via acreate. Expected {author.id}, got {book.author_id}")
++        return False
++    
++    # Test aget_or_create on related manager
++    book2, created = await author.books.aget_or_create(title="Test Book 2")
++    print(f"Created book via aget_or_create: {book2.title}, created: {created}")
++    
++    # Check if the foreign key was set correctly
++    if book2.author_id == author.id:
++        print("✓ Foreign key set correctly via aget_or_create")
++    else:
++        print(f"✗ Foreign key NOT set correctly via aget_or_create. Expected {author.id}, got {book2.author_id}")
++        return False
++    
++    # Test aupdate_or_create on related manager
++    book3, created = await author.books.aupdate_or_create(
++        title="Test Book 3",
++        defaults={'title': 'Test Book 3'}
++    )
++    print(f"Created book via aupdate_or_create: {book3.title}, created: {created}")
++    
++    # Check if the foreign key was set correctly
++    if book3.author_id == author.id:
++        print("✓ Foreign key set correctly via aupdate_or_create")
++    else:
++        print(f"✗ Foreign key NOT set correctly via aupdate_or_create. Expected {author.id}, got {book3.author_id}")
++        return False
++    
++    # Verify all books are in the author's book set
++    count = await author.books.acount()
++    if count == 3:
++        print("✓ All books correctly associated with author")
++        return True
++    else:
++        print(f"✗ Expected 3 books, got {count}")
++        return False
++
++
++async def test_forward_many_to_many_async_methods():
++    """Test async methods on forward many-to-many related manager."""
++    print("\nTesting forward many-to-many async methods...")
++    
++    # Create an article
++    article = await TestArticle.objects.acreate(title="Test Article")
++    print(f"Created article: {article.title}")
++    
++    # Test acreate on related manager
++    category = await article.categories.acreate(name="Test Category")
++    print(f"Created category via acreate: {category.name}")
++    
++    # Check if the relationship was created
++    count = await article.categories.acount()
++    if count == 1:
++        print("✓ Many-to-many relationship created correctly via acreate")
++    else:
++        print(f"✗ Many-to-many relationship NOT created correctly via acreate. Expected 1, got {count}")
++        return False
++    
++    # Test aget_or_create on related manager
++    category2, created = await article.categories.aget_or_create(name="Test Category 2")
++    print(f"Created category via aget_or_create: {category2.name}, created: {created}")
++    
++    # Check if the relationship was created
++    count = await article.categories.acount()
++    if count == 2:
++        print("✓ Many-to-many relationship created correctly via aget_or_create")
++    else:
++        print(f"✗ Many-to-many relationship NOT created correctly via aget_or_create. Expected 2, got {count}")
++        return False
++    
++    # Test aupdate_or_create on related manager
++    category3, created = await article.categories.aupdate_or_create(
++        name="Test Category 3",
++        defaults={'name': 'Test Category 3'}
++    )
++    print(f"Created category via aupdate_or_create: {category3.name}, created: {created}")
++    
++    # Check if the relationship was created
++    count = await article.categories.acount()
++    if count == 3:
++        print("✓ Many-to-many relationship created correctly via aupdate_or_create")
++        return True
++    else:
++        print(f"✗ Many-to-many relationship NOT created correctly via aupdate_or_create. Expected 3, got {count}")
++        return False
++
++
++def verify_async_methods_are_overridden():
++    """Verify that async methods are now properly overridden."""
++    print("Verifying async methods are properly overridden...")
++    
++    # Create instances (not saved to DB, just for demonstration)
++    author = TestAuthor(name="Test Author", pk=1)  # Set pk to avoid validation
++    article = TestArticle(title="Test Article", pk=1)  # Set pk to avoid validation
++    
++    # Check that async methods are now different from QuerySet
++    print(f"author.books.acreate is QuerySet.acreate: {author.books.acreate.__func__ is QuerySet.acreate}")
++    print(f"author.books.aget_or_create is QuerySet.aget_or_create: {author.books.aget_or_create.__func__ is QuerySet.aget_or_create}")
++    print(f"author.books.aupdate_or_create is QuerySet.aupdate_or_create: {author.books.aupdate_or_create.__func__ is QuerySet.aupdate_or_create}")
++    
++    print(f"article.categories.acreate is QuerySet.acreate: {article.categories.acreate.__func__ is QuerySet.acreate}")
++    print(f"article.categories.aget_or_create is QuerySet.aget_or_create: {article.categories.aget_or_create.__func__ is QuerySet.aget_or_create}")
++    print(f"article.categories.aupdate_or_create is QuerySet.aupdate_or_create: {article.categories.aupdate_or_create.__func__ is QuerySet.aupdate_or_create}")
++    
++    # All should be False now
++    all_different = (
++        author.books.acreate.__func__ is not QuerySet.acreate and
++        author.books.aget_or_create.__func__ is not QuerySet.aget_or_create and
++        author.books.aupdate_or_create.__func__ is not QuerySet.aupdate_or_create and
++        article.categories.acreate.__func__ is not QuerySet.acreate and
++        article.categories.aget_or_create.__func__ is not QuerySet.aget_or_create and
++        article.categories.aupdate_or_create.__func__ is not QuerySet.aupdate_or_create
++    )
++    
++    if all_different:
++        print("✓ All async methods are properly overridden")
++        return True
++    else:
++        print("✗ Some async methods are still using QuerySet versions")
++        return False
++
++
++async def main():
++    print("Testing the async related manager fix...\n")
++    
++    # Verify methods are overridden
++    methods_ok = verify_async_methods_are_overridden()
++    
++    if not methods_ok:
++        print("❌ Fix verification failed - methods not properly overridden")
++        return
++    
++    # Test functionality
++    try:
++        reverse_ok = await test_reverse_many_to_one_async_methods()
++        forward_ok = await test_forward_many_to_many_async_methods()
++        
++        if reverse_ok and forward_ok:
++            print("\n🎉 All tests passed! The fix is working correctly.")
++        else:
++            print("\n❌ Some tests failed. The fix needs more work.")
++    except Exception as e:
++        print(f"\n❌ Error during testing: {e}")
++        import traceback
++        traceback.print_exc()
++
++
++if __name__ == "__main__":
++    setup_database()
++    asyncio.run(main())
+\ No newline at end of file
+diff --git a/test_async_issue_demo.py b/test_async_issue_demo.py
+new file mode 100644
+index 0000000000..1dbfb85711
+--- /dev/null
++++ b/test_async_issue_demo.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python
++"""
++Simple demonstration of the async related manager issue.
++"""
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.db import models
++from django.db.models.query import QuerySet
++
++
++# Create test models
++class TestAuthor(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestBook(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(TestAuthor, on_delete=models.CASCADE, related_name='books')
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestCategory(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestArticle(models.Model):
++    title = models.CharField(max_length=100)
++    categories = models.ManyToManyField(TestCategory, related_name='articles')
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++def demonstrate_issue():
++    """Demonstrate that async methods exist on related managers but are wrong."""
++    print("Demonstrating the async related manager issue...")
++    
++    # Create instances (not saved to DB, just for demonstration)
++    author = TestAuthor(name="Test Author", pk=1)  # Set pk to avoid validation
++    article = TestArticle(title="Test Article", pk=1)  # Set pk to avoid validation
++    
++    print("\n1. Checking if async methods exist on related managers:")
++    print(f"   author.books has acreate: {hasattr(author.books, 'acreate')}")
++    print(f"   author.books has aget_or_create: {hasattr(author.books, 'aget_or_create')}")
++    print(f"   author.books has aupdate_or_create: {hasattr(author.books, 'aupdate_or_create')}")
++    
++    print(f"   article.categories has acreate: {hasattr(article.categories, 'acreate')}")
++    print(f"   article.categories has aget_or_create: {hasattr(article.categories, 'aget_or_create')}")
++    print(f"   article.categories has aupdate_or_create: {hasattr(article.categories, 'aupdate_or_create')}")
++    
++    print("\n2. Checking if these are the same methods as QuerySet (this is the problem):")
++    print(f"   author.books.acreate is QuerySet.acreate: {author.books.acreate.__func__ is QuerySet.acreate}")
++    print(f"   author.books.aget_or_create is QuerySet.aget_or_create: {author.books.aget_or_create.__func__ is QuerySet.aget_or_create}")
++    print(f"   author.books.aupdate_or_create is QuerySet.aupdate_or_create: {author.books.aupdate_or_create.__func__ is QuerySet.aupdate_or_create}")
++    
++    print(f"   article.categories.acreate is QuerySet.acreate: {article.categories.acreate.__func__ is QuerySet.acreate}")
++    print(f"   article.categories.aget_or_create is QuerySet.aget_or_create: {article.categories.aget_or_create.__func__ is QuerySet.aget_or_create}")
++    print(f"   article.categories.aupdate_or_create is QuerySet.aupdate_or_create: {article.categories.aupdate_or_create.__func__ is QuerySet.aupdate_or_create}")
++    
++    print("\n2.1. Let's check what these async methods actually are:")
++    print(f"   author.books.acreate: {author.books.acreate}")
++    print(f"   author.books.acreate.__func__: {author.books.acreate.__func__}")
++    print(f"   QuerySet.acreate: {QuerySet.acreate}")
++    
++    print(f"   article.categories.acreate: {article.categories.acreate}")
++    print(f"   article.categories.acreate.__func__: {article.categories.acreate.__func__}")
++    
++    # Check the MRO to see where these methods come from
++    print(f"\n2.2. Method Resolution Order for related managers:")
++    print(f"   author.books.__class__.__mro__: {author.books.__class__.__mro__}")
++    print(f"   article.categories.__class__.__mro__: {article.categories.__class__.__mro__}")
++    
++    print("\n3. Checking if synchronous methods exist on related managers:")
++    print(f"   author.books has create: {hasattr(author.books, 'create')}")
++    print(f"   author.books has get_or_create: {hasattr(author.books, 'get_or_create')}")
++    print(f"   author.books has update_or_create: {hasattr(author.books, 'update_or_create')}")
++    
++    print(f"   article.categories has create: {hasattr(article.categories, 'create')}")
++    print(f"   article.categories has get_or_create: {hasattr(article.categories, 'get_or_create')}")
++    print(f"   article.categories has update_or_create: {hasattr(article.categories, 'update_or_create')}")
++    
++    print("\n4. Checking if sync methods are different from QuerySet (they should be):")
++    print(f"   author.books.create is QuerySet.create: {author.books.create.__func__ is QuerySet.create}")
++    print(f"   author.books.get_or_create is QuerySet.get_or_create: {author.books.get_or_create.__func__ is QuerySet.get_or_create}")
++    print(f"   author.books.update_or_create is QuerySet.update_or_create: {author.books.update_or_create.__func__ is QuerySet.update_or_create}")
++    
++    print(f"   article.categories.create is QuerySet.create: {article.categories.create.__func__ is QuerySet.create}")
++    print(f"   article.categories.get_or_create is QuerySet.get_or_create: {article.categories.get_or_create.__func__ is QuerySet.get_or_create}")
++    print(f"   article.categories.update_or_create is QuerySet.update_or_create: {article.categories.update_or_create.__func__ is QuerySet.update_or_create}")
++    
++    print("\n5. The problem:")
++    print("   - The async methods (acreate, aget_or_create, aupdate_or_create) on related managers")
++    print("     are the same as QuerySet methods, which means they bypass the related manager's")
++    print("     custom logic for setting foreign keys and many-to-many relationships.")
++    print("   - The sync methods (create, get_or_create, update_or_create) are correctly")
++    print("     overridden in related managers to handle relationships properly.")
++    print("   - We need to add proper async versions to related managers that call the")
++    print("     related manager's sync methods, not the QuerySet methods.")
++
++
++if __name__ == "__main__":
++    demonstrate_issue()
+\ No newline at end of file
+diff --git a/test_async_issue_simple.py b/test_async_issue_simple.py
+new file mode 100644
+index 0000000000..cacd0ac53e
+--- /dev/null
++++ b/test_async_issue_simple.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python
++"""
++Simple test to demonstrate the async related manager issue.
++"""
++import asyncio
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.db import models
++from django.test import TestCase
++from django.test.utils import setup_test_environment, teardown_test_environment
++from django.test.runner import DiscoverRunner
++from django.conf import settings
++
++
++# Create test models
++class TestAuthor(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestBook(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(TestAuthor, on_delete=models.CASCADE, related_name='books')
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestCategory(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestArticle(models.Model):
++    title = models.CharField(max_length=100)
++    categories = models.ManyToManyField(TestCategory, related_name='articles')
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++def setup_database():
++    """Set up test database."""
++    from django.db import connection
++    with connection.schema_editor() as schema_editor:
++        try:
++            schema_editor.create_model(TestAuthor)
++            schema_editor.create_model(TestBook)
++            schema_editor.create_model(TestCategory)
++            schema_editor.create_model(TestArticle)
++            
++            # Create the many-to-many through table
++            through_model = TestArticle._meta.get_field('categories').remote_field.through
++            schema_editor.create_model(through_model)
++        except Exception as e:
++            pass  # Tables may already exist
++
++
++async def check_async_methods_exist():
++    """Check if async methods exist on related managers."""
++    print("Checking if async methods exist on related managers...")
++    
++    # Create and save instances
++    author = await TestAuthor.objects.acreate(name="Test Author")
++    article = await TestArticle.objects.acreate(title="Test Article")
++    
++    # Check reverse many-to-one manager
++    print(f"author.books has acreate: {hasattr(author.books, 'acreate')}")
++    print(f"author.books has aget_or_create: {hasattr(author.books, 'aget_or_create')}")
++    print(f"author.books has aupdate_or_create: {hasattr(author.books, 'aupdate_or_create')}")
++    
++    # Check forward many-to-many manager
++    print(f"article.categories has acreate: {hasattr(article.categories, 'acreate')}")
++    print(f"article.categories has aget_or_create: {hasattr(article.categories, 'aget_or_create')}")
++    print(f"article.categories has aupdate_or_create: {hasattr(article.categories, 'aupdate_or_create')}")
++    
++    # Check if they are the same methods as QuerySet (this is the problem)
++    from django.db.models.query import QuerySet
++    
++    print(f"\nComparing methods:")
++    print(f"author.books.acreate is QuerySet.acreate: {author.books.acreate.__func__ is QuerySet.acreate}")
++    print(f"author.books.aget_or_create is QuerySet.aget_or_create: {author.books.aget_or_create.__func__ is QuerySet.aget_or_create}")
++    print(f"author.books.aupdate_or_create is QuerySet.aupdate_or_create: {author.books.aupdate_or_create.__func__ is QuerySet.aupdate_or_create}")
++    
++    print(f"article.categories.acreate is QuerySet.acreate: {article.categories.acreate.__func__ is QuerySet.acreate}")
++    print(f"article.categories.aget_or_create is QuerySet.aget_or_create: {article.categories.aget_or_create.__func__ is QuerySet.aget_or_create}")
++    print(f"article.categories.aupdate_or_create is QuerySet.aupdate_or_create: {article.categories.aupdate_or_create.__func__ is QuerySet.aupdate_or_create}")
++    
++    return author, article
++
++
++async def test_async_methods_behavior(author, article):
++    """Test the behavior of async methods on related managers."""
++    print("\nTesting async methods behavior...")
++    
++    try:
++        # Test reverse many-to-one
++        print(f"Testing with author: {author.name}")
++        
++        # This should set the foreign key correctly, but it doesn't
++        book = await author.books.acreate(title="Test Book")
++        print(f"Created book: {book.title}")
++        print(f"Book's author_id: {book.author_id} (should be {author.id})")
++        
++        if book.author_id == author.id:
++            print("✓ Foreign key set correctly")
++        else:
++            print("✗ Foreign key NOT set correctly - this is the bug!")
++        
++        # Test forward many-to-many
++        print(f"Testing with article: {article.title}")
++        
++        # This should add the relationship, but it doesn't
++        category = await article.categories.acreate(name="Test Category")
++        print(f"Created category: {category.name}")
++        
++        count = await article.categories.acount()
++        print(f"Article categories count: {count} (should be 1)")
++        
++        if count == 1:
++            print("✓ Many-to-many relationship created correctly")
++        else:
++            print("✗ Many-to-many relationship NOT created correctly - this is the bug!")
++            
++    except Exception as e:
++        print(f"Error during testing: {e}")
++
++
++async def main():
++    author, article = await check_async_methods_exist()
++    await test_async_methods_behavior(author, article)
++
++
++if __name__ == "__main__":
++    setup_database()
++    asyncio.run(main())
+\ No newline at end of file
+diff --git a/test_async_related_issue.py b/test_async_related_issue.py
+new file mode 100644
+index 0000000000..a7a25a67e0
+--- /dev/null
++++ b/test_async_related_issue.py
+@@ -0,0 +1,203 @@
++#!/usr/bin/env python
++"""
++Test to reproduce the async related manager issue.
++"""
++import asyncio
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++from django.test import TestCase
++from django.test.utils import override_settings
++from asgiref.sync import sync_to_async
++
++django.setup()
++
++from tests.many_to_one.models import Reporter, Article
++from tests.many_to_many.models import Publication, Article as M2MArticle
++
++
++class AsyncRelatedManagerTest(TestCase):
++    """Test async methods on related managers."""
++    
++    async def test_reverse_many_to_one_acreate(self):
++        """Test acreate on reverse many-to-one related manager."""
++        # Create a reporter
++        reporter = await Reporter.objects.acreate(
++            first_name="Test", 
++            last_name="Reporter", 
++            email="test@example.com"
++        )
++        
++        # Test acreate on related manager
++        article = await reporter.article_set.acreate(
++            headline="Test Article",
++            pub_date="2023-01-01"
++        )
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(article.reporter_id, reporter.id)
++        
++        # Verify the article is in the reporter's article set
++        count = await reporter.article_set.acount()
++        self.assertEqual(count, 1)
++    
++    async def test_reverse_many_to_one_aget_or_create(self):
++        """Test aget_or_create on reverse many-to-one related manager."""
++        # Create a reporter
++        reporter = await Reporter.objects.acreate(
++            first_name="Test", 
++            last_name="Reporter", 
++            email="test@example.com"
++        )
++        
++        # Test aget_or_create on related manager
++        article, created = await reporter.article_set.aget_or_create(
++            headline="Test Article",
++            pub_date="2023-01-01"
++        )
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(article.reporter_id, reporter.id)
++        self.assertTrue(created)
++        
++        # Verify the article is in the reporter's article set
++        count = await reporter.article_set.acount()
++        self.assertEqual(count, 1)
++    
++    async def test_reverse_many_to_one_aupdate_or_create(self):
++        """Test aupdate_or_create on reverse many-to-one related manager."""
++        # Create a reporter
++        reporter = await Reporter.objects.acreate(
++            first_name="Test", 
++            last_name="Reporter", 
++            email="test@example.com"
++        )
++        
++        # Test aupdate_or_create on related manager
++        article, created = await reporter.article_set.aupdate_or_create(
++            headline="Test Article",
++            defaults={'pub_date': '2023-01-01'}
++        )
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(article.reporter_id, reporter.id)
++        self.assertTrue(created)
++        
++        # Verify the article is in the reporter's article set
++        count = await reporter.article_set.acount()
++        self.assertEqual(count, 1)
++    
++    async def test_forward_many_to_many_acreate(self):
++        """Test acreate on forward many-to-many related manager."""
++        # Create an article
++        article = await M2MArticle.objects.acreate(headline="Test M2M Article")
++        
++        # Test acreate on related manager
++        publication = await article.publications.acreate(title="Test Publication")
++        
++        # Check if the relationship was created
++        count = await article.publications.acount()
++        self.assertEqual(count, 1)
++        
++        # Verify the publication is in the article's publications
++        publications = [p async for p in article.publications.all()]
++        self.assertEqual(len(publications), 1)
++        self.assertEqual(publications[0].title, "Test Publication")
++    
++    async def test_forward_many_to_many_aget_or_create(self):
++        """Test aget_or_create on forward many-to-many related manager."""
++        # Create an article
++        article = await M2MArticle.objects.acreate(headline="Test M2M Article")
++        
++        # Test aget_or_create on related manager
++        publication, created = await article.publications.aget_or_create(title="Test Publication")
++        
++        # Check if the relationship was created
++        self.assertTrue(created)
++        count = await article.publications.acount()
++        self.assertEqual(count, 1)
++        
++        # Verify the publication is in the article's publications
++        publications = [p async for p in article.publications.all()]
++        self.assertEqual(len(publications), 1)
++        self.assertEqual(publications[0].title, "Test Publication")
++    
++    async def test_forward_many_to_many_aupdate_or_create(self):
++        """Test aupdate_or_create on forward many-to-many related manager."""
++        # Create an article
++        article = await M2MArticle.objects.acreate(headline="Test M2M Article")
++        
++        # Test aupdate_or_create on related manager
++        publication, created = await article.publications.aupdate_or_create(
++            title="Test Publication",
++            defaults={'title': 'Test Publication'}
++        )
++        
++        # Check if the relationship was created
++        self.assertTrue(created)
++        count = await article.publications.acount()
++        self.assertEqual(count, 1)
++        
++        # Verify the publication is in the article's publications
++        publications = [p async for p in article.publications.all()]
++        self.assertEqual(len(publications), 1)
++        self.assertEqual(publications[0].title, "Test Publication")
++
++
++async def run_async_tests():
++    """Run the async tests."""
++    test_instance = AsyncRelatedManagerTest()
++    test_instance._pre_setup()
++    
++    try:
++        print("Testing reverse many-to-one acreate...")
++        await test_instance.test_reverse_many_to_one_acreate()
++        print("✓ Passed")
++    except Exception as e:
++        print(f"✗ Failed: {e}")
++    
++    try:
++        print("Testing reverse many-to-one aget_or_create...")
++        await test_instance.test_reverse_many_to_one_aget_or_create()
++        print("✓ Passed")
++    except Exception as e:
++        print(f"✗ Failed: {e}")
++    
++    try:
++        print("Testing reverse many-to-one aupdate_or_create...")
++        await test_instance.test_reverse_many_to_one_aupdate_or_create()
++        print("✓ Passed")
++    except Exception as e:
++        print(f"✗ Failed: {e}")
++    
++    try:
++        print("Testing forward many-to-many acreate...")
++        await test_instance.test_forward_many_to_many_acreate()
++        print("✓ Passed")
++    except Exception as e:
++        print(f"✗ Failed: {e}")
++    
++    try:
++        print("Testing forward many-to-many aget_or_create...")
++        await test_instance.test_forward_many_to_many_aget_or_create()
++        print("✓ Passed")
++    except Exception as e:
++        print(f"✗ Failed: {e}")
++    
++    try:
++        print("Testing forward many-to-many aupdate_or_create...")
++        await test_instance.test_forward_many_to_many_aupdate_or_create()
++        print("✓ Passed")
++    except Exception as e:
++        print(f"✗ Failed: {e}")
++    
++    test_instance._post_teardown()
++
++
++if __name__ == "__main__":
++    asyncio.run(run_async_tests())
+\ No newline at end of file
+diff --git a/test_async_related_managers.py b/test_async_related_managers.py
+new file mode 100644
+index 0000000000..71dcb84599
+--- /dev/null
++++ b/test_async_related_managers.py
+@@ -0,0 +1,206 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the issue with async methods on related managers.
++"""
++import asyncio
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db import connection
++
++
++# Test models
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books')
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = '__main__'
++
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    categories = models.ManyToManyField(Category, related_name='articles')
++    
++    class Meta:
++        app_label = '__main__'
++
++
++async def test_reverse_many_to_one_async_methods():
++    """Test async methods on reverse many-to-one related manager (Author.books)"""
++    print("Testing reverse many-to-one async methods...")
++    
++    # Create an author
++    author = await Author.objects.acreate(name="Test Author")
++    print(f"Created author: {author.name}")
++    
++    # Test acreate on related manager
++    try:
++        book = await author.books.acreate(title="Test Book")
++        print(f"Created book via acreate: {book.title}")
++        
++        # Check if the foreign key was set correctly
++        if book.author_id == author.id:
++            print("✓ Foreign key set correctly via acreate")
++        else:
++            print(f"✗ Foreign key NOT set correctly via acreate. Expected {author.id}, got {book.author_id}")
++    except Exception as e:
++        print(f"✗ Error with acreate: {e}")
++    
++    # Test aget_or_create on related manager
++    try:
++        book2, created = await author.books.aget_or_create(title="Test Book 2")
++        print(f"Created book via aget_or_create: {book2.title}, created: {created}")
++        
++        # Check if the foreign key was set correctly
++        if book2.author_id == author.id:
++            print("✓ Foreign key set correctly via aget_or_create")
++        else:
++            print(f"✗ Foreign key NOT set correctly via aget_or_create. Expected {author.id}, got {book2.author_id}")
++    except Exception as e:
++        print(f"✗ Error with aget_or_create: {e}")
++    
++    # Test aupdate_or_create on related manager
++    try:
++        book3, created = await author.books.aupdate_or_create(
++            title="Test Book 3", 
++            defaults={'title': 'Updated Test Book 3'}
++        )
++        print(f"Created book via aupdate_or_create: {book3.title}, created: {created}")
++        
++        # Check if the foreign key was set correctly
++        if book3.author_id == author.id:
++            print("✓ Foreign key set correctly via aupdate_or_create")
++        else:
++            print(f"✗ Foreign key NOT set correctly via aupdate_or_create. Expected {author.id}, got {book3.author_id}")
++    except Exception as e:
++        print(f"✗ Error with aupdate_or_create: {e}")
++
++
++async def test_forward_many_to_many_async_methods():
++    """Test async methods on forward many-to-many related manager (Article.categories)"""
++    print("\nTesting forward many-to-many async methods...")
++    
++    # Create an article
++    article = await Article.objects.acreate(title="Test Article")
++    print(f"Created article: {article.title}")
++    
++    # Test acreate on related manager
++    try:
++        category = await article.categories.acreate(name="Test Category")
++        print(f"Created category via acreate: {category.name}")
++        
++        # Check if the relationship was created
++        count = await article.categories.acount()
++        if count == 1:
++            print("✓ Many-to-many relationship created correctly via acreate")
++        else:
++            print(f"✗ Many-to-many relationship NOT created correctly via acreate. Expected 1, got {count}")
++    except Exception as e:
++        print(f"✗ Error with acreate: {e}")
++    
++    # Test aget_or_create on related manager
++    try:
++        category2, created = await article.categories.aget_or_create(name="Test Category 2")
++        print(f"Created category via aget_or_create: {category2.name}, created: {created}")
++        
++        # Check if the relationship was created
++        count = await article.categories.acount()
++        if count == 2:
++            print("✓ Many-to-many relationship created correctly via aget_or_create")
++        else:
++            print(f"✗ Many-to-many relationship NOT created correctly via aget_or_create. Expected 2, got {count}")
++    except Exception as e:
++        print(f"✗ Error with aget_or_create: {e}")
++    
++    # Test aupdate_or_create on related manager
++    try:
++        category3, created = await article.categories.aupdate_or_create(
++            name="Test Category 3",
++            defaults={'name': 'Updated Test Category 3'}
++        )
++        print(f"Created category via aupdate_or_create: {category3.name}, created: {created}")
++        
++        # Check if the relationship was created
++        count = await article.categories.acount()
++        if count == 3:
++            print("✓ Many-to-many relationship created correctly via aupdate_or_create")
++        else:
++            print(f"✗ Many-to-many relationship NOT created correctly via aupdate_or_create. Expected 3, got {count}")
++    except Exception as e:
++        print(f"✗ Error with aupdate_or_create: {e}")
++
++
++def create_tables():
++    # Create tables
++    with connection.schema_editor() as schema_editor:
++        try:
++            schema_editor.create_model(Author)
++        except:
++            pass
++        try:
++            schema_editor.create_model(Book)
++        except:
++            pass
++        try:
++            schema_editor.create_model(Category)
++        except:
++            pass
++        try:
++            schema_editor.create_model(Article)
++        except:
++            pass
++        
++        # Create the many-to-many through table for Article.categories
++        try:
++            through_model = Article._meta.get_field('categories').remote_field.through
++            schema_editor.create_model(through_model)
++        except:
++            pass
++
++
++async def main():
++    await test_reverse_many_to_one_async_methods()
++    await test_forward_many_to_many_async_methods()
++
++
++if __name__ == "__main__":
++    create_tables()
++    asyncio.run(main())
+\ No newline at end of file
+diff --git a/test_async_related_managers_proper.py b/test_async_related_managers_proper.py
+new file mode 100644
+index 0000000000..d315105f5a
+--- /dev/null
++++ b/test_async_related_managers_proper.py
+@@ -0,0 +1,182 @@
++"""
++Test case for async methods on related managers.
++This test should be added to Django's test suite.
++"""
++import asyncio
++from django.test import TestCase
++from asgiref.sync import sync_to_async
++
++from tests.many_to_one.models import Reporter, Article
++from tests.many_to_many.models import Publication, Article as M2MArticle
++
++
++class AsyncRelatedManagerTest(TestCase):
++    """Test async methods on related managers."""
++    
++    async def test_reverse_many_to_one_acreate(self):
++        """Test acreate on reverse many-to-one related manager."""
++        # Create a reporter
++        reporter = await Reporter.objects.acreate(
++            first_name="Test", 
++            last_name="Reporter", 
++            email="test@example.com"
++        )
++        
++        # Test acreate on related manager
++        article = await reporter.article_set.acreate(
++            headline="Test Article",
++            pub_date="2023-01-01"
++        )
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(article.reporter_id, reporter.id)
++        
++        # Verify the article is in the reporter's article set
++        count = await reporter.article_set.acount()
++        self.assertEqual(count, 1)
++    
++    async def test_reverse_many_to_one_aget_or_create(self):
++        """Test aget_or_create on reverse many-to-one related manager."""
++        # Create a reporter
++        reporter = await Reporter.objects.acreate(
++            first_name="Test", 
++            last_name="Reporter", 
++            email="test@example.com"
++        )
++        
++        # Test aget_or_create on related manager
++        article, created = await reporter.article_set.aget_or_create(
++            headline="Test Article",
++            pub_date="2023-01-01"
++        )
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(article.reporter_id, reporter.id)
++        self.assertTrue(created)
++        
++        # Test getting existing
++        article2, created2 = await reporter.article_set.aget_or_create(
++            headline="Test Article",
++            pub_date="2023-01-01"
++        )
++        
++        self.assertEqual(article.id, article2.id)
++        self.assertFalse(created2)
++    
++    async def test_reverse_many_to_one_aupdate_or_create(self):
++        """Test aupdate_or_create on reverse many-to-one related manager."""
++        # Create a reporter
++        reporter = await Reporter.objects.acreate(
++            first_name="Test", 
++            last_name="Reporter", 
++            email="test@example.com"
++        )
++        
++        # Test aupdate_or_create on related manager
++        article, created = await reporter.article_set.aupdate_or_create(
++            headline="Test Article",
++            defaults={'pub_date': '2023-01-01'}
++        )
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(article.reporter_id, reporter.id)
++        self.assertTrue(created)
++        
++        # Test updating existing
++        article2, created2 = await reporter.article_set.aupdate_or_create(
++            headline="Test Article",
++            defaults={'pub_date': '2023-01-02'}
++        )
++        
++        self.assertEqual(article.id, article2.id)
++        self.assertFalse(created2)
++        self.assertEqual(str(article2.pub_date), '2023-01-02')
++    
++    async def test_forward_many_to_many_acreate(self):
++        """Test acreate on forward many-to-many related manager."""
++        # Create an article
++        article = await M2MArticle.objects.acreate(headline="Test M2M Article")
++        
++        # Test acreate on related manager
++        publication = await article.publications.acreate(title="Test Publication")
++        
++        # Check if the relationship was created
++        count = await article.publications.acount()
++        self.assertEqual(count, 1)
++        
++        # Verify the publication is in the article's publications
++        publications = [p async for p in article.publications.all()]
++        self.assertEqual(len(publications), 1)
++        self.assertEqual(publications[0].title, "Test Publication")
++    
++    async def test_forward_many_to_many_aget_or_create(self):
++        """Test aget_or_create on forward many-to-many related manager."""
++        # Create an article
++        article = await M2MArticle.objects.acreate(headline="Test M2M Article")
++        
++        # Test aget_or_create on related manager
++        publication, created = await article.publications.aget_or_create(title="Test Publication")
++        
++        # Check if the relationship was created
++        self.assertTrue(created)
++        count = await article.publications.acount()
++        self.assertEqual(count, 1)
++        
++        # Test getting existing
++        publication2, created2 = await article.publications.aget_or_create(title="Test Publication")
++        
++        self.assertEqual(publication.id, publication2.id)
++        self.assertFalse(created2)
++    
++    async def test_forward_many_to_many_aupdate_or_create(self):
++        """Test aupdate_or_create on forward many-to-many related manager."""
++        # Create an article
++        article = await M2MArticle.objects.acreate(headline="Test M2M Article")
++        
++        # Test aupdate_or_create on related manager
++        publication, created = await article.publications.aupdate_or_create(
++            title="Test Publication",
++            defaults={'title': 'Test Publication'}
++        )
++        
++        # Check if the relationship was created
++        self.assertTrue(created)
++        count = await article.publications.acount()
++        self.assertEqual(count, 1)
++        
++        # Test updating existing
++        publication2, created2 = await article.publications.aupdate_or_create(
++            title="Test Publication",
++            defaults={'title': 'Updated Test Publication'}
++        )
++        
++        self.assertEqual(publication.id, publication2.id)
++        self.assertFalse(created2)
++        self.assertEqual(publication2.title, 'Updated Test Publication')
++
++
++# Convert async test methods to sync for Django's test runner
++def make_sync_test(async_method):
++    """Convert an async test method to sync."""
++    def sync_method(self):
++        return asyncio.run(async_method(self))
++    return sync_method
++
++
++# Apply the conversion to all test methods
++for attr_name in dir(AsyncRelatedManagerTest):
++    if attr_name.startswith('test_') and asyncio.iscoroutinefunction(getattr(AsyncRelatedManagerTest, attr_name)):
++        async_method = getattr(AsyncRelatedManagerTest, attr_name)
++        sync_method = make_sync_test(async_method)
++        setattr(AsyncRelatedManagerTest, attr_name, sync_method)
++
++
++if __name__ == "__main__":
++    import django
++    from django.test.utils import get_runner
++    from django.conf import settings
++    
++    django.setup()
++    TestRunner = get_runner(settings)
++    test_runner = TestRunner()
++    failures = test_runner.run_tests(["__main__"])
+\ No newline at end of file
+diff --git a/test_async_related_simple.py b/test_async_related_simple.py
+new file mode 100644
+index 0000000000..b96162e849
+--- /dev/null
++++ b/test_async_related_simple.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python
++"""
++Simple test script to reproduce the issue with async methods on related managers.
++"""
++import asyncio
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from tests.many_to_one.models import Reporter, Article
++from tests.many_to_many.models import Publication, Article as M2MArticle
++
++
++async def test_reverse_many_to_one_async_methods():
++    """Test async methods on reverse many-to-one related manager (Reporter.article_set)"""
++    print("Testing reverse many-to-one async methods...")
++    
++    # Create a reporter
++    reporter = await Reporter.objects.acreate(
++        first_name="Test", 
++        last_name="Reporter", 
++        email="test@example.com"
++    )
++    print(f"Created reporter: {reporter.first_name} {reporter.last_name}")
++    
++    # Test acreate on related manager
++    try:
++        article = await reporter.article_set.acreate(
++            headline="Test Article",
++            pub_date="2023-01-01"
++        )
++        print(f"Created article via acreate: {article.headline}")
++        
++        # Check if the foreign key was set correctly
++        if article.reporter_id == reporter.id:
++            print("✓ Foreign key set correctly via acreate")
++        else:
++            print(f"✗ Foreign key NOT set correctly via acreate. Expected {reporter.id}, got {article.reporter_id}")
++    except Exception as e:
++        print(f"✗ Error with acreate: {e}")
++    
++    # Test aget_or_create on related manager
++    try:
++        article2, created = await reporter.article_set.aget_or_create(
++            headline="Test Article 2",
++            pub_date="2023-01-02"
++        )
++        print(f"Created article via aget_or_create: {article2.headline}, created: {created}")
++        
++        # Check if the foreign key was set correctly
++        if article2.reporter_id == reporter.id:
++            print("✓ Foreign key set correctly via aget_or_create")
++        else:
++            print(f"✗ Foreign key NOT set correctly via aget_or_create. Expected {reporter.id}, got {article2.reporter_id}")
++    except Exception as e:
++        print(f"✗ Error with aget_or_create: {e}")
++    
++    # Test aupdate_or_create on related manager
++    try:
++        article3, created = await reporter.article_set.aupdate_or_create(
++            headline="Test Article 3",
++            defaults={'pub_date': '2023-01-03'}
++        )
++        print(f"Created article via aupdate_or_create: {article3.headline}, created: {created}")
++        
++        # Check if the foreign key was set correctly
++        if article3.reporter_id == reporter.id:
++            print("✓ Foreign key set correctly via aupdate_or_create")
++        else:
++            print(f"✗ Foreign key NOT set correctly via aupdate_or_create. Expected {reporter.id}, got {article3.reporter_id}")
++    except Exception as e:
++        print(f"✗ Error with aupdate_or_create: {e}")
++
++
++async def test_forward_many_to_many_async_methods():
++    """Test async methods on forward many-to-many related manager (Article.publications)"""
++    print("\nTesting forward many-to-many async methods...")
++    
++    # Create an article
++    article = await M2MArticle.objects.acreate(headline="Test M2M Article")
++    print(f"Created article: {article.headline}")
++    
++    # Test acreate on related manager
++    try:
++        publication = await article.publications.acreate(title="Test Publication")
++        print(f"Created publication via acreate: {publication.title}")
++        
++        # Check if the relationship was created
++        count = await article.publications.acount()
++        if count == 1:
++            print("✓ Many-to-many relationship created correctly via acreate")
++        else:
++            print(f"✗ Many-to-many relationship NOT created correctly via acreate. Expected 1, got {count}")
++    except Exception as e:
++        print(f"✗ Error with acreate: {e}")
++    
++    # Test aget_or_create on related manager
++    try:
++        publication2, created = await article.publications.aget_or_create(title="Test Publication 2")
++        print(f"Created publication via aget_or_create: {publication2.title}, created: {created}")
++        
++        # Check if the relationship was created
++        count = await article.publications.acount()
++        if count == 2:
++            print("✓ Many-to-many relationship created correctly via aget_or_create")
++        else:
++            print(f"✗ Many-to-many relationship NOT created correctly via aget_or_create. Expected 2, got {count}")
++    except Exception as e:
++        print(f"✗ Error with aget_or_create: {e}")
++    
++    # Test aupdate_or_create on related manager
++    try:
++        publication3, created = await article.publications.aupdate_or_create(
++            title="Test Publication 3",
++            defaults={'title': 'Updated Test Publication 3'}
++        )
++        print(f"Created publication via aupdate_or_create: {publication3.title}, created: {created}")
++        
++        # Check if the relationship was created
++        count = await article.publications.acount()
++        if count == 3:
++            print("✓ Many-to-many relationship created correctly via aupdate_or_create")
++        else:
++            print(f"✗ Many-to-many relationship NOT created correctly via aupdate_or_create. Expected 3, got {count}")
++    except Exception as e:
++        print(f"✗ Error with aupdate_or_create: {e}")
++
++
++async def main():
++    await test_reverse_many_to_one_async_methods()
++    await test_forward_many_to_many_async_methods()
++
++
++if __name__ == "__main__":
++    asyncio.run(main())
+\ No newline at end of file
+diff --git a/test_method_verification.py b/test_method_verification.py
+new file mode 100644
+index 0000000000..7ea9da4ca7
+--- /dev/null
++++ b/test_method_verification.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python
++"""
++Test to verify the async related manager methods are properly overridden.
++"""
++import os
++import sys
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.2')
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.test_sqlite')
++
++import django
++django.setup()
++
++from django.db import models
++from django.db.models.query import QuerySet
++
++
++# Create test models
++class TestAuthor(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestBook(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(TestAuthor, on_delete=models.CASCADE, related_name='books')
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestCategory(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++class TestArticle(models.Model):
++    title = models.CharField(max_length=100)
++    categories = models.ManyToManyField(TestCategory, related_name='articles')
++    
++    class Meta:
++        app_label = 'test_app'
++
++
++def verify_async_methods_are_overridden():
++    """Verify that async methods are now properly overridden."""
++    print("Verifying async methods are properly overridden...")
++    
++    # Create instances (not saved to DB, just for demonstration)
++    author = TestAuthor(name="Test Author", pk=1)  # Set pk to avoid validation
++    article = TestArticle(title="Test Article", pk=1)  # Set pk to avoid validation
++    
++    print("\n1. Checking reverse many-to-one manager (author.books):")
++    print(f"   acreate method: {author.books.acreate}")
++    print(f"   acreate is QuerySet.acreate: {author.books.acreate.__func__ is QuerySet.acreate}")
++    print(f"   aget_or_create is QuerySet.aget_or_create: {author.books.aget_or_create.__func__ is QuerySet.aget_or_create}")
++    print(f"   aupdate_or_create is QuerySet.aupdate_or_create: {author.books.aupdate_or_create.__func__ is QuerySet.aupdate_or_create}")
++    
++    print("\n2. Checking forward many-to-many manager (article.categories):")
++    print(f"   acreate method: {article.categories.acreate}")
++    print(f"   acreate is QuerySet.acreate: {article.categories.acreate.__func__ is QuerySet.acreate}")
++    print(f"   aget_or_create is QuerySet.aget_or_create: {article.categories.aget_or_create.__func__ is QuerySet.aget_or_create}")
++    print(f"   aupdate_or_create is QuerySet.aupdate_or_create: {article.categories.aupdate_or_create.__func__ is QuerySet.aupdate_or_create}")
++    
++    # Check that all methods have alters_data = True
++    print("\n3. Checking alters_data attribute:")
++    print(f"   author.books.acreate.alters_data: {getattr(author.books.acreate, 'alters_data', False)}")
++    print(f"   author.books.aget_or_create.alters_data: {getattr(author.books.aget_or_create, 'alters_data', False)}")
++    print(f"   author.books.aupdate_or_create.alters_data: {getattr(author.books.aupdate_or_create, 'alters_data', False)}")
++    
++    print(f"   article.categories.acreate.alters_data: {getattr(article.categories.acreate, 'alters_data', False)}")
++    print(f"   article.categories.aget_or_create.alters_data: {getattr(article.categories.aget_or_create, 'alters_data', False)}")
++    print(f"   article.categories.aupdate_or_create.alters_data: {getattr(article.categories.aupdate_or_create, 'alters_data', False)}")
++    
++    # All should be False for the QuerySet comparison and True for alters_data
++    all_different = (
++        author.books.acreate.__func__ is not QuerySet.acreate and
++        author.books.aget_or_create.__func__ is not QuerySet.aget_or_create and
++        author.books.aupdate_or_create.__func__ is not QuerySet.aupdate_or_create and
++        article.categories.acreate.__func__ is not QuerySet.acreate and
++        article.categories.aget_or_create.__func__ is not QuerySet.aget_or_create and
++        article.categories.aupdate_or_create.__func__ is not QuerySet.aupdate_or_create
++    )
++    
++    all_have_alters_data = (
++        getattr(author.books.acreate, 'alters_data', False) and
++        getattr(author.books.aget_or_create, 'alters_data', False) and
++        getattr(author.books.aupdate_or_create, 'alters_data', False) and
++        getattr(article.categories.acreate, 'alters_data', False) and
++        getattr(article.categories.aget_or_create, 'alters_data', False) and
++        getattr(article.categories.aupdate_or_create, 'alters_data', False)
++    )
++    
++    print(f"\n4. Results:")
++    if all_different:
++        print("✓ All async methods are properly overridden (not using QuerySet versions)")
++    else:
++        print("✗ Some async methods are still using QuerySet versions")
++    
++    if all_have_alters_data:
++        print("✓ All async methods have alters_data = True")
++    else:
++        print("✗ Some async methods are missing alters_data = True")
++    
++    return all_different and all_have_alters_data
++
++
++if __name__ == "__main__":
++    success = verify_async_methods_are_overridden()
++    if success:
++        print("\n🎉 Fix verification successful! All async methods are properly implemented.")
++    else:
++        print("\n❌ Fix verification failed.")
+\ No newline at end of file
+diff --git a/tests/async_related_managers/__init__.py b/tests/async_related_managers/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/async_related_managers/models.py b/tests/async_related_managers/models.py
+new file mode 100644
+index 0000000000..e863d86859
+--- /dev/null
++++ b/tests/async_related_managers/models.py
+@@ -0,0 +1,19 @@
++from django.db import models
++
++
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++
++
++class Book(models.Model):
++    title = models.CharField(max_length=100)
++    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name='books')
++
++
++class Category(models.Model):
++    name = models.CharField(max_length=100)
++
++
++class Article(models.Model):
++    title = models.CharField(max_length=100)
++    categories = models.ManyToManyField(Category, related_name='articles')
+\ No newline at end of file
+diff --git a/tests/async_related_managers/tests.py b/tests/async_related_managers/tests.py
+new file mode 100644
+index 0000000000..9e586a18c8
+--- /dev/null
++++ b/tests/async_related_managers/tests.py
+@@ -0,0 +1,148 @@
++"""
++Test case for async methods on related managers.
++"""
++import asyncio
++from django.test import TestCase
++from asgiref.sync import sync_to_async
++
++from .models import Author, Book, Category, Article
++
++
++class AsyncRelatedManagerTest(TestCase):
++    """Test async methods on related managers."""
++    
++    async def test_reverse_many_to_one_acreate(self):
++        """Test acreate on reverse many-to-one related manager."""
++        # Create an author
++        author = await Author.objects.acreate(name="Test Author")
++        
++        # Test acreate on related manager
++        book = await author.books.acreate(title="Test Book")
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(book.author_id, author.id)
++        
++        # Verify the book is in the author's book set
++        count = await author.books.acount()
++        self.assertEqual(count, 1)
++    
++    async def test_reverse_many_to_one_aget_or_create(self):
++        """Test aget_or_create on reverse many-to-one related manager."""
++        # Create an author
++        author = await Author.objects.acreate(name="Test Author")
++        
++        # Test aget_or_create on related manager
++        book, created = await author.books.aget_or_create(title="Test Book")
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(book.author_id, author.id)
++        self.assertTrue(created)
++        
++        # Test getting existing
++        book2, created2 = await author.books.aget_or_create(title="Test Book")
++        
++        self.assertEqual(book.id, book2.id)
++        self.assertFalse(created2)
++    
++    async def test_reverse_many_to_one_aupdate_or_create(self):
++        """Test aupdate_or_create on reverse many-to-one related manager."""
++        # Create an author
++        author = await Author.objects.acreate(name="Test Author")
++        
++        # Test aupdate_or_create on related manager
++        book, created = await author.books.aupdate_or_create(
++            title="Test Book",
++            defaults={'title': 'Test Book'}
++        )
++        
++        # Check if the foreign key was set correctly
++        self.assertEqual(book.author_id, author.id)
++        self.assertTrue(created)
++        
++        # Test updating existing
++        book2, created2 = await author.books.aupdate_or_create(
++            title="Test Book",
++            defaults={'title': 'Updated Test Book'}
++        )
++        
++        self.assertEqual(book.id, book2.id)
++        self.assertFalse(created2)
++        self.assertEqual(book2.title, 'Updated Test Book')
++    
++    async def test_forward_many_to_many_acreate(self):
++        """Test acreate on forward many-to-many related manager."""
++        # Create an article
++        article = await Article.objects.acreate(title="Test Article")
++        
++        # Test acreate on related manager
++        category = await article.categories.acreate(name="Test Category")
++        
++        # Check if the relationship was created
++        count = await article.categories.acount()
++        self.assertEqual(count, 1)
++        
++        # Verify the category is in the article's categories
++        categories = [c async for c in article.categories.all()]
++        self.assertEqual(len(categories), 1)
++        self.assertEqual(categories[0].name, "Test Category")
++    
++    async def test_forward_many_to_many_aget_or_create(self):
++        """Test aget_or_create on forward many-to-many related manager."""
++        # Create an article
++        article = await Article.objects.acreate(title="Test Article")
++        
++        # Test aget_or_create on related manager
++        category, created = await article.categories.aget_or_create(name="Test Category")
++        
++        # Check if the relationship was created
++        self.assertTrue(created)
++        count = await article.categories.acount()
++        self.assertEqual(count, 1)
++        
++        # Test getting existing
++        category2, created2 = await article.categories.aget_or_create(name="Test Category")
++        
++        self.assertEqual(category.id, category2.id)
++        self.assertFalse(created2)
++    
++    async def test_forward_many_to_many_aupdate_or_create(self):
++        """Test aupdate_or_create on forward many-to-many related manager."""
++        # Create an article
++        article = await Article.objects.acreate(title="Test Article")
++        
++        # Test aupdate_or_create on related manager
++        category, created = await article.categories.aupdate_or_create(
++            name="Test Category",
++            defaults={'name': 'Test Category'}
++        )
++        
++        # Check if the relationship was created
++        self.assertTrue(created)
++        count = await article.categories.acount()
++        self.assertEqual(count, 1)
++        
++        # Test updating existing
++        category2, created2 = await article.categories.aupdate_or_create(
++            name="Test Category",
++            defaults={'name': 'Updated Test Category'}
++        )
++        
++        self.assertEqual(category.id, category2.id)
++        self.assertFalse(created2)
++        self.assertEqual(category2.name, 'Updated Test Category')
++
++
++# Convert async test methods to sync for Django's test runner
++def make_sync_test(async_method):
++    """Convert an async test method to sync."""
++    def sync_method(self):
++        return asyncio.run(async_method(self))
++    return sync_method
++
++
++# Apply the conversion to all test methods
++for attr_name in dir(AsyncRelatedManagerTest):
++    if attr_name.startswith('test_') and asyncio.iscoroutinefunction(getattr(AsyncRelatedManagerTest, attr_name)):
++        async_method = getattr(AsyncRelatedManagerTest, attr_name)
++        sync_method = make_sync_test(async_method)
++        setattr(AsyncRelatedManagerTest, attr_name, sync_method)
+\ No newline at end of file

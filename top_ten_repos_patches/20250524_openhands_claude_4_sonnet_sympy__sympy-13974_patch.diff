@@ -1,0 +1,293 @@
+diff --git a/sympy/core/power.py b/sympy/core/power.py
+index 02ec6480cb..65362d813c 100644
+--- a/sympy/core/power.py
++++ b/sympy/core/power.py
+@@ -1062,6 +1062,29 @@ def _eval_expand_multinomial(self, **hints):
+         else:
+             return result
+ 
++    def _eval_expand_tensorproduct(self, **hints):
++        """Expand powers of TensorProducts."""
++        from sympy.physics.quantum.tensorproduct import TensorProduct, tensor_product_simp_Mul
++        from sympy import Mul
++        
++        base = self.base
++        exp = self.exp
++        
++        # If the base is a TensorProduct and exponent is a positive integer,
++        # expand the power into a product and simplify
++        if isinstance(base, TensorProduct) and exp.is_integer and exp.is_positive:
++            # Convert tp(A,B)**n to tp(A,B)*tp(A,B)*...*tp(A,B) (n times)
++            # Use evaluate=False to prevent automatic simplification back to power
++            expanded = Mul(*[base for _ in range(int(exp))], evaluate=False)
++            # Use tensor_product_simp_Mul directly to avoid recursion
++            return tensor_product_simp_Mul(expanded)
++        else:
++            # For other cases, recursively expand the base
++            expanded_base = base.expand(tensorproduct=True)
++            if expanded_base != base:
++                return self.func(expanded_base, exp)
++            return self
++
+     def as_real_imag(self, deep=True, **hints):
+         from sympy import atan2, cos, im, re, sin
+         from sympy.polys.polytools import poly
+diff --git a/sympy/physics/quantum/tensorproduct.py b/sympy/physics/quantum/tensorproduct.py
+index 9dd10d219e..5ad4a74e87 100644
+--- a/sympy/physics/quantum/tensorproduct.py
++++ b/sympy/physics/quantum/tensorproduct.py
+@@ -382,9 +382,25 @@ def tensor_product_simp(e, **hints):
+     if isinstance(e, Add):
+         return Add(*[tensor_product_simp(arg) for arg in e.args])
+     elif isinstance(e, Pow):
+-        return tensor_product_simp(e.base) ** e.exp
++        # Handle powers of TensorProducts by expanding them
++        base = e.base
++        exp = e.exp
++        
++        # If the base is a TensorProduct and exponent is a positive integer,
++        # expand the power into a product and then simplify
++        if isinstance(base, TensorProduct) and exp.is_integer and exp.is_positive:
++            # Convert tp(A,B)**n to tp(A,B)*tp(A,B)*...*tp(A,B) (n times)
++            # Use evaluate=False to prevent automatic simplification back to power
++            expanded = Mul(*[base for _ in range(int(exp))], evaluate=False)
++            return tensor_product_simp_Mul(expanded)
++        else:
++            # For other cases, recursively simplify the base
++            return tensor_product_simp(base) ** exp
+     elif isinstance(e, Mul):
+-        return tensor_product_simp_Mul(e)
++        # First recursively simplify each argument, then apply tensor_product_simp_Mul
++        simplified_args = [tensor_product_simp(arg) for arg in e.args]
++        simplified_mul = Mul(*simplified_args)
++        return tensor_product_simp_Mul(simplified_mul)
+     elif isinstance(e, Commutator):
+         return Commutator(*[tensor_product_simp(arg) for arg in e.args])
+     elif isinstance(e, AntiCommutator):
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..8a0c46348b
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""
++Test edge cases for the TensorProduct powers fix.
++"""
++
++from sympy import *
++from sympy.physics.quantum import TensorProduct as tp
++from sympy.physics.quantum import tensor_product_simp as tps
++from sympy.physics.paulialgebra import Pauli
++
++def test_edge_cases():
++    """Test edge cases for tensor product powers."""
++    
++    print("=== Testing Edge Cases ===")
++    
++    # Test case 1: Zero power
++    print("\n1. Testing tp(1,1)**0:")
++    t1 = tp(1,1)**0
++    print(f"   Expression: {t1}")
++    print(f"   tps(t1): {tps(t1)}")
++    print(f"   Expected: 1")
++    
++    # Test case 2: Negative power
++    print("\n2. Testing tp(1,1)**(-1):")
++    t2 = tp(1,1)**(-1)
++    print(f"   Expression: {t2}")
++    print(f"   tps(t2): {tps(t2)}")
++    print(f"   Expected: (1x1)**(-1) (unchanged)")
++    
++    # Test case 3: Non-integer power
++    print("\n3. Testing tp(1,1)**(1/2):")
++    t3 = tp(1,1)**(Rational(1,2))
++    print(f"   Expression: {t3}")
++    print(f"   tps(t3): {tps(t3)}")
++    print(f"   Expected: (1x1)**(1/2) (unchanged)")
++    
++    # Test case 4: Symbolic power
++    print("\n4. Testing tp(1,1)**n:")
++    n = Symbol('n')
++    t4 = tp(1,1)**n
++    print(f"   Expression: {t4}")
++    print(f"   tps(t4): {tps(t4)}")
++    print(f"   Expected: (1x1)**n (unchanged)")
++    
++    # Test case 5: Large power
++    print("\n5. Testing tp(1,1)**5:")
++    t5 = tp(1,1)**5
++    print(f"   Expression: {t5}")
++    print(f"   tps(t5): {tps(t5)}")
++    print(f"   Expected: 1x1")
++    
++    # Test case 6: Complex tensor product
++    print("\n6. Testing tp(Pauli(1), Pauli(2))**2:")
++    t6 = tp(Pauli(1), Pauli(2))**2
++    print(f"   Expression: {t6}")
++    print(f"   tps(t6): {tps(t6)}")
++    print(f"   Expected: 1x1 (since Pauli(i)**2 = 1)")
++    
++    # Test case 7: Mixed commutative and non-commutative
++    print("\n7. Testing tp(2, Pauli(3))**2:")
++    t7 = tp(2, Pauli(3))**2
++    print(f"   Expression: {t7}")
++    print(f"   tps(t7): {tps(t7)}")
++    print(f"   Expected: 4x1 (since 2*2=4, Pauli(3)*Pauli(3)=1)")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..c4a3fad4a0
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""
++Test script to verify the original issue from the problem description is resolved.
++"""
++
++from sympy import *
++from sympy.physics.quantum import TensorProduct as tp
++from sympy.physics.quantum import tensor_product_simp as tps
++from sympy.physics.paulialgebra import Pauli
++
++def test_original_issue():
++    """Test the exact examples from the original issue description."""
++    
++    print("=== Testing Original Issue Examples ===")
++    
++    # Original issue example 1
++    print("\n[1] t1 = tp(1,1)*tp(1,1)")
++    a = Symbol('a', commutative=False)
++    t1 = tp(1,1)*tp(1,1)
++    print(f"    t1: {t1}")
++    
++    print("\n[2] tps(t1)")
++    result2 = tps(t1)
++    print(f"    Result: {result2}")
++    print(f"    Expected: 1x1")
++    print(f"    ✓ PASS" if str(result2) == "1x1" else f"    ✗ FAIL")
++    
++    print("\n[3] t1.expand(tensorproduct=True)")
++    result3 = t1.expand(tensorproduct=True)
++    print(f"    Result: {result3}")
++    print(f"    Expected: 1x1")
++    print(f"    ✓ PASS" if str(result3) == "1x1" else f"    ✗ FAIL")
++    
++    print("\n[4] tps(tp(1,1)*tp(1,a)).subs(a, 1)")
++    result4 = tps(tp(1,1)*tp(1,a)).subs(a, 1)
++    print(f"    Result: {result4}")
++    print(f"    Expected: 1x1")
++    print(f"    ✓ PASS" if str(result4) == "1x1" else f"    ✗ FAIL")
++    
++    # Original issue example 2
++    print("\n[5] t2 = tp(1,Pauli(3))*tp(1,Pauli(3))")
++    t2 = tp(1,Pauli(3))*tp(1,Pauli(3))
++    print(f"    t2: {t2}")
++    
++    print("\n[6] tps(t2)")
++    result6 = tps(t2)
++    print(f"    Result: {result6}")
++    print(f"    Expected: 1x1")
++    print(f"    ✓ PASS" if str(result6) == "1x1" else f"    ✗ FAIL")
++    
++    print("\n[7] t2.expand(tensorproduct=True)")
++    result7 = t2.expand(tensorproduct=True)
++    print(f"    Result: {result7}")
++    print(f"    Expected: 1x1")
++    print(f"    ✓ PASS" if str(result7) == "1x1" else f"    ✗ FAIL")
++    
++    print("\n[8] tps(tp(1,Pauli(3))*tp(1,a)).subs(a, Pauli(3))")
++    result8 = tps(tp(1,Pauli(3))*tp(1,a)).subs(a, Pauli(3))
++    print(f"    Result: {result8}")
++    print(f"    Expected: 1x1")
++    print(f"    ✓ PASS" if str(result8) == "1x1" else f"    ✗ FAIL")
++    
++    # Summary
++    results = [
++        str(result2) == "1x1",
++        str(result3) == "1x1", 
++        str(result4) == "1x1",
++        str(result6) == "1x1",
++        str(result7) == "1x1",
++        str(result8) == "1x1"
++    ]
++    
++    print(f"\n=== SUMMARY ===")
++    print(f"Tests passed: {sum(results)}/{len(results)}")
++    if all(results):
++        print("🎉 ALL TESTS PASSED! The original issue has been resolved.")
++    else:
++        print("❌ Some tests failed. The issue is not fully resolved.")
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file
+diff --git a/test_tensorproduct_powers.py b/test_tensorproduct_powers.py
+new file mode 100644
+index 0000000000..6361534e08
+--- /dev/null
++++ b/test_tensorproduct_powers.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""
++Test script to reproduce the TensorProduct powers issue.
++"""
++
++from sympy import *
++from sympy.physics.quantum import TensorProduct as tp
++from sympy.physics.quantum import tensor_product_simp as tps
++from sympy.physics.paulialgebra import Pauli
++
++def test_tensorproduct_powers():
++    """Test that powers of tensor products are properly simplified."""
++    
++    print("=== Testing TensorProduct Powers Issue ===")
++    
++    # Test case 1: Simple numeric tensor products
++    print("\n1. Testing tp(1,1)*tp(1,1):")
++    t1 = tp(1,1)*tp(1,1)
++    print(f"   Expression: {t1}")
++    print(f"   tps(t1): {tps(t1)}")
++    print(f"   t1.expand(tensorproduct=True): {t1.expand(tensorproduct=True)}")
++    print(f"   Expected: 1x1")
++    
++    # Test case 2: Pauli matrices
++    print("\n2. Testing tp(1,Pauli(3))*tp(1,Pauli(3)):")
++    t2 = tp(1,Pauli(3))*tp(1,Pauli(3))
++    print(f"   Expression: {t2}")
++    print(f"   tps(t2): {tps(t2)}")
++    print(f"   t2.expand(tensorproduct=True): {t2.expand(tensorproduct=True)}")
++    print(f"   Expected: 1x1 (since Pauli(3)*Pauli(3) = 1)")
++    
++    # Test case 3: Verify the workaround works
++    print("\n3. Testing workaround with substitution:")
++    a = Symbol('a', commutative=False)
++    t3 = tps(tp(1,1)*tp(1,a)).subs(a, 1)
++    print(f"   tps(tp(1,1)*tp(1,a)).subs(a, 1): {t3}")
++    
++    t4 = tps(tp(1,Pauli(3))*tp(1,a)).subs(a, Pauli(3))
++    print(f"   tps(tp(1,Pauli(3))*tp(1,a)).subs(a, Pauli(3)): {t4}")
++    
++    # Test case 4: Higher powers
++    print("\n4. Testing higher powers:")
++    t5 = tp(1,1)**3
++    print(f"   tp(1,1)**3: {t5}")
++    print(f"   tps(tp(1,1)**3): {tps(t5)}")
++    print(f"   Expected: 1x1")
++    
++    # Test case 5: Mixed tensor products
++    print("\n5. Testing mixed tensor products:")
++    A = Symbol('A', commutative=False)
++    B = Symbol('B', commutative=False)
++    t6 = tp(A,B)**2
++    print(f"   tp(A,B)**2: {t6}")
++    print(f"   tps(tp(A,B)**2): {tps(t6)}")
++    print(f"   Expected: (A*A)x(B*B)")
++
++if __name__ == "__main__":
++    test_tensorproduct_powers()
+\ No newline at end of file

@@ -1,0 +1,641 @@
+diff --git a/django/urls/resolvers.py b/django/urls/resolvers.py
+index 9b00e24509..935ca4e553 100644
+--- a/django/urls/resolvers.py
++++ b/django/urls/resolvers.py
+@@ -45,16 +45,28 @@ class ResolverMatch:
+         self.namespaces = [x for x in namespaces if x] if namespaces else []
+         self.namespace = ':'.join(self.namespaces)
+ 
+-        if not hasattr(func, '__name__'):
++        # Unwrap functools.partial objects to get the underlying function
++        # for a more useful representation
++        func_for_path = self._unwrap_partial(func)
++
++        if not hasattr(func_for_path, '__name__'):
+             # A class-based view
+-            self._func_path = func.__class__.__module__ + '.' + func.__class__.__name__
++            self._func_path = func_for_path.__class__.__module__ + '.' + func_for_path.__class__.__name__
+         else:
+             # A function-based view
+-            self._func_path = func.__module__ + '.' + func.__name__
++            self._func_path = func_for_path.__module__ + '.' + func_for_path.__name__
+ 
+         view_path = url_name or self._func_path
+         self.view_name = ':'.join(self.namespaces + [view_path])
+ 
++    def _unwrap_partial(self, func):
++        """
++        Unwrap functools.partial objects to get the underlying function.
++        """
++        while isinstance(func, functools.partial):
++            func = func.func
++        return func
++
+     def __getitem__(self, index):
+         return (self.func, self.args, self.kwargs)[index]
+ 
+diff --git a/test_comprehensive.py b/test_comprehensive.py
+new file mode 100644
+index 0000000000..75bd223448
+--- /dev/null
++++ b/test_comprehensive.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the functools.partial fix works correctly
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++sys.path.insert(0, '/workspace/django__django__4.0/tests')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='urlpatterns_reverse.urls',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.urls import resolve
++
++
++def test_comprehensive():
++    """Comprehensive test of the functools.partial fix."""
++    
++    print("Comprehensive test of functools.partial fix:")
++    print("=" * 60)
++    
++    # Test cases: (URL, expected_func_path_contains)
++    test_cases = [
++        # Regular function
++        ('/no_kwargs/42/37/', 'urlpatterns_reverse.views.empty_view'),
++        
++        # Partial functions (these should now show the underlying function)
++        ('/partial/', 'urlpatterns_reverse.views.empty_view'),
++        ('/partial_nested/', 'urlpatterns_reverse.views.empty_view'),
++        ('/partial_wrapped/', 'urlpatterns_reverse.views.empty_view'),
++    ]
++    
++    all_passed = True
++    
++    for url, expected_func_path in test_cases:
++        print(f"\nTesting {url}:")
++        try:
++            match = resolve(url)
++            repr_str = repr(match)
++            print(f"   Repr: {repr_str}")
++            
++            # Check if the expected function path is in the repr
++            if expected_func_path in repr_str:
++                print(f"   ✓ PASS: Contains expected function path '{expected_func_path}'")
++            else:
++                print(f"   ✗ FAIL: Does not contain expected function path '{expected_func_path}'")
++                all_passed = False
++                
++            # Check that it doesn't contain "functools.partial"
++            if 'functools.partial' not in repr_str:
++                print(f"   ✓ PASS: Does not contain 'functools.partial'")
++            else:
++                print(f"   ✗ FAIL: Still contains 'functools.partial'")
++                all_passed = False
++                
++        except Exception as e:
++            print(f"   ✗ ERROR: {e}")
++            all_passed = False
++    
++    print("\n" + "=" * 60)
++    if all_passed:
++        print("✓ ALL TESTS PASSED!")
++    else:
++        print("✗ SOME TESTS FAILED!")
++    
++    return all_passed
++
++
++if __name__ == '__main__':
++    success = test_comprehensive()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..4ff04c44a4
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the functools.partial fix
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='test_edge_urls',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from functools import partial, update_wrapper
++from django.urls import path, resolve
++from django.http import HttpResponse
++from django.views.generic import View
++
++
++def test_view(request, arg1=None, arg2=None):
++    """A simple test view function."""
++    return HttpResponse(f"arg1={arg1}, arg2={arg2}")
++
++
++class TestClassView(View):
++    def get(self, request):
++        return HttpResponse("Class view")
++
++
++# Create various types of functions
++test_view_partial = partial(test_view, arg1="default_value")
++test_view_nested_partial = partial(test_view_partial, arg2="nested_value")
++test_view_wrapped_partial = update_wrapper(partial(test_view, arg1="wrapped"), test_view)
++
++# Test with class-based view
++class_view_instance = TestClassView.as_view()
++
++# Create URL patterns
++urlpatterns = [
++    path('normal/', test_view, name='normal'),
++    path('partial/', test_view_partial, name='partial'),
++    path('nested_partial/', test_view_nested_partial, name='nested_partial'),
++    path('wrapped_partial/', test_view_wrapped_partial, name='wrapped_partial'),
++    path('class_view/', class_view_instance, name='class_view'),
++]
++
++# Create a temporary module for the URL patterns
++import types
++test_edge_urls_module = types.ModuleType('test_edge_urls')
++test_edge_urls_module.urlpatterns = urlpatterns
++sys.modules['test_edge_urls'] = test_edge_urls_module
++
++
++def test_edge_cases():
++    """Test edge cases for the functools.partial fix."""
++    
++    print("Testing edge cases for functools.partial fix:")
++    print("=" * 60)
++    
++    test_cases = [
++        ('/normal/', 'Normal function'),
++        ('/partial/', 'Partial function'),
++        ('/nested_partial/', 'Nested partial function'),
++        ('/wrapped_partial/', 'Wrapped partial function'),
++        ('/class_view/', 'Class-based view'),
++    ]
++    
++    for url, description in test_cases:
++        print(f"\n{description} ({url}):")
++        try:
++            match = resolve(url)
++            print(f"   Function: {match.func}")
++            print(f"   Function type: {type(match.func)}")
++            print(f"   Repr: {repr(match)}")
++            
++            # Test that the function is still callable
++            # (This ensures we didn't break the actual functionality)
++            print(f"   Function is callable: {callable(match.func)}")
++            
++        except Exception as e:
++            print(f"   Error: {e}")
++
++
++if __name__ == '__main__':
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_existing_partial.py b/test_existing_partial.py
+new file mode 100644
+index 0000000000..be5aef50d0
+--- /dev/null
++++ b/test_existing_partial.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the functools.partial issue with existing Django test URLs
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++sys.path.insert(0, '/workspace/django__django__4.0/tests')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='urlpatterns_reverse.urls',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.urls import resolve
++
++
++def test_existing_partial_urls():
++    """Test the existing partial URLs in Django's test suite."""
++    
++    print("Testing existing partial URLs from Django test suite:")
++    print("=" * 60)
++    
++    # Test partial URL
++    print("\n1. Partial URL (/partial/):")
++    try:
++        match = resolve('/partial/')
++        print(f"   Function: {match.func}")
++        print(f"   Function type: {type(match.func)}")
++        if hasattr(match.func, 'func'):
++            print(f"   Underlying function: {match.func.func}")
++            print(f"   Partial keywords: {match.func.keywords}")
++        print(f"   Repr: {repr(match)}")
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    # Test nested partial URL
++    print("\n2. Nested partial URL (/partial_nested/):")
++    try:
++        match = resolve('/partial_nested/')
++        print(f"   Function: {match.func}")
++        print(f"   Function type: {type(match.func)}")
++        if hasattr(match.func, 'func'):
++            print(f"   Underlying function: {match.func.func}")
++            print(f"   Partial keywords: {match.func.keywords}")
++            # Check if the underlying function is also a partial
++            if hasattr(match.func.func, 'func'):
++                print(f"   Nested underlying function: {match.func.func.func}")
++                print(f"   Nested partial keywords: {match.func.func.keywords}")
++        print(f"   Repr: {repr(match)}")
++    except Exception as e:
++        print(f"   Error: {e}")
++    
++    # Test wrapped partial URL
++    print("\n3. Wrapped partial URL (/partial_wrapped/):")
++    try:
++        match = resolve('/partial_wrapped/')
++        print(f"   Function: {match.func}")
++        print(f"   Function type: {type(match.func)}")
++        if hasattr(match.func, 'func'):
++            print(f"   Underlying function: {match.func.func}")
++            print(f"   Partial keywords: {match.func.keywords}")
++        print(f"   Repr: {repr(match)}")
++    except Exception as e:
++        print(f"   Error: {e}")
++
++
++if __name__ == '__main__':
++    test_existing_partial_urls()
+\ No newline at end of file
+diff --git a/test_final_verification.py b/test_final_verification.py
+new file mode 100644
+index 0000000000..74e3027d62
+--- /dev/null
++++ b/test_final_verification.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python
++"""
++Final verification test for the functools.partial fix
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++sys.path.insert(0, '/workspace/django__django__4.0/tests')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='urlpatterns_reverse.urls',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from django.urls import resolve
++
++
++def test_final_verification():
++    """Final verification that the fix works correctly."""
++    
++    print("Final verification of functools.partial fix:")
++    print("=" * 60)
++    
++    # Test the specific issue mentioned in the problem description
++    print("\n1. Testing partial function representation:")
++    match = resolve('/partial/')
++    repr_str = repr(match)
++    print(f"   URL: /partial/")
++    print(f"   Repr: {repr_str}")
++    
++    # Verify the fix
++    if 'functools.partial' in repr_str:
++        print("   ❌ FAIL: Still shows 'functools.partial'")
++        return False
++    elif 'urlpatterns_reverse.views.empty_view' in repr_str:
++        print("   ✅ PASS: Shows underlying function")
++    else:
++        print("   ❌ FAIL: Unexpected representation")
++        return False
++    
++    print("\n2. Testing nested partial function representation:")
++    match = resolve('/partial_nested/')
++    repr_str = repr(match)
++    print(f"   URL: /partial_nested/")
++    print(f"   Repr: {repr_str}")
++    
++    # Verify the fix
++    if 'functools.partial' in repr_str:
++        print("   ❌ FAIL: Still shows 'functools.partial'")
++        return False
++    elif 'urlpatterns_reverse.views.empty_view' in repr_str:
++        print("   ✅ PASS: Shows underlying function")
++    else:
++        print("   ❌ FAIL: Unexpected representation")
++        return False
++    
++    print("\n3. Testing that normal functions still work:")
++    match = resolve('/no_kwargs/42/37/')
++    repr_str = repr(match)
++    print(f"   URL: /no_kwargs/42/37/")
++    print(f"   Repr: {repr_str}")
++    
++    # Verify normal functions still work
++    if 'urlpatterns_reverse.views.empty_view' in repr_str:
++        print("   ✅ PASS: Normal function representation unchanged")
++    else:
++        print("   ❌ FAIL: Normal function representation broken")
++        return False
++    
++    print("\n4. Testing that wrapped partials still work:")
++    match = resolve('/partial_wrapped/')
++    repr_str = repr(match)
++    print(f"   URL: /partial_wrapped/")
++    print(f"   Repr: {repr_str}")
++    
++    # Verify wrapped partials work
++    if 'urlpatterns_reverse.views.empty_view' in repr_str:
++        print("   ✅ PASS: Wrapped partial representation correct")
++    else:
++        print("   ❌ FAIL: Wrapped partial representation broken")
++        return False
++    
++    print("\n" + "=" * 60)
++    print("✅ ALL VERIFICATIONS PASSED!")
++    print("\nThe fix successfully addresses the issue:")
++    print("- functools.partial objects are unwrapped to show the underlying function")
++    print("- Nested partials are handled correctly")
++    print("- Normal functions continue to work as before")
++    print("- Wrapped partials continue to work as before")
++    print("- The actual function objects are preserved (only repr is improved)")
++    
++    return True
++
++
++if __name__ == '__main__':
++    success = test_final_verification()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_partial_class_view.py b/test_partial_class_view.py
+new file mode 100644
+index 0000000000..e2a5cd2b71
+--- /dev/null
++++ b/test_partial_class_view.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python
++"""
++Test functools.partial with class-based views
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='test_partial_class_urls',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from functools import partial
++from django.urls import path, resolve
++from django.http import HttpResponse
++from django.views.generic import View
++
++
++class TestView(View):
++    def __init__(self, extra_context=None):
++        super().__init__()
++        self.extra_context = extra_context or {}
++    
++    def get(self, request):
++        return HttpResponse(f"Extra context: {self.extra_context}")
++
++
++# Create a partial of a class-based view function
++# This is a more realistic scenario
++test_view_function = TestView.as_view()
++test_view_partial_function = partial(test_view_function, extra_context={'key': 'value'})
++
++# Create URL patterns
++urlpatterns = [
++    path('class/', test_view_function, name='class'),
++    path('partial_class/', test_view_partial_function, name='partial_class'),
++]
++
++# Create a temporary module for the URL patterns
++import types
++test_partial_class_urls_module = types.ModuleType('test_partial_class_urls')
++test_partial_class_urls_module.urlpatterns = urlpatterns
++sys.modules['test_partial_class_urls'] = test_partial_class_urls_module
++
++
++def test_partial_class_view():
++    """Test functools.partial with class-based views."""
++    
++    print("Testing functools.partial with class-based views:")
++    print("=" * 60)
++    
++    test_cases = [
++        ('/class/', 'Regular class-based view'),
++        ('/partial_class/', 'Partial class-based view'),
++    ]
++    
++    for url, description in test_cases:
++        print(f"\n{description} ({url}):")
++        try:
++            match = resolve(url)
++            print(f"   Function: {match.func}")
++            print(f"   Function type: {type(match.func)}")
++            print(f"   Repr: {repr(match)}")
++            print(f"   Function is callable: {callable(match.func)}")
++            
++        except Exception as e:
++            print(f"   Error: {e}")
++
++
++if __name__ == '__main__':
++    test_partial_class_view()
+\ No newline at end of file
+diff --git a/test_partial_repr.py b/test_partial_repr.py
+new file mode 100644
+index 0000000000..6b6f634dd7
+--- /dev/null
++++ b/test_partial_repr.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the functools.partial issue with ResolverMatch.__repr__()
++"""
++import os
++import sys
++import django
++from django.conf import settings
++
++# Add the Django project to the path
++sys.path.insert(0, '/workspace/django__django__4.0')
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        ROOT_URLCONF='test_urls',
++        SECRET_KEY='test-secret-key',
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++        ],
++    )
++
++django.setup()
++
++from functools import partial
++from django.urls import path, resolve
++from django.http import HttpResponse
++
++
++def test_view(request, arg1=None, arg2=None):
++    """A simple test view function."""
++    return HttpResponse(f"arg1={arg1}, arg2={arg2}")
++
++
++# Create a partial function
++test_view_partial = partial(test_view, arg1="default_value")
++
++# Create a nested partial function
++test_view_nested_partial = partial(test_view_partial, arg2="nested_value")
++
++# Create URL patterns
++urlpatterns = [
++    path('normal/', test_view, name='normal'),
++    path('partial/', test_view_partial, name='partial'),
++    path('nested_partial/', test_view_nested_partial, name='nested_partial'),
++]
++
++# Create a temporary module for the URL patterns
++import types
++test_urls_module = types.ModuleType('test_urls')
++test_urls_module.urlpatterns = urlpatterns
++sys.modules['test_urls'] = test_urls_module
++
++
++def test_resolver_match_repr():
++    """Test the ResolverMatch.__repr__() method with different function types."""
++    
++    print("Testing ResolverMatch.__repr__() with different function types:")
++    print("=" * 60)
++    
++    # Test normal function
++    print("\n1. Normal function:")
++    match = resolve('/normal/')
++    print(f"   Function: {match.func}")
++    print(f"   Repr: {repr(match)}")
++    
++    # Test partial function
++    print("\n2. Partial function:")
++    match = resolve('/partial/')
++    print(f"   Function: {match.func}")
++    print(f"   Function type: {type(match.func)}")
++    print(f"   Function.__name__: {getattr(match.func, '__name__', 'NO __name__ ATTRIBUTE')}")
++    print(f"   Function.__module__: {getattr(match.func, '__module__', 'NO __module__ ATTRIBUTE')}")
++    if hasattr(match.func, 'func'):
++        print(f"   Underlying function: {match.func.func}")
++        print(f"   Partial args: {match.func.args}")
++        print(f"   Partial keywords: {match.func.keywords}")
++    print(f"   Repr: {repr(match)}")
++    
++    # Test nested partial function
++    print("\n3. Nested partial function:")
++    match = resolve('/nested_partial/')
++    print(f"   Function: {match.func}")
++    print(f"   Function type: {type(match.func)}")
++    print(f"   Function.__name__: {getattr(match.func, '__name__', 'NO __name__ ATTRIBUTE')}")
++    print(f"   Function.__module__: {getattr(match.func, '__module__', 'NO __module__ ATTRIBUTE')}")
++    if hasattr(match.func, 'func'):
++        print(f"   Underlying function: {match.func.func}")
++        print(f"   Partial args: {match.func.args}")
++        print(f"   Partial keywords: {match.func.keywords}")
++        # Check if the underlying function is also a partial
++        if hasattr(match.func.func, 'func'):
++            print(f"   Nested underlying function: {match.func.func.func}")
++            print(f"   Nested partial args: {match.func.func.args}")
++            print(f"   Nested partial keywords: {match.func.func.keywords}")
++    print(f"   Repr: {repr(match)}")
++
++
++if __name__ == '__main__':
++    test_resolver_match_repr()
+\ No newline at end of file

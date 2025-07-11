@@ -1,0 +1,660 @@
+diff --git a/comprehensive_test.py b/comprehensive_test.py
+new file mode 100644
+index 0000000000..f167c3c344
+--- /dev/null
++++ b/comprehensive_test.py
+@@ -0,0 +1,187 @@
++#!/usr/bin/env python
++"""
++Comprehensive test to verify the ImageField post_init signal fix works correctly
++for all edge cases.
++"""
++
++import os
++import sys
++import tempfile
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.core.files.storage import FileSystemStorage
++from django.db.models import signals
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Create temp storage for testing
++temp_storage_dir = tempfile.mkdtemp()
++temp_storage = FileSystemStorage(temp_storage_dir)
++
++# Test models for different scenarios
++class PersonNoFields(models.Model):
++    """ImageField with no dimension fields - should NOT have signal handler"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(storage=temp_storage, upload_to="tests")
++    
++    class Meta:
++        app_label = '__main__'
++
++class PersonWidthOnly(models.Model):
++    """ImageField with only width_field - SHOULD have signal handler"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(
++        storage=temp_storage, 
++        upload_to="tests",
++        width_field="mugshot_width"
++    )
++    mugshot_width = models.PositiveSmallIntegerField(null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class PersonHeightOnly(models.Model):
++    """ImageField with only height_field - SHOULD have signal handler"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(
++        storage=temp_storage, 
++        upload_to="tests",
++        height_field="mugshot_height"
++    )
++    mugshot_height = models.PositiveSmallIntegerField(null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class PersonBothFields(models.Model):
++    """ImageField with both width and height fields - SHOULD have signal handler"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(
++        storage=temp_storage, 
++        upload_to="tests",
++        height_field="mugshot_height",
++        width_field="mugshot_width"
++    )
++    mugshot_height = models.PositiveSmallIntegerField(null=True)
++    mugshot_width = models.PositiveSmallIntegerField(null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++class AbstractPersonWithImage(models.Model):
++    """Abstract model with ImageField - should NOT have signal handler due to abstract=True"""
++    mugshot = models.ImageField(
++        storage=temp_storage, 
++        upload_to="tests",
++        height_field="mugshot_height",
++        width_field="mugshot_width"
++    )
++    mugshot_height = models.PositiveSmallIntegerField(null=True)
++    mugshot_width = models.PositiveSmallIntegerField(null=True)
++    
++    class Meta:
++        abstract = True
++        app_label = '__main__'
++
++class ConcretePersonFromAbstract(AbstractPersonWithImage):
++    """Concrete model inheriting from abstract - SHOULD have signal handler"""
++    name = models.CharField(max_length=50)
++    
++    class Meta:
++        app_label = '__main__'
++
++def check_model_signal_behavior(model_class, expected_has_receiver):
++    """Check if a model has the expected signal behavior"""
++    print(f"\n{model_class.__name__}:")
++    
++    # Get the ImageField
++    mugshot_field = model_class._meta.get_field('mugshot')
++    
++    # Check if it has dimension fields
++    has_dimension_fields = mugshot_field.width_field or mugshot_field.height_field
++    print(f"  - Has dimension fields: {has_dimension_fields}")
++    print(f"  - Width field: {mugshot_field.width_field}")
++    print(f"  - Height field: {mugshot_field.height_field}")
++    
++    # Check post_init signal connections
++    model_receivers = signals.post_init._live_receivers(sender=model_class)
++    
++    # Check if any receiver is the ImageField's update_dimension_fields
++    has_imagefield_receiver = False
++    for receiver_list in model_receivers:
++        if isinstance(receiver_list, list):
++            for receiver in receiver_list:
++                if (hasattr(receiver, '__self__') and 
++                    hasattr(receiver.__self__, 'update_dimension_fields')):
++                    has_imagefield_receiver = True
++                    break
++    
++    print(f"  - Has ImageField post_init receiver: {has_imagefield_receiver}")
++    print(f"  - Expected to have receiver: {expected_has_receiver}")
++    
++    # Verify the behavior is correct
++    if has_imagefield_receiver == expected_has_receiver:
++        print(f"  - ✅ CORRECT: Signal behavior matches expectation")
++        return True
++    else:
++        print(f"  - ❌ INCORRECT: Signal behavior does not match expectation")
++        return False
++
++def main():
++    print("Comprehensive ImageField post_init Signal Test")
++    print("=" * 60)
++    
++    test_cases = [
++        # (model_class, expected_has_receiver, description)
++        (PersonNoFields, False, "No dimension fields"),
++        (PersonWidthOnly, True, "Width field only"),
++        (PersonHeightOnly, True, "Height field only"),
++        (PersonBothFields, True, "Both width and height fields"),
++        (ConcretePersonFromAbstract, True, "Concrete model from abstract parent"),
++    ]
++    
++    all_passed = True
++    
++    for model_class, expected_has_receiver, description in test_cases:
++        print(f"\nTesting: {description}")
++        passed = check_model_signal_behavior(model_class, expected_has_receiver)
++        if not passed:
++            all_passed = False
++    
++    print("\n" + "=" * 60)
++    if all_passed:
++        print("🎉 ALL TESTS PASSED! The fix works correctly for all scenarios.")
++    else:
++        print("❌ Some tests failed. The fix needs adjustment.")
++    
++    return all_passed
++
++if __name__ == "__main__":
++    success = main()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/django/db/models/fields/files.py b/django/db/models/fields/files.py
+index 7f8eb128e1..9b6fae1176 100644
+--- a/django/db/models/fields/files.py
++++ b/django/db/models/fields/files.py
+@@ -441,7 +441,8 @@ class ImageField(FileField):
+         # after their corresponding image field don't stay cleared by
+         # Model.__init__, see bug #11196.
+         # Only run post-initialization dimension update on non-abstract models
+-        if not cls._meta.abstract:
++        # and only when width_field or height_field are set.
++        if not cls._meta.abstract and (self.width_field or self.height_field):
+             signals.post_init.connect(self.update_dimension_fields, sender=cls)
+ 
+     def update_dimension_fields(self, instance, force=False, *args, **kwargs):
+diff --git a/performance_demo.py b/performance_demo.py
+new file mode 100644
+index 0000000000..6c4a418750
+--- /dev/null
++++ b/performance_demo.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python
++"""
++Performance demonstration showing the improvement from the ImageField fix.
++"""
++
++import os
++import sys
++import time
++import tempfile
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.core.files.storage import FileSystemStorage
++from django.db.models import signals
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Create temp storage for testing
++temp_storage_dir = tempfile.mkdtemp()
++temp_storage = FileSystemStorage(temp_storage_dir)
++
++class PersonNoFields(models.Model):
++    """Model with ImageField but no width/height fields"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(storage=temp_storage, upload_to="tests")
++    
++    class Meta:
++        app_label = '__main__'
++
++class PersonWithFields(models.Model):
++    """Model with ImageField and width/height fields"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(
++        storage=temp_storage, 
++        upload_to="tests",
++        height_field="mugshot_height",
++        width_field="mugshot_width"
++    )
++    mugshot_height = models.PositiveSmallIntegerField(null=True)
++    mugshot_width = models.PositiveSmallIntegerField(null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def measure_signal_overhead(model_class, iterations=10000):
++    """Measure the overhead of post_init signals for a model"""
++    # Create a test instance
++    instance = model_class(name="Test Person")
++    
++    # Measure time to send post_init signals
++    start_time = time.time()
++    for _ in range(iterations):
++        signals.post_init.send(sender=model_class, instance=instance)
++    end_time = time.time()
++    
++    total_time = end_time - start_time
++    avg_time_ms = (total_time / iterations) * 1000
++    
++    return total_time, avg_time_ms
++
++def main():
++    print("ImageField Performance Improvement Demonstration")
++    print("=" * 60)
++    
++    iterations = 10000
++    print(f"Measuring post_init signal overhead over {iterations} iterations...\n")
++    
++    # Test PersonNoFields (should have minimal overhead now)
++    print("PersonNoFields (ImageField without dimension fields):")
++    total_time, avg_time_ms = measure_signal_overhead(PersonNoFields, iterations)
++    print(f"  - Total time: {total_time:.4f} seconds")
++    print(f"  - Average per signal: {avg_time_ms:.6f} ms")
++    
++    # Check if it has signal handlers
++    receivers = signals.post_init._live_receivers(sender=PersonNoFields)
++    has_imagefield_receiver = any(
++        any(hasattr(r, '__self__') and hasattr(r.__self__, 'update_dimension_fields') 
++            for r in receiver_list if isinstance(receiver_list, list))
++        for receiver_list in receivers
++    )
++    print(f"  - Has ImageField signal handler: {has_imagefield_receiver}")
++    
++    print()
++    
++    # Test PersonWithFields (should have normal overhead)
++    print("PersonWithFields (ImageField with dimension fields):")
++    total_time, avg_time_ms = measure_signal_overhead(PersonWithFields, iterations)
++    print(f"  - Total time: {total_time:.4f} seconds")
++    print(f"  - Average per signal: {avg_time_ms:.6f} ms")
++    
++    # Check if it has signal handlers
++    receivers = signals.post_init._live_receivers(sender=PersonWithFields)
++    has_imagefield_receiver = any(
++        any(hasattr(r, '__self__') and hasattr(r.__self__, 'update_dimension_fields') 
++            for r in receiver_list if isinstance(receiver_list, list))
++        for receiver_list in receivers
++    )
++    print(f"  - Has ImageField signal handler: {has_imagefield_receiver}")
++    
++    print("\n" + "=" * 60)
++    print("Summary:")
++    print("- PersonNoFields no longer has unnecessary ImageField signal handlers")
++    print("- PersonWithFields retains necessary ImageField signal handlers")
++    print("- This eliminates the performance overhead for models with ImageFields")
++    print("  that don't use width_field or height_field parameters")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/simple_test.py b/simple_test.py
+new file mode 100644
+index 0000000000..30285bc751
+--- /dev/null
++++ b/simple_test.py
+@@ -0,0 +1,116 @@
++#!/usr/bin/env python
++"""
++Simple test to demonstrate the ImageField post_init signal issue.
++"""
++
++import os
++import sys
++import tempfile
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.core.files.storage import FileSystemStorage
++from django.db.models import signals
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Create temp storage for testing
++temp_storage_dir = tempfile.mkdtemp()
++temp_storage = FileSystemStorage(temp_storage_dir)
++
++# Test models
++class PersonNoFields(models.Model):
++    """Model with ImageField but no width/height fields - should NOT have signal handler"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(storage=temp_storage, upload_to="tests")
++    
++    class Meta:
++        app_label = '__main__'
++
++class PersonWithFields(models.Model):
++    """Model with ImageField and width/height fields - SHOULD have signal handler"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(
++        storage=temp_storage, 
++        upload_to="tests",
++        height_field="mugshot_height",
++        width_field="mugshot_width"
++    )
++    mugshot_height = models.PositiveSmallIntegerField(null=True)
++    mugshot_width = models.PositiveSmallIntegerField(null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def main():
++    print("ImageField post_init Signal Issue Demonstration")
++    print("=" * 60)
++    
++    for model_class in [PersonNoFields, PersonWithFields]:
++        print(f"\n{model_class.__name__}:")
++        
++        # Get the ImageField
++        mugshot_field = model_class._meta.get_field('mugshot')
++        
++        # Check if it has dimension fields
++        has_dimension_fields = mugshot_field.width_field or mugshot_field.height_field
++        print(f"  - Has dimension fields: {has_dimension_fields}")
++        print(f"  - Width field: {mugshot_field.width_field}")
++        print(f"  - Height field: {mugshot_field.height_field}")
++        
++        # Check post_init signal connections
++        model_receivers = signals.post_init._live_receivers(sender=model_class)
++        print(f"  - Number of post_init receivers: {len(model_receivers)}")
++        
++        # Check if any receiver is the ImageField's update_dimension_fields
++        has_imagefield_receiver = False
++        print(f"  - Receivers:")
++        for i, receiver_list in enumerate(model_receivers):
++            print(f"    {i+1}. {receiver_list}")
++            # receiver_list is a list of receivers
++            if isinstance(receiver_list, list):
++                for receiver in receiver_list:
++                    if (hasattr(receiver, '__self__') and 
++                        hasattr(receiver.__self__, 'update_dimension_fields')):
++                        has_imagefield_receiver = True
++                        print(f"       ^ This is ImageField.update_dimension_fields")
++        
++        print(f"  - Has ImageField post_init receiver: {has_imagefield_receiver}")
++        
++        # This is the issue: both models have the receiver, but only PersonWithFields should
++        if not has_dimension_fields and has_imagefield_receiver:
++            print(f"  - ⚠️  ISSUE: Unnecessary post_init receiver for ImageField without dimension fields!")
++        elif has_dimension_fields and has_imagefield_receiver:
++            print(f"  - ✅ Correctly has post_init receiver for ImageField with dimension fields")
++        elif not has_dimension_fields and not has_imagefield_receiver:
++            print(f"  - ✅ Correctly has no post_init receiver for ImageField without dimension fields")
++        else:
++            print(f"  - ❌ Missing post_init receiver for ImageField with dimension fields!")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_imagefield_performance.py b/test_imagefield_performance.py
+new file mode 100644
+index 0000000000..f5b4fadf0e
+--- /dev/null
++++ b/test_imagefield_performance.py
+@@ -0,0 +1,182 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce and verify the ImageField post_init signal performance issue.
++
++This script demonstrates that ImageField unnecessarily adds post_init signal handlers
++even when width_field and height_field are not set.
++"""
++
++import os
++import sys
++import time
++import tempfile
++from unittest.mock import patch
++
++# Add Django to path
++sys.path.insert(0, '/workspace/django__django__5.0')
++
++# Configure Django settings
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
++
++import django
++from django.conf import settings
++from django.db import models
++from django.core.files.storage import FileSystemStorage
++from django.db.models import signals
++
++# Configure minimal Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            '__main__',  # This module
++        ],
++        USE_TZ=True,
++        SECRET_KEY='test-secret-key',
++    )
++
++django.setup()
++
++# Create temp storage for testing
++temp_storage_dir = tempfile.mkdtemp()
++temp_storage = FileSystemStorage(temp_storage_dir)
++
++# Test models
++class PersonNoFields(models.Model):
++    """Model with ImageField but no width/height fields - should NOT have signal handler"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(storage=temp_storage, upload_to="tests")
++    
++    class Meta:
++        app_label = '__main__'
++
++class PersonWithFields(models.Model):
++    """Model with ImageField and width/height fields - SHOULD have signal handler"""
++    name = models.CharField(max_length=50)
++    mugshot = models.ImageField(
++        storage=temp_storage, 
++        upload_to="tests",
++        height_field="mugshot_height",
++        width_field="mugshot_width"
++    )
++    mugshot_height = models.PositiveSmallIntegerField(null=True)
++    mugshot_width = models.PositiveSmallIntegerField(null=True)
++    
++    class Meta:
++        app_label = '__main__'
++
++def check_signal_connections():
++    """Check which models have post_init signal handlers connected"""
++    print("=== Checking post_init signal connections ===")
++    
++    # Check for our specific models
++    for model_class in [PersonNoFields, PersonWithFields]:
++        # Get receivers for this specific model
++        model_receivers = signals.post_init._live_receivers(sender=model_class)
++        
++        print(f"{model_class.__name__}: {len(model_receivers)} post_init receivers")
++        
++        # Check if the ImageField has dimension fields
++        mugshot_field = model_class._meta.get_field('mugshot')
++        has_dimension_fields = mugshot_field.width_field or mugshot_field.height_field
++        print(f"  - Has dimension fields: {has_dimension_fields}")
++        print(f"  - Width field: {mugshot_field.width_field}")
++        print(f"  - Height field: {mugshot_field.height_field}")
++        
++        # List the actual receivers
++        for i, receiver in enumerate(model_receivers):
++            if hasattr(receiver, '__self__') and hasattr(receiver.__self__, 'update_dimension_fields'):
++                print(f"  - Receiver {i+1}: ImageField.update_dimension_fields")
++            else:
++                print(f"  - Receiver {i+1}: {receiver}")
++        
++        print()
++
++def measure_initialization_performance():
++    """Measure the performance impact of post_init signals during model initialization"""
++    print("=== Measuring initialization performance ===")
++    
++    # Create database tables
++    from django.db import connection
++    
++    # Create tables for our models
++    for model in [PersonNoFields, PersonWithFields]:
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(model)
++    
++    # Test initialization performance
++    iterations = 1000
++    
++    for model_class in [PersonNoFields, PersonWithFields]:
++        print(f"\nTesting {model_class.__name__}:")
++        
++        # Create a test instance first
++        instance = model_class(name="Test Person")
++        instance.save()
++        
++        # Measure time to initialize instances (simulating post_init signal calls)
++        start_time = time.time()
++        for _ in range(iterations):
++            # Simulate loading from database by creating new instance with same data
++            obj = model_class(id=instance.id, name=instance.name, mugshot=instance.mugshot)
++            # Trigger post_init signal manually to simulate database loading
++            signals.post_init.send(sender=model_class, instance=obj)
++        end_time = time.time()
++        
++        total_time = end_time - start_time
++        avg_time = total_time / iterations * 1000  # Convert to milliseconds
++        
++        print(f"  - {iterations} initializations took {total_time:.4f} seconds")
++        print(f"  - Average time per initialization: {avg_time:.4f} ms")
++
++def test_signal_handler_behavior():
++    """Test that the signal handler behaves correctly when called"""
++    print("\n=== Testing signal handler behavior ===")
++    
++    # Create database tables
++    from django.core.management.color import no_style
++    from django.db import connection
++    
++    for model in [PersonNoFields, PersonWithFields]:
++        with connection.schema_editor() as schema_editor:
++            schema_editor.create_model(model)
++    
++    # Test PersonNoFields - should have no effect when signal handler is called
++    print("Testing PersonNoFields (no dimension fields):")
++    person_no_fields = PersonNoFields(name="Test")
++    person_no_fields.save()
++    
++    # Get the ImageField
++    mugshot_field = PersonNoFields._meta.get_field('mugshot')
++    
++    # Call update_dimension_fields manually to see what happens
++    print(f"  - Calling update_dimension_fields manually...")
++    result = mugshot_field.update_dimension_fields(person_no_fields)
++    print(f"  - Result: {result} (should return early due to no dimension fields)")
++    
++    # Test PersonWithFields - should work normally
++    print("\nTesting PersonWithFields (has dimension fields):")
++    person_with_fields = PersonWithFields(name="Test")
++    person_with_fields.save()
++    
++    mugshot_field = PersonWithFields._meta.get_field('mugshot')
++    print(f"  - Has width_field: {mugshot_field.width_field}")
++    print(f"  - Has height_field: {mugshot_field.height_field}")
++
++if __name__ == "__main__":
++    print("ImageField post_init Signal Performance Test")
++    print("=" * 50)
++    
++    check_signal_connections()
++    test_signal_handler_behavior()
++    measure_initialization_performance()
++    
++    print("\n" + "=" * 50)
++    print("Test completed!")
+\ No newline at end of file

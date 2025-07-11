@@ -1,0 +1,428 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..cad1694f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""Script to reproduce the binary payload issue."""
++
++import requests
++from requests.models import PreparedRequest
++
++def test_binary_payload_local():
++    """Test the issue with binary payload using local PreparedRequest."""
++    print("Testing binary payload issue locally...")
++    
++    try:
++        # Test the _encode_params method directly
++        req = PreparedRequest()
++        binary_data = u"ööö".encode("utf-8")
++        print(f"Binary data: {binary_data}")
++        print(f"Type: {type(binary_data)}")
++        
++        # This should fail in the current version
++        result = req._encode_params(binary_data)
++        print(f"SUCCESS: _encode_params returned: {result}")
++        print(f"Result type: {type(result)}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_binary_payload_remote():
++    """Test the issue with binary payload using actual HTTP request."""
++    print("\nTesting binary payload issue with HTTP request...")
++    
++    try:
++        # This should work but fails in 2.9
++        response = requests.put("http://httpbin.org/put", data=u"ööö".encode("utf-8"))
++        print("SUCCESS: Request completed successfully")
++        print(f"Status code: {response.status_code}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_string_payload():
++    """Test that string payloads still work."""
++    print("\nTesting string payload (should work)...")
++    
++    try:
++        req = PreparedRequest()
++        string_data = "test string"
++        result = req._encode_params(string_data)
++        print(f"SUCCESS: String _encode_params returned: {result}")
++        print(f"Result type: {type(result)}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++def test_dict_payload():
++    """Test that dict payloads still work."""
++    print("\nTesting dict payload (should work)...")
++    
++    try:
++        req = PreparedRequest()
++        dict_data = {"key": "value", "unicode": u"ööö"}
++        result = req._encode_params(dict_data)
++        print(f"SUCCESS: Dict _encode_params returned: {result}")
++        print(f"Result type: {type(result)}")
++        return True
++    except Exception as e:
++        print(f"ERROR: {type(e).__name__}: {e}")
++        import traceback
++        traceback.print_exc()
++        return False
++
++if __name__ == "__main__":
++    test_binary_payload_local()
++    test_string_payload()
++    test_dict_payload()
++    test_binary_payload_remote()
+\ No newline at end of file
+diff --git a/requests/models.py b/requests/models.py
+index 9c624d3c..157e2b54 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -80,7 +80,9 @@ class RequestEncodingMixin(object):
+         if parameters are supplied as a dict.
+         """
+ 
+-        if isinstance(data, (str, bytes)):
++        if isinstance(data, bytes):
++            return data
++        elif isinstance(data, str):
+             return to_native_string(data)
+         elif hasattr(data, 'read'):
+             return data
+diff --git a/test_binary_payload_fix.py b/test_binary_payload_fix.py
+new file mode 100644
+index 00000000..253efbd7
+--- /dev/null
++++ b/test_binary_payload_fix.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""Test for the binary payload fix (GitHub issue #2844)."""
++
++import pytest
++import requests
++from requests.models import PreparedRequest
++
++
++class TestBinaryPayloadFix:
++    """Test cases for binary payload handling."""
++    
++    def test_binary_data_encode_params(self):
++        """Test that _encode_params handles binary data correctly."""
++        req = PreparedRequest()
++        
++        # Test UTF-8 encoded binary data
++        binary_data = u"ööö".encode("utf-8")
++        result = req._encode_params(binary_data)
++        assert result == binary_data
++        assert isinstance(result, bytes)
++        
++        # Test other binary data
++        raw_bytes = b'\x00\x01\x02\x03\xff'
++        result = req._encode_params(raw_bytes)
++        assert result == raw_bytes
++        assert isinstance(result, bytes)
++        
++        # Test empty bytes
++        empty_bytes = b''
++        result = req._encode_params(empty_bytes)
++        assert result == empty_bytes
++        assert isinstance(result, bytes)
++    
++    def test_string_data_encode_params(self):
++        """Test that _encode_params still handles string data correctly."""
++        req = PreparedRequest()
++        
++        # Test ASCII string
++        string_data = "hello world"
++        result = req._encode_params(string_data)
++        assert result == string_data
++        assert isinstance(result, str)
++        
++        # Test Unicode string
++        unicode_data = u"ööö"
++        result = req._encode_params(unicode_data)
++        assert result == unicode_data
++        assert isinstance(result, str)
++    
++    def test_dict_data_encode_params(self):
++        """Test that _encode_params still handles dict data correctly."""
++        req = PreparedRequest()
++        
++        dict_data = {"key": "value", "unicode": u"ööö"}
++        result = req._encode_params(dict_data)
++        assert isinstance(result, str)
++        assert "key=value" in result
++        assert "unicode=" in result
++    
++    def test_binary_payload_http_request(self):
++        """Test that binary payloads work in actual HTTP requests."""
++        # This is the exact case from the GitHub issue
++        binary_data = u"ööö".encode("utf-8")
++        
++        # This should not raise an exception
++        response = requests.put("http://httpbin.org/put", data=binary_data)
++        assert response.status_code == 200
++        
++        # Test with POST as well
++        response = requests.post("http://httpbin.org/post", data=binary_data)
++        assert response.status_code == 200
++    
++    def test_various_binary_encodings(self):
++        """Test various binary encodings work correctly."""
++        test_cases = [
++            u"ööö".encode("utf-8"),
++            u"café".encode("latin-1"),
++            u"hello".encode("ascii"),
++            b'\x00\x01\x02\x03\xff',
++        ]
++        
++        for binary_data in test_cases:
++            response = requests.put("http://httpbin.org/put", data=binary_data)
++            assert response.status_code == 200
++
++
++if __name__ == "__main__":
++    # Run the tests
++    test_instance = TestBinaryPayloadFix()
++    
++    print("Running binary payload fix tests...")
++    
++    test_instance.test_binary_data_encode_params()
++    print("✓ test_binary_data_encode_params passed")
++    
++    test_instance.test_string_data_encode_params()
++    print("✓ test_string_data_encode_params passed")
++    
++    test_instance.test_dict_data_encode_params()
++    print("✓ test_dict_data_encode_params passed")
++    
++    test_instance.test_binary_payload_http_request()
++    print("✓ test_binary_payload_http_request passed")
++    
++    test_instance.test_various_binary_encodings()
++    print("✓ test_various_binary_encodings passed")
++    
++    print("\n🎉 All binary payload fix tests passed!")
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..d99a42c2
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""Test edge cases for the binary payload fix."""
++
++from requests.models import PreparedRequest
++
++def test_edge_cases():
++    """Test edge cases for _encode_params."""
++    req = PreparedRequest()
++    
++    # Test empty bytes
++    result = req._encode_params(b'')
++    assert result == b''
++    assert isinstance(result, bytes)
++    print("✓ Empty bytes")
++    
++    # Test bytes with null characters
++    result = req._encode_params(b'\x00\x01\x02')
++    assert result == b'\x00\x01\x02'
++    assert isinstance(result, bytes)
++    print("✓ Bytes with null characters")
++    
++    # Test large binary data
++    large_data = b'x' * 10000
++    result = req._encode_params(large_data)
++    assert result == large_data
++    assert isinstance(result, bytes)
++    print("✓ Large binary data")
++    
++    # Test empty string
++    result = req._encode_params('')
++    assert result == ''
++    assert isinstance(result, str)
++    print("✓ Empty string")
++    
++    # Test None (should pass through)
++    result = req._encode_params(None)
++    assert result is None
++    print("✓ None value")
++    
++    # Test file-like object
++    import io
++    file_obj = io.BytesIO(b'test')
++    result = req._encode_params(file_obj)
++    assert result is file_obj
++    print("✓ File-like object")
++    
++    # Test list (should be URL encoded)
++    result = req._encode_params([('key', 'value')])
++    assert isinstance(result, str)
++    assert 'key=value' in result
++    print("✓ List of tuples")
++    
++    print("\n🎉 All edge cases passed!")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_fix_comprehensive.py b/test_fix_comprehensive.py
+new file mode 100644
+index 00000000..ae5323d5
+--- /dev/null
++++ b/test_fix_comprehensive.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""Comprehensive test script for the binary payload fix."""
++
++import requests
++from requests.models import PreparedRequest
++
++def test_various_binary_data():
++    """Test various types of binary data."""
++    print("Testing various binary data types...")
++    
++    test_cases = [
++        ("UTF-8 encoded unicode", u"ööö".encode("utf-8")),
++        ("UTF-16 encoded unicode", u"ööö".encode("utf-16")),
++        ("Latin-1 encoded", u"café".encode("latin-1")),
++        ("Raw bytes", b'\x00\x01\x02\x03\xff'),
++        ("Empty bytes", b''),
++        ("ASCII bytes", b'hello world'),
++    ]
++    
++    req = PreparedRequest()
++    
++    for description, data in test_cases:
++        try:
++            result = req._encode_params(data)
++            print(f"✓ {description}: SUCCESS - returned {type(result)} with length {len(result)}")
++            assert result == data, f"Expected {data}, got {result}"
++        except Exception as e:
++            print(f"✗ {description}: FAILED - {type(e).__name__}: {e}")
++            return False
++    
++    return True
++
++def test_string_data():
++    """Test that string data still works correctly."""
++    print("\nTesting string data...")
++    
++    test_cases = [
++        ("ASCII string", "hello world"),
++        ("Unicode string", u"ööö"),
++        ("Empty string", ""),
++    ]
++    
++    req = PreparedRequest()
++    
++    for description, data in test_cases:
++        try:
++            result = req._encode_params(data)
++            print(f"✓ {description}: SUCCESS - returned {type(result)}: '{result}'")
++            assert isinstance(result, str), f"Expected str, got {type(result)}"
++        except Exception as e:
++            print(f"✗ {description}: FAILED - {type(e).__name__}: {e}")
++            return False
++    
++    return True
++
++def test_other_data_types():
++    """Test that other data types still work correctly."""
++    print("\nTesting other data types...")
++    
++    # Test dict
++    try:
++        req = PreparedRequest()
++        dict_data = {"key": "value", "unicode": u"ööö"}
++        result = req._encode_params(dict_data)
++        print(f"✓ Dict data: SUCCESS - returned {type(result)}: '{result}'")
++        assert isinstance(result, str), f"Expected str, got {type(result)}"
++        assert "key=value" in result and "unicode=" in result
++    except Exception as e:
++        print(f"✗ Dict data: FAILED - {type(e).__name__}: {e}")
++        return False
++    
++    # Test file-like object
++    try:
++        import io
++        req = PreparedRequest()
++        file_data = io.BytesIO(b"file content")
++        result = req._encode_params(file_data)
++        print(f"✓ File-like data: SUCCESS - returned {type(result)}")
++        assert result is file_data, "Expected same object to be returned"
++    except Exception as e:
++        print(f"✗ File-like data: FAILED - {type(e).__name__}: {e}")
++        return False
++    
++    # Test None
++    try:
++        req = PreparedRequest()
++        result = req._encode_params(None)
++        print(f"✓ None data: SUCCESS - returned {result}")
++        assert result is None
++    except Exception as e:
++        print(f"✗ None data: FAILED - {type(e).__name__}: {e}")
++        return False
++    
++    return True
++
++def test_http_requests():
++    """Test actual HTTP requests with binary data."""
++    print("\nTesting HTTP requests...")
++    
++    test_cases = [
++        ("PUT with UTF-8 binary", "put", u"ööö".encode("utf-8")),
++        ("POST with UTF-8 binary", "post", u"café".encode("utf-8")),
++        ("PUT with raw bytes", "put", b'\x00\x01\x02\x03'),
++        ("POST with empty bytes", "post", b''),
++    ]
++    
++    for description, method, data in test_cases:
++        try:
++            url = f"http://httpbin.org/{method}"
++            response = requests.request(method.upper(), url, data=data)
++            print(f"✓ {description}: SUCCESS - status {response.status_code}")
++            assert response.status_code == 200
++        except Exception as e:
++            print(f"✗ {description}: FAILED - {type(e).__name__}: {e}")
++            return False
++    
++    return True
++
++if __name__ == "__main__":
++    success = True
++    success &= test_various_binary_data()
++    success &= test_string_data()
++    success &= test_other_data_types()
++    success &= test_http_requests()
++    
++    if success:
++        print("\n🎉 All tests passed!")
++    else:
++        print("\n❌ Some tests failed!")
++        exit(1)
+\ No newline at end of file

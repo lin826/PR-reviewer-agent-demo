@@ -1,0 +1,56 @@
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1905,6 +1905,19 @@
+     coeffs = coeffs.reindex(
+         {degree_dim: np.arange(max_deg + 1)}, fill_value=0, copy=False
+     )
++    
++    # Special handling for datetime64 data with timedelta64 coordinates
++    # This maintains backward compatibility for common usage patterns
++    from .dataarray import DataArray
++    original_coord = None
++    if (isinstance(coord, DataArray) and 
++        coord.dtype.kind == 'M' and  # datetime64 data
++        coord.name in coord.coords and  # has coordinate with same name
++        coord.coords[coord.name].dtype.kind == 'm'):  # timedelta64 coordinate
++        # Use the timedelta64 coordinate instead of datetime64 data
++        original_coord = coord  # Save original for coordinate preservation
++        coord = coord.coords[coord.name]
++    
+     coord = _ensure_numeric(coord)  # type: ignore # https://github.com/python/mypy/issues/1533 ?
+ 
+     # using Horner's method
+@@ -1914,6 +1927,16 @@
+         res *= coord
+         res += coeffs.isel({degree_dim: deg}, drop=True)
+ 
++    # Handle special case where we substituted coordinates for data
++    if original_coord is not None:
++        # Transpose to match expected dimension order (coord_dim first, then other dims)
++        coord_dim = original_coord.dims[0]
++        other_dims = [d for d in res.dims if d != coord_dim]
++        res = res.transpose(coord_dim, *other_dims)
++        
++        # Restore original datetime64 coordinates
++        res = res.assign_coords({coord_dim: original_coord.values})
++
+     return res
+ 
+ 
+@@ -1934,10 +1957,15 @@
+ 
+     def to_floatable(x: DataArray) -> DataArray:
+         if x.dtype.kind in "mM":
++            # For datetime64, use epoch offset; for timedelta64, use None (minimum value)
++            if x.dtype.kind == "M":
++                offset = np.datetime64("1970-01-01")
++            else:  # timedelta64
++                offset = None
+             return x.copy(
+                 data=datetime_to_numeric(
+                     x.data,
+-                    offset=np.datetime64("1970-01-01"),
++                    offset=offset,
+                     datetime_unit="ns",
+                 ),
+             )

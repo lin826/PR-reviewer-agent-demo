@@ -1,0 +1,242 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..aad9887d64
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python
++
++"""
++Script to reproduce the evalf issue with implemented functions.
++"""
++
++from sympy.utilities.lambdify import implemented_function
++
++def test_issue():
++    print("Testing evalf with implemented functions...")
++    
++    # Create implemented functions
++    f = implemented_function('f', lambda x: x ** 2)
++    g = implemented_function('g', lambda x: 2 * x)
++    
++    print("f = implemented_function('f', lambda x: x ** 2)")
++    print("g = implemented_function('g', lambda x: 2 * x)")
++    print()
++    
++    # Test individual functions
++    print("Testing individual functions:")
++    result_f = f(2).evalf()
++    print(f"f(2).evalf() = {result_f}")
++    
++    result_g = g(2).evalf()
++    print(f"g(2).evalf() = {result_g}")
++    print()
++    
++    # Test nested function - this should fail
++    print("Testing nested function (this should show the bug):")
++    nested_expr = f(g(2))
++    print(f"f(g(2)) = {nested_expr}")
++    
++    result_nested = nested_expr.evalf()
++    print(f"f(g(2)).evalf() = {result_nested}")
++    print(f"Type of result: {type(result_nested)}")
++    
++    # Expected result should be f(g(2)) = f(4) = 16
++    print()
++    print("Expected: f(g(2)).evalf() should return 16.0000000000000")
++    print(f"Actual: {result_nested}")
++    
++    # Check if it's still symbolic
++    if str(result_nested) == "f(g(2))":
++        print("BUG CONFIRMED: Result is still symbolic, not evaluated!")
++        return False
++    else:
++        print("SUCCESS: Result was properly evaluated!")
++        return True
++
++if __name__ == "__main__":
++    test_issue()
+\ No newline at end of file
+diff --git a/sympy/core/function.py b/sympy/core/function.py
+index 1b8005e1d2..cd5cd38df5 100644
+--- a/sympy/core/function.py
++++ b/sympy/core/function.py
+@@ -507,7 +507,18 @@ def _eval_evalf(self, prec):
+             func = getattr(mpmath, fname)
+         except (AttributeError, KeyError):
+             try:
+-                return Float(self._imp_(*self.args), prec)
++                # Evaluate arguments first before passing to _imp_
++                evaluated_args = []
++                for arg in self.args:
++                    evaluated_arg = arg.evalf(prec)
++                    # If evalf returns the same object, the argument couldn't be evaluated
++                    if evaluated_arg is arg:
++                        # If any argument can't be evaluated, we can't proceed
++                        return
++                    evaluated_args.append(evaluated_arg)
++                
++                result = self._imp_(*evaluated_args)
++                return Float(result, prec)
+             except (AttributeError, TypeError, ValueError):
+                 return
+ 
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000000..a7ce04fa9d
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python
++
++"""
++Test edge cases for the evalf fix.
++"""
++
++from sympy.utilities.lambdify import implemented_function
++from sympy import symbols, Function
++
++def test_edge_cases():
++    print("Testing edge cases for evalf fix...")
++    
++    # Test 1: Basic nested functions (should work)
++    f = implemented_function('f', lambda x: x ** 2)
++    g = implemented_function('g', lambda x: 2 * x)
++    
++    result = f(g(2)).evalf()
++    print(f"Test 1 - f(g(2)).evalf() = {result}")
++    assert result == 16.0, f"Expected 16.0, got {result}"
++    
++    # Test 2: Triple nesting
++    h = implemented_function('h', lambda x: x + 1)
++    result = f(g(h(2))).evalf()  # f(g(h(2))) = f(g(3)) = f(6) = 36
++    print(f"Test 2 - f(g(h(2))).evalf() = {result}")
++    assert result == 36.0, f"Expected 36.0, got {result}"
++    
++    # Test 3: Multiple arguments
++    add_func = implemented_function('add_func', lambda x, y: x + y)
++    result = add_func(g(2), f(3)).evalf()  # add_func(4, 9) = 13
++    print(f"Test 3 - add_func(g(2), f(3)).evalf() = {result}")
++    assert result == 13.0, f"Expected 13.0, got {result}"
++    
++    # Test 4: Non-evaluable arguments (should return None or original expression)
++    x = symbols('x')
++    result = f(x).evalf()
++    print(f"Test 4 - f(x).evalf() = {result}")
++    # This should return the original expression since x can't be evaluated
++    assert str(result) == "f(x)", f"Expected f(x), got {result}"
++    
++    # Test 5: Mixed evaluable and non-evaluable (should return original)
++    result = add_func(g(2), x).evalf()
++    print(f"Test 5 - add_func(g(2), x).evalf() = {result}")
++    # This should return the original expression since x can't be evaluated
++    assert str(result) == "add_func(g(2), x)", f"Expected add_func(g(2), x), got {result}"
++    
++    # Test 6: Regular functions without _imp_ should still work
++    regular_func = Function('regular_func')
++    result = regular_func(2).evalf()
++    print(f"Test 6 - regular_func(2).evalf() = {result}")
++    # Should return the original since there's no _imp_
++    assert str(result) == "regular_func(2)", f"Expected regular_func(2), got {result}"
++    
++    print("All edge case tests passed!")
++
++if __name__ == "__main__":
++    test_edge_cases()
+\ No newline at end of file
+diff --git a/test_nested_implemented_functions.py b/test_nested_implemented_functions.py
+new file mode 100644
+index 0000000000..e65e996b2f
+--- /dev/null
++++ b/test_nested_implemented_functions.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python
++
++"""
++Test for nested implemented function evaluation.
++This test can be added to the test suite to prevent regression.
++"""
++
++def test_nested_implemented_function_evalf():
++    """Test that evalf works recursively with nested implemented functions."""
++    from sympy.utilities.lambdify import implemented_function
++    
++    # Create implemented functions
++    f = implemented_function('f', lambda x: x ** 2)
++    g = implemented_function('g', lambda x: 2 * x)
++    h = implemented_function('h', lambda x: x + 1)
++    
++    # Test basic nested evaluation
++    assert f(g(2)).evalf() == 16.0
++    
++    # Test triple nesting
++    assert f(g(h(2))).evalf() == 36.0  # f(g(h(2))) = f(g(3)) = f(6) = 36
++    
++    # Test multiple arguments with nesting
++    add_func = implemented_function('add_func', lambda x, y: x + y)
++    assert add_func(g(2), f(3)).evalf() == 13.0  # add_func(4, 9) = 13
++    
++    # Test precision handling
++    result_10 = f(g(2)).evalf(10)
++    result_50 = f(g(2)).evalf(50)
++    assert abs(float(result_10) - 16.0) < 1e-9
++    assert abs(float(result_50) - 16.0) < 1e-9
++    
++    # Test that non-evaluable arguments still work correctly
++    from sympy import symbols
++    x = symbols('x')
++    result = f(x).evalf()
++    assert str(result) == "f(x)"  # Should return original expression
++    
++    # Test mixed evaluable and non-evaluable arguments
++    result = add_func(g(2), x).evalf()
++    assert str(result) == "add_func(g(2), x)"  # Should return original expression
++    
++    print("All nested implemented function tests passed!")
++
++if __name__ == "__main__":
++    test_nested_implemented_function_evalf()
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 0000000000..e87cb50ee7
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python
++
++"""
++Test the exact example from the original issue description.
++"""
++
++from sympy.utilities.lambdify import implemented_function
++
++def test_original_issue():
++    """Test the exact example from the Stack Overflow question."""
++    
++    f = implemented_function('f', lambda x: x ** 2)
++    g = implemented_function('g', lambda x: 2 * x)
++    
++    # Test the exact examples from the issue
++    result1 = f(2).evalf()
++    print(f"f(2).evalf() = {result1}")
++    assert result1 == 4.0, f"Expected 4.0, got {result1}"
++    
++    result2 = g(2).evalf()
++    print(f"g(2).evalf() = {result2}")
++    assert result2 == 4.0, f"Expected 4.0, got {result2}"
++    
++    # This was the failing case in the original issue
++    result3 = f(g(2)).evalf()
++    print(f"f(g(2)).evalf() = {result3}")
++    
++    # Before the fix, this would return f(g(2)) (symbolic)
++    # After the fix, this should return 16.0000000000000 (numerical)
++    assert result3 == 16.0, f"Expected 16.0, got {result3}"
++    assert str(result3) != "f(g(2))", f"Result should be numerical, not symbolic: {result3}"
++    
++    print("Original issue test PASSED!")
++
++if __name__ == "__main__":
++    test_original_issue()
+\ No newline at end of file

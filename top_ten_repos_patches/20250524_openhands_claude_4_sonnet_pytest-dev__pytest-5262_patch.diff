@@ -1,0 +1,615 @@
+diff --git a/src/_pytest/capture.py b/src/_pytest/capture.py
+index 25eab7fdf..03c7b6a8b 100644
+--- a/src/_pytest/capture.py
++++ b/src/_pytest/capture.py
+@@ -447,6 +447,25 @@ class EncodedFile(object):
+         """Ensure that file.name is a string."""
+         return repr(self.buffer)
+ 
++    @property
++    def mode(self):
++        """Return the mode as a text mode, not the underlying buffer's binary mode."""
++        # Get the underlying buffer's mode
++        buffer_mode = getattr(self.buffer, "mode", None)
++        if buffer_mode is None:
++            # If no mode attribute, default to text write mode
++            return "w"
++        
++        # Convert binary mode to text mode by removing 'b'
++        # Examples: 'rb+' -> 'r+', 'wb' -> 'w', 'ab+' -> 'a+'
++        text_mode = buffer_mode.replace('b', '')
++        
++        # Ensure we have at least a basic mode
++        if not text_mode:
++            return "w"
++        
++        return text_mode
++
+     def __getattr__(self, name):
+         return getattr(object.__getattribute__(self, "buffer"), name)
+ 
+diff --git a/test_attribute_delegation.py b/test_attribute_delegation.py
+new file mode 100644
+index 000000000..5a682bc26
+--- /dev/null
++++ b/test_attribute_delegation.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python
++"""
++Test that attribute delegation still works correctly for non-mode attributes.
++"""
++
++import tempfile
++import os
++from src._pytest.capture import EncodedFile
++
++
++def test_attribute_delegation():
++    """Test that other attributes are still delegated to the buffer"""
++    
++    print("=== Testing attribute delegation ===")
++    
++    with tempfile.NamedTemporaryFile(mode='wb+', delete=False) as f:
++        temp_path = f.name
++        
++        # Create EncodedFile wrapper
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        
++        # Test that mode is overridden
++        print(f"File mode: {f.mode}")
++        print(f"EncodedFile mode: {encoded_file.mode}")
++        assert encoded_file.mode == 'r+', f"Expected 'r+', got {encoded_file.mode}"
++        
++        # Test that other attributes are delegated
++        print(f"File fileno: {f.fileno()}")
++        print(f"EncodedFile fileno: {encoded_file.fileno()}")
++        assert encoded_file.fileno() == f.fileno(), "fileno() should be delegated"
++        
++        # Test that name property works (it's explicitly defined)
++        print(f"EncodedFile name: {encoded_file.name}")
++        assert encoded_file.name == repr(f), "name should return repr of buffer"
++        
++        # Test that other file methods are delegated
++        try:
++            encoded_file.flush()
++            print("✓ flush() delegated successfully")
++        except Exception as e:
++            print(f"✗ flush() delegation failed: {e}")
++            raise
++        
++        # Test that we can access other attributes
++        try:
++            readable = encoded_file.readable()
++            print(f"✓ readable() delegated successfully: {readable}")
++        except Exception as e:
++            print(f"✗ readable() delegation failed: {e}")
++            raise
++        
++        # Clean up
++        os.unlink(temp_path)
++    
++    print("✓ All attribute delegation tests passed!")
++
++
++if __name__ == '__main__':
++    test_attribute_delegation()
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 000000000..121338999
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python
++"""
++Test edge cases for the EncodedFile mode fix.
++"""
++
++import sys
++import tempfile
++import io
++from src._pytest.capture import EncodedFile
++
++
++def test_various_modes():
++    """Test mode conversion for various binary modes"""
++    
++    test_cases = [
++        ('rb+', 'r+'),
++        ('wb+', 'w+'),
++        ('ab+', 'a+'),
++        ('rb', 'r'),
++        ('wb', 'w'),
++        ('ab', 'a'),
++        ('r+b', 'r+'),  # Different order
++        ('w+b', 'w+'),
++        ('a+b', 'a+'),
++    ]
++    
++    print("=== Testing mode conversions ===")
++    for binary_mode, expected_text_mode in test_cases:
++        # Create a mock buffer with the specified mode
++        class MockBuffer:
++            def __init__(self, mode):
++                self.mode = mode
++            def write(self, data):
++                pass
++        
++        buffer = MockBuffer(binary_mode)
++        encoded_file = EncodedFile(buffer, encoding='utf-8')
++        
++        actual_mode = encoded_file.mode
++        print(f"{binary_mode:>6} -> {actual_mode:<6} (expected: {expected_text_mode})")
++        
++        assert actual_mode == expected_text_mode, f"Expected {expected_text_mode}, got {actual_mode}"
++
++
++def test_no_mode_attribute():
++    """Test when underlying buffer has no mode attribute"""
++    
++    print("\n=== Testing buffer without mode attribute ===")
++    
++    # Create a buffer without mode attribute
++    buffer = io.BytesIO()
++    # BytesIO doesn't have a mode attribute
++    assert not hasattr(buffer, 'mode')
++    
++    encoded_file = EncodedFile(buffer, encoding='utf-8')
++    mode = encoded_file.mode
++    
++    print(f"Buffer without mode -> EncodedFile mode: {mode}")
++    assert mode == 'w', f"Expected 'w', got {mode}"
++
++
++def test_empty_mode():
++    """Test when mode is empty or just 'b'"""
++    
++    print("\n=== Testing edge case modes ===")
++    
++    class MockBuffer:
++        def __init__(self, mode):
++            self.mode = mode
++        def write(self, data):
++            pass
++    
++    # Test empty mode
++    buffer = MockBuffer('')
++    encoded_file = EncodedFile(buffer, encoding='utf-8')
++    mode = encoded_file.mode
++    print(f"Empty mode -> {mode}")
++    assert mode == 'w', f"Expected 'w', got {mode}"
++    
++    # Test just 'b'
++    buffer = MockBuffer('b')
++    encoded_file = EncodedFile(buffer, encoding='utf-8')
++    mode = encoded_file.mode
++    print(f"Mode 'b' -> {mode}")
++    assert mode == 'w', f"Expected 'w', got {mode}"
++
++
++def test_real_file_integration():
++    """Test with real temporary files"""
++    
++    print("\n=== Testing with real files ===")
++    
++    modes_to_test = ['rb+', 'wb+', 'ab+']
++    
++    for file_mode in modes_to_test:
++        with tempfile.NamedTemporaryFile(mode=file_mode) as f:
++            encoded_file = EncodedFile(f, encoding='utf-8')
++            
++            print(f"File mode {file_mode} -> EncodedFile mode {encoded_file.mode}")
++            
++            # Test that we can write strings
++            try:
++                encoded_file.write("test string\n")
++                print(f"  ✓ String write successful")
++            except Exception as e:
++                print(f"  ✗ String write failed: {e}")
++                raise
++            
++            # Test that bytes are rejected
++            try:
++                encoded_file.write(b"test bytes")
++                print(f"  ✗ Bytes write should have failed")
++                raise AssertionError("Bytes write should have failed")
++            except TypeError:
++                print(f"  ✓ Bytes write correctly rejected")
++
++
++if __name__ == '__main__':
++    test_various_modes()
++    test_no_mode_attribute()
++    test_empty_mode()
++    test_real_file_integration()
++    print("\n✓ All edge case tests passed!")
+\ No newline at end of file
+diff --git a/test_exact_issue.py b/test_exact_issue.py
+new file mode 100644
+index 000000000..39504d7c4
+--- /dev/null
++++ b/test_exact_issue.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python
++"""
++Test that exactly reproduces the scenario from the GitHub issue.
++
++The issue was:
++- youtube-dl looks for 'b' in out.mode to decide whether to write bytes or str
++- _pytest.capture.EncodedFile incorrectly advertises 'rb+' (the mode of underlying stream)
++- Its write() method raises exception when passed bytes
++"""
++
++import tempfile
++from src._pytest.capture import EncodedFile
++
++
++def youtube_dl_write_logic(out, message):
++    """
++    Exact logic from youtube-dl that was failing.
++    From youtube_dl/utils.py write_string function.
++    """
++    # This is the exact check youtube-dl does
++    if 'b' in getattr(out, 'mode', ''):
++        # youtube-dl tries to write bytes when it sees 'b' in mode
++        byt = message.encode('utf-8', 'replace')
++        out.write(byt)  # This was causing the TypeError
++    else:
++        # youtube-dl writes string when no 'b' in mode
++        out.write(message)
++
++
++def test_exact_github_issue():
++    """Test the exact scenario from the GitHub issue"""
++    
++    print("=== Reproducing exact GitHub issue scenario ===")
++    
++    # Create the same setup that causes the issue
++    with tempfile.NamedTemporaryFile(mode='rb+') as f:
++        # This is what pytest does internally - creates EncodedFile wrapper
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        
++        print(f"Underlying file mode: {f.mode}")
++        print(f"EncodedFile mode (what youtube-dl sees): {encoded_file.mode}")
++        
++        # The message from the original error
++        message = "[generic] example: Requesting header\n"
++        
++        print(f"youtube-dl checks if 'b' in mode: {'b' in encoded_file.mode}")
++        
++        try:
++            # This is exactly what youtube-dl does
++            youtube_dl_write_logic(encoded_file, message)
++            print("✓ SUCCESS: No TypeError! youtube-dl logic works now.")
++            return True
++        except TypeError as e:
++            print(f"✗ FAILED: Still getting TypeError: {e}")
++            return False
++
++
++def test_before_fix_simulation():
++    """Simulate what would happen before the fix"""
++    
++    print("\n=== Simulating behavior before fix ===")
++    
++    with tempfile.NamedTemporaryFile(mode='rb+') as f:
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        
++        # Simulate the old behavior where mode was 'rb+'
++        old_mode = f.mode  # This would be 'rb+'
++        print(f"Before fix, EncodedFile.mode would be: {old_mode}")
++        print(f"youtube-dl would see 'b' in mode: {'b' in old_mode}")
++        
++        if 'b' in old_mode:
++            print("youtube-dl would try to write bytes, causing TypeError")
++            try:
++                encoded_file.write(b"test bytes")
++                print("✗ This should have failed")
++                return False
++            except TypeError as e:
++                print(f"✓ Confirmed: bytes write fails with: {e}")
++                return True
++
++
++if __name__ == '__main__':
++    issue_fixed = test_exact_github_issue()
++    old_behavior_confirmed = test_before_fix_simulation()
++    
++    print(f"\nResults:")
++    print(f"GitHub issue fixed: {issue_fixed}")
++    print(f"Old behavior confirmed: {old_behavior_confirmed}")
++    
++    if issue_fixed and old_behavior_confirmed:
++        print("\n✓ Perfect! The exact GitHub issue has been resolved.")
++        print("  - EncodedFile.mode no longer includes 'b'")
++        print("  - youtube-dl now writes strings instead of bytes")
++        print("  - No more TypeError!")
++    else:
++        print("\n✗ Something is still wrong.")
+\ No newline at end of file
+diff --git a/test_original_issue.py b/test_original_issue.py
+new file mode 100644
+index 000000000..62db42db0
+--- /dev/null
++++ b/test_original_issue.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python
++"""
++Test that reproduces the original issue from the bug report.
++
++This simulates what happens when youtube-dl tries to write to pytest's captured output.
++"""
++
++import tempfile
++from src._pytest.capture import EncodedFile
++
++
++def simulate_youtube_dl_write_string(out, message, encoding='utf-8'):
++    """
++    Simulate youtube-dl's write_string function from utils.py
++    
++    This is the actual logic that was failing:
++    https://github.com/ytdl-org/youtube-dl/blob/master/youtube_dl/utils.py#L1496
++    """
++    
++    # youtube-dl checks the mode to decide whether to write bytes or str
++    if 'b' in getattr(out, 'mode', ''):
++        # If mode contains 'b', youtube-dl writes bytes
++        byt = message.encode(encoding, 'replace')
++        out.write(byt)
++    else:
++        # If mode doesn't contain 'b', youtube-dl writes str
++        out.write(message)
++
++
++def test_original_issue_fixed():
++    """Test that the original issue is now fixed"""
++    
++    print("=== Testing original youtube-dl issue ===")
++    
++    # Create the same setup that pytest uses internally
++    with tempfile.NamedTemporaryFile(mode='wb+') as f:
++        # This is what pytest does - wraps a binary file with EncodedFile
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        
++        print(f"Underlying file mode: {f.mode}")
++        print(f"EncodedFile mode: {encoded_file.mode}")
++        
++        # This is what youtube-dl does
++        test_message = "[generic] example: Requesting header\n"
++        
++        try:
++            simulate_youtube_dl_write_string(encoded_file, test_message)
++            print("✓ SUCCESS: youtube-dl write_string worked!")
++            return True
++        except TypeError as e:
++            print(f"✗ FAILED: {e}")
++            return False
++
++
++def test_bytes_still_rejected():
++    """Test that EncodedFile still correctly rejects bytes"""
++    
++    print("\n=== Testing that bytes are still rejected ===")
++    
++    with tempfile.NamedTemporaryFile(mode='wb+') as f:
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        
++        try:
++            encoded_file.write(b"test bytes")
++            print("✗ FAILED: bytes write should have been rejected")
++            return False
++        except TypeError as e:
++            print(f"✓ SUCCESS: bytes correctly rejected - {e}")
++            return True
++
++
++def test_string_writes_work():
++    """Test that string writes still work correctly"""
++    
++    print("\n=== Testing that string writes still work ===")
++    
++    with tempfile.NamedTemporaryFile(mode='wb+') as f:
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        
++        try:
++            encoded_file.write("test string\n")
++            print("✓ SUCCESS: string write worked")
++            return True
++        except Exception as e:
++            print(f"✗ FAILED: string write failed - {e}")
++            return False
++
++
++if __name__ == '__main__':
++    issue_fixed = test_original_issue_fixed()
++    bytes_rejected = test_bytes_still_rejected()
++    strings_work = test_string_writes_work()
++    
++    print(f"\nResults:")
++    print(f"Original issue fixed: {issue_fixed}")
++    print(f"Bytes still rejected: {bytes_rejected}")
++    print(f"Strings still work: {strings_work}")
++    
++    if issue_fixed and bytes_rejected and strings_work:
++        print("\n✓ All tests passed! The fix is working correctly.")
++    else:
++        print("\n✗ Some tests failed!")
+\ No newline at end of file
+diff --git a/test_reproduction.py b/test_reproduction.py
+new file mode 100644
+index 000000000..bf027d617
+--- /dev/null
++++ b/test_reproduction.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python
++"""
++Reproduction script for the EncodedFile mode issue.
++
++This script reproduces the issue where EncodedFile.mode incorrectly includes 'b' (binary),
++causing external libraries like youtube-dl to write bytes instead of strings.
++"""
++
++import sys
++import io
++from src._pytest.capture import EncodedFile
++
++
++def test_encoded_file_mode_issue():
++    """Test that demonstrates the issue with EncodedFile.mode"""
++    
++    # Create a binary buffer (like what pytest uses internally)
++    binary_buffer = io.BytesIO()
++    
++    # The binary buffer has mode 'rb+' or similar
++    print(f"Binary buffer mode: {getattr(binary_buffer, 'mode', 'no mode attr')}")
++    
++    # Create an EncodedFile wrapper (this is what pytest does)
++    encoded_file = EncodedFile(binary_buffer, encoding='utf-8')
++    
++    # The issue: EncodedFile.mode returns the binary buffer's mode
++    print(f"EncodedFile mode: {getattr(encoded_file, 'mode', 'no mode attr')}")
++    
++    # This is what youtube-dl does: check for 'b' in mode
++    mode = getattr(encoded_file, 'mode', '')
++    has_binary_flag = 'b' in mode
++    print(f"Mode contains 'b': {has_binary_flag}")
++    
++    if has_binary_flag:
++        print("youtube-dl would try to write bytes...")
++        try:
++            # This is what youtube-dl tries to do when it sees 'b' in mode
++            encoded_file.write(b'test bytes')
++            print("ERROR: bytes write succeeded (should have failed)")
++        except TypeError as e:
++            print(f"EXPECTED ERROR: {e}")
++    else:
++        print("youtube-dl would write strings...")
++        try:
++            encoded_file.write('test string')
++            print("String write succeeded")
++        except Exception as e:
++            print(f"Unexpected error: {e}")
++
++
++def test_with_real_file():
++    """Test with a real file to see the mode behavior"""
++    import tempfile
++    import os
++    
++    # Create a temporary file
++    with tempfile.NamedTemporaryFile(mode='wb+', delete=False) as f:
++        temp_path = f.name
++        print(f"Real file mode: {f.mode}")
++        
++        # Create EncodedFile wrapper
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        print(f"EncodedFile mode: {getattr(encoded_file, 'mode', 'no mode attr')}")
++        
++        # Clean up
++        os.unlink(temp_path)
++
++
++if __name__ == '__main__':
++    print("=== Testing EncodedFile mode issue ===")
++    test_encoded_file_mode_issue()
++    print("\n=== Testing with real file ===")
++    test_with_real_file()
+\ No newline at end of file
+diff --git a/test_youtube_dl_scenario.py b/test_youtube_dl_scenario.py
+new file mode 100644
+index 000000000..aac74acd7
+--- /dev/null
++++ b/test_youtube_dl_scenario.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python
++"""
++Test script that reproduces the exact youtube-dl scenario.
++"""
++
++import sys
++import tempfile
++import os
++from src._pytest.capture import EncodedFile
++
++
++def simulate_youtube_dl_behavior(out_file):
++    """Simulate what youtube-dl does when writing to output"""
++    
++    # This is similar to what youtube-dl does in utils.py write_string function
++    mode = getattr(out_file, 'mode', '')
++    print(f"Output file mode: {mode}")
++    
++    # youtube-dl checks for 'b' in mode to decide whether to write bytes or str
++    if 'b' in mode:
++        print("youtube-dl detected binary mode, will write bytes")
++        # This is what causes the error
++        message = "test message\n"
++        byt = message.encode('utf-8')
++        try:
++            out_file.write(byt)  # This should fail with EncodedFile
++            print("SUCCESS: bytes written")
++        except TypeError as e:
++            print(f"ERROR: {e}")
++            return False
++    else:
++        print("youtube-dl detected text mode, will write string")
++        try:
++            out_file.write("test message\n")
++            print("SUCCESS: string written")
++        except Exception as e:
++            print(f"ERROR: {e}")
++            return False
++    
++    return True
++
++
++def test_current_behavior():
++    """Test the current problematic behavior"""
++    print("=== Testing current EncodedFile behavior ===")
++    
++    # Create a file with binary mode (like pytest does internally)
++    with tempfile.NamedTemporaryFile(mode='wb+') as f:
++        print(f"Underlying file mode: {f.mode}")
++        
++        # Create EncodedFile wrapper
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        
++        # Test the behavior
++        success = simulate_youtube_dl_behavior(encoded_file)
++        print(f"Test passed: {success}")
++        return success
++
++
++def test_fixed_behavior():
++    """Test the behavior after the fix"""
++    print("\n=== Testing fixed behavior ===")
++    
++    # Create a file with binary mode
++    with tempfile.NamedTemporaryFile(mode='wb+') as f:
++        print(f"Underlying file mode: {f.mode}")
++        
++        # Create EncodedFile wrapper
++        encoded_file = EncodedFile(f, encoding='utf-8')
++        
++        # The fix should make mode return text mode
++        print(f"EncodedFile mode after fix: {encoded_file.mode}")
++        
++        # Test the behavior
++        success = simulate_youtube_dl_behavior(encoded_file)
++        print(f"Test passed: {success}")
++        return success
++
++
++if __name__ == '__main__':
++    current_works = test_current_behavior()
++    fixed_works = test_fixed_behavior()
++    
++    print(f"\nFixed behavior works: {current_works}")
++    print(f"Additional test works: {fixed_works}")
++    
++    if current_works and fixed_works:
++        print("✓ Fix successful - both tests pass")
++    else:
++        print("✗ Fix failed")
+\ No newline at end of file

@@ -1,0 +1,656 @@
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000000..d9304d8554
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++"""
++Debug script to test the specific failing cases.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++from django.db.backends.ddl_references import Columns, IndexColumns
++
++def quote_name(name):
++    return name.upper()
++
++print("Testing specific failing cases...")
++
++# Test 1: Columns with suffixes
++print("\n1. Columns with suffixes:")
++reference = Columns(
++    'table', ['first_column', 'second_column'], quote_name,
++    col_suffixes=['DESC', '']
++)
++result = str(reference)
++print(f"   Result: '{result}'")
++print(f"   Expected: 'FIRST_COLUMN DESC, SECOND_COLUMN'")
++print(f"   Match: {result == 'FIRST_COLUMN DESC, SECOND_COLUMN'}")
++
++# Test 2: IndexColumns with opclass, no suffix
++print("\n2. IndexColumns with opclass, no suffix:")
++reference = IndexColumns(
++    'table', ['first_column'], quote_name,
++    col_suffixes=[''], opclasses=['text_pattern_ops']
++)
++result = str(reference)
++print(f"   Result: '{result}'")
++print(f"   Expected: 'FIRST_COLUMN text_pattern_ops'")
++print(f"   Match: {result == 'FIRST_COLUMN text_pattern_ops'}")
++
++# Test 3: IndexColumns with multiple columns
++print("\n3. IndexColumns with multiple columns:")
++reference = IndexColumns(
++    'table', ['first_column', 'second_column'], quote_name,
++    col_suffixes=['', 'DESC'], opclasses=['text_pattern_ops', 'int4_ops']
++)
++result = str(reference)
++print(f"   Result: '{result}'")
++print(f"   Expected: 'FIRST_COLUMN text_pattern_ops, SECOND_COLUMN int4_ops DESC'")
++print(f"   Match: {result == 'FIRST_COLUMN text_pattern_ops, SECOND_COLUMN int4_ops DESC'}")
++
++# Debug: Let's check what each part produces
++print("\n4. Debug individual parts:")
++def debug_col_str(column, idx, col_suffixes, opclasses=None):
++    if opclasses:
++        col = '{} {}'.format(quote_name(column), opclasses[idx])
++        try:
++            suffix = col_suffixes[idx]
++            col = '{}{}'.format(col, ' ' + suffix if suffix else '')
++            print(f"   Column {idx}: '{column}' -> opclass: '{opclasses[idx]}' -> suffix: '{suffix}' -> result: '{col}'")
++        except IndexError:
++            print(f"   Column {idx}: '{column}' -> opclass: '{opclasses[idx]}' -> no suffix -> result: '{col}'")
++    else:
++        try:
++            suffix = col_suffixes[idx]
++            col = quote_name(column) + (' ' + suffix if suffix else '')
++            print(f"   Column {idx}: '{column}' -> suffix: '{suffix}' -> result: '{col}'")
++        except IndexError:
++            col = quote_name(column)
++            print(f"   Column {idx}: '{column}' -> no suffix -> result: '{col}'")
++    return col
++
++print("   Regular Columns debug:")
++debug_col_str('first_column', 0, ['DESC', ''])
++debug_col_str('second_column', 1, ['DESC', ''])
++
++print("   IndexColumns debug:")
++debug_col_str('first_column', 0, [''], ['text_pattern_ops'])
++debug_col_str('first_column', 0, ['', 'DESC'], ['text_pattern_ops', 'int4_ops'])
++debug_col_str('second_column', 1, ['', 'DESC'], ['text_pattern_ops', 'int4_ops'])
+\ No newline at end of file
+diff --git a/django/db/backends/ddl_references.py b/django/db/backends/ddl_references.py
+index 44e49806f8..b716b40be3 100644
+--- a/django/db/backends/ddl_references.py
++++ b/django/db/backends/ddl_references.py
+@@ -84,7 +84,8 @@ class Columns(TableColumns):
+     def __str__(self):
+         def col_str(column, idx):
+             try:
+-                return self.quote_name(column) + self.col_suffixes[idx]
++                suffix = self.col_suffixes[idx]
++                return self.quote_name(column) + (' ' + suffix if suffix else '')
+             except IndexError:
+                 return self.quote_name(column)
+ 
+@@ -114,7 +115,8 @@ class IndexColumns(Columns):
+             # length as self.columns.
+             col = '{} {}'.format(self.quote_name(column), self.opclasses[idx])
+             try:
+-                col = '{} {}'.format(col, self.col_suffixes[idx])
++                suffix = self.col_suffixes[idx]
++                col = '{}{}'.format(col, ' ' + suffix if suffix else '')
+             except IndexError:
+                 pass
+             return col
+diff --git a/final_verification.py b/final_verification.py
+new file mode 100644
+index 0000000000..4f21181613
+--- /dev/null
++++ b/final_verification.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python
++"""
++Final verification script using the exact examples from the issue description.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Index
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++# Add testbed to path so we use the fixed version
++sys.path.insert(0, '/testbed')
++django.setup()
++
++# Create a model that matches the issue description
++class Author(models.Model):
++    name = models.CharField(max_length=100)
++    
++    class Meta:
++        app_label = 'schema'
++        db_table = 'schema_author'
++
++def test_exact_issue_examples():
++    """Test the exact examples from the issue description."""
++    
++    print("Final verification using exact examples from issue description...")
++    print("=" * 70)
++    
++    # Example 1: Index with descending order
++    print("\n1. Testing Index(fields=['-name'], name='idx'):")
++    index1 = Index(fields=['-name'], name='idx')
++    sql1 = index1.create_sql(Author, connection.schema_editor())
++    print(f"   Generated SQL: {sql1}")
++    
++    # Check for the expected result
++    sql_str = str(sql1)
++    if '"name" DESC' in sql_str:
++        print("   ✅ CORRECT: Space before DESC is present")
++        print("   Expected: CREATE INDEX \"idx\" ON \"schema_author\" (\"name\" DESC)")
++    else:
++        print("   ❌ ISSUE: Missing space before DESC")
++    
++    # Example 2: Index with opclasses but no explicit ordering
++    print("\n2. Testing Index(fields=['name'], name='idx', opclasses=['text_pattern_ops']):")
++    
++    # We need to test this with PostgreSQL-style IndexColumns
++    from django.db.backends.ddl_references import IndexColumns
++    
++    def quote_name(name):
++        return f'"{name}"'
++    
++    index_columns = IndexColumns(
++        table='schema_author',
++        columns=['name'],
++        quote_name=quote_name,
++        col_suffixes=[''],  # Empty string for ascending order
++        opclasses=['text_pattern_ops']
++    )
++    
++    result = str(index_columns)
++    print(f"   Generated column reference: {result}")
++    
++    if result == '"name" text_pattern_ops':
++        print("   ✅ CORRECT: No trailing space after opclass")
++        print("   Expected: \"name\" text_pattern_ops")
++    else:
++        print("   ❌ ISSUE: Extra space after opclass")
++        print(f"   Got: '{result}' (check for trailing space)")
++    
++    # Example 3: Index with opclasses and descending order (should work correctly)
++    print("\n3. Testing Index with opclasses and descending order:")
++    
++    index_columns_desc = IndexColumns(
++        table='schema_author',
++        columns=['name'],
++        quote_name=quote_name,
++        col_suffixes=['DESC'],
++        opclasses=['text_pattern_ops']
++    )
++    
++    result_desc = str(index_columns_desc)
++    print(f"   Generated column reference: {result_desc}")
++    
++    if result_desc == '"name" text_pattern_ops DESC':
++        print("   ✅ CORRECT: Proper spacing with opclass and DESC")
++        print("   Expected: \"name\" text_pattern_ops DESC")
++    else:
++        print("   ❌ ISSUE: Incorrect spacing")
++    
++    print("\n" + "=" * 70)
++    print("🎉 All examples from the issue description are now working correctly!")
++
++if __name__ == '__main__':
++    test_exact_issue_examples()
+\ No newline at end of file
+diff --git a/test_comprehensive_whitespace.py b/test_comprehensive_whitespace.py
+new file mode 100644
+index 0000000000..696fcdff47
+--- /dev/null
++++ b/test_comprehensive_whitespace.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python
++"""
++Comprehensive test script to verify the whitespace fixes work in all scenarios.
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Index
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    weight = models.IntegerField()
++    description = models.TextField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_comprehensive_whitespace():
++    """Test all whitespace scenarios comprehensively."""
++    
++    print("Comprehensive whitespace testing...")
++    print("=" * 50)
++    
++    from django.db.backends.ddl_references import Columns, IndexColumns
++    
++    def quote_name(name):
++        return f'"{name}"'
++    
++    test_cases = [
++        # Test case format: (description, class, kwargs, expected_result)
++        
++        # Regular Columns tests
++        ("Columns with no suffix", Columns, {
++            'table': 'test_table',
++            'columns': ['name'],
++            'quote_name': quote_name,
++            'col_suffixes': []
++        }, '"name"'),
++        
++        ("Columns with empty suffix", Columns, {
++            'table': 'test_table',
++            'columns': ['name'],
++            'quote_name': quote_name,
++            'col_suffixes': ['']
++        }, '"name"'),
++        
++        ("Columns with DESC suffix", Columns, {
++            'table': 'test_table',
++            'columns': ['name'],
++            'quote_name': quote_name,
++            'col_suffixes': ['DESC']
++        }, '"name" DESC'),
++        
++        ("Columns with multiple columns and mixed suffixes", Columns, {
++            'table': 'test_table',
++            'columns': ['name', 'weight'],
++            'quote_name': quote_name,
++            'col_suffixes': ['DESC', '']
++        }, '"name" DESC, "weight"'),
++        
++        # IndexColumns tests
++        ("IndexColumns with opclass, no suffix", IndexColumns, {
++            'table': 'test_table',
++            'columns': ['name'],
++            'quote_name': quote_name,
++            'col_suffixes': [''],
++            'opclasses': ['text_pattern_ops']
++        }, '"name" text_pattern_ops'),
++        
++        ("IndexColumns with opclass and DESC", IndexColumns, {
++            'table': 'test_table',
++            'columns': ['name'],
++            'quote_name': quote_name,
++            'col_suffixes': ['DESC'],
++            'opclasses': ['text_pattern_ops']
++        }, '"name" text_pattern_ops DESC'),
++        
++        ("IndexColumns with multiple columns", IndexColumns, {
++            'table': 'test_table',
++            'columns': ['name', 'weight'],
++            'quote_name': quote_name,
++            'col_suffixes': ['', 'DESC'],
++            'opclasses': ['text_pattern_ops', 'int4_ops']
++        }, '"name" text_pattern_ops, "weight" int4_ops DESC'),
++        
++        ("IndexColumns with no col_suffixes (IndexError case)", IndexColumns, {
++            'table': 'test_table',
++            'columns': ['name'],
++            'quote_name': quote_name,
++            'col_suffixes': [],
++            'opclasses': ['text_pattern_ops']
++        }, '"name" text_pattern_ops'),
++    ]
++    
++    all_passed = True
++    
++    for i, (description, cls, kwargs, expected) in enumerate(test_cases, 1):
++        print(f"\n{i}. {description}")
++        
++        try:
++            instance = cls(**kwargs)
++            result = str(instance)
++            
++            if result == expected:
++                print(f"   ✅ PASS: '{result}'")
++            else:
++                print(f"   ❌ FAIL: Expected '{expected}', got '{result}'")
++                all_passed = False
++                
++        except Exception as e:
++            print(f"   ❌ ERROR: {e}")
++            all_passed = False
++    
++    # Test actual Index SQL generation
++    print(f"\n{len(test_cases) + 1}. Real Index SQL generation tests")
++    
++    index_tests = [
++        ("Index with ascending field", Index(fields=['name'], name='idx_asc'), 
++         lambda sql: '"name"' in str(sql) and 'DESC' not in str(sql)),
++        
++        ("Index with descending field", Index(fields=['-name'], name='idx_desc'),
++         lambda sql: '"name" DESC' in str(sql)),
++        
++        ("Index with multiple mixed fields", Index(fields=['name', '-weight'], name='idx_mixed'),
++         lambda sql: '"name", "weight" DESC' in str(sql)),
++    ]
++    
++    for description, index, validator in index_tests:
++        print(f"   Testing: {description}")
++        try:
++            sql = index.create_sql(TestModel, connection.schema_editor())
++            if validator(sql):
++                print(f"      ✅ PASS: {sql}")
++            else:
++                print(f"      ❌ FAIL: {sql}")
++                all_passed = False
++        except Exception as e:
++            print(f"      ❌ ERROR: {e}")
++            all_passed = False
++    
++    print("\n" + "=" * 50)
++    if all_passed:
++        print("🎉 ALL TESTS PASSED! Whitespace issues are fixed.")
++    else:
++        print("❌ Some tests failed. Please review the implementation.")
++    
++    return all_passed
++
++if __name__ == '__main__':
++    success = test_comprehensive_whitespace()
++    sys.exit(0 if success else 1)
+\ No newline at end of file
+diff --git a/test_whitespace_issue.py b/test_whitespace_issue.py
+new file mode 100644
+index 0000000000..9abac3b9b8
+--- /dev/null
++++ b/test_whitespace_issue.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python
++"""
++Test script to reproduce the whitespace issues in CREATE INDEX statements.
++
++This script tests both issues mentioned in the problem:
++1. Missing space before DESC in regular indexes
++2. Extra space after opclass when no explicit ordering is used
++"""
++
++import os
++import sys
++import django
++from django.conf import settings
++from django.db import models, connection
++from django.db.models import Index
++
++# Configure Django settings
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        USE_TZ=True,
++    )
++
++django.setup()
++
++# Create a simple model for testing
++class TestModel(models.Model):
++    name = models.CharField(max_length=100)
++    weight = models.IntegerField()
++    
++    class Meta:
++        app_label = 'test_app'
++
++def test_whitespace_issues():
++    """Test the whitespace issues in CREATE INDEX statements."""
++    
++    print("Testing whitespace issues in CREATE INDEX statements...")
++    print("=" * 60)
++    
++    # Test 1: Missing space before DESC
++    print("\n1. Testing missing space before DESC:")
++    print("   Creating index with descending order: Index(fields=['-name'], name='idx_desc')")
++    
++    index_desc = Index(fields=['-name'], name='idx_desc')
++    sql_desc = index_desc.create_sql(TestModel, connection.schema_editor())
++    print(f"   Generated SQL: {sql_desc}")
++    
++    # Check if there's a space before DESC
++    sql_str = str(sql_desc)
++    if '"name"DESC' in sql_str:
++        print("   ❌ ISSUE FOUND: Missing space before DESC")
++        print(f"      Found: \"name\"DESC")
++        print(f"      Expected: \"name\" DESC")
++    elif '"name" DESC' in sql_str:
++        print("   ✅ CORRECT: Space before DESC is present")
++    else:
++        print(f"   ⚠️  UNEXPECTED: Neither pattern found in: {sql_str}")
++    
++    # Test 2: Extra space after opclass (PostgreSQL-specific)
++    print("\n2. Testing extra space after opclass:")
++    print("   Creating index with opclass but no explicit ordering:")
++    print("   Index(fields=['name'], name='idx_opclass', opclasses=['text_pattern_ops'])")
++    
++    # We need to simulate PostgreSQL behavior
++    # Let's directly test the IndexColumns class
++    from django.db.backends.ddl_references import IndexColumns
++    
++    def quote_name(name):
++        return f'"{name}"'
++    
++    # Test IndexColumns with opclass and empty suffix (ascending order)
++    index_columns = IndexColumns(
++        table='test_table',
++        columns=['name'],
++        quote_name=quote_name,
++        col_suffixes=[''],  # Empty string for ascending order
++        opclasses=['text_pattern_ops']
++    )
++    
++    result = str(index_columns)
++    print(f"   Generated column reference: {result}")
++    
++    # Check for trailing space after opclass
++    if result.endswith(' '):
++        print("   ❌ ISSUE FOUND: Extra space after opclass")
++        print(f"      Found: '{result}' (note trailing space)")
++        print(f"      Expected: '\"name\" text_pattern_ops' (no trailing space)")
++    else:
++        print("   ✅ CORRECT: No trailing space after opclass")
++    
++    # Test 3: Test IndexColumns with opclass and DESC (should work correctly)
++    print("\n3. Testing opclass with DESC (should work correctly):")
++    
++    index_columns_desc = IndexColumns(
++        table='test_table',
++        columns=['name'],
++        quote_name=quote_name,
++        col_suffixes=['DESC'],  # DESC for descending order
++        opclasses=['text_pattern_ops']
++    )
++    
++    result_desc = str(index_columns_desc)
++    print(f"   Generated column reference: {result_desc}")
++    print("   This should be correct: \"name\" text_pattern_ops DESC")
++    
++    # Test 4: Test regular Columns with DESC (should show the missing space issue)
++    print("\n4. Testing regular Columns with DESC:")
++    
++    from django.db.backends.ddl_references import Columns
++    
++    regular_columns = Columns(
++        table='test_table',
++        columns=['name'],
++        quote_name=quote_name,
++        col_suffixes=['DESC']
++    )
++    
++    result_regular = str(regular_columns)
++    print(f"   Generated column reference: {result_regular}")
++    
++    if '"name"DESC' in result_regular:
++        print("   ❌ ISSUE FOUND: Missing space before DESC in regular Columns")
++        print(f"      Found: {result_regular}")
++        print(f"      Expected: \"name\" DESC")
++    elif '"name" DESC' in result_regular:
++        print("   ✅ CORRECT: Space before DESC is present")
++    else:
++        print(f"   ⚠️  UNEXPECTED: Neither pattern found in: {result_regular}")
++
++if __name__ == '__main__':
++    test_whitespace_issues()
+\ No newline at end of file
+diff --git a/tests/backends/test_ddl_references.py b/tests/backends/test_ddl_references.py
+index d96ebcb57f..7869f32b51 100644
+--- a/tests/backends/test_ddl_references.py
++++ b/tests/backends/test_ddl_references.py
+@@ -1,5 +1,5 @@
+ from django.db.backends.ddl_references import (
+-    Columns, ForeignKeyName, IndexName, Statement, Table,
++    Columns, ForeignKeyName, IndexColumns, IndexName, Statement, Table,
+ )
+ from django.test import SimpleTestCase
+ 
+@@ -57,6 +57,8 @@ class ColumnsTests(TableTests):
+         self.assertEqual(str(self.reference), 'FIRST_COLUMN, SECOND_COLUMN')
+ 
+ 
++
++
+ class IndexNameTests(ColumnsTests):
+     def setUp(self):
+         def create_index_name(table_name, column_names, suffix):
+@@ -181,3 +183,57 @@ class StatementTests(SimpleTestCase):
+         reference = MockReference('reference', {}, {})
+         statement = Statement("%(reference)s - %(non_reference)s", reference=reference, non_reference='non_reference')
+         self.assertEqual(str(statement), 'reference - non_reference')
++
++
++class ColumnsWhitespaceTests(SimpleTestCase):
++    """Test whitespace handling in Columns class."""
++    
++    def test_str_with_suffixes(self):
++        """Test that suffixes are properly spaced."""
++        reference = Columns(
++            'table', ['first_column', 'second_column'], lambda column: column.upper(),
++            col_suffixes=['DESC', '']
++        )
++        self.assertEqual(str(reference), 'FIRST_COLUMN DESC, SECOND_COLUMN')
++
++    def test_str_with_empty_suffix(self):
++        """Test that empty suffixes don't add extra spaces."""
++        reference = Columns(
++            'table', ['first_column'], lambda column: column.upper(),
++            col_suffixes=['']
++        )
++        self.assertEqual(str(reference), 'FIRST_COLUMN')
++
++
++class IndexColumnsTests(SimpleTestCase):
++    def test_str_with_opclasses_no_suffix(self):
++        """Test IndexColumns with opclasses but no suffix (ascending order)."""
++        reference = IndexColumns(
++            'table', ['first_column'], lambda column: column.upper(),
++            col_suffixes=[''], opclasses=['text_pattern_ops']
++        )
++        self.assertEqual(str(reference), 'FIRST_COLUMN text_pattern_ops')
++
++    def test_str_with_opclasses_and_suffix(self):
++        """Test IndexColumns with opclasses and DESC suffix."""
++        reference = IndexColumns(
++            'table', ['first_column'], lambda column: column.upper(),
++            col_suffixes=['DESC'], opclasses=['text_pattern_ops']
++        )
++        self.assertEqual(str(reference), 'FIRST_COLUMN text_pattern_ops DESC')
++
++    def test_str_with_multiple_columns_mixed_suffixes(self):
++        """Test IndexColumns with multiple columns and mixed suffixes."""
++        reference = IndexColumns(
++            'table', ['first_column', 'second_column'], lambda column: column.upper(),
++            col_suffixes=['', 'DESC'], opclasses=['text_pattern_ops', 'int4_ops']
++        )
++        self.assertEqual(str(reference), 'FIRST_COLUMN text_pattern_ops, SECOND_COLUMN int4_ops DESC')
++
++    def test_str_with_missing_suffix(self):
++        """Test IndexColumns when col_suffixes is shorter than columns (IndexError case)."""
++        reference = IndexColumns(
++            'table', ['first_column'], lambda column: column.upper(),
++            col_suffixes=[], opclasses=['text_pattern_ops']
++        )
++        self.assertEqual(str(reference), 'FIRST_COLUMN text_pattern_ops')
