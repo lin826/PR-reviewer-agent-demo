@@ -10,7 +10,9 @@ How can we evaluate not only pass/fail but also the code quality from SWE-bench?
 
 If you get a `NoCredentialsError` downloading logs, you may have to apply `experiments.patch` in this repo to `analysis/download_logs.py` in the `experiments` repo.
 
-# Dependencies
+# Development Setup
+
+## Dependencies
 
 We use `uv` for package management
 
@@ -19,3 +21,26 @@ $ uv venv
 $ source .venv/bin/activate
 $ uv sync
 ```
+
+## Running the Application
+
+### Backend API
+
+Start the FastAPI backend server:
+
+```bash
+$ uvicorn backend.main:app --reload --port 8000
+```
+
+The backend also provides interactive docs at http://localhost:8000/docs
+
+### Frontend UI
+
+Start the Vite development server:
+
+```bash
+$ cd frontend
+$ npm run dev
+```
+
+The frontend will be available at http://localhost:3000
