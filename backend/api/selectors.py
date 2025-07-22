@@ -73,7 +73,7 @@ def list_repositories() -> list[Repository]:
             org, repo = "unknown", repo_name
 
         # Generate display name
-        display_name = f"{org}/{repo}"
+        display_name = repo
 
         repo_list.append(
             Repository(
@@ -121,6 +121,7 @@ def list_problems_for_selector(
                 problem_id=problem.problem_id,
                 repo=problem.repo,
                 issue_number=problem.issue_number,
+                base_commit=problem.base_commit,
                 github_url=problem.github_url,
                 resolved_agents=resolved_agents,
                 total_agents=len(submissions),

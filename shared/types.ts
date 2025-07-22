@@ -20,6 +20,7 @@ export interface ProblemSummary {
   problem_id: string;
   repo: string;
   issue_number: string;
+  base_commit: string;
   github_url: string;
   resolved_agents: string[];
   total_agents: number;

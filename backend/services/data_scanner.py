@@ -3,6 +3,8 @@ from pathlib import Path
 
 from backend.models import AgentResults, AgentSubmission, Problem
 
+from .ground_truth_loader import ground_truth_loader
+
 
 class DataScanner:
     def __init__(self, data_dir: str = "data/submissions") -> None:
@@ -49,12 +51,23 @@ class DataScanner:
         for problem_id in all_problem_ids:
             repo, issue_number = self._parse_problem_id(problem_id)
 
+            # Get additional problem info from ground truth dataset
+            ground_truth_info = ground_truth_loader.get_problem_info(problem_id)
+            base_commit = (
+                ground_truth_info.get("base_commit", "") if ground_truth_info else ""
+            )
+            problem_statement = (
+                ground_truth_info.get("problem_statement", "")
+                if ground_truth_info
+                else ""
+            )
+
             problem = Problem(
                 problem_id=problem_id,
                 repo=repo,
                 issue_number=issue_number,
-                base_commit="",
-                problem_statement="",
+                base_commit=base_commit,
+                problem_statement=problem_statement,
                 github_url=self._generate_github_url(repo, issue_number),
                 ground_truth_patch=None,
             )

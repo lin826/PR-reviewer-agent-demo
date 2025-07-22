@@ -34,6 +34,7 @@ class ProblemSummary(BaseModel):
     problem_id: str = Field(..., description="Problem identifier")
     repo: str = Field(..., description="Repository name")
     issue_number: str = Field(..., description="Issue number")
+    base_commit: str = Field("", description="Base commit SHA")
     github_url: str = Field(..., description="GitHub URL")
     resolved_agents: list[str] = Field(
         default_factory=list, description="List of agents that resolved this problem"

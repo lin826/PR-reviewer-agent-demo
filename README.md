@@ -12,14 +12,37 @@ If you get a `NoCredentialsError` downloading logs, you may have to apply `exper
 
 # Development Setup
 
+## Prerequisites
+
+- **[uv](https://github.com/astral-sh/uv)** - Python package manager
+- **[Node.js](https://nodejs.org/)** - JavaScript runtime (for frontend)
+- **[npm](https://www.npmjs.com/)** - Node package manager (comes with Node.js)
+
+### macOS Installation (Homebrew)
+
+```bash
+$ brew install uv node
+```
+
 ## Dependencies
 
-We use `uv` for package management
+### Backend
+
+We use `uv` for Python package management:
 
 ```bash
 $ uv venv
 $ source .venv/bin/activate
 $ uv sync
+```
+
+### Frontend
+
+Install Node.js dependencies:
+
+```bash
+$ cd frontend
+$ npm install
 ```
 
 ## Running the Application

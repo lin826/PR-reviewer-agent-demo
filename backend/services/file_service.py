@@ -5,7 +5,7 @@ from backend.models import Label, LabelCreate, LabelResponse
 
 
 class FileService:
-    def __init__(self, labels_dir: str = "labels") -> None:
+    def __init__(self, labels_dir: str = "data") -> None:
         self.labels_dir: Path = Path(labels_dir)
 
     def ensure_label_dir(self, problem_id: str) -> Path:
