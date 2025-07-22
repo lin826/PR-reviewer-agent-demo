@@ -2,21 +2,22 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.models import Label, LabelCreate, LabelResponse
+from backend.services.data_scanner import scanner
 
 
 class FileService:
-    def __init__(self, labels_dir: str = "data") -> None:
+    def __init__(self, labels_dir: str = "data/labels") -> None:
         self.labels_dir: Path = Path(labels_dir)
 
-    def ensure_label_dir(self, problem_id: str) -> Path:
-        """Ensure the label directory exists for a problem."""
-        problem_dir = self.labels_dir / problem_id
-        problem_dir.mkdir(parents=True, exist_ok=True)
-        return problem_dir
+    def ensure_label_dir(self, agent_name: str) -> Path:
+        """Ensure the label directory exists for an agent."""
+        agent_dir = self.labels_dir / agent_name
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        return agent_dir
 
     def get_label_file_path(self, problem_id: str, agent_name: str) -> Path:
         """Get the file path for a label."""
-        return self.labels_dir / problem_id / f"{agent_name}.md"
+        return self.labels_dir / agent_name / f"{problem_id}.md"
 
     def load_label(self, problem_id: str, agent_name: str) -> Label | None:
         """Load a label from file."""
@@ -49,7 +50,7 @@ class FileService:
         self, problem_id: str, agent_name: str, label_create: LabelCreate
     ) -> Label:
         """Save a label to file."""
-        _ = self.ensure_label_dir(problem_id)
+        _ = self.ensure_label_dir(agent_name)
         label_file = self.get_label_file_path(problem_id, agent_name)
 
         # Check if file exists to determine created_at
@@ -83,14 +84,12 @@ class FileService:
 
     def get_all_labels_for_problem(self, problem_id: str) -> list[Label]:
         """Get all labels for a problem."""
-        problem_dir = self.labels_dir / problem_id
-
-        if not problem_dir.exists():
-            return []
-
         labels: list[Label] = []
-        for label_file in problem_dir.glob("*.md"):
-            agent_name = label_file.stem  # filename without .md extension
+
+        # Get all available agents from the scanner
+        agents = scanner.get_agents()
+
+        for agent_name in agents:
             label = self.load_label(problem_id, agent_name)
             if label:
                 labels.append(label)
