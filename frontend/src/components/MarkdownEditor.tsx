@@ -1,8 +1,8 @@
-import React, { useCallback, useState } from 'react';
+import { useCallback } from 'react';
 import Editor from '@monaco-editor/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type * as monaco from 'monaco-editor';
+import * as monaco from 'monaco-editor';
 import 'github-markdown-css/github-markdown-light.css';
 import '../styles/markdown-tweaks.css';
 
@@ -132,7 +132,7 @@ export const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
             tabCompletion: 'off',
             wordBasedSuggestions: 'off',
             // Clean padding since no border
-            padding: { top: 16, bottom: 16, left: 8, right: 8 },
+            padding: { top: 16, bottom: 16 },
           }}
           theme="markdown-theme"
         />

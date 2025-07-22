@@ -144,14 +144,13 @@ export const MainContent: React.FC<MainContentProps> = ({
 
   // Generate base commit URL for clickable links
   const baseCommitUrl =
-    selectedProblemData?.problem?.base_commit &&
-    selectedProblemData?.problem?.github_url
+    selectedProblemData?.base_commit && selectedProblemData?.github_url
       ? (() => {
-          const repoMatch = selectedProblemData.problem.github_url.match(
+          const repoMatch = selectedProblemData.github_url.match(
             /github\.com\/([^/]+\/[^/]+)/
           );
           return repoMatch
-            ? `https://github.com/${repoMatch[1]}/tree/${selectedProblemData.problem.base_commit}`
+            ? `https://github.com/${repoMatch[1]}/tree/${selectedProblemData.base_commit}`
             : undefined;
         })()
       : undefined;
@@ -190,7 +189,7 @@ export const MainContent: React.FC<MainContentProps> = ({
                   onClick={() =>
                     setIsProblemStatementRendered(!isProblemStatementRendered)
                   }
-                  disabled={!selectedProblemData?.problem?.problem_statement}
+                  disabled={!selectedProblemData?.problem_statement}
                 >
                   {isProblemStatementRendered ? 'View Raw' : 'View Rendered'}
                 </button>
@@ -208,9 +207,9 @@ export const MainContent: React.FC<MainContentProps> = ({
           {!isProblemStatementCollapsed && (
             <div className="panel-content">
               <div className="problem-statement-viewer">
-                {selectedProblemData?.problem?.problem_statement ? (
+                {selectedProblemData?.problem_statement ? (
                   <MarkdownEditor
-                    value={selectedProblemData.problem.problem_statement}
+                    value={selectedProblemData.problem_statement}
                     onChange={() => {}} // Read-only, no changes allowed
                     onSave={() => {}} // No save functionality needed
                     disabled={true} // Always disabled since it's read-only

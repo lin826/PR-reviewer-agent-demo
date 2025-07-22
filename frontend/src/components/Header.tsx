@@ -14,9 +14,9 @@ interface HeaderProps {
   selectedRepository: string | null;
   selectedProblem: string | null;
   selectedProblemData: Problem | null;
-  onAgentChange: (agentName: string | null) => void;
-  onRepositoryChange: (repositoryName: string | null) => void;
-  onProblemChange: (problemId: string | null) => void;
+  onAgentChange: (_agentName: string | null) => void;
+  onRepositoryChange: (_repositoryName: string | null) => void;
+  onProblemChange: (_problemId: string | null) => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -47,16 +47,15 @@ export const Header: React.FC<HeaderProps> = ({
   };
 
   // Generate GitHub links
-  const githubUrl = selectedProblemData?.problem?.github_url || '#';
+  const githubUrl = selectedProblemData?.github_url || '#';
   const baseCommitUrl =
-    selectedProblemData?.problem?.base_commit &&
-    selectedProblemData?.problem?.github_url
+    selectedProblemData?.base_commit && selectedProblemData?.github_url
       ? (() => {
-          const repoMatch = selectedProblemData.problem.github_url.match(
+          const repoMatch = selectedProblemData.github_url.match(
             /github\.com\/([^/]+\/[^/]+)/
           );
           return repoMatch
-            ? `https://github.com/${repoMatch[1]}/tree/${selectedProblemData.problem.base_commit}`
+            ? `https://github.com/${repoMatch[1]}/tree/${selectedProblemData.base_commit}`
             : '#';
         })()
       : '#';

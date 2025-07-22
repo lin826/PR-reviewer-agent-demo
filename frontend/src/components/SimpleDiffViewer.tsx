@@ -12,13 +12,14 @@ interface DiffLine {
   lineNumber?: number;
   filePath?: string;
   isClickable?: boolean;
+  isNewFile?: boolean;
 }
 
 function classifyDiffLine(line: string): DiffLine {
   if (line.startsWith('diff --git')) {
     // Extract file path from "diff --git a/path/to/file b/path/to/file"
     const match = line.match(/^diff --git a\/(.+) b\/(.+)$/);
-    const filePath = match ? match[2] : undefined; // Use the "new" path (b/path)
+    const filePath = match ? match[1] : undefined; // Use the "old" path (a/path)
     return { type: 'meta', content: line, filePath, isClickable: !!filePath };
   }
 
@@ -128,6 +129,36 @@ function createGitHubFileUrl(
   return lineNumber ? `${url}#L${lineNumber}` : url;
 }
 
+function parseDiffLines(lines: string[]): DiffLine[] {
+  const diffLines: DiffLine[] = [];
+  let currentFileIsNew = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const diffLine = classifyDiffLine(line);
+
+    // Reset new file flag when starting a new diff
+    if (diffLine.type === 'meta' && line.startsWith('diff --git')) {
+      currentFileIsNew = false;
+    }
+
+    // Check for new file indicators
+    if (line.startsWith('new file mode') || line === '--- /dev/null') {
+      currentFileIsNew = true;
+    }
+
+    // Apply new file flag to meta lines (file headers)
+    if (diffLine.type === 'meta' && diffLine.filePath && currentFileIsNew) {
+      diffLine.isNewFile = true;
+      diffLine.isClickable = false; // Don't make new files clickable
+    }
+
+    diffLines.push(diffLine);
+  }
+
+  return diffLines;
+}
+
 export const SimpleDiffViewer: React.FC<SimpleDiffViewerProps> = ({
   diffText,
   placeholder = 'No diff content to display',
@@ -152,7 +183,7 @@ export const SimpleDiffViewer: React.FC<SimpleDiffViewerProps> = ({
   }
 
   const lines = diffText.split('\n');
-  const diffLines = lines.map(classifyDiffLine);
+  const diffLines = parseDiffLines(lines);
 
   // Track current file for hunk headers
   let currentFilePath = '';

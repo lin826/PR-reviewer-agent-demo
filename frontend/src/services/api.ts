@@ -78,7 +78,10 @@ class APIClient {
 
   // Problem endpoints
   async getProblem(problemId: string): Promise<Problem> {
-    return this.request<Problem>(`/problems/${problemId}`);
+    const response = await this.request<{ problem: Problem }>(
+      `/problems/${problemId}`
+    );
+    return response.problem;
   }
 
   // Patch endpoints

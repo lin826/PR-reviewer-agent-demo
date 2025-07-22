@@ -5,12 +5,15 @@ import prettier from 'eslint-config-prettier';
 
 export default [
   {
+    files: ['frontend/**/*.{js,ts,tsx}', 'shared/**/*.{js,ts,tsx}'],
     ignores: [
       'node_modules/**',
       '.venv/**',
       '**/dist/**',
       'build/**',
       '*.min.js',
+      'data/**',
+      'backend/**',
     ],
   },
   js.configs.recommended,
