@@ -8,10 +8,10 @@ import '../styles/markdown-tweaks.css';
 
 interface MarkdownEditorProps {
   value: string;
-  onChange: (value: string) => void;
+  onChange: (_value: string) => void;
   onSave: () => void;
   disabled?: boolean;
-  placeholder?: string;
+  _placeholder?: string;
   isRendered?: boolean;
 }
 

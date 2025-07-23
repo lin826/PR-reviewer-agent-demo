@@ -52,6 +52,7 @@ function App(): React.ReactElement {
           setProblems(problemsData);
           setSelectedProblem(null); // Clear problem selection
           setSelectedProblemData(null);
+          setSelectedAgent(null); // Clear agent selection when repository changes
         } catch (err) {
           console.error('Failed to load problems:', err);
           setProblems([]);
@@ -62,6 +63,7 @@ function App(): React.ReactElement {
       setProblems([]);
       setSelectedProblem(null);
       setSelectedProblemData(null);
+      setSelectedAgent(null); // Clear agent selection when no repository
     }
   }, [selectedRepository]);
 
@@ -78,8 +80,10 @@ function App(): React.ReactElement {
         }
       };
       loadProblemData();
+      setSelectedAgent(null); // Clear agent selection when problem changes
     } else {
       setSelectedProblemData(null);
+      setSelectedAgent(null); // Clear agent selection when no problem
     }
   }, [selectedProblem]);
 

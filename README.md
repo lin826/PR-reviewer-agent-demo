@@ -52,7 +52,7 @@ $ npm install
 Start the FastAPI backend server:
 
 ```bash
-$ uvicorn backend.main:app --reload --port 8000
+$ uv run uvicorn backend.main:app --reload --port 8000
 ```
 
 The backend also provides interactive docs at http://localhost:8000/docs
@@ -62,8 +62,7 @@ The backend also provides interactive docs at http://localhost:8000/docs
 Start the Vite development server:
 
 ```bash
-$ cd frontend
-$ npm run dev
+$ npm run dev -C frontend
 ```
 
 The frontend will be available at http://localhost:3000

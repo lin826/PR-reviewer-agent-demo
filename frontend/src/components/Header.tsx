@@ -69,20 +69,6 @@ export const Header: React.FC<HeaderProps> = ({
         <h1>SWE Quality Viewer</h1>
         <div className="selectors">
           <select
-            value={selectedAgent || ''}
-            onChange={handleAgentChange}
-            disabled={agents.length === 0}
-          >
-            <option value="">Select Agent...</option>
-            {agents.map((agent) => (
-              <option key={agent.name} value={agent.name}>
-                {agent.display_name} ({agent.resolved_problems}/
-                {agent.total_problems})
-              </option>
-            ))}
-          </select>
-
-          <select
             value={selectedRepository || ''}
             onChange={handleRepositoryChange}
             disabled={repositories.length === 0}
@@ -90,7 +76,7 @@ export const Header: React.FC<HeaderProps> = ({
             <option value="">Select Repository...</option>
             {repositories.map((repo) => (
               <option key={repo.name} value={repo.name}>
-                {repo.display_name} ({repo.total_problems} problems)
+                {repo.display_name} ({repo.total_problems} issues)
               </option>
             ))}
           </select>
@@ -100,21 +86,40 @@ export const Header: React.FC<HeaderProps> = ({
             onChange={handleProblemChange}
             disabled={problems.length === 0}
           >
-            <option value="">Select Problem...</option>
+            <option value="">Select Issue...</option>
             {problems.map((problem) => {
-              // Show emoji status when an agent is selected
-              let statusDisplay: string;
-              if (selectedAgent) {
-                const isResolved =
-                  problem.resolved_agents.includes(selectedAgent);
-                statusDisplay = isResolved ? '✅' : '❌';
-              } else {
-                statusDisplay = `(${problem.resolved_agents.length}/${problem.total_agents} agents)`;
-              }
-
+              const statusDisplay = `(${problem.resolved_agents.length}/${problem.total_agents} agent resolutions)`;
               return (
                 <option key={problem.problem_id} value={problem.problem_id}>
                   #{problem.issue_number} {statusDisplay}
+                </option>
+              );
+            })}
+          </select>
+
+          <select
+            value={selectedAgent || ''}
+            onChange={handleAgentChange}
+            disabled={agents.length === 0 || !selectedProblem}
+          >
+            <option value="">Select Agent...</option>
+            {agents.map((agent) => {
+              // Show emoji status based on whether this agent resolved the selected problem
+              let statusDisplay: string = '';
+              if (selectedProblem && problems.length > 0) {
+                const selectedProblemData = problems.find(
+                  (p) => p.problem_id === selectedProblem
+                );
+                if (selectedProblemData) {
+                  const isResolved =
+                    selectedProblemData.resolved_agents.includes(agent.name);
+                  statusDisplay = isResolved ? ' ✅' : ' ❌';
+                }
+              }
+              return (
+                <option key={agent.name} value={agent.name}>
+                  {agent.display_name}
+                  {statusDisplay}
                 </option>
               );
             })}
