@@ -1,0 +1,1 @@
+The GT is way more concise and maintainable.

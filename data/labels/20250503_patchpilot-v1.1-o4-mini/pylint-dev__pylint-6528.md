@@ -1,0 +1,1 @@
+duplicated code, also seems to have changed the behavior of `_is_in_ignore_list_re` unnecessarily.

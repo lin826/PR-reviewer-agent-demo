@@ -1,0 +1,1 @@
+Agent adds a redundant `if sys.path` check.

@@ -1,0 +1,1 @@
+Redundant. Mislead by issue description. Maintainers also don't like the `or 1` pattern.
