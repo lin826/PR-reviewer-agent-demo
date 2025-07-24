@@ -1,1 +1,1 @@
-Redundant. Mislead by issue description.
+Redundant. Mislead by issue description, which suggests making edits in 2 locations.

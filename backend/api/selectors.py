@@ -2,6 +2,7 @@ from fastapi import APIRouter, Query
 
 from backend.models import Agent, ProblemSummary, Repository
 from backend.services import scanner
+from backend.services.label_stats_cache import label_stats_cache
 
 router = APIRouter(prefix="/selectors", tags=["selectors"])
 
@@ -63,9 +64,6 @@ def list_repositories() -> list[Repository]:
     repo_list: list[Repository] = []
 
     for repo_name in repos:
-        # Get problems for this repository
-        problems = scanner.get_problems(repo=repo_name)
-
         # Parse organization and repo name
         if "__" in repo_name:
             org, repo = repo_name.split("__", 1)
@@ -75,13 +73,20 @@ def list_repositories() -> list[Repository]:
         # Generate display name
         display_name = repo
 
+        # Get label statistics for this repository
+        (
+            labeled_issues,
+            total_issues_with_resolved_agents,
+        ) = label_stats_cache.get_repo_label_stats(repo_name)
+
         repo_list.append(
             Repository(
                 name=repo_name,
                 display_name=display_name,
                 organization=org,
                 repo_name=repo,
-                total_problems=len(problems),
+                total_problems=total_issues_with_resolved_agents,
+                labeled_issues=labeled_issues,
             )
         )
 
@@ -116,6 +121,12 @@ def list_problems_for_selector(
             if submission.resolved
         ]
 
+        # Get label statistics for this problem
+        (
+            labeled_resolved_agents,
+            total_resolved_agents,
+        ) = label_stats_cache.get_problem_label_stats(problem.problem_id)
+
         problem_summaries.append(
             ProblemSummary(
                 problem_id=problem.problem_id,
@@ -125,6 +136,8 @@ def list_problems_for_selector(
                 github_url=problem.github_url,
                 resolved_agents=resolved_agents,
                 total_agents=len(submissions),
+                labeled_resolved_agents=labeled_resolved_agents,
+                total_resolved_agents=total_resolved_agents,
             )
         )
 

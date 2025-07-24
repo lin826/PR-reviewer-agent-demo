@@ -13,7 +13,8 @@ export interface Repository {
   display_name: string;
   organization: string;
   repo_name: string;
-  total_problems: number;
+  total_problems: number; // Number of problems with at least one resolved agent
+  labeled_issues: number; // Number of issues where all resolved agents have labels
 }
 
 export interface ProblemSummary {
@@ -24,6 +25,8 @@ export interface ProblemSummary {
   github_url: string;
   resolved_agents: string[];
   total_agents: number;
+  labeled_resolved_agents: number;
+  total_resolved_agents: number;
 }
 
 export interface Problem {

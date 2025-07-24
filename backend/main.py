@@ -13,6 +13,7 @@ from backend.api import (
     selectors_router,
 )
 from backend.services import ground_truth_loader, scanner
+from backend.services.label_stats_cache import label_stats_cache
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +46,11 @@ async def lifespan(_app: FastAPI):
             f"Total submissions: {stats['total_submissions']}"
         )
         logger.info(f"   ⏱️  Scan time: {elapsed:.2f}s")
+
+        # Build label statistics cache
+        logger.info("📋 Building label statistics cache...")
+        label_stats_cache.rebuild_cache()
+        logger.info("✅ Label statistics cache ready!")
 
         # Log ground truth loader status
         if ground_truth_loader.is_available():

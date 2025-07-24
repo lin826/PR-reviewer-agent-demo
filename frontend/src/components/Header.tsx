@@ -1,4 +1,4 @@
-import React from 'react';
+import type { FC, ChangeEvent } from 'react';
 import type {
   Agent,
   Repository,
@@ -14,12 +14,13 @@ interface HeaderProps {
   selectedRepository: string | null;
   selectedProblem: string | null;
   selectedProblemData: Problem | null;
+  hasUncommittedChanges: boolean;
   onAgentChange: (_agentName: string | null) => void;
   onRepositoryChange: (_repositoryName: string | null) => void;
   onProblemChange: (_problemId: string | null) => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({
+export const Header: FC<HeaderProps> = ({
   agents,
   repositories,
   problems,
@@ -27,21 +28,22 @@ export const Header: React.FC<HeaderProps> = ({
   selectedRepository,
   selectedProblem,
   selectedProblemData,
+  hasUncommittedChanges,
   onAgentChange,
   onRepositoryChange,
   onProblemChange,
 }) => {
-  const handleAgentChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+  const handleAgentChange = (e: ChangeEvent<HTMLSelectElement>) => {
     const value = e.target.value || null;
     onAgentChange(value);
   };
 
-  const handleRepositoryChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+  const handleRepositoryChange = (e: ChangeEvent<HTMLSelectElement>) => {
     const value = e.target.value || null;
     onRepositoryChange(value);
   };
 
-  const handleProblemChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+  const handleProblemChange = (e: ChangeEvent<HTMLSelectElement>) => {
     const value = e.target.value || null;
     onProblemChange(value);
   };
@@ -71,12 +73,18 @@ export const Header: React.FC<HeaderProps> = ({
           <select
             value={selectedRepository || ''}
             onChange={handleRepositoryChange}
-            disabled={repositories.length === 0}
+            disabled={repositories.length === 0 || hasUncommittedChanges}
+            title={
+              hasUncommittedChanges
+                ? 'Commit or discard changes to navigate'
+                : ''
+            }
           >
             <option value="">Select Repository...</option>
             {repositories.map((repo) => (
               <option key={repo.name} value={repo.name}>
-                {repo.display_name} ({repo.total_problems} issues)
+                {repo.display_name} ({repo.labeled_issues}/{repo.total_problems}{' '}
+                labeled)
               </option>
             ))}
           </select>
@@ -84,11 +92,16 @@ export const Header: React.FC<HeaderProps> = ({
           <select
             value={selectedProblem || ''}
             onChange={handleProblemChange}
-            disabled={problems.length === 0}
+            disabled={problems.length === 0 || hasUncommittedChanges}
+            title={
+              hasUncommittedChanges
+                ? 'Commit or discard changes to navigate'
+                : ''
+            }
           >
             <option value="">Select Issue...</option>
             {problems.map((problem) => {
-              const statusDisplay = `(${problem.resolved_agents.length}/${problem.total_agents} agent resolutions)`;
+              const statusDisplay = `(${problem.labeled_resolved_agents}/${problem.total_resolved_agents} labeled)`;
               return (
                 <option key={problem.problem_id} value={problem.problem_id}>
                   #{problem.issue_number} {statusDisplay}
@@ -100,7 +113,14 @@ export const Header: React.FC<HeaderProps> = ({
           <select
             value={selectedAgent || ''}
             onChange={handleAgentChange}
-            disabled={agents.length === 0 || !selectedProblem}
+            disabled={
+              agents.length === 0 || !selectedProblem || hasUncommittedChanges
+            }
+            title={
+              hasUncommittedChanges
+                ? 'Commit or discard changes to navigate'
+                : ''
+            }
           >
             <option value="">Select Agent...</option>
             {agents.map((agent) => {

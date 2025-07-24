@@ -24,7 +24,13 @@ class Repository(BaseModel):
     organization: str = Field(..., description="GitHub organization")
     repo_name: str = Field(..., description="Repository name")
     total_problems: int = Field(
-        ..., description="Number of problems in this repository"
+        ...,
+        description=(
+            "Number of problems in this repository with at least one resolved agent"
+        ),
+    )
+    labeled_issues: int = Field(
+        ..., description="Number of issues where all resolved agents have labels"
     )
 
 
@@ -41,6 +47,12 @@ class ProblemSummary(BaseModel):
     )
     total_agents: int = Field(
         ..., description="Total agents that attempted this problem"
+    )
+    labeled_resolved_agents: int = Field(
+        ..., description="Number of resolved agents with labels"
+    )
+    total_resolved_agents: int = Field(
+        ..., description="Total number of agents that resolved this problem"
     )
 
 

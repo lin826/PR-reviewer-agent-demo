@@ -1,0 +1,3 @@
+Metavar fix is preferred, see https://github.com/pylint-dev/pylint/pull/6386#issuecomment-1102288022
+
+Also fixes an unrelated typo.

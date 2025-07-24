@@ -19,6 +19,10 @@ class FileService:
         """Get the file path for a label."""
         return self.labels_dir / agent_name / f"{problem_id}.md"
 
+    def get_draft_file_path(self, problem_id: str, agent_name: str) -> Path:
+        """Get the file path for a draft."""
+        return self.labels_dir / agent_name / f"{problem_id}.draft.md"
+
     def load_label(self, problem_id: str, agent_name: str) -> Label | None:
         """Load a label from file."""
         label_file = self.get_label_file_path(problem_id, agent_name)
@@ -108,6 +112,89 @@ class FileService:
                 print(f"Warning: Failed to delete label file {label_file}: {e}")
 
         return False
+
+    def save_draft(self, problem_id: str, agent_name: str, content: str) -> None:
+        """Save a draft to file."""
+        self.ensure_label_dir(agent_name)
+        draft_file = self.get_draft_file_path(problem_id, agent_name)
+
+        try:
+            with open(draft_file, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError as e:
+            raise RuntimeError(f"Failed to save draft file {draft_file}: {e}") from e
+
+    def load_draft(self, problem_id: str, agent_name: str) -> str | None:
+        """Load a draft from file."""
+        draft_file = self.get_draft_file_path(problem_id, agent_name)
+
+        if not draft_file.exists():
+            return None
+
+        try:
+            with open(draft_file, encoding="utf-8") as f:
+                return f.read()
+        except OSError as e:
+            print(f"Warning: Failed to read draft file {draft_file}: {e}")
+            return None
+
+    def delete_draft(self, problem_id: str, agent_name: str) -> bool:
+        """Delete a draft file."""
+        draft_file = self.get_draft_file_path(problem_id, agent_name)
+
+        if draft_file.exists():
+            try:
+                draft_file.unlink()
+                return True
+            except OSError as e:
+                print(f"Warning: Failed to delete draft file {draft_file}: {e}")
+
+        return False
+
+    def commit_draft(self, problem_id: str, agent_name: str) -> Label:
+        """Commit a draft by moving it to the label file."""
+        draft_file = self.get_draft_file_path(problem_id, agent_name)
+        label_file = self.get_label_file_path(problem_id, agent_name)
+
+        if not draft_file.exists():
+            raise RuntimeError(f"No draft file found: {draft_file}")
+
+        self.ensure_label_dir(agent_name)
+
+        # Check if label file exists to determine created_at
+        is_new = not label_file.exists()
+        now = datetime.now()
+
+        # Get created_at before moving if label file exists
+        existing_created_at: datetime | None = None
+        if not is_new:
+            try:
+                existing_created_at = datetime.fromtimestamp(label_file.stat().st_ctime)
+            except OSError:
+                existing_created_at = now
+
+        try:
+            # Read draft content
+            with open(draft_file, encoding="utf-8") as f:
+                content = f.read()
+
+            # Move draft to label (atomic operation)
+            draft_file.rename(label_file)
+
+            # Set created_at and updated_at
+            created_at = now if is_new else (existing_created_at or now)
+
+            return Label(
+                problem_id=problem_id,
+                agent_name=agent_name,
+                content=content,
+                created_at=created_at,
+                updated_at=now,
+            )
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to commit draft {draft_file} to {label_file}: {e}"
+            ) from e
 
     def label_to_response(self, label: Label) -> LabelResponse:
         """Convert Label model to LabelResponse."""

@@ -3,6 +3,7 @@ import time
 from fastapi import APIRouter
 
 from backend.services import scanner
+from backend.services.label_stats_cache import label_stats_cache
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -18,6 +19,9 @@ def refresh_data() -> dict[str, str | float | dict[str, int]]:
 
     # Re-scan the data
     scanner.scan_data()
+
+    # Rebuild label statistics cache
+    label_stats_cache.rebuild_cache()
 
     # Get updated statistics
     stats = scanner.get_stats()

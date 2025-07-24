@@ -1,23 +1,51 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, type FC } from 'react';
 import { MarkdownEditor } from './MarkdownEditor';
 import { SimpleDiffViewer } from './SimpleDiffViewer';
+import { StatusBar } from './StatusBar';
 import { apiClient } from '../services/api';
+import { useAutosave } from '../hooks/useAutosave';
+import { draftManager, type DraftStatus } from '../services/draftManager';
 import type { Problem, PatchContent, Label } from '../types/index';
 
 interface MainContentProps {
   selectedProblem: string | null;
   selectedAgent: string | null;
   selectedProblemData: Problem | null;
+  onUncommittedChangesChange: (_hasChanges: boolean) => void;
+  refreshRepositories: () => Promise<void>;
+  refreshProblems: () => Promise<void>;
 }
 
-export const MainContent: React.FC<MainContentProps> = ({
+// Helper function to determine the correct draft status based on new flow
+const determineDraftStatus = (
+  currentContent: string,
+  committedContent: string,
+  isManualSaving: boolean
+): DraftStatus => {
+  if (isManualSaving) return 'committing';
+
+  // Both empty = no status shown
+  if (!currentContent.trim() && !committedContent.trim()) return null;
+
+  // Content matches committed = saved to server
+  if (currentContent === committedContent) return 'committed';
+
+  // Content differs from committed = draft (will be handled by autosave logic)
+  return 'uncommitted';
+};
+
+export const MainContent: FC<MainContentProps> = ({
   selectedProblem,
   selectedAgent,
   selectedProblemData,
+  onUncommittedChangesChange,
+  refreshRepositories,
+  refreshProblems,
 }) => {
   const [comment, setComment] = useState('');
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [draftStatus, setDraftStatus] = useState<DraftStatus>(null);
   const [isMarkdownRendered, setIsMarkdownRendered] = useState(false);
   const [isProblemStatementRendered, setIsProblemStatementRendered] =
     useState(false);
@@ -28,6 +56,22 @@ export const MainContent: React.FC<MainContentProps> = ({
   );
   const [agentPatch, setAgentPatch] = useState<PatchContent | null>(null);
   const [currentLabel, setCurrentLabel] = useState<Label | null>(null);
+
+  // Autosave hook - only operates when we're in a draft state
+  const { deleteDraft } = useAutosave({
+    content: comment,
+    problemId: selectedProblem,
+    agentName: selectedAgent,
+    isDraft:
+      draftStatus === 'uncommitted' || draftStatus === 'autosave_triggered',
+    onAutosaveStart: () => {
+      // Autosave is actually starting - UI already shows "autosaving"
+    },
+    onAutosaveComplete: () => {
+      // After autosave completes, return to regular "Draft" status
+      setDraftStatus('uncommitted');
+    },
+  });
 
   // Load ground truth patch when problem changes
   useEffect(() => {
@@ -68,58 +112,167 @@ export const MainContent: React.FC<MainContentProps> = ({
     }
   }, [selectedProblem, selectedAgent]);
 
-  // Load label when problem and agent change
+  // Load label and draft when problem and agent change
   useEffect(() => {
+    // Immediately clear comment state when selections change to prevent stale data
+    setCurrentLabel(null);
+    setComment('');
+    setHasUnsavedChanges(false);
+    setDraftStatus(null);
+
     if (selectedProblem && selectedAgent) {
-      const loadLabel = async () => {
+      // Create cancellation flag to prevent stale updates
+      let isCancelled = false;
+
+      const loadLabelAndDraft = async () => {
         try {
-          const label = await apiClient.getLabel(
-            selectedProblem,
-            selectedAgent
-          );
+          // Load both draft and committed label in parallel
+          const [draft, labelResult] = await Promise.allSettled([
+            draftManager.loadDraft(selectedProblem, selectedAgent),
+            apiClient.getLabel(selectedProblem, selectedAgent),
+          ]);
+
+          if (isCancelled) return;
+
+          // Get the committed label content (or null if failed/404)
+          const label =
+            labelResult.status === 'fulfilled' ? labelResult.value : null;
+          const committedContent = label?.content || '';
+
+          // Check if we have a draft and if it differs from committed content
+          const draftData = draft.status === 'fulfilled' ? draft.value : null;
+          const hasMeaningfulDraft =
+            draftData && draftData.content !== committedContent;
+
+          const contentToUse = hasMeaningfulDraft
+            ? draftData.content
+            : committedContent;
+
+          setComment(contentToUse);
           setCurrentLabel(label);
-          setComment(label?.content || '');
           setHasUnsavedChanges(false);
+
+          // Determine the correct status based on content
+          const status = determineDraftStatus(
+            contentToUse,
+            committedContent,
+            false
+          );
+          setDraftStatus(status);
+
+          // Clean up any draft that matches committed content
+          if (draftData && draftData.content === committedContent) {
+            await draftManager.deleteDraft(selectedProblem, selectedAgent);
+          }
         } catch (err) {
-          // 404 means no label exists yet - that's fine
-          if (err instanceof Error && err.message.includes('404')) {
+          // Only handle errors if request wasn't cancelled
+          if (!isCancelled) {
+            console.error('Failed to load label and draft:', err);
             setCurrentLabel(null);
             setComment('');
+            setDraftStatus(null);
             setHasUnsavedChanges(false);
-          } else {
-            console.error('Failed to load label:', err);
           }
         }
       };
-      loadLabel();
-    } else {
-      setCurrentLabel(null);
-      setComment('');
-      setHasUnsavedChanges(false);
+
+      loadLabelAndDraft();
+
+      // Cleanup function to cancel request when selections change
+      return () => {
+        isCancelled = true;
+      };
     }
   }, [selectedProblem, selectedAgent]);
 
-  const handleCommentChange = useCallback((value: string) => {
-    setComment(value);
-    setHasUnsavedChanges(true);
-  }, []);
+  const handleCommentChange = useCallback(
+    (value: string) => {
+      // Guard: Only allow comment changes when both problem and agent are selected
+      if (!selectedProblem || !selectedAgent) {
+        console.warn(
+          'Attempted to change comment without valid problem/agent selection'
+        );
+        return;
+      }
 
-  const handleSave = useCallback(async () => {
-    if (!selectedProblem || !selectedAgent || isSaving) return;
+      setComment(value);
+      setHasUnsavedChanges(true);
+
+      // Determine status when user types
+      const committedContent = currentLabel?.content || '';
+
+      // Check if both current and committed content are empty
+      if (!value.trim() && !committedContent.trim()) {
+        // Both empty = no status shown
+        setDraftStatus(null);
+        draftManager
+          .deleteDraft(selectedProblem, selectedAgent)
+          .catch((err) => {
+            console.error('Failed to delete draft:', err);
+          });
+      } else if (value !== committedContent) {
+        // Content differs from committed - this is a draft with autosave queued
+        setDraftStatus('autosave_triggered');
+        // This immediately shows "Draft (autosaving)" to indicate autosave is scheduled
+      } else {
+        // Content matches committed - determine appropriate status
+        const newStatus = determineDraftStatus(
+          value,
+          committedContent,
+          isSaving
+        );
+        setDraftStatus(newStatus);
+
+        // Clean up any existing draft since content matches
+        draftManager
+          .deleteDraft(selectedProblem, selectedAgent)
+          .catch((err) => {
+            console.error('Failed to delete draft:', err);
+          });
+      }
+    },
+    [selectedProblem, selectedAgent, currentLabel, isSaving, draftStatus]
+  );
+
+  const handleCommit = useCallback(async () => {
+    // Guard: Prevent commit if no valid selections or already committing
+    if (!selectedProblem || !selectedAgent || isSaving) {
+      console.warn(
+        'Attempted to commit label without valid problem/agent selection or while committing'
+      );
+      return;
+    }
 
     const content = comment.trim();
     setIsSaving(true);
+    setDraftStatus('committing');
 
     try {
       if (content) {
-        // Save label
-        const savedLabel = await apiClient.saveLabel(
-          selectedProblem,
-          selectedAgent,
-          content
-        );
+        let savedLabel: Label;
+
+        // Check if we have a draft - if so, commit it (file move operation)
+        if (
+          draftStatus === 'uncommitted' ||
+          draftStatus === 'autosave_triggered'
+        ) {
+          // First save current content as draft, then commit
+          await draftManager.saveDraft(selectedProblem, selectedAgent, content);
+          savedLabel = await draftManager.commitDraft(
+            selectedProblem,
+            selectedAgent
+          );
+        } else {
+          // No draft, save directly to server
+          savedLabel = await apiClient.saveLabel(
+            selectedProblem,
+            selectedAgent,
+            content
+          );
+        }
+
         setCurrentLabel(savedLabel);
-        console.log(`Label saved successfully: ${content.length} chars`);
+        console.log(`Label committed successfully: ${content.length} chars`);
       } else {
         // Delete label if content is empty
         if (currentLabel) {
@@ -127,20 +280,71 @@ export const MainContent: React.FC<MainContentProps> = ({
           setCurrentLabel(null);
           console.log('Label deleted successfully');
         }
+
+        // Also clean up any draft
+        await deleteDraft();
       }
+
       setHasUnsavedChanges(false);
+
+      // Determine the correct status after commit
+      const finalContent = content || '';
+      const status = determineDraftStatus(finalContent, finalContent, false);
+      setDraftStatus(status);
+
+      // Refresh both repository and problems statistics to reflect label changes
+      await Promise.all([refreshRepositories(), refreshProblems()]);
     } catch (error) {
-      console.error('Failed to save label:', error);
+      console.error('Failed to commit label:', error);
+      setDraftStatus('error');
     } finally {
       setIsSaving(false);
     }
-  }, [selectedProblem, selectedAgent, comment, currentLabel, isSaving]);
+  }, [
+    selectedProblem,
+    selectedAgent,
+    comment,
+    currentLabel,
+    isSaving,
+    draftStatus,
+    deleteDraft,
+    refreshRepositories,
+    refreshProblems,
+  ]);
+
+  const handleDiscard = useCallback(async () => {
+    if (!selectedProblem || !selectedAgent) return;
+
+    // Delete the draft
+    await deleteDraft();
+
+    // Reset to committed content (or empty if no committed label)
+    const committedContent = currentLabel?.content || '';
+    setComment(committedContent);
+    setHasUnsavedChanges(false);
+
+    // Determine the correct status based on the committed content
+    const status = determineDraftStatus(
+      committedContent,
+      committedContent,
+      false
+    );
+    setDraftStatus(status);
+  }, [selectedProblem, selectedAgent, deleteDraft, currentLabel]);
 
   const isDisabled = !selectedProblem || !selectedAgent;
-  const canSave =
+  const canCommit =
     !isDisabled &&
     (hasUnsavedChanges || (!currentLabel && comment.trim().length > 0)) &&
     !isSaving;
+
+  const hasUncommittedChanges =
+    draftStatus === 'uncommitted' || draftStatus === 'autosave_triggered';
+
+  // Notify parent component when uncommitted changes status changes
+  useEffect(() => {
+    onUncommittedChangesChange(hasUncommittedChanges);
+  }, [hasUncommittedChanges, onUncommittedChangesChange]);
 
   // Generate base commit URL for clickable links
   const baseCommitUrl =
@@ -217,7 +421,7 @@ export const MainContent: React.FC<MainContentProps> = ({
                   />
                 ) : (
                   <div className="placeholder">
-                    Select a problem to view problem statement
+                    Select an issue to view problem statement
                   </div>
                 )}
               </div>
@@ -236,7 +440,7 @@ export const MainContent: React.FC<MainContentProps> = ({
               <div className="patch-viewer" id="ground-truth-content">
                 {renderPatchContent(
                   groundTruthPatch,
-                  'Select a problem to view ground truth patch'
+                  'Select an issue to view ground truth patch'
                 )}
               </div>
             </div>
@@ -251,7 +455,7 @@ export const MainContent: React.FC<MainContentProps> = ({
               <div className="patch-viewer" id="agent-submission-content">
                 {renderPatchContent(
                   agentPatch,
-                  'Select an agent and problem to view submission'
+                  'Select an issue and agent to view submission'
                 )}
               </div>
             </div>
@@ -268,30 +472,39 @@ export const MainContent: React.FC<MainContentProps> = ({
                   style={{
                     background: isMarkdownRendered ? '#007acc' : '#f3f3f3',
                     color: isMarkdownRendered ? 'white' : '#333',
-                    marginRight: '8px',
                   }}
                 >
                   {isMarkdownRendered ? 'Edit' : 'Preview'}
                 </button>
-                <button
-                  id="save-comment"
-                  disabled={!canSave}
-                  onClick={handleSave}
-                >
-                  {isSaving ? 'Saving...' : 'Save'}
-                </button>
               </div>
             </div>
             <div className="panel-content">
-              <div className="comment-editor">
-                <MarkdownEditor
-                  value={comment}
-                  onChange={handleCommentChange}
-                  onSave={handleSave}
-                  disabled={isDisabled || isSaving}
-                  isRendered={isMarkdownRendered}
-                />
-              </div>
+              {isDisabled ? (
+                <div className="placeholder">
+                  <br />
+                  Select an issue and agent to add comments
+                </div>
+              ) : (
+                <>
+                  <div className="comment-editor">
+                    <MarkdownEditor
+                      value={comment}
+                      onChange={handleCommentChange}
+                      onSave={handleCommit}
+                      disabled={isSaving}
+                      isRendered={isMarkdownRendered}
+                    />
+                  </div>
+                  <StatusBar
+                    draftStatus={draftStatus}
+                    canCommit={canCommit}
+                    hasUncommittedChanges={hasUncommittedChanges}
+                    isCommitting={isSaving}
+                    onCommit={handleCommit}
+                    onDiscard={handleDiscard}
+                  />
+                </>
+              )}
             </div>
           </div>
         </div>

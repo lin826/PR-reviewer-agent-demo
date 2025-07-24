@@ -4,8 +4,8 @@ import tsparser from '@typescript-eslint/parser';
 import prettier from 'eslint-config-prettier';
 
 export default [
+  // Global ignores - this should be the first config
   {
-    files: ['frontend/**/*.{js,ts,tsx}', 'shared/**/*.{js,ts,tsx}'],
     ignores: [
       'node_modules/**',
       '.venv/**',
@@ -14,33 +14,17 @@ export default [
       '*.min.js',
       'data/**',
       'backend/**',
+      'SWE-bench/**',
+      'django/**',
+      'tools/**',
+      'experiments.patch',
     ],
   },
-  js.configs.recommended,
+
+  // JavaScript/TypeScript files only
   {
-    files: ['**/*.ts', '**/*.tsx'],
-    languageOptions: {
-      parser: tsparser,
-      parserOptions: {
-        ecmaVersion: 2024,
-        sourceType: 'module',
-      },
-    },
-    plugins: {
-      '@typescript-eslint': tseslint,
-    },
-    rules: {
-      ...tseslint.configs.recommended.rules,
-      '@typescript-eslint/no-unused-vars': [
-        'error',
-        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
-      ],
-      '@typescript-eslint/no-explicit-any': 'error',
-      'no-unused-vars': 'off', // Turn off base rule as it can report incorrect errors
-    },
-  },
-  prettier,
-  {
+    files: ['frontend/**/*.{js,ts,tsx}', 'shared/**/*.{js,ts,tsx}'],
+    ...js.configs.recommended,
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'module',
@@ -70,4 +54,31 @@ export default [
       ],
     },
   },
+
+  // TypeScript-specific rules
+  {
+    files: ['frontend/**/*.{ts,tsx}', 'shared/**/*.{ts,tsx}'],
+    languageOptions: {
+      parser: tsparser,
+      parserOptions: {
+        ecmaVersion: 2024,
+        sourceType: 'module',
+      },
+    },
+    plugins: {
+      '@typescript-eslint': tseslint,
+    },
+    rules: {
+      ...tseslint.configs.recommended.rules,
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
+      ],
+      '@typescript-eslint/no-explicit-any': 'error',
+      'no-unused-vars': 'off', // Turn off base rule as it can report incorrect errors
+    },
+  },
+
+  // Prettier config (should be last)
+  prettier,
 ];

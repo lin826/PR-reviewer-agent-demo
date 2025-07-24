@@ -1,7 +1,14 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from backend.models import LabelCreate, LabelResponse
 from backend.services import file_service, scanner
+from backend.services.label_stats_cache import label_stats_cache
+
+
+class DraftCreate(BaseModel):
+    content: str
+
 
 router = APIRouter(prefix="/labels", tags=["labels"])
 
@@ -110,6 +117,10 @@ def save_label(
 
     # Save the label
     label = file_service.save_label(problem_id, agent_name, label_create)
+
+    # Update cache stats
+    label_stats_cache.update_problem_label_stats(problem_id, agent_name, has_label=True)
+
     return file_service.label_to_response(label)
 
 
@@ -129,9 +140,124 @@ def delete_label(problem_id: str, agent_name: str) -> dict[str, str]:
     deleted = file_service.delete_label(problem_id, agent_name)
 
     if deleted:
+        # Update cache stats
+        label_stats_cache.update_problem_label_stats(
+            problem_id, agent_name, has_label=False
+        )
         return {"message": f"Label deleted for {problem_id}/{agent_name}"}
     else:
         raise HTTPException(
             status_code=404,
             detail=f"No label found for {problem_id}/{agent_name}",
+        )
+
+
+# Draft endpoints
+@router.post("/{problem_id}/{agent_name}/draft")
+def save_draft(
+    problem_id: str, agent_name: str, draft_create: DraftCreate
+) -> dict[str, str]:
+    """
+    Save a draft for a specific problem-agent combination.
+
+    Drafts are stored as .draft.md files alongside labels.
+    """
+    # Verify problem exists
+    problem = scanner.get_problem(problem_id)
+    if not problem:
+        raise HTTPException(status_code=404, detail=f"Problem '{problem_id}' not found")
+
+    # Verify agent submission exists
+    submission = scanner.get_agent_submission(agent_name, problem_id)
+    if not submission:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_name}' has no submission for problem '{problem_id}'",
+        )
+
+    try:
+        file_service.save_draft(problem_id, agent_name, draft_create.content)
+        return {"message": f"Draft saved for {problem_id}/{agent_name}"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/{problem_id}/{agent_name}/draft")
+def get_draft(problem_id: str, agent_name: str) -> dict[str, str] | None:
+    """
+    Get a draft for a specific problem-agent combination.
+
+    Returns None if no draft exists.
+    """
+    # Verify problem exists
+    problem = scanner.get_problem(problem_id)
+    if not problem:
+        raise HTTPException(status_code=404, detail=f"Problem '{problem_id}' not found")
+
+    # Verify agent submission exists
+    submission = scanner.get_agent_submission(agent_name, problem_id)
+    if not submission:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_name}' has no submission for problem '{problem_id}'",
+        )
+
+    content = file_service.load_draft(problem_id, agent_name)
+    if content is not None:
+        return {"content": content}
+
+    return None
+
+
+@router.post("/{problem_id}/{agent_name}/commit", response_model=LabelResponse)
+def commit_draft(problem_id: str, agent_name: str) -> LabelResponse:
+    """
+    Commit a draft by moving it to the label file.
+
+    This is an atomic file move operation.
+    """
+    # Verify problem exists
+    problem = scanner.get_problem(problem_id)
+    if not problem:
+        raise HTTPException(status_code=404, detail=f"Problem '{problem_id}' not found")
+
+    # Verify agent submission exists
+    submission = scanner.get_agent_submission(agent_name, problem_id)
+    if not submission:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_name}' has no submission for problem '{problem_id}'",
+        )
+
+    try:
+        label = file_service.commit_draft(problem_id, agent_name)
+
+        # Update cache stats
+        label_stats_cache.update_problem_label_stats(
+            problem_id, agent_name, has_label=True
+        )
+
+        return file_service.label_to_response(label)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.delete("/{problem_id}/{agent_name}/draft")
+def delete_draft(problem_id: str, agent_name: str) -> dict[str, str]:
+    """
+    Delete a draft for a specific problem-agent combination.
+    """
+    # Verify problem exists
+    problem = scanner.get_problem(problem_id)
+    if not problem:
+        raise HTTPException(status_code=404, detail=f"Problem '{problem_id}' not found")
+
+    deleted = file_service.delete_draft(problem_id, agent_name)
+
+    if deleted:
+        return {"message": f"Draft deleted for {problem_id}/{agent_name}"}
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No draft found for {problem_id}/{agent_name}",
         )

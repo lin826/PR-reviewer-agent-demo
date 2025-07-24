@@ -141,6 +141,48 @@ class APIClient {
     return this.request<LabelStats>(`/labels/stats/${problemId}`);
   }
 
+  // Draft endpoints
+  async saveDraft(
+    problemId: string,
+    agentName: string,
+    content: string
+  ): Promise<{ message: string }> {
+    return this.request<{ message: string }>(
+      `/labels/${problemId}/${agentName}/draft`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ content }),
+      }
+    );
+  }
+
+  async getDraft(
+    problemId: string,
+    agentName: string
+  ): Promise<{ content: string } | null> {
+    return this.request<{ content: string } | null>(
+      `/labels/${problemId}/${agentName}/draft`
+    );
+  }
+
+  async commitDraft(problemId: string, agentName: string): Promise<Label> {
+    return this.request<Label>(`/labels/${problemId}/${agentName}/commit`, {
+      method: 'POST',
+    });
+  }
+
+  async deleteDraft(
+    problemId: string,
+    agentName: string
+  ): Promise<{ message: string }> {
+    return this.request<{ message: string }>(
+      `/labels/${problemId}/${agentName}/draft`,
+      {
+        method: 'DELETE',
+      }
+    );
+  }
+
   // Utility endpoints
   async getHealth(): Promise<HealthResponse> {
     return this.request<HealthResponse>('/health');

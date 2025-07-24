@@ -18,6 +18,7 @@ function App(): React.ReactElement {
     useState<Problem | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [hasUncommittedChanges, setHasUncommittedChanges] = useState(false);
 
   // Load initial data
   useEffect(() => {
@@ -88,15 +89,47 @@ function App(): React.ReactElement {
   }, [selectedProblem]);
 
   const handleAgentChange = (agentName: string | null) => {
+    if (hasUncommittedChanges) {
+      console.warn('Cannot change agent: uncommitted changes exist');
+      return;
+    }
     setSelectedAgent(agentName);
   };
 
   const handleRepositoryChange = (repositoryName: string | null) => {
+    if (hasUncommittedChanges) {
+      console.warn('Cannot change repository: uncommitted changes exist');
+      return;
+    }
     setSelectedRepository(repositoryName);
   };
 
   const handleProblemChange = (problemId: string | null) => {
+    if (hasUncommittedChanges) {
+      console.warn('Cannot change problem: uncommitted changes exist');
+      return;
+    }
     setSelectedProblem(problemId);
+  };
+
+  const refreshRepositories = async () => {
+    try {
+      const repositoriesData = await apiClient.getRepositories();
+      setRepositories(repositoriesData);
+    } catch (err) {
+      console.error('Failed to refresh repositories:', err);
+    }
+  };
+
+  const refreshProblems = async () => {
+    if (selectedRepository) {
+      try {
+        const problemsData = await apiClient.getProblems(selectedRepository);
+        setProblems(problemsData);
+      } catch (err) {
+        console.error('Failed to refresh problems:', err);
+      }
+    }
   };
 
   if (loading) {
@@ -144,6 +177,7 @@ function App(): React.ReactElement {
         selectedRepository={selectedRepository}
         selectedProblem={selectedProblem}
         selectedProblemData={selectedProblemData}
+        hasUncommittedChanges={hasUncommittedChanges}
         onAgentChange={handleAgentChange}
         onRepositoryChange={handleRepositoryChange}
         onProblemChange={handleProblemChange}
@@ -152,6 +186,9 @@ function App(): React.ReactElement {
         selectedProblem={selectedProblem}
         selectedAgent={selectedAgent}
         selectedProblemData={selectedProblemData}
+        onUncommittedChangesChange={setHasUncommittedChanges}
+        refreshRepositories={refreshRepositories}
+        refreshProblems={refreshProblems}
       />
     </div>
   );
