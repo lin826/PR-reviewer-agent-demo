@@ -350,14 +350,7 @@ export const MainContent: FC<MainContentProps> = ({
   // Generate base commit URL for clickable links
   const baseCommitUrl =
     selectedProblemData?.base_commit && selectedProblemData?.github_url
-      ? (() => {
-          const repoMatch = selectedProblemData.github_url.match(
-            /github\.com\/([^/]+\/[^/]+)/
-          );
-          return repoMatch
-            ? `https://github.com/${repoMatch[1]}/tree/${selectedProblemData.base_commit}`
-            : undefined;
-        })()
+      ? `${selectedProblemData.github_url}/tree/${selectedProblemData.base_commit}`
       : undefined;
 
   // Render patch content with simple diff viewer

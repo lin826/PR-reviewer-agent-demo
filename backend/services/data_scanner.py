@@ -131,10 +131,10 @@ class DataScanner:
         return problem_id, ""
 
     def _generate_github_url(self, repo: str, issue_number: str) -> str:
-        """Generate GitHub URL for the issue."""
-        if "__" in repo and issue_number:
+        """Generate GitHub repository URL."""
+        if "__" in repo:
             org, repo_name = repo.split("__", 1)
-            return f"https://github.com/{org}/{repo_name}/issues/{issue_number}"
+            return f"https://github.com/{org}/{repo_name}"
         return ""
 
     # Public interface methods
