@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, type FC } from 'react';
 import { MarkdownEditor } from './MarkdownEditor';
-import { SimpleDiffViewer } from './SimpleDiffViewer';
+import { SimpleDiffViewer, hasFilterableContent } from './SimpleDiffViewer';
 import { StatusBar } from './StatusBar';
 import { apiClient } from '../services/api';
 import { useAutosave } from '../hooks/useAutosave';
@@ -56,6 +56,7 @@ export const MainContent: FC<MainContentProps> = ({
   );
   const [agentPatch, setAgentPatch] = useState<PatchContent | null>(null);
   const [currentLabel, setCurrentLabel] = useState<Label | null>(null);
+  const [hideAuxiliaryFiles, setHideAuxiliaryFiles] = useState(true);
 
   // Autosave hook - only operates when we're in a draft state
   const { deleteDraft } = useAutosave({
@@ -75,6 +76,8 @@ export const MainContent: FC<MainContentProps> = ({
 
   // Load ground truth patch when problem changes
   useEffect(() => {
+    setGroundTruthPatch(null);
+
     if (selectedProblem) {
       const loadGroundTruth = async () => {
         try {
@@ -86,14 +89,14 @@ export const MainContent: FC<MainContentProps> = ({
         }
       };
       loadGroundTruth();
-    } else {
-      setGroundTruthPatch(null);
     }
   }, [selectedProblem]);
 
-  // Load agent patch when problem and agent change
+  // Load agent patch when agent changes (problem is already selected)
   useEffect(() => {
-    if (selectedProblem && selectedAgent) {
+    setAgentPatch(null);
+
+    if (selectedAgent && selectedProblem) {
       const loadAgentPatch = async () => {
         try {
           const patch = await apiClient.getAgentPatch(
@@ -107,20 +110,18 @@ export const MainContent: FC<MainContentProps> = ({
         }
       };
       loadAgentPatch();
-    } else {
-      setAgentPatch(null);
     }
-  }, [selectedProblem, selectedAgent]);
+  }, [selectedAgent]);
 
-  // Load label and draft when problem and agent change
+  // Load label and draft when agent changes (problem is already selected)
   useEffect(() => {
-    // Immediately clear comment state when selections change to prevent stale data
+    // Immediately clear comment state when agent changes to prevent stale data
     setCurrentLabel(null);
     setComment('');
     setHasUnsavedChanges(false);
     setDraftStatus(null);
 
-    if (selectedProblem && selectedAgent) {
+    if (selectedAgent && selectedProblem) {
       // Create cancellation flag to prevent stale updates
       let isCancelled = false;
 
@@ -183,7 +184,7 @@ export const MainContent: FC<MainContentProps> = ({
         isCancelled = true;
       };
     }
-  }, [selectedProblem, selectedAgent]);
+  }, [selectedAgent]);
 
   const handleCommentChange = useCallback(
     (value: string) => {
@@ -362,7 +363,8 @@ export const MainContent: FC<MainContentProps> = ({
   // Render patch content with simple diff viewer
   const renderPatchContent = (
     patch: PatchContent | null,
-    placeholder: string
+    placeholder: string,
+    isAgentPatch: boolean = false
   ) => {
     if (!patch) {
       return <div className="placeholder">{placeholder}</div>;
@@ -373,6 +375,7 @@ export const MainContent: FC<MainContentProps> = ({
         diffText={patch.content}
         placeholder={placeholder}
         baseCommitUrl={baseCommitUrl}
+        hideAuxiliaryFiles={isAgentPatch ? hideAuxiliaryFiles : false}
       />
     );
   };
@@ -450,12 +453,26 @@ export const MainContent: FC<MainContentProps> = ({
           <div className="panel" id="agent-submission-panel">
             <div className="panel-header">
               <h2>Agent Submission</h2>
+              <div className="comment-actions">
+                {agentPatch && hasFilterableContent(agentPatch.content) && (
+                  <button
+                    onClick={() => setHideAuxiliaryFiles(!hideAuxiliaryFiles)}
+                    style={{
+                      background: hideAuxiliaryFiles ? '#f3f3f3' : '#007acc',
+                      color: hideAuxiliaryFiles ? '#333' : 'white',
+                    }}
+                  >
+                    {hideAuxiliaryFiles ? 'Show Original' : 'Hide Auxiliary'}
+                  </button>
+                )}
+              </div>
             </div>
             <div className="panel-content">
               <div className="patch-viewer" id="agent-submission-content">
                 {renderPatchContent(
                   agentPatch,
-                  'Select an issue and agent to view submission'
+                  'Select an issue and agent to view submission',
+                  true
                 )}
               </div>
             </div>

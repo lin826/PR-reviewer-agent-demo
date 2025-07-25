@@ -4,6 +4,7 @@ interface SimpleDiffViewerProps {
   diffText: string;
   placeholder?: string;
   baseCommitUrl?: string;
+  hideAuxiliaryFiles?: boolean;
 }
 
 interface DiffLine {
@@ -129,12 +130,131 @@ function createGitHubFileUrl(
   return lineNumber ? `${url}#L${lineNumber}` : url;
 }
 
-function parseDiffLines(lines: string[]): DiffLine[] {
+function shouldFilterDiffSection(lines: string[], startIndex: number): boolean {
+  // Find the file path from the diff --git line
+  let filePath = '';
+  let isNewFile = false;
+
+  // Look at the current line and a few lines ahead to gather context
+  for (let i = startIndex; i < Math.min(startIndex + 10, lines.length); i++) {
+    const line = lines[i];
+
+    // Stop looking once we hit the next diff section (but not the first one)
+    if (i > startIndex && line.startsWith('diff --git')) {
+      break;
+    }
+
+    // Extract file path from diff --git line (only from the starting line)
+    if (i === startIndex && line.startsWith('diff --git')) {
+      const match = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+      if (match) {
+        filePath = match[2]; // Use the "new" path (b/path)
+      }
+    }
+
+    // Check if this is a new file
+    if (line.startsWith('new file mode') || line === '--- /dev/null') {
+      isNewFile = true;
+    }
+  }
+
+  // Filter Dockerfile changes
+  if (filePath === 'Dockerfile' || filePath.endsWith('.dockerfile')) {
+    return true;
+  }
+
+  // Filter newly created test files
+  if (isNewFile && filePath.toLowerCase().includes('test')) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasFilterableContent(diffText: string): boolean {
+  if (!diffText.trim()) return false;
+
+  const lines = diffText.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('diff --git')) {
+      if (shouldFilterDiffSection(lines, i)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function parseDiffLines(
+  lines: string[],
+  hideAuxiliaryFiles: boolean = false
+): DiffLine[] {
+  if (!hideAuxiliaryFiles) {
+    // If filtering is disabled, use the original logic
+    const diffLines: DiffLine[] = [];
+    let currentFileIsNew = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const diffLine = classifyDiffLine(line);
+
+      // Reset new file flag when starting a new diff
+      if (diffLine.type === 'meta' && line.startsWith('diff --git')) {
+        currentFileIsNew = false;
+      }
+
+      // Check for new file indicators
+      if (line.startsWith('new file mode') || line === '--- /dev/null') {
+        currentFileIsNew = true;
+      }
+
+      // Apply new file flag to meta lines (file headers)
+      if (diffLine.type === 'meta' && diffLine.filePath && currentFileIsNew) {
+        diffLine.isNewFile = true;
+        diffLine.isClickable = false; // Don't make new files clickable
+      }
+
+      diffLines.push(diffLine);
+    }
+
+    return diffLines;
+  }
+
+  // Filtering enabled - filter out entire sections
+  const filteredLines: string[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // If we hit a diff section, check if we should skip it
+    if (line.startsWith('diff --git')) {
+      if (shouldFilterDiffSection(lines, i)) {
+        // Skip this entire diff section - find the end
+        let sectionEnd = i + 1;
+        while (
+          sectionEnd < lines.length &&
+          !lines[sectionEnd].startsWith('diff --git')
+        ) {
+          sectionEnd++;
+        }
+        i = sectionEnd - 1; // Will be incremented at end of loop
+      } else {
+        filteredLines.push(line);
+      }
+    } else {
+      filteredLines.push(line);
+    }
+    i++;
+  }
+
+  // Now parse the filtered lines normally
   const diffLines: DiffLine[] = [];
   let currentFileIsNew = false;
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+  for (let i = 0; i < filteredLines.length; i++) {
+    const line = filteredLines[i];
     const diffLine = classifyDiffLine(line);
 
     // Reset new file flag when starting a new diff
@@ -159,10 +279,13 @@ function parseDiffLines(lines: string[]): DiffLine[] {
   return diffLines;
 }
 
+export { hasFilterableContent };
+
 export const SimpleDiffViewer: React.FC<SimpleDiffViewerProps> = ({
   diffText,
   placeholder = 'No diff content to display',
   baseCommitUrl,
+  hideAuxiliaryFiles = false,
 }) => {
   if (!diffText.trim()) {
     return (
@@ -183,7 +306,7 @@ export const SimpleDiffViewer: React.FC<SimpleDiffViewerProps> = ({
   }
 
   const lines = diffText.split('\n');
-  const diffLines = parseDiffLines(lines);
+  const diffLines = parseDiffLines(lines, hideAuxiliaryFiles);
 
   // Track current file for hunk headers
   let currentFilePath = '';
