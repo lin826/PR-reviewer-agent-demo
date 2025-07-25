@@ -164,7 +164,11 @@ function shouldFilterDiffSection(lines: string[], startIndex: number): boolean {
   }
 
   // Filter newly created test files
-  if (isNewFile && filePath.toLowerCase().includes('test')) {
+  if (
+    (isNewFile && filePath.toLowerCase().includes('test')) ||
+    (isNewFile && filePath.toLowerCase().includes('reproduce')) ||
+    (isNewFile && filePath.toLowerCase().includes('debug'))
+  ) {
     return true;
   }
 

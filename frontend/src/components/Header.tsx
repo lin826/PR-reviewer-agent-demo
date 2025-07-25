@@ -49,7 +49,9 @@ export const Header: FC<HeaderProps> = ({
   };
 
   // Generate GitHub links
-  const githubUrl = selectedProblemData?.github_url || '#';
+  const prUrl = selectedProblemData?.github_url
+    ? selectedProblemData.github_url.replace('/issues/', '/pull/')
+    : '#';
   const baseCommitUrl =
     selectedProblemData?.base_commit && selectedProblemData?.github_url
       ? (() => {
@@ -62,13 +64,29 @@ export const Header: FC<HeaderProps> = ({
         })()
       : '#';
 
-  const hasValidGithubUrl = githubUrl !== '#';
+  // Generate GitHub issue link
+  const selectedProblemSummary = problems.find(
+    (p) => p.problem_id === selectedProblem
+  );
+  const issueUrl =
+    selectedProblemData?.github_url && selectedProblemSummary?.issue_number
+      ? (() => {
+          const repoMatch = selectedProblemData.github_url.match(
+            /github\.com\/([^/]+\/[^/]+)/
+          );
+          return repoMatch
+            ? `https://github.com/${repoMatch[1]}/issues/${selectedProblemSummary.issue_number}`
+            : '#';
+        })()
+      : '#';
+
+  const hasValidPrUrl = prUrl !== '#';
   const hasValidBaseCommitUrl = baseCommitUrl !== '#';
+  const hasValidIssueUrl = issueUrl !== '#';
 
   return (
     <header className="header">
       <div className="header-content">
-        <h1>SWE Quality Viewer</h1>
         <div className="selectors">
           <select
             value={selectedRepository || ''}
@@ -144,17 +162,31 @@ export const Header: FC<HeaderProps> = ({
               );
             })}
           </select>
+        </div>
 
+        <div className="header-buttons">
           <a
-            href={githubUrl}
+            href={issueUrl}
             target="_blank"
             rel="noopener noreferrer"
             style={{
-              opacity: hasValidGithubUrl ? 1 : 0.5,
-              pointerEvents: hasValidGithubUrl ? 'auto' : 'none',
+              opacity: hasValidIssueUrl ? 1 : 0.5,
+              pointerEvents: hasValidIssueUrl ? 'auto' : 'none',
             }}
           >
-            View PR on GitHub
+            Issue ↗
+          </a>
+
+          <a
+            href={prUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              opacity: hasValidPrUrl ? 1 : 0.5,
+              pointerEvents: hasValidPrUrl ? 'auto' : 'none',
+            }}
+          >
+            PR ↗
           </a>
 
           <a
@@ -166,7 +198,7 @@ export const Header: FC<HeaderProps> = ({
               pointerEvents: hasValidBaseCommitUrl ? 'auto' : 'none',
             }}
           >
-            View Base Commit
+            Base Commit ↗
           </a>
         </div>
       </div>
