@@ -1,0 +1,1 @@
+This seems... less general? But maybe even preferred given how messed up the original was.
