@@ -16,7 +16,7 @@ def list_problems(
         default=None, description="Filter by repository (e.g., 'django__django')"
     ),
     limit: int = Query(
-        default=100, ge=1, le=1000, description="Maximum number of results"
+        default=1000, ge=1, le=1000, description="Maximum number of results"
     ),
     offset: int = Query(default=0, ge=0, description="Number of results to skip"),
 ) -> list[Problem]:

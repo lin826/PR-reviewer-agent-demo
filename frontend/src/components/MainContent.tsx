@@ -447,17 +447,43 @@ export const MainContent: FC<MainContentProps> = ({
             <div className="panel-header">
               <h2>Agent Submission</h2>
               <div className="comment-actions">
-                {agentPatch && hasFilterableContent(agentPatch.content) && (
-                  <button
-                    onClick={() => setHideAuxiliaryFiles(!hideAuxiliaryFiles)}
-                    style={{
-                      background: hideAuxiliaryFiles ? '#f3f3f3' : '#007acc',
-                      color: hideAuxiliaryFiles ? '#333' : 'white',
-                    }}
-                  >
-                    {hideAuxiliaryFiles ? 'Show Original' : 'Hide Auxiliary'}
-                  </button>
-                )}
+                {agentPatch &&
+                  (() => {
+                    const filterResult = hasFilterableContent(
+                      agentPatch.content
+                    );
+
+                    if (!filterResult.hasFilterable) return null;
+
+                    const getBackgroundColor = () => {
+                      if (!hideAuxiliaryFiles) return '#007acc';
+                      return filterResult.hasRisky ? '#dc3545' : '#f3f3f3';
+                    };
+
+                    const getButtonText = () => {
+                      if (!hideAuxiliaryFiles) return 'Hide auxiliary';
+                      return filterResult.hasRisky
+                        ? '⚠️ Show original ⚠️'
+                        : 'Show original';
+                    };
+
+                    return (
+                      <button
+                        onClick={() =>
+                          setHideAuxiliaryFiles(!hideAuxiliaryFiles)
+                        }
+                        style={{
+                          background: getBackgroundColor(),
+                          color:
+                            hideAuxiliaryFiles && !filterResult.hasRisky
+                              ? '#333'
+                              : 'white',
+                        }}
+                      >
+                        {getButtonText()}
+                      </button>
+                    );
+                  })()}
               </div>
             </div>
             <div className="panel-content">

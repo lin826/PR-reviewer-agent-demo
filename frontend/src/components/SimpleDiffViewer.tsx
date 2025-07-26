@@ -16,16 +16,35 @@ interface DiffLine {
   isNewFile?: boolean;
 }
 
-function classifyDiffLine(line: string): DiffLine {
+function classifyDiffLine(line: string, currentFilePath: string): DiffLine {
   if (line.startsWith('diff --git')) {
     // Extract file path from "diff --git a/path/to/file b/path/to/file"
+    // This ensures git diff lines are immediately clickable, but "--- a/" line will be canonical
     const match = line.match(/^diff --git a\/(.+) b\/(.+)$/);
-    const filePath = match ? match[1] : undefined; // Use the "old" path (a/path)
+    const filePath = match ? match[1] : undefined;
     return { type: 'meta', content: line, filePath, isClickable: !!filePath };
   }
 
   if (line.startsWith('index ')) {
     return { type: 'meta', content: line };
+  }
+
+  if (line.startsWith('--- a/')) {
+    // CANONICAL file path extraction - this line exists in both git and traditional diff formats
+    // This will override any file path from "diff --git" line and set the definitive file path
+    const match = line.match(/^--- a\/(.+)$/);
+    const filePath = match ? match[1] : undefined;
+    return { type: 'header', content: line, filePath, isClickable: !!filePath };
+  }
+
+  if (line.startsWith('+++ b/')) {
+    // Use the current file path for +++ lines (make them clickable too)
+    return {
+      type: 'header',
+      content: line,
+      filePath: currentFilePath,
+      isClickable: !!currentFilePath,
+    };
   }
 
   if (line.startsWith('---') || line.startsWith('+++')) {
@@ -40,7 +59,8 @@ function classifyDiffLine(line: string): DiffLine {
       type: 'hunk',
       content: line,
       lineNumber,
-      isClickable: !!lineNumber,
+      filePath: currentFilePath,
+      isClickable: !!(lineNumber && currentFilePath),
     };
   }
 
@@ -130,64 +150,106 @@ function createGitHubFileUrl(
   return lineNumber ? `${url}#L${lineNumber}` : url;
 }
 
-function shouldFilterDiffSection(lines: string[], startIndex: number): boolean {
-  // Find the file path from the diff --git line
+function shouldFilterDiffSection(
+  lines: string[],
+  startIndex: number
+): { shouldFilter: boolean; isRisky: boolean } {
   let filePath = '';
-  let isNewFile = false;
+  let hasGitDiffLine = false;
+  let isNewFileGit = false;
+  let startsFromLineZero = false;
 
   // Look at the current line and a few lines ahead to gather context
   for (let i = startIndex; i < Math.min(startIndex + 10, lines.length); i++) {
     const line = lines[i];
 
     // Stop looking once we hit the next diff section (but not the first one)
-    if (i > startIndex && line.startsWith('diff --git')) {
+    if (
+      i > startIndex &&
+      (line.startsWith('diff --git') || line.startsWith('--- a/'))
+    ) {
       break;
     }
 
-    // Extract file path from diff --git line (only from the starting line)
-    if (i === startIndex && line.startsWith('diff --git')) {
+    // Check for git diff format
+    if (line.startsWith('diff --git')) {
+      hasGitDiffLine = true;
       const match = line.match(/^diff --git a\/(.+) b\/(.+)$/);
       if (match) {
         filePath = match[2]; // Use the "new" path (b/path)
       }
     }
 
-    // Check if this is a new file
+    // Extract file path from traditional diff format (always override - this is canonical)
+    if (line.startsWith('--- a/')) {
+      const match = line.match(/^--- a\/(.+)$/);
+      if (match) {
+        filePath = match[1]; // Always use this as canonical source
+      }
+    }
+
+    // Check for git new file indicators
     if (line.startsWith('new file mode') || line === '--- /dev/null') {
-      isNewFile = true;
+      isNewFileGit = true;
+    }
+
+    // Check for traditional diff new file indicator (starts from line 0)
+    if (line.startsWith('@@') && line.match(/^@@\s*-0,0\s*\+/)) {
+      startsFromLineZero = true;
     }
   }
 
-  // Filter Dockerfile changes
+  // Safe filtering: Dockerfiles (never risky)
   if (filePath === 'Dockerfile' || filePath.endsWith('.dockerfile')) {
-    return true;
+    return { shouldFilter: true, isRisky: false };
   }
 
-  // Filter newly created test files
-  if (
-    (isNewFile && filePath.toLowerCase().includes('test')) ||
-    (isNewFile && filePath.toLowerCase().includes('reproduce')) ||
-    (isNewFile && filePath.toLowerCase().includes('debug'))
-  ) {
-    return true;
+  // Check if this is a top-level file (no directory separators)
+  const isTopLevelFile = !filePath.includes('/');
+
+  // Check if this is in a tests/ directory
+  const isInTestsDirectory =
+    filePath.startsWith('tests/') || filePath.includes('/tests/');
+
+  if (isTopLevelFile || isInTestsDirectory) {
+    // Git format new file: filter without warning
+    if (hasGitDiffLine && isNewFileGit) {
+      return { shouldFilter: true, isRisky: false };
+    }
+
+    // Traditional diff inferred new file: filter with warning
+    if (!hasGitDiffLine && startsFromLineZero) {
+      return { shouldFilter: true, isRisky: true };
+    }
   }
 
-  return false;
+  // Conservative: don't filter anything else
+  return { shouldFilter: false, isRisky: false };
 }
 
-function hasFilterableContent(diffText: string): boolean {
-  if (!diffText.trim()) return false;
+function hasFilterableContent(diffText: string): {
+  hasFilterable: boolean;
+  hasRisky: boolean;
+} {
+  if (!diffText.trim()) return { hasFilterable: false, hasRisky: false };
 
   const lines = diffText.split('\n');
+  let hasFilterable = false;
+  let hasRisky = false;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (line.startsWith('diff --git')) {
-      if (shouldFilterDiffSection(lines, i)) {
-        return true;
+    if (line.startsWith('diff --git') || line.startsWith('--- a/')) {
+      const result = shouldFilterDiffSection(lines, i);
+      if (result.shouldFilter) {
+        hasFilterable = true;
+        if (result.isRisky) {
+          hasRisky = true;
+        }
       }
     }
   }
-  return false;
+  return { hasFilterable, hasRisky };
 }
 
 function parseDiffLines(
@@ -198,14 +260,21 @@ function parseDiffLines(
     // If filtering is disabled, use the original logic
     const diffLines: DiffLine[] = [];
     let currentFileIsNew = false;
+    let currentFilePath = '';
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      const diffLine = classifyDiffLine(line);
 
       // Reset new file flag when starting a new diff
-      if (diffLine.type === 'meta' && line.startsWith('diff --git')) {
+      if (line.startsWith('diff --git') || line.startsWith('--- a/')) {
         currentFileIsNew = false;
+      }
+
+      const diffLine = classifyDiffLine(line, currentFilePath);
+
+      // Update current file path when we find one
+      if (diffLine.filePath) {
+        currentFilePath = diffLine.filePath;
       }
 
       // Check for new file indicators
@@ -233,13 +302,15 @@ function parseDiffLines(
     const line = lines[i];
 
     // If we hit a diff section, check if we should skip it
-    if (line.startsWith('diff --git')) {
-      if (shouldFilterDiffSection(lines, i)) {
+    if (line.startsWith('diff --git') || line.startsWith('--- a/')) {
+      const filterResult = shouldFilterDiffSection(lines, i);
+      if (filterResult.shouldFilter) {
         // Skip this entire diff section - find the end
         let sectionEnd = i + 1;
         while (
           sectionEnd < lines.length &&
-          !lines[sectionEnd].startsWith('diff --git')
+          !lines[sectionEnd].startsWith('diff --git') &&
+          !lines[sectionEnd].startsWith('--- a/')
         ) {
           sectionEnd++;
         }
@@ -256,14 +327,21 @@ function parseDiffLines(
   // Now parse the filtered lines normally
   const diffLines: DiffLine[] = [];
   let currentFileIsNew = false;
+  let currentFilePath = '';
 
   for (let i = 0; i < filteredLines.length; i++) {
     const line = filteredLines[i];
-    const diffLine = classifyDiffLine(line);
 
     // Reset new file flag when starting a new diff
-    if (diffLine.type === 'meta' && line.startsWith('diff --git')) {
+    if (line.startsWith('diff --git') || line.startsWith('--- a/')) {
       currentFileIsNew = false;
+    }
+
+    const diffLine = classifyDiffLine(line, currentFilePath);
+
+    // Update current file path when we find one
+    if (diffLine.filePath) {
+      currentFilePath = diffLine.filePath;
     }
 
     // Check for new file indicators
@@ -325,8 +403,8 @@ export const SimpleDiffViewer: React.FC<SimpleDiffViewerProps> = ({
       }}
     >
       {diffLines.map((diffLine, index) => {
-        // Update current file path when we encounter a diff --git line
-        if (diffLine.type === 'meta' && diffLine.filePath) {
+        // Update current file path when we encounter any line with a file path
+        if (diffLine.filePath) {
           currentFilePath = diffLine.filePath;
         }
 

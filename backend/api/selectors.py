@@ -98,7 +98,7 @@ def list_repositories() -> list[Repository]:
 def list_problems_for_selector(
     repo: str | None = Query(default=None, description="Filter by repository"),
     limit: int = Query(
-        default=50, ge=1, le=500, description="Maximum number of results"
+        default=1000, ge=1, le=1000, description="Maximum number of results"
     ),
 ) -> list[ProblemSummary]:
     """
